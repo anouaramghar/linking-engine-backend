@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+!.env.example
+
+# ML artifacts
+*.pt
+*.ckpt
+models/checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
