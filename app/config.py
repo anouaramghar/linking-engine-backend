@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     # External search (v3)
     brave_api_key: str = ""
     tavily_api_key: str = ""
+    external_provider: str = "tavily"  # tavily | brave
+    max_external_per_article: int = 3
+    external_trust_threshold: float = 0.5
 
     # Embeddings
     embedding_model: str = "BAAI/bge-m3"

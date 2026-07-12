@@ -115,17 +115,17 @@ class WordPressConnector(ContentConnector):
 
     def apply_link(self, suggestion: Suggestion) -> None:
         source = suggestion.source_article
-        target = suggestion.target_article
+        url, title = suggestion.link_url, suggestion.link_title  # internal or external (v3)
         if not source.external_id:
             raise ValueError(f"article {source.id} has no WP post id")
         resp = self.client.get(f"/wp-json/wp/v2/posts/{source.external_id}", params={"context": "edit"})
         resp.raise_for_status()
         content = resp.json()["content"]["raw"]
-        if target.url in content:
+        if url in content:
             return  # link already present — idempotent
         # ponytail: appended "read also" block; in-text placement + anchor generation is v4
-        anchor = suggestion.anchor_text or target.title
-        content += f'\n<p>Read also: <a href="{target.url}">{anchor}</a></p>'
+        anchor = suggestion.anchor_text or title
+        content += f'\n<p>Read also: <a href="{url}">{anchor}</a></p>'
         update = self.client.post(
             f"/wp-json/wp/v2/posts/{source.external_id}", json={"content": content}
         )

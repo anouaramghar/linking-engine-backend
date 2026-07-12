@@ -46,6 +46,16 @@ def trigger_analysis(
     return JobAccepted(job_id=job.id)
 
 
+@router.post("/suggestions/{site_id}/external", status_code=202, response_model=JobAccepted)
+def trigger_external(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
+    if db.get(Site, site_id) is None:
+        raise HTTPException(404, f"site {site_id} not found")
+    from app.tasks.external import external_site
+
+    job = default_queue.enqueue(external_site, site_id, job_timeout=7200)
+    return JobAccepted(job_id=job.id)
+
+
 @router.get("/suggestions/{site_id}", response_model=list[SuggestionOut])
 def list_suggestions(
     site_id: int,
