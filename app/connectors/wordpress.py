@@ -9,6 +9,7 @@ from lxml import html as lxml_html
 
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
 from app.models.suggestion import Suggestion
+from app.services.link_placement import inject_inline
 
 
 def _iso(dt_str: str | None) -> datetime | None:
@@ -123,9 +124,10 @@ class WordPressConnector(ContentConnector):
         content = resp.json()["content"]["raw"]
         if url in content:
             return  # link already present — idempotent
-        # ponytail: appended "read also" block; in-text placement + anchor generation is v4
+        # v4: in-text placement when the anchor phrase occurs; appended block otherwise
         anchor = suggestion.anchor_text or title
-        content += f'\n<p>Read also: <a href="{url}">{anchor}</a></p>'
+        placed = inject_inline(content, anchor, url)
+        content = placed if placed else content + f'\n<p>Read also: <a href="{url}">{anchor}</a></p>'
         update = self.client.post(
             f"/wp-json/wp/v2/posts/{source.external_id}", json={"content": content}
         )

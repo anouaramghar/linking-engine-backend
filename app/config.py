@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     # Editorial rules (A4)
     max_suggestions_per_article: int = 5
 
+    # Anchor generation (v4) — OpenRouter free models, comma-separated fallback chain
+    openrouter_api_key: str = ""
+    openrouter_models: str = (
+        "meta-llama/llama-3.3-70b-instruct:free,google/gemma-3-27b-it:free"
+    )
+    anchor_max_words: int = 8
+
     # GNN (v2)
     gnn_hidden_dim: int = 256
     gnn_out_dim: int = 128
