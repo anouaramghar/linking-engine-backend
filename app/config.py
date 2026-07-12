@@ -22,5 +22,12 @@ class Settings(BaseSettings):
     # Editorial rules (A4)
     max_suggestions_per_article: int = 5
 
+    # GNN (v2)
+    gnn_hidden_dim: int = 256
+    gnn_out_dim: int = 128
+    gnn_epochs: int = 200
+    gnn_lr: float = 0.01
+    model_dir: str = "models"
+
 
 settings = Settings()

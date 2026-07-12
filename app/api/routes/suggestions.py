@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -34,10 +35,14 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)
-def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
+def trigger_analysis(
+    site_id: int,
+    method: Literal["baseline_cosine", "gnn_graphsage"] = "baseline_cosine",
+    db: Session = Depends(get_db),
+) -> JobAccepted:
     if db.get(Site, site_id) is None:
         raise HTTPException(404, f"site {site_id} not found")
-    job = default_queue.enqueue(analyze_site, site_id, job_timeout=7200)
+    job = default_queue.enqueue(analyze_site, site_id, method, job_timeout=7200)
     return JobAccepted(job_id=job.id)
 
 
