@@ -1,9 +1,10 @@
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+from app.models.article import Article
 
 SuggestionMethod = Enum(
     "baseline_cosine", "gnn_graphsage", name="suggestion_method", native_enum=False, length=30
@@ -34,3 +35,6 @@ class Suggestion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    source_article: Mapped[Article] = relationship(foreign_keys=[source_article_id])
+    target_article: Mapped[Article] = relationship(foreign_keys=[target_article_id])
