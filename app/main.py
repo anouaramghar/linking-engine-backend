@@ -1,7 +1,9 @@
 from fastapi import FastAPI
 
-from app.api.routes import health
+from app.api.routes import health, ingestion, jobs, publish, sites, suggestions
 
 app = FastAPI(title="LinkMesh Engine", version="0.1.0")
 
-app.include_router(health.router, prefix="/api/v1")
+for router in [health.router, sites.router, ingestion.router, suggestions.router,
+               publish.router, jobs.router]:
+    app.include_router(router, prefix="/api/v1")
