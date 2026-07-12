@@ -19,7 +19,7 @@ def _review(db: Session, suggestion: Suggestion, status: str) -> None:
     if suggestion.status == "applied":
         raise HTTPException(409, f"suggestion {suggestion.id} is already applied")
     suggestion.status = status
-    suggestion.reviewed_at = datetime.now(timezone.utc)
+    suggestion.reviewed_at = None if status == "pending" else datetime.now(timezone.utc)
 
 
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
@@ -66,6 +66,29 @@ def trigger_anchor_generation(site_id: int, db: Session = Depends(get_db)) -> Jo
     return JobAccepted(job_id=job.id)
 
 
+@router.get("/suggestions", response_model=list[SuggestionOut])
+def list_all_suggestions(  # cross-site view for the validation dashboard (v5)
+    site_id: int | None = None,
+    status: str | None = None,
+    method: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+) -> list[Suggestion]:
+    query = (
+        select(Suggestion)
+        .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
+        .order_by(Suggestion.score.desc())
+    )
+    if site_id:
+        query = query.where(Suggestion.site_id == site_id)
+    if status:
+        query = query.where(Suggestion.status == status)
+    if method:
+        query = query.where(Suggestion.method == method)
+    return db.scalars(query.limit(limit).offset(offset)).all()
+
+
 @router.get("/suggestions/{site_id}", response_model=list[SuggestionOut])
 def list_suggestions(
     site_id: int,
@@ -75,17 +98,7 @@ def list_suggestions(
     offset: int = 0,
     db: Session = Depends(get_db),
 ) -> list[Suggestion]:
-    query = (
-        select(Suggestion)
-        .where(Suggestion.site_id == site_id)
-        .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
-        .order_by(Suggestion.score.desc())
-    )
-    if status:
-        query = query.where(Suggestion.status == status)
-    if method:
-        query = query.where(Suggestion.method == method)
-    return db.scalars(query.limit(limit).offset(offset)).all()
+    return list_all_suggestions(site_id, status, method, limit, offset, db)
 
 
 @router.put("/suggestions/{suggestion_id}", response_model=SuggestionOut)

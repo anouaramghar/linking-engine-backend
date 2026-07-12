@@ -5,7 +5,10 @@ Usage: uv run python scripts/run_evaluation.py SITE_ID [--k 10] [--test-fraction
 """
 
 import argparse
+import json
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 sys.path.insert(0, ".")
 
@@ -62,11 +65,26 @@ def main() -> int:
         }
 
         rb, rg = recall_at_k(base, truth, args.k), recall_at_k(gnn, truth, args.k)
+        mb, mg = mrr(base, truth), mrr(gnn, truth)
         print(f"{'':14}{'Recall@' + str(args.k):>12}{'MRR':>8}")
-        print(f"{'baseline':14}{rb:12.3f}{mrr(base, truth):8.3f}")
-        print(f"{'gnn':14}{rg:12.3f}{mrr(gnn, truth):8.3f}   (final loss {loss:.4f})")
+        print(f"{'baseline':14}{rb:12.3f}{mb:8.3f}")
+        print(f"{'gnn':14}{rg:12.3f}{mg:8.3f}   (final loss {loss:.4f})")
         gate = rg - rb >= 0.10
         print(f"\ngate (+10pts Recall@{args.k}): {'PASS' if gate else 'FAIL'} ({(rg - rb) * 100:+.1f}pts)")
+
+        # Persist for the validation dashboard (GET /stats/{site_id}/evaluation)
+        out = Path(settings.model_dir) / f"eval_site_{args.site_id}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps({
+            "site_id": args.site_id,
+            "k": args.k,
+            "train_links": len(train),
+            "test_links": len(test),
+            "baseline": {"recall_at_k": rb, "mrr": mb},
+            "gnn": {"recall_at_k": rg, "mrr": mg},
+            "gate_passed": gate,
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        }))
         return 0 if gate else 1
     finally:
         db.close()

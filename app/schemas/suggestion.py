@@ -20,14 +20,17 @@ class SuggestionOut(BaseModel):
     external_url: str | None = None
     external_title: str | None = None
     trust_score: float | None = None
+    context_before: str = ""  # source text around the anchor (v5 dashboard preview)
+    context_after: str = ""
     created_at: datetime
 
 
 class SuggestionReview(BaseModel):
-    # 'applied' is set exclusively by the publication worker — contract-level guarantee
-    status: Literal["approved", "rejected"]
+    # 'applied' is set exclusively by the publication worker — contract-level guarantee;
+    # 'pending' = undo a review (v5 dashboard)
+    status: Literal["approved", "rejected", "pending"]
 
 
 class BulkReview(BaseModel):
     suggestion_ids: list[int]
-    status: Literal["approved", "rejected"]
+    status: Literal["approved", "rejected", "pending"]

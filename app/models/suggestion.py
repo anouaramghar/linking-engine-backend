@@ -55,3 +55,20 @@ class Suggestion(Base):
     @property
     def link_title(self) -> str:
         return self.external_title or self.target_article.title
+
+    # Text around the anchor occurrence, for the dashboard's in-context preview.
+    def _context(self) -> tuple[str, str]:
+        text = self.source_article.content_text
+        if self.anchor_text:
+            idx = text.lower().find(self.anchor_text.lower())
+            if idx >= 0:
+                return text[max(0, idx - 180) : idx], text[idx + len(self.anchor_text) : idx + 180]
+        return text[:240], ""
+
+    @property
+    def context_before(self) -> str:
+        return self._context()[0]
+
+    @property
+    def context_after(self) -> str:
+        return self._context()[1]
