@@ -1,3 +1,11 @@
+x-app-service: &app-service
+  image: linkmesh-engine:local
+  env_file:
+    - .env
+  environment:
+    DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh
+    REDIS_URL: redis://redis:6379/0
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -6,7 +14,7 @@ services:
       POSTGRES_PASSWORD: linkmesh
       POSTGRES_DB: linkmesh
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -27,12 +35,19 @@ services:
       timeout: 5s
       retries: 10
 
+  migrate:
+    <<: *app-service
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   api:
-    build: .
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh
-      REDIS_URL: redis://redis:6379/0
+    <<: *app-service
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     depends_on:
@@ -40,20 +55,33 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=5)"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   worker:
-    build: .
-    command: rq worker --url redis://redis:6379/0 default
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh
-      REDIS_URL: redis://redis:6379/0
+    <<: *app-service
+    command: ["rq", "worker", "--url", "redis://redis:6379/0", "default"]
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - hf_cache:/home/linkmesh/.cache/huggingface
 
 volumes:
   pgdata:
   redisdata:
+  hf_cache:
