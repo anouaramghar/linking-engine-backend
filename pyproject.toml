@@ -39,6 +39,16 @@ dev = [
     "ruff>=0.6",
 ]
 
+[tool.uv.sources]
+# CPU-only wheels: PyPI's Linux torch bundles the full CUDA toolkit (~4 GB),
+# which EMBEDDING_DEVICE=cpu never uses.
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
