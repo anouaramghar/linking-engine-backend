@@ -14,6 +14,7 @@
 - Use Python `3.12` and pin `uv` to `0.11.28`.
 - Resolve dependencies from `uv.lock` with `--frozen --no-dev --extra ml`.
 - Use one `linkmesh-engine:local` image for API, migrations, and worker.
+- Keep PostgreSQL on `db:5432` internally and publish it as `localhost:15432`; host port 5432 belongs to an existing PostgreSQL 18 installation.
 - Run application processes as a non-root `linkmesh` user.
 - Keep `.env` ignored and out of the image; never commit secrets.
 - Preserve `pgdata`, `redisdata`, and `hf_cache`; never run `docker compose down -v`.
@@ -165,7 +166,7 @@ Expected: one commit containing only `Dockerfile` and `.dockerignore`.
 Create `.env` with:
 
 ```dotenv
-DATABASE_URL=postgresql+psycopg://linkmesh:linkmesh@localhost:5432/linkmesh
+DATABASE_URL=postgresql+psycopg://linkmesh:linkmesh@localhost:15432/linkmesh
 REDIS_URL=redis://localhost:6379/0
 API_HOST=0.0.0.0
 API_PORT=8000
@@ -221,7 +222,7 @@ services:
       POSTGRES_PASSWORD: linkmesh
       POSTGRES_DB: linkmesh
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -339,11 +340,11 @@ Run:
 
 ```powershell
 Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
-  Where-Object { $_.LocalPort -in 5432, 6379, 8000 } |
+  Where-Object { $_.LocalPort -in 15432, 6379, 8000 } |
   Select-Object LocalAddress,LocalPort,OwningProcess
 ```
 
-Expected: no unrelated listener owns ports 5432, 6379, or 8000. If a listener exists, identify it before proceeding; do not stop unrelated processes or containers.
+Expected: no unrelated listener owns ports 15432, 6379, or 8000. If a listener exists, identify it before proceeding; do not stop unrelated processes or containers.
 
 - [ ] **Step 2: Build through Compose and start the stack**
 

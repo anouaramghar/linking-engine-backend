@@ -52,7 +52,7 @@ A `.dockerignore` file will exclude Git metadata, virtual environments, Python/t
 - Continue using `pgvector/pgvector:pg16`.
 - Persist data in `pgdata`.
 - Keep the existing `pg_isready` health check.
-- Expose port 5432 for local development.
+- Keep PostgreSQL on port 5432 inside the Compose network and expose it as host port 15432 because the development machine already runs PostgreSQL 18 on host port 5432.
 
 ### `redis`
 
@@ -85,7 +85,7 @@ A `.dockerignore` file will exclude Git metadata, virtual environments, Python/t
 
 ## Configuration and secrets
 
-The ignored `.env` file will be initialized locally from `.env.example`. It supplies non-secret development defaults and empty external-search keys. Compose will override `DATABASE_URL` and `REDIS_URL` with service-network addresses for all application-image services.
+The ignored `.env` file will be initialized locally from `.env.example`. Its host-facing `DATABASE_URL` uses `localhost:15432`, while Compose overrides `DATABASE_URL` and `REDIS_URL` with service-network addresses for all application-image services. The file otherwise supplies non-secret development defaults and empty external-search keys.
 
 The `.env` file must not be copied into the image or committed. WordPress credentials and external API keys remain empty unless the developer explicitly supplies local values later.
 
