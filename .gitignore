@@ -22,3 +22,6 @@ models/checkpoints/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Local Git worktrees
+.worktrees/
