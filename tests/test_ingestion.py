@@ -80,6 +80,87 @@ def test_permalink_change_updates_in_place(db, site):
     assert db.get(Article, first_id).url == f"{site.base_url}/new-slug"
 
 
+def test_reassigned_permalink_updates_existing_url_row(db, site):
+    """A new WP post id at an existing permalink must replace the stale identity."""
+    old = ArticleData(url=f"{site.base_url}/same-slug", title="Old", content_text="old", external_id="1")
+    replacement = ArticleData(
+        url=f"{site.base_url}/same-slug",
+        title="Replacement",
+        content_text="new",
+        external_id="2",
+    )
+
+    first_id = ingestion_service._upsert_article(db, site.id, old)
+    db.commit()
+    replacement_id = ingestion_service._upsert_article(db, site.id, replacement)
+    db.commit()
+
+    assert replacement_id == first_id
+    article = db.get(Article, first_id)
+    assert article.external_id == "2"
+    assert article.title == "Replacement"
+
+
+def test_wordpress_ingestion_claims_existing_html_url_row(db, site):
+    """Switching a site from HTML to WordPress must attach the WP id to its URL row."""
+    html_article = ArticleData(
+        url=f"{site.base_url}/shared", title="HTML", content_text="html", external_id=None
+    )
+    wordpress_article = ArticleData(
+        url=f"{site.base_url}/shared", title="WordPress", content_text="wp", external_id="42"
+    )
+
+    html_id = ingestion_service._upsert_article(db, site.id, html_article)
+    db.commit()
+    wordpress_id = ingestion_service._upsert_article(db, site.id, wordpress_article)
+    db.commit()
+
+    assert wordpress_id == html_id
+    article = db.get(Article, html_id)
+    assert article.external_id == "42"
+    assert article.title == "WordPress"
+
+
+def test_slug_swap_preserves_both_article_identities(db, site):
+    """A WP post moving onto another post's permalink must not violate URL uniqueness."""
+    first = ArticleData(
+        url=f"{site.base_url}/first", title="First", content_text="first", external_id="1"
+    )
+    second = ArticleData(
+        url=f"{site.base_url}/second", title="Second", content_text="second", external_id="2"
+    )
+    moved_first = ArticleData(
+        url=f"{site.base_url}/second", title="First moved", content_text="moved", external_id="1"
+    )
+
+    first_id = ingestion_service._upsert_article(db, site.id, first)
+    second_id = ingestion_service._upsert_article(db, site.id, second)
+    db.commit()
+    moved_id = ingestion_service._upsert_article(db, site.id, moved_first)
+    db.commit()
+
+    assert moved_id == first_id
+    assert db.get(Article, first_id).url == f"{site.base_url}/second"
+    assert db.get(Article, second_id).url == f"{site.base_url}/first"
+
+
+def test_url_only_ingestion_preserves_wordpress_external_id(db, site):
+    wordpress_article = ArticleData(
+        url=f"{site.base_url}/shared", title="WordPress", content_text="wp", external_id="42"
+    )
+    url_only_article = ArticleData(
+        url=f"{site.base_url}/shared", title="HTML", content_text="html", external_id=None
+    )
+
+    article_id = ingestion_service._upsert_article(db, site.id, wordpress_article)
+    db.commit()
+    same_id = ingestion_service._upsert_article(db, site.id, url_only_article)
+    db.commit()
+
+    assert same_id == article_id
+    assert db.get(Article, article_id).external_id == "42"
+
+
 def test_failed_run_never_stays_running(db, site, monkeypatch):
     def boom(s):
         raise RuntimeError("connector exploded")

@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -20,36 +20,47 @@ def normalize_url(url: str) -> str:
 
 
 def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
-    # external_id (WP post id) survives permalink changes; URL is the key only without one
-    conflict_key = ["site_id", "external_id"] if art.external_id else ["site_id", "url"]
-    stmt = (
-        pg_insert(Article)
-        .values(
-            site_id=site_id,
-            external_id=art.external_id,
-            url=art.url,
-            title=art.title,
-            content_text=art.content_text,
-            content_html=art.content_html,
-            language=art.language,
-            published_at=art.published_at,
-        )
-        .on_conflict_do_update(
-            index_elements=conflict_key,
-            set_={
-                "external_id": art.external_id,
-                "url": art.url,
-                "title": art.title,
-                "content_text": art.content_text,
-                "content_html": art.content_html,
-                "language": art.language,
-                "published_at": art.published_at,
-                "updated_at": func.now(),
-            },
-        )
-        .returning(Article.id)
+    identity_filters = [Article.url == art.url]
+    if art.external_id is not None:
+        identity_filters.append(Article.external_id == art.external_id)
+
+    matches = db.scalars(
+        select(Article)
+        .where(Article.site_id == site_id, or_(*identity_filters))
+        .with_for_update()
+    ).all()
+    by_url = next((article for article in matches if article.url == art.url), None)
+    by_external_id = next(
+        (
+            article
+            for article in matches
+            if art.external_id is not None and article.external_id == art.external_id
+        ),
+        None,
     )
-    return db.execute(stmt).scalar_one()
+    article = by_external_id or by_url
+
+    if article is None:
+        article = Article(site_id=site_id, url=art.url, title="", content_text="")
+        db.add(article)
+    elif by_external_id is not None and by_url is not None and by_external_id.id != by_url.id:
+        previous_url = by_external_id.url
+        by_url.url = f"linkmesh://url-swap/{site_id}/{by_url.id}"
+        db.flush()
+        by_external_id.url = art.url
+        db.flush()
+        by_url.url = previous_url
+
+    if art.external_id is not None:
+        article.external_id = art.external_id
+    article.url = art.url
+    article.title = art.title
+    article.content_text = art.content_text
+    article.content_html = art.content_html
+    article.language = art.language
+    article.published_at = art.published_at
+    db.flush()
+    return article.id
 
 
 def _upsert_taxonomies(db: Session, site_id: int, article_id: int, art: ArticleData) -> None:
