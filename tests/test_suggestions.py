@@ -1,8 +1,13 @@
 """Baseline cosine + review lifecycle — hand-crafted embeddings, no torch needed."""
 
-from sqlalchemy import select
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, BrokenBarrierError, Lock
+
+from sqlalchemy import event, select
 
 from app.config import settings
+from app.db import engine
 from app.models import Article, Embedding, InternalLink, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.services.suggestion_service import generate_suggestions
@@ -70,6 +75,59 @@ def test_baseline_suggestions(db, site):
     generate_suggestions(site.id)
     total = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     assert len(total) == len(suggestions)
+
+
+def test_reanalysis_respects_total_suggestion_cap(db, site):
+    _make_articles(db, site, [_vec(0) for _ in range(7)])
+
+    first = generate_suggestions(site.id)
+    second = generate_suggestions(site.id)
+
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    counts = Counter(suggestion.source_article_id for suggestion in suggestions)
+    assert first == {"articles_encoded": 0, "suggestions_created": 35}
+    assert second == {"articles_encoded": 0, "suggestions_created": 0}
+    assert set(counts.values()) == {settings.max_suggestions_per_article}
+
+
+def test_concurrent_analysis_respects_total_suggestion_cap(db, site):
+    _make_articles(db, site, [_vec(0) for _ in range(7)])
+    worker_entries = Barrier(2)
+    candidate_snapshots = Barrier(2)
+    listener_lock = Lock()
+    paused_queries = 0
+
+    def synchronize_first_candidate_queries(
+        conn, cursor, statement, parameters, context, executemany
+    ):
+        nonlocal paused_queries
+        if "SELECT a2.id AS target_id" not in statement:
+            return
+        with listener_lock:
+            if paused_queries >= 2:
+                return
+            paused_queries += 1
+        try:
+            candidate_snapshots.wait(timeout=2)
+        except BrokenBarrierError:
+            pass
+
+    event.listen(engine, "after_cursor_execute", synchronize_first_candidate_queries)
+    try:
+        def analyze(site_id):
+            worker_entries.wait(timeout=2)
+            return generate_suggestions(site_id)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(analyze, [site.id, site.id]))
+    finally:
+        event.remove(engine, "after_cursor_execute", synchronize_first_candidate_queries)
+
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    counts = Counter(suggestion.source_article_id for suggestion in suggestions)
+    assert sum(result["suggestions_created"] for result in results) == 35
+    assert len(suggestions) == 35
+    assert set(counts.values()) == {settings.max_suggestions_per_article}
 
 
 def test_review_lifecycle(client, db, site):
