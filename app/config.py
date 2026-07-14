@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     api_port: int = 8000
     environment: str = "development"
 
+    # Static API key for all non-health endpoints; empty disables the check (local dev only)
+    api_key: str = ""
+
     # External search (v3)
     tavily_api_key: str = ""
 
