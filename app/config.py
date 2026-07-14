@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     environment: str = "development"
 
     # External search (v3)
-    brave_api_key: str = ""
     tavily_api_key: str = ""
 
     # Embeddings
