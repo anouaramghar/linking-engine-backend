@@ -12,6 +12,8 @@ from app.connectors.registry import get_connector
 from app.db import SessionLocal
 from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Site, Taxonomy
 
+_ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C4D  # "LM"
+
 
 def normalize_url(url: str) -> str:
     """Comparison key: scheme-insensitive, no fragment/query, no trailing slash."""
@@ -20,6 +22,8 @@ def normalize_url(url: str) -> str:
 
 
 def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
+    db.execute(select(func.pg_advisory_xact_lock(_ARTICLE_UPSERT_LOCK_NAMESPACE, site_id)))
+
     identity_filters = [Article.url == art.url]
     if art.external_id is not None:
         identity_filters.append(Article.external_id == art.external_id)

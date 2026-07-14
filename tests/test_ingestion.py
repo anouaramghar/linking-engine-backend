@@ -1,9 +1,13 @@
 """Ingestion pipeline against a stub connector — no network, real database."""
 
-from sqlalchemy import select
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, BrokenBarrierError
+
+from sqlalchemy import event, select
 
 import app.services.ingestion_service as ingestion_service
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
+from app.db import SessionLocal, engine
 from app.models import Article, IngestionRun, InternalLink, Taxonomy
 
 
@@ -159,6 +163,35 @@ def test_url_only_ingestion_preserves_wordpress_external_id(db, site):
 
     assert same_id == article_id
     assert db.get(Article, article_id).external_id == "42"
+
+
+def test_concurrent_article_insert_resolves_to_one_row(site):
+    article = ArticleData(
+        url=f"{site.base_url}/concurrent", title="Concurrent", content_text="content", external_id="7"
+    )
+    lookups = Barrier(2, timeout=1)
+
+    def synchronize_empty_lookups(conn, cursor, statement, parameters, context, executemany):
+        if "FROM articles" in statement and "FOR UPDATE" in statement:
+            try:
+                lookups.wait()
+            except BrokenBarrierError:
+                pass
+
+    def upsert_in_separate_transaction():
+        with SessionLocal() as session:
+            article_id = ingestion_service._upsert_article(session, site.id, article)
+            session.commit()
+            return article_id
+
+    event.listen(engine, "after_cursor_execute", synchronize_empty_lookups)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            article_ids = list(executor.map(lambda _: upsert_in_separate_transaction(), range(2)))
+    finally:
+        event.remove(engine, "after_cursor_execute", synchronize_empty_lookups)
+
+    assert article_ids[0] == article_ids[1]
 
 
 def test_failed_run_never_stays_running(db, site, monkeypatch):
