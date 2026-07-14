@@ -3,9 +3,15 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+from app.config import settings
 from app.db import SessionLocal
 from app.main import app
 from app.models import Site
+
+
+@pytest.fixture(autouse=True)
+def disable_api_key(monkeypatch):
+    monkeypatch.setattr(settings, "api_key", "")
 
 
 @pytest.fixture
