@@ -20,6 +20,8 @@ def normalize_url(url: str) -> str:
 
 
 def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
+    # external_id (WP post id) survives permalink changes; URL is the key only without one
+    conflict_key = ["site_id", "external_id"] if art.external_id else ["site_id", "url"]
     stmt = (
         pg_insert(Article)
         .values(
@@ -33,9 +35,10 @@ def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
             published_at=art.published_at,
         )
         .on_conflict_do_update(
-            index_elements=["site_id", "url"],
+            index_elements=conflict_key,
             set_={
                 "external_id": art.external_id,
+                "url": art.url,
                 "title": art.title,
                 "content_text": art.content_text,
                 "content_html": art.content_html,

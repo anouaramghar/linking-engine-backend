@@ -1,8 +1,9 @@
 """WordPress connector — WP REST API, read via public API, write via Application Passwords (A2)."""
 
+import html
 from collections.abc import Iterator
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from lxml import html as lxml_html
@@ -61,15 +62,17 @@ class WordPressConnector(ContentConnector):
                 out[term["id"]] = TaxonomyData(kind=kind, name=term["name"], external_id=str(term["id"]))
         return out
 
-    def _internal_hrefs(self, content_html: str) -> list[str]:
+    def _internal_hrefs(self, content_html: str, page_url: str) -> list[str]:
+        """Hrefs pointing at this site's host, resolved absolute (handles /relative/ links)."""
         if not content_html.strip():
             return []
         tree = lxml_html.fromstring(content_html)
-        return [
-            href
-            for href in tree.xpath("//a/@href")
-            if urlparse(href).netloc == self._host
-        ]
+        hrefs = []
+        for href in tree.xpath("//a/@href"):
+            absolute = urljoin(page_url, href)
+            if urlparse(absolute).netloc == self._host:
+                hrefs.append(absolute)
+        return hrefs
 
     def _to_article(self, post: dict, taxonomy_map: dict[int, TaxonomyData]) -> ArticleData:
         content_html = post["content"]["rendered"]
@@ -83,7 +86,7 @@ class WordPressConnector(ContentConnector):
             language=None,  # language filter disabled (A5) — fleet is 100% English
             published_at=_iso(post.get("date_gmt")),
             taxonomies=[taxonomy_map[tid] for tid in term_ids if tid in taxonomy_map],
-            outbound_internal_urls=self._internal_hrefs(content_html),
+            outbound_internal_urls=self._internal_hrefs(content_html, post["link"]),
         )
 
     def fetch_articles(self) -> Iterator[ArticleData]:
@@ -121,11 +124,14 @@ class WordPressConnector(ContentConnector):
         resp = self.client.get(f"/wp-json/wp/v2/posts/{source.external_id}", params={"context": "edit"})
         resp.raise_for_status()
         content = resp.json()["content"]["raw"]
-        if target.url in content:
-            return  # link already present — idempotent
+        if content.strip():
+            # exact href match, not substring — "/post" must not match href="/post-2"
+            existing = {urljoin(source.url, h) for h in lxml_html.fromstring(content).xpath("//a/@href")}
+            if target.url in existing:
+                return  # link already present — idempotent
         # ponytail: appended "read also" block; in-text placement + anchor generation is v4
-        anchor = suggestion.anchor_text or target.title
-        content += f'\n<p>Read also: <a href="{target.url}">{anchor}</a></p>'
+        anchor = html.escape(suggestion.anchor_text or target.title)
+        content += f'\n<p>Read also: <a href="{html.escape(target.url)}">{anchor}</a></p>'
         update = self.client.post(
             f"/wp-json/wp/v2/posts/{source.external_id}", json={"content": content}
         )

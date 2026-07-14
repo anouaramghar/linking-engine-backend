@@ -66,6 +66,20 @@ def test_ingestion_idempotent(db, site, monkeypatch):
     assert all(r.status == "succeeded" and r.finished_at is not None for r in runs)
 
 
+def test_permalink_change_updates_in_place(db, site):
+    """Same WP post id under a new URL must update the row, not violate (site_id, external_id)."""
+    old = ArticleData(url=f"{site.base_url}/old-slug", title="T", content_text="x", external_id="99")
+    new = ArticleData(url=f"{site.base_url}/new-slug", title="T", content_text="x", external_id="99")
+
+    first_id = ingestion_service._upsert_article(db, site.id, old)
+    db.commit()
+    second_id = ingestion_service._upsert_article(db, site.id, new)
+    db.commit()
+
+    assert first_id == second_id
+    assert db.get(Article, first_id).url == f"{site.base_url}/new-slug"
+
+
 def test_failed_run_never_stays_running(db, site, monkeypatch):
     def boom(s):
         raise RuntimeError("connector exploded")
