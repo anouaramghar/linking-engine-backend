@@ -29,6 +29,25 @@ def test_internal_hrefs_resolves_relative_links():
     ]
 
 
+def test_to_article_handles_comment_only_rendered_content():
+    c = make_connector()
+    article = c._to_article(
+        {
+            "id": 10,
+            "link": "https://example.com/dynamic-block",
+            "title": {"rendered": "Dynamic block"},
+            "content": {"rendered": "<!-- wp:latest-posts /-->"},
+            "categories": [],
+            "tags": [],
+            "date_gmt": None,
+        },
+        {},
+    )
+
+    assert article.content_text == ""
+    assert article.outbound_internal_urls == []
+
+
 def _mock_publish(connector, raw_content):
     """Route GET -> post with raw_content; capture the update POST body, if any."""
     captured = {}
@@ -59,6 +78,16 @@ def test_apply_link_escapes_html():
     c.apply_link(_suggestion())
     assert "Tips &amp; &lt;Tricks&gt;" in captured["content"]
     assert 'href="https://example.com/t?a=1&amp;b=2"' in captured["content"]
+
+
+def test_apply_link_handles_comment_only_content():
+    c = make_connector()
+    captured = _mock_publish(c, "<!-- wp:latest-posts /-->")
+
+    c.apply_link(_suggestion())
+
+    assert captured["content"].startswith("<!-- wp:latest-posts /-->")
+    assert "Read also" in captured["content"]
 
 
 def test_apply_link_skips_only_on_exact_href():

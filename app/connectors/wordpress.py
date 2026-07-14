@@ -7,6 +7,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from lxml import html as lxml_html
+from lxml.etree import ParserError
+from lxml.html import HtmlElement
 
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
 from app.models.suggestion import Suggestion
@@ -18,10 +20,21 @@ def _iso(dt_str: str | None) -> datetime | None:
     return datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
 
 
-def _strip_html(fragment: str) -> str:
+def _parse_html(fragment: str) -> HtmlElement | None:
     if not fragment.strip():
-        return ""
-    return lxml_html.fromstring(fragment).text_content().strip()
+        return None
+    try:
+        return lxml_html.fromstring(fragment)
+    except ParserError:
+        return None
+
+
+def _text_content(tree: HtmlElement | None) -> str:
+    return tree.text_content().strip() if tree is not None else ""
+
+
+def _strip_html(fragment: str) -> str:
+    return _text_content(_parse_html(fragment))
 
 
 class WordPressConnector(ContentConnector):
@@ -64,9 +77,13 @@ class WordPressConnector(ContentConnector):
 
     def _internal_hrefs(self, content_html: str, page_url: str) -> list[str]:
         """Hrefs pointing at this site's host, resolved absolute (handles /relative/ links)."""
-        if not content_html.strip():
+        return self._internal_hrefs_from_tree(_parse_html(content_html), page_url)
+
+    def _internal_hrefs_from_tree(
+        self, tree: HtmlElement | None, page_url: str
+    ) -> list[str]:
+        if tree is None:
             return []
-        tree = lxml_html.fromstring(content_html)
         hrefs = []
         for href in tree.xpath("//a/@href"):
             absolute = urljoin(page_url, href)
@@ -76,17 +93,18 @@ class WordPressConnector(ContentConnector):
 
     def _to_article(self, post: dict, taxonomy_map: dict[int, TaxonomyData]) -> ArticleData:
         content_html = post["content"]["rendered"]
+        content_tree = _parse_html(content_html)
         term_ids = post.get("categories", []) + post.get("tags", [])
         return ArticleData(
             url=post["link"],
             external_id=str(post["id"]),
             title=_strip_html(post["title"]["rendered"]),
-            content_text=_strip_html(content_html),
+            content_text=_text_content(content_tree),
             content_html=content_html,
             language=None,  # language filter disabled (A5) — fleet is 100% English
             published_at=_iso(post.get("date_gmt")),
             taxonomies=[taxonomy_map[tid] for tid in term_ids if tid in taxonomy_map],
-            outbound_internal_urls=self._internal_hrefs(content_html, post["link"]),
+            outbound_internal_urls=self._internal_hrefs_from_tree(content_tree, post["link"]),
         )
 
     def fetch_articles(self) -> Iterator[ArticleData]:
@@ -126,7 +144,7 @@ class WordPressConnector(ContentConnector):
         content = resp.json()["content"]["raw"]
         if content.strip():
             # exact href match, not substring — "/post" must not match href="/post-2"
-            existing = {urljoin(source.url, h) for h in lxml_html.fromstring(content).xpath("//a/@href")}
+            existing = set(self._internal_hrefs(content, source.url))
             if target.url in existing:
                 return  # link already present — idempotent
         # ponytail: appended "read also" block; in-text placement + anchor generation is v4
