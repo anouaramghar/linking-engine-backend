@@ -1,3 +1,6 @@
+from typing import Self
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +26,12 @@ class Settings(BaseSettings):
 
     # Editorial rules (A4)
     max_suggestions_per_article: int = 5
+
+    @model_validator(mode="after")
+    def require_api_key_outside_development(self) -> Self:
+        if self.environment != "development" and not self.api_key:
+            raise ValueError("API_KEY must be set outside development")
+        return self
 
 
 settings = Settings()
