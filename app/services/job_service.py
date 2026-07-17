@@ -5,6 +5,8 @@ next enqueue. Duplicate triggers are refused while a run is active. RQ retries a
 limited and safe — all three task bodies are idempotent (upserts, cached embeddings,
 publication claims)."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from rq import Retry
@@ -13,7 +15,7 @@ from rq.job import Job
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db import SessionLocal
+from app.db import SessionLocal, engine
 from app.models import JobRun
 from app.tasks.queues import analysis_queue, ingestion_queue, publication_queue, redis_conn
 
@@ -33,6 +35,17 @@ class DuplicateJobError(Exception):
         super().__init__(f"{run.kind} job already {run.status} for site {run.site_id}")
 
 
+@contextmanager
+def _site_enqueue_lock(site_id: int) -> Iterator[None]:
+    # The work session commits the durable row before enqueueing. A dedicated
+    # transaction keeps the per-site advisory lock across both work commits.
+    with engine.begin() as lock_connection:
+        lock_connection.execute(
+            select(func.pg_advisory_xact_lock(_ENQUEUE_LOCK_NAMESPACE, site_id))
+        ).scalar_one()
+        yield
+
+
 def _still_in_queue(run: JobRun) -> bool:
     if run.queue_job_id is None:  # crashed between insert and enqueue
         return False
@@ -43,10 +56,11 @@ def _still_in_queue(run: JobRun) -> bool:
     return job.get_status() in _RQ_ACTIVE_STATUSES
 
 
-def enqueue_job(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
+def _enqueue_job_locked(
+    db: Session, site_id: int, kind: str, fn, job_timeout: int
+) -> JobRun:
     """Create the durable run row, then enqueue. Raises DuplicateJobError while an
     active run of this kind exists for the site."""
-    db.execute(select(func.pg_advisory_xact_lock(_ENQUEUE_LOCK_NAMESPACE, site_id))).scalar_one()
     active = db.scalars(
         select(JobRun).where(
             JobRun.site_id == site_id,
@@ -66,7 +80,7 @@ def enqueue_job(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> J
 
     run = JobRun(site_id=site_id, kind=kind)
     db.add(run)
-    db.flush()
+    db.commit()
     job = _QUEUES[kind].enqueue(
         fn,
         site_id,
@@ -78,6 +92,11 @@ def enqueue_job(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> J
     db.commit()
     db.refresh(run)
     return run
+
+
+def enqueue_job(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
+    with _site_enqueue_lock(site_id):
+        return _enqueue_job_locked(db, site_id, kind, fn, job_timeout)
 
 
 def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:

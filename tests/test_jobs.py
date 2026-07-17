@@ -5,9 +5,12 @@ nothing listens on the per-stage queues during tests, so enqueued jobs never exe
 import pytest
 from rq.exceptions import NoSuchJobError
 from rq.job import Job
+from sqlalchemy import select
 
+import app.services.job_service as job_service
+from app.db import SessionLocal
 from app.models import JobRun
-from app.services.job_service import run_durably
+from app.services.job_service import enqueue_job, run_durably
 from app.tasks.queues import redis_conn
 
 
@@ -37,6 +40,43 @@ def test_trigger_creates_durable_run(client, db, site, cleanup_rq):
     assert run.status == "queued"
     assert run.queue_job_id == body["job_id"]
     assert Job.fetch(body["job_id"], connection=redis_conn).origin == "ingestion"
+
+
+def test_job_run_is_committed_before_enqueue(db, site, monkeypatch):
+    observed = {}
+
+    class InspectingQueue:
+        def enqueue(self, _fn, _site_id, **kwargs):
+            with SessionLocal() as observer:
+                visible_run = observer.get(JobRun, kwargs["job_run_id"])
+                observed["status"] = visible_run.status
+                observed["queue_job_id"] = visible_run.queue_job_id
+            return type("QueuedJob", (), {"id": "committed-before-enqueue"})()
+
+    monkeypatch.setitem(job_service._QUEUES, "ingestion", InspectingQueue())
+
+    run = enqueue_job(db, site.id, "ingestion", lambda: None, job_timeout=60)
+
+    assert observed == {"status": "queued", "queue_job_id": None}
+    assert run.queue_job_id == "committed-before-enqueue"
+
+
+def test_enqueue_failure_leaves_reconcilable_queued_run(db, site, monkeypatch):
+    class FailingQueue:
+        def enqueue(self, _fn, _site_id, **_kwargs):
+            raise RuntimeError("Redis unavailable")
+
+    monkeypatch.setitem(job_service._QUEUES, "ingestion", FailingQueue())
+
+    with pytest.raises(RuntimeError, match="Redis unavailable"):
+        enqueue_job(db, site.id, "ingestion", lambda: None, job_timeout=60)
+
+    db.expire_all()
+    run = db.scalars(
+        select(JobRun).where(JobRun.site_id == site.id, JobRun.kind == "ingestion")
+    ).one()
+    assert run.status == "queued"
+    assert run.queue_job_id is None
 
 
 def test_duplicate_trigger_rejected_while_active(client, db, site, cleanup_rq):
