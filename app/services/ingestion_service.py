@@ -22,6 +22,7 @@ from app.models import (
     Suggestion,
     Taxonomy,
 )
+from app.services.job_service import record_progress
 
 # Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 ingestion run,
 # 0x4C4A enqueue, 0x4C4D analysis, and 0x4C50 publication.
@@ -242,7 +243,7 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
     )
 
 
-def _run_ingestion_locked(site_id: int) -> dict:
+def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
     """RQ task body. A run never stays 'running' (sequence 4.1 alt success/failure)."""
     db = SessionLocal()
     run = IngestionRun(site_id=site_id)
@@ -264,11 +265,18 @@ def _run_ingestion_locked(site_id: int) -> dict:
             outbound.append((article_id, art.outbound_internal_urls))
             articles += 1
             if articles % 50 == 0:
+                record_progress(
+                    db,
+                    job_run_id,
+                    stage="crawling",
+                    articles=articles,
+                )
                 db.commit()  # batch commit — resumable, bounded transaction size
 
         _validate_snapshot_completeness(db, site_id, run.id, articles)
 
         # Resolve links once all articles are known (forward references)
+        record_progress(db, job_run_id, stage="resolving_links")
         links = 0
         seen: set[tuple[int, int]] = set()
         for source_id, urls in outbound:
@@ -280,6 +288,13 @@ def _run_ingestion_locked(site_id: int) -> dict:
                     links += 1
 
         # Reconciliation is success-gated after link resolution (Phase 0, finding 3).
+        record_progress(
+            db,
+            job_run_id,
+            stage="reconciling",
+            articles=articles,
+            links=links,
+        )
         _reconcile_snapshot(db, site_id, run.id)
         run.status = "succeeded"
         run.articles_upserted = articles
@@ -298,13 +313,13 @@ def _run_ingestion_locked(site_id: int) -> dict:
         db.close()
 
 
-def run_ingestion(site_id: int) -> dict:
+def run_ingestion(site_id: int, job_run_id: int | None = None) -> dict:
     """Run one site crawl at a time and record lock contention as a failed run."""
     lock_acquired = False
     try:
         with _site_ingestion_lock(site_id):
             lock_acquired = True
-            return _run_ingestion_locked(site_id)
+            return _run_ingestion_locked(site_id, job_run_id)
     except Exception as error:
         if lock_acquired:
             raise

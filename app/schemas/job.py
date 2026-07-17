@@ -14,6 +14,8 @@ class JobStatus(BaseModel):
     # job_runs vocabulary once evicted (queued | running | succeeded | failed)
     status: str
     result: dict | None = None
+    progress: dict | None = None
+    progress_at: datetime | None = None
     error: str | None = None
 
 
@@ -27,6 +29,8 @@ class JobRunOut(BaseModel):
     queue_job_id: str | None
     attempts: int
     result: dict | None
+    progress: dict | None
+    progress_at: datetime | None
     error: str | None
     enqueued_at: datetime
     started_at: datetime | None

@@ -28,6 +28,8 @@ class JobRun(Base):
     queue_job_id: Mapped[str | None] = mapped_column(String(64), index=True)  # RQ job id
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     result: Mapped[dict | None] = mapped_column(JSONB)
+    progress: Mapped[dict | None] = mapped_column(JSONB)
+    progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
     enqueued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

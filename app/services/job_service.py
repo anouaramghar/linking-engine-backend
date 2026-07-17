@@ -8,6 +8,8 @@ publication claims)."""
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import logging
+from inspect import Parameter, signature
 
 from rq import Retry, get_current_job
 from rq.exceptions import NoSuchJobError
@@ -28,6 +30,8 @@ _QUEUES = {
     "publication": publication_queue,
 }
 _RQ_ACTIVE_STATUSES = {"queued", "started", "deferred", "scheduled"}
+
+logger = logging.getLogger(__name__)
 
 
 class DuplicateJobError(Exception):
@@ -57,9 +61,7 @@ def _still_in_queue(run: JobRun) -> bool:
     return job.get_status() in _RQ_ACTIVE_STATUSES
 
 
-def _enqueue_job_locked(
-    db: Session, site_id: int, kind: str, fn, job_timeout: int
-) -> JobRun:
+def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
     """Create the durable run row, then enqueue. Raises DuplicateJobError while an
     active run of this kind exists for the site."""
     active = db.scalars(
@@ -83,6 +85,8 @@ def _enqueue_job_locked(
                     "attempts": run.attempts,
                     "error": run.error,
                 },
+                kind="job_lost",
+                site_id=run.site_id,
             )
     still_active = [run for run in active if run.status in ("queued", "running")]
     if still_active:
@@ -110,6 +114,38 @@ def enqueue_job(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> J
         return _enqueue_job_locked(db, site_id, kind, fn, job_timeout)
 
 
+def record_progress(
+    db: Session,
+    job_run_id: int | None,
+    **fields,
+) -> None:
+    """Advisory progress update that participates in the caller's next commit."""
+    if job_run_id is None:
+        return
+    try:
+        # Flush the update inside a savepoint so a progress-only database error can
+        # be rolled back without discarding the task's surrounding work transaction.
+        with db.begin_nested():
+            run = db.get(JobRun, job_run_id)
+            if run is None:
+                return
+            run.progress = {**(run.progress or {}), **fields}
+            run.progress_at = datetime.now(timezone.utc)
+            db.flush()
+    except Exception:
+        logger.exception("failed to record progress for job run %s", job_run_id)
+
+
+def _run_task_body(fn, site_id: int, job_run_id: int | None) -> dict:
+    parameters = signature(fn).parameters.values()
+    if any(
+        parameter.name == "job_run_id" or parameter.kind == Parameter.VAR_KEYWORD
+        for parameter in parameters
+    ):
+        return fn(site_id, job_run_id=job_run_id)
+    return fn(site_id)
+
+
 def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
     """Task-body wrapper: records start, attempt count, result or error. Re-raises so
     RQ can retry; the final attempt's failure stays recorded. Tolerates a missing row
@@ -123,7 +159,7 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
             run.started_at = datetime.now(timezone.utc)
             db.commit()
         try:
-            result = fn(site_id)
+            result = _run_task_body(fn, site_id, job_run_id)
         except Exception as e:
             error = str(e)[:2000]
             if run is not None:
@@ -147,6 +183,8 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
                         "attempts": run.attempts if run is not None else 1,
                         "error": error,
                     },
+                    kind="job_failed",
+                    site_id=site_id,
                 )
             raise
         if run is not None:
@@ -174,6 +212,8 @@ def get_job_status(job_id: str) -> dict | None:
                 "job_id": job_id,
                 "status": run.status,
                 "result": run.result,
+                "progress": run.progress,
+                "progress_at": run.progress_at,
                 "error": run.error,
             }
         finally:

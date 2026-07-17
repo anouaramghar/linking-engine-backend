@@ -12,6 +12,7 @@ from app.db import SessionLocal, engine
 from app.models import Article, Embedding, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
+from app.services.job_service import record_progress
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
@@ -30,7 +31,12 @@ def _site_analysis_lock(site_id: int) -> Iterator[None]:
         yield
 
 
-def _embed_missing(db, site_id: int, model: str) -> int:
+def _embed_missing(
+    db,
+    site_id: int,
+    model: str,
+    job_run_id: int | None = None,
+) -> int:
     """Encode active articles whose model-specific embedding is missing or stale."""
     encoded = 0
     last_article_id = 0
@@ -108,8 +114,14 @@ def _embed_missing(db, site_id: int, model: str) -> int:
                 db.add(Embedding(article_id=article_id, model=model, **values))
             else:
                 db.execute(update(Embedding).where(Embedding.id == embedding_id).values(**values))
-        db.commit()
         encoded += len(batch)
+        record_progress(
+            db,
+            job_run_id,
+            stage="encoding",
+            encoded=encoded,
+        )
+        db.commit()
 
 
 def _validate_embedding_dimension(model: str) -> None:
@@ -129,14 +141,14 @@ def _validate_embedding_dimension(model: str) -> None:
         )
 
 
-def generate_suggestions(site_id: int) -> dict:
+def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
         db = SessionLocal()
         try:
             model = settings.embedding_model
             _validate_embedding_dimension(model)
-            encoded = _embed_missing(db, site_id, model)
+            encoded = _embed_missing(db, site_id, model, job_run_id)
 
             article_ids = db.scalars(
                 select(Article.id).where(
@@ -173,6 +185,12 @@ def generate_suggestions(site_id: int) -> dict:
                         )
                     )
                     created += 1
+                record_progress(
+                    db,
+                    job_run_id,
+                    stage="suggesting",
+                    created=created,
+                )
                 db.commit()
             return {"articles_encoded": encoded, "suggestions_created": created}
         finally:

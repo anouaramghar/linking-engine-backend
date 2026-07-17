@@ -9,7 +9,16 @@ from sqlalchemy import event, func, select
 import app.services.ingestion_service as ingestion_service
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
 from app.db import SessionLocal, engine
-from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Suggestion, Taxonomy
+from app.models import (
+    Article,
+    ArticleTaxonomy,
+    IngestionRun,
+    InternalLink,
+    JobRun,
+    Suggestion,
+    Taxonomy,
+)
+from app.services.job_service import run_durably
 
 
 class StubConnector(ContentConnector):
@@ -125,6 +134,49 @@ def test_ingestion_idempotent(db, site, monkeypatch):
     runs = db.scalars(select(IngestionRun).where(IngestionRun.site_id == site.id)).all()
     assert len(runs) == 2
     assert all(r.status == "succeeded" and r.finished_at is not None for r in runs)
+
+
+def test_durable_ingestion_records_final_progress(db, site, monkeypatch):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    job_run = JobRun(site_id=site.id, kind="ingestion")
+    db.add(job_run)
+    db.commit()
+
+    result = run_durably(job_run.id, ingestion_service.run_ingestion, site.id)
+
+    assert result == {"articles": 2, "links": 2}
+    db.expire_all()
+    job_run = db.get(JobRun, job_run.id)
+    assert job_run.status == "succeeded"
+    assert job_run.progress == {
+        "stage": "reconciling",
+        "articles": 2,
+        "links": 2,
+    }
+    assert job_run.progress_at is not None
+
+
+def test_progress_write_failure_does_not_fail_ingestion(db, site, monkeypatch):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    job_run = JobRun(site_id=site.id, kind="ingestion")
+    db.add(job_run)
+    db.commit()
+
+    def fail_progress_update(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().lower().startswith("update job_runs set progress"):
+            raise RuntimeError("progress storage unavailable")
+
+    event.listen(engine, "before_cursor_execute", fail_progress_update)
+    try:
+        result = run_durably(job_run.id, ingestion_service.run_ingestion, site.id)
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_progress_update)
+
+    assert result == {"articles": 2, "links": 2}
+    db.expire_all()
+    job_run = db.get(JobRun, job_run.id)
+    assert job_run.status == "succeeded"
+    assert job_run.progress is None
 
 
 def test_successful_recrawl_deactivates_article_not_seen(db, site, monkeypatch):

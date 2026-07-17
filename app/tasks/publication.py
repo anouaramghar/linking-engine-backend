@@ -23,7 +23,7 @@ from sqlalchemy.orm import joinedload
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
 from app.models import Article, Site, Suggestion
-from app.services.job_service import run_durably
+from app.services.job_service import record_progress, run_durably
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
     return run_durably(job_run_id, _publish_approved, site_id)
 
 
-def _publish_approved(site_id: int) -> dict:
+def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
     db = SessionLocal()
     try:
         site = db.get(Site, site_id)
@@ -46,9 +46,19 @@ def _publish_approved(site_id: int) -> dict:
             .where(Suggestion.site_id == site_id, Suggestion.status == "approved")
             .order_by(Suggestion.id)
         ).all()
+        applied = failed = skipped = 0
+        total = len(batch)
+        record_progress(
+            db,
+            job_run_id,
+            stage="publishing",
+            applied=applied,
+            failed=failed,
+            skipped=skipped,
+            total=total,
+        )
         db.commit()  # end the read transaction — each claim below gets its own
 
-        applied = failed = skipped = 0
         for suggestion_id, source_article_id in batch:
             try:
                 # one publication update per source article at a time
@@ -81,8 +91,17 @@ def _publish_approved(site_id: int) -> dict:
                 # 'applied' is set exclusively here — lifecycle guarantee
                 suggestion.status = "applied"
                 suggestion.applied_at = datetime.now(timezone.utc)
-                db.commit()  # releases the advisory and row locks
                 applied += 1
+                record_progress(
+                    db,
+                    job_run_id,
+                    stage="publishing",
+                    applied=applied,
+                    failed=failed,
+                    skipped=skipped,
+                    total=total,
+                )
+                db.commit()  # releases the advisory and row locks
             except Exception:
                 db.rollback()  # claim undone — suggestion is 'approved' again for retry
                 logger.exception("apply_link failed for suggestion %s", suggestion_id)

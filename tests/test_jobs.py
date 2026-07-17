@@ -2,6 +2,7 @@
 lost-job reconciliation, durable status after Redis eviction. Real Redis + PostgreSQL;
 nothing listens on the per-stage queues during tests, so enqueued jobs never execute."""
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -10,8 +11,11 @@ from rq.job import Job
 from sqlalchemy import select
 
 import app.services.job_service as job_service
+from app.config import settings
 from app.db import SessionLocal
-from app.models import JobRun
+from app.models import Alert, JobRun
+from app.schemas.job import JobRunOut
+from app.services import alerts as alert_service
 from app.services.job_service import enqueue_job, run_durably
 from app.tasks.queues import redis_conn
 
@@ -96,12 +100,12 @@ def test_duplicate_trigger_rejected_while_active(client, db, site, cleanup_rq):
     cleanup_rq.append(analysis.json()["job_id"])
 
 
-def test_lost_job_is_reconciled_and_retriggerable(
-    client, db, site, cleanup_rq, monkeypatch
-):
+def test_lost_job_is_reconciled_and_retriggerable(client, db, site, cleanup_rq, monkeypatch):
     alerts = []
     monkeypatch.setattr(
-        job_service, "send_alert", lambda subject, payload: alerts.append((subject, payload))
+        job_service,
+        "send_alert",
+        lambda subject, payload, **metadata: alerts.append((subject, payload, metadata)),
     )
     first = client.post(f"/api/v1/sites/{site.id}/ingest")
     assert first.status_code == 202
@@ -127,6 +131,7 @@ def test_lost_job_is_reconciled_and_retriggerable(
                 "attempts": 0,
                 "error": "lost from queue before completion",
             },
+            {"kind": "job_lost", "site_id": site.id},
         )
     ]
 
@@ -135,43 +140,36 @@ def test_final_job_failure_sends_alert(db, site, monkeypatch):
     run = JobRun(site_id=site.id, kind="analysis")
     db.add(run)
     db.commit()
-    sent = []
-    monkeypatch.setattr(
-        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=0)
-    )
-    monkeypatch.setattr(
-        job_service, "send_alert", lambda subject, payload: sent.append((subject, payload))
-    )
+    monkeypatch.setattr(settings, "alert_webhook_url", "")
+    monkeypatch.setattr(job_service, "get_current_job", lambda: SimpleNamespace(retries_left=0))
 
     error = "x" * 2100
     with pytest.raises(RuntimeError, match="x+"):
         run_durably(run.id, lambda _site_id: (_ for _ in ()).throw(RuntimeError(error)), site.id)
 
-    assert sent == [
-        (
-            "LinkMesh analysis job failed",
-            {
-                "site_id": site.id,
-                "kind": "analysis",
-                "job_run_id": run.id,
-                "attempts": 1,
-                "error": "x" * 2000,
-            },
-        )
-    ]
+    db.expire_all()
+    stored = db.scalar(select(Alert).where(Alert.site_id == site.id))
+    assert stored.kind == "job_failed"
+    assert stored.subject == "LinkMesh analysis job failed"
+    assert stored.occurrences == 1
+    assert stored.payload == {
+        "site_id": site.id,
+        "kind": "analysis",
+        "job_run_id": run.id,
+        "attempts": 1,
+        "error": "x" * 2000,
+    }
 
 
 def test_nonfinal_job_failure_does_not_send_alert(db, site, monkeypatch):
     run = JobRun(site_id=site.id, kind="analysis")
     db.add(run)
     db.commit()
-    monkeypatch.setattr(
-        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1)
-    )
+    monkeypatch.setattr(job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1))
     monkeypatch.setattr(
         job_service,
         "send_alert",
-        lambda *_args: pytest.fail("non-final retry must not alert"),
+        lambda *_args, **_kwargs: pytest.fail("non-final retry must not alert"),
     )
 
     with pytest.raises(RuntimeError, match="retry me"):
@@ -180,6 +178,30 @@ def test_nonfinal_job_failure_does_not_send_alert(db, site, monkeypatch):
             lambda _site_id: (_ for _ in ()).throw(RuntimeError("retry me")),
             site.id,
         )
+
+
+def test_alert_db_failure_preserves_original_job_error(db, site, monkeypatch, caplog):
+    run = JobRun(site_id=site.id, kind="analysis")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(settings, "alert_webhook_url", "")
+    monkeypatch.setattr(job_service, "get_current_job", lambda: None)
+
+    def fail_session():
+        raise RuntimeError("alerts database unavailable")
+
+    monkeypatch.setattr(alert_service, "SessionLocal", fail_session)
+
+    with pytest.raises(RuntimeError, match="original task error"):
+        run_durably(
+            run.id,
+            lambda _site_id: (_ for _ in ()).throw(RuntimeError("original task error")),
+            site.id,
+        )
+
+    assert "failed to persist alert" in caplog.text
+    db.expire_all()
+    assert db.get(JobRun, run.id).error == "original task error"
 
 
 def test_run_durably_records_attempts_result_and_error(db, site):
@@ -212,12 +234,15 @@ def test_run_durably_tolerates_missing_row(site):
 
 
 def test_job_status_survives_redis_eviction(client, db, site):
+    progress_at = datetime.now(timezone.utc)
     run = JobRun(
         site_id=site.id,
         kind="publication",
         status="succeeded",
         queue_job_id="evicted-job-id",
         result={"applied": 2, "failed": 0, "skipped": 0},
+        progress={"stage": "publishing", "applied": 2, "total": 2},
+        progress_at=progress_at,
     )
     db.add(run)
     db.commit()
@@ -227,6 +252,8 @@ def test_job_status_survives_redis_eviction(client, db, site):
     body = resp.json()
     assert body["status"] == "succeeded"
     assert body["result"] == {"applied": 2, "failed": 0, "skipped": 0}
+    assert body["progress"] == {"stage": "publishing", "applied": 2, "total": 2}
+    assert body["progress_at"] is not None
 
     assert client.get("/api/v1/jobs/never-existed").status_code == 404
 
@@ -246,3 +273,20 @@ def test_list_job_runs_per_site(client, db, site):
     only_analysis = client.get(f"/api/v1/jobs/site/{site.id}", params={"kind": "analysis"}).json()
     assert [r["kind"] for r in only_analysis] == ["analysis"]
     assert only_analysis[0]["error"] == "x"
+
+
+def test_job_run_out_serializes_progress(db, site):
+    progress_at = datetime.now(timezone.utc)
+    run = JobRun(
+        site_id=site.id,
+        kind="ingestion",
+        progress={"stage": "crawling", "articles": 50},
+        progress_at=progress_at,
+    )
+    db.add(run)
+    db.commit()
+
+    serialized = JobRunOut.model_validate(run)
+
+    assert serialized.progress == {"stage": "crawling", "articles": 50}
+    assert serialized.progress_at == progress_at
