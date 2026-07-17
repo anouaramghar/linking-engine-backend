@@ -5,6 +5,7 @@ ponytail: sequential httpx fetching — fine for pilot-scale sites; switch to th
 spider in app/crawler/ when fleet-scale crawling (v5) needs concurrency/politeness.
 """
 
+import logging
 from collections.abc import Iterator
 from urllib.parse import urljoin, urlparse
 
@@ -12,17 +13,29 @@ import httpx
 import trafilatura
 from lxml import etree, html as lxml_html
 
+from app.config import settings
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata
+from app.connectors.url_guard import UnsafeURLError, request_guard, validate_url
 from app.models.suggestion import Suggestion
 
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+# Sitemap XML is untrusted input — no entity resolution, no network fetches
+_XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
+
+logger = logging.getLogger(__name__)
 
 
 class HTMLConnector(ContentConnector):
     def __init__(self, site):
         super().__init__(site)
+        allow_private = settings.allow_unsafe_crawl_targets
+        validate_url(site.base_url, allow_private=allow_private, resolve_dns=False)
         self.client = httpx.Client(
-            timeout=30, follow_redirects=True, headers={"User-Agent": "LinkMesh/0.1"}
+            timeout=30,
+            follow_redirects=True,
+            max_redirects=5,
+            headers={"User-Agent": "LinkMesh/0.1"},
+            event_hooks={"request": [request_guard(allow_private=allow_private)]},
         )
         self._host = urlparse(site.base_url).netloc
 
@@ -37,8 +50,19 @@ class HTMLConnector(ContentConnector):
     def _parse_sitemap(self, url: str, xpath: str) -> list[str]:
         resp = self.client.get(url)
         resp.raise_for_status()
-        tree = etree.fromstring(resp.content)
-        return [loc.text.strip() for loc in tree.xpath(xpath, namespaces=SITEMAP_NS) if loc.text]
+        tree = etree.fromstring(resp.content, parser=_XML_PARSER)
+        locs = [loc.text.strip() for loc in tree.xpath(xpath, namespaces=SITEMAP_NS) if loc.text]
+        return [loc for loc in locs if self._same_origin(loc)]
+
+    def _same_origin(self, url: str) -> bool:
+        """Sitemap traversal stays on the site's own host (Phase 0, finding #1)."""
+        try:
+            # host check only here — the request guard does the address check at fetch time
+            validate_url(url, allow_private=True, same_host_as=self.site.base_url)
+        except UnsafeURLError as e:
+            logger.warning("skipping sitemap URL: %s", e)
+            return False
+        return True
 
     def fetch_articles(self) -> Iterator[ArticleData]:
         for url in self._sitemap_urls():

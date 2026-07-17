@@ -10,7 +10,9 @@ from lxml import html as lxml_html
 from lxml.etree import ParserError
 from lxml.html import HtmlElement
 
+from app.config import settings
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
+from app.connectors.url_guard import request_guard, validate_url
 from app.models.suggestion import Suggestion
 
 
@@ -41,12 +43,26 @@ class WordPressConnector(ContentConnector):
     def __init__(self, site):
         super().__init__(site)
         auth = (site.wp_username, site.wp_app_password) if site.wp_username else None
+        allow_private = settings.allow_unsafe_crawl_targets
+        require_https = auth is not None and not allow_private
+        # Fail fast on scheme/credential problems; addresses are re-checked per
+        # request (incl. redirect hops) by the guard hook, which also resolves DNS.
+        validate_url(
+            site.base_url,
+            allow_private=allow_private,
+            require_https=require_https,
+            resolve_dns=False,
+        )
         self.client = httpx.Client(
             base_url=site.base_url.rstrip("/"),
             auth=auth,
             timeout=30,
             follow_redirects=True,
+            max_redirects=5,
             headers={"User-Agent": "LinkMesh/0.1"},
+            event_hooks={
+                "request": [request_guard(allow_private=allow_private, require_https=require_https)]
+            },
         )
         self._host = urlparse(site.base_url).netloc
 

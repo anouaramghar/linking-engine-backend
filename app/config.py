@@ -27,10 +27,21 @@ class Settings(BaseSettings):
     # Editorial rules (A4)
     max_suggestions_per_article: int = 5
 
+    # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/
+    # metadata destinations and require HTTPS when WP credentials are used.
+    # True relaxes both for crawling local test sites — development only.
+    allow_unsafe_crawl_targets: bool = False
+
     @model_validator(mode="after")
     def require_api_key_outside_development(self) -> Self:
         if self.environment != "development" and not self.api_key:
             raise ValueError("API_KEY must be set outside development")
+        return self
+
+    @model_validator(mode="after")
+    def forbid_unsafe_crawl_targets_outside_development(self) -> Self:
+        if self.environment != "development" and self.allow_unsafe_crawl_targets:
+            raise ValueError("ALLOW_UNSAFE_CRAWL_TARGETS is development-only")
         return self
 
 
