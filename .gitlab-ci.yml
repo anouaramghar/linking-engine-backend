@@ -1,0 +1,83 @@
+stages:
+  - lint
+  - test
+  - build
+
+.python-job:
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  before_script:
+    - uv sync --frozen --dev
+
+lint:
+  extends: .python-job
+  stage: lint
+  script:
+    - uv lock --check
+    - uv run ruff check .
+
+test:
+  extends: .python-job
+  stage: test
+  services:
+    - name: pgvector/pgvector:pg16
+      alias: db
+    - name: redis:7-alpine
+      alias: redis
+  variables:
+    POSTGRES_USER: linkmesh
+    POSTGRES_PASSWORD: linkmesh
+    POSTGRES_DB: linkmesh
+    DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh
+    REDIS_URL: redis://redis:6379/0
+  script:
+    - |
+      uv run python - <<'PY'
+      import os
+      import time
+
+      from redis import Redis
+      from sqlalchemy import create_engine, text
+
+      engine = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True)
+      redis = Redis.from_url(os.environ["REDIS_URL"])
+
+      def probe_postgres():
+          with engine.connect() as connection:
+              connection.execute(text("SELECT 1"))
+
+      def wait_for(name, probe):
+          deadline = time.monotonic() + 60
+          last_error = None
+          while time.monotonic() < deadline:
+              try:
+                  probe()
+                  return
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(1)
+          raise RuntimeError(f"{name} did not become ready: {last_error}")
+
+      wait_for("PostgreSQL", probe_postgres)
+      wait_for("Redis", redis.ping)
+      PY
+    - uv run alembic upgrade head
+    - uv run pytest -q
+    - uv run alembic check
+
+build:
+  image: docker:29-cli
+  stage: build
+  services:
+    - name: docker:29-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    TEST_IMAGE: linkmesh-engine:ci
+  script:
+    - docker compose config --no-env-resolution -q
+    - docker build --tag "$TEST_IMAGE" .
+    - |
+      uid="$(docker run --rm --entrypoint id "$TEST_IMAGE" -u)"
+      echo "container uid: $uid"
+      test "$uid" -ne 0

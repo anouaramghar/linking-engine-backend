@@ -2,7 +2,7 @@
 ultimate-sitemap-parser dropped per supervisor decision), content extraction via trafilatura.
 
 ponytail: sequential httpx fetching — fine for pilot-scale sites; switch to the Scrapy
-spider in app/crawler/ when fleet-scale crawling (v5) needs concurrency/politeness.
+crawler implementation when fleet-scale crawling (v5) needs concurrency/politeness.
 """
 
 import logging
