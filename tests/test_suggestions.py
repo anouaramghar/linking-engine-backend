@@ -134,6 +134,74 @@ def test_reanalysis_respects_total_suggestion_cap(db, site):
     assert set(counts.values()) == {settings.max_suggestions_per_article}
 
 
+def test_rejected_and_applied_suggestions_free_active_quota(db, site):
+    articles = _make_articles(
+        db,
+        site,
+        [_vec(0) for _ in range(settings.max_suggestions_per_article + 3)],
+    )
+    source_id = articles[0].id
+    generate_suggestions(site.id)
+
+    original = db.scalars(
+        select(Suggestion)
+        .where(Suggestion.source_article_id == source_id)
+        .order_by(Suggestion.id)
+    ).all()
+    assert len(original) == settings.max_suggestions_per_article
+    rejected, applied = original[:2]
+    rejected.status = "rejected"
+    applied.status = "applied"
+    decided_target_ids = {rejected.target_article_id, applied.target_article_id}
+    original_ids = {suggestion.id for suggestion in original}
+    db.commit()
+
+    result = generate_suggestions(site.id)
+
+    suggestions = db.scalars(
+        select(Suggestion)
+        .where(Suggestion.source_article_id == source_id)
+        .order_by(Suggestion.id)
+    ).all()
+    active = [
+        suggestion
+        for suggestion in suggestions
+        if suggestion.status in {"pending", "approved", "applying"}
+    ]
+    replacements = [suggestion for suggestion in suggestions if suggestion.id not in original_ids]
+    assert result == {"articles_encoded": 0, "suggestions_created": 2}
+    assert len(active) == settings.max_suggestions_per_article
+    assert len(replacements) == 2
+    assert decided_target_ids.isdisjoint(
+        {suggestion.target_article_id for suggestion in replacements}
+    )
+
+
+def test_rejected_source_target_pair_is_not_recreated(db, site):
+    source, target = _make_articles(db, site, [_vec(0), _vec(0)])
+    generate_suggestions(site.id)
+    suggestion = db.scalar(
+        select(Suggestion).where(
+            Suggestion.source_article_id == source.id,
+            Suggestion.target_article_id == target.id,
+        )
+    )
+    suggestion.status = "rejected"
+    db.commit()
+
+    result = generate_suggestions(site.id)
+
+    matching = db.scalars(
+        select(Suggestion).where(
+            Suggestion.source_article_id == source.id,
+            Suggestion.target_article_id == target.id,
+        )
+    ).all()
+    assert result == {"articles_encoded": 0, "suggestions_created": 0}
+    assert len(matching) == 1
+    assert matching[0].status == "rejected"
+
+
 def test_concurrent_analysis_respects_total_suggestion_cap(db, site):
     _make_articles(db, site, [_vec(0) for _ in range(7)])
     worker_entries = Barrier(2)

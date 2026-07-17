@@ -129,7 +129,10 @@ def generate_suggestions(site_id: int) -> dict:
             existing_counts = dict(
                 db.execute(
                     select(Suggestion.source_article_id, func.count())
-                    .where(Suggestion.site_id == site_id)
+                    .where(
+                        Suggestion.site_id == site_id,
+                        Suggestion.status.in_(("pending", "approved", "applying")),
+                    )
                     .group_by(Suggestion.source_article_id)
                 ).all()
             )
