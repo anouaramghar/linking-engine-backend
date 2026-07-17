@@ -8,8 +8,8 @@ from app.api.deps import get_db
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
 from app.schemas.suggestion import BulkReview, SuggestionOut, SuggestionReview
+from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.analysis import analyze_site
-from app.tasks.queues import default_queue
 
 router = APIRouter(tags=["suggestions"])
 
@@ -44,8 +44,11 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
 def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
     if db.get(Site, site_id) is None:
         raise HTTPException(404, f"site {site_id} not found")
-    job = default_queue.enqueue(analyze_site, site_id, job_timeout=7200)
-    return JobAccepted(job_id=job.id)
+    try:
+        run = enqueue_job(db, site_id, "analysis", analyze_site, job_timeout=7200)
+    except DuplicateJobError as e:
+        raise HTTPException(409, str(e)) from e
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
 @router.get("/suggestions/{site_id}", response_model=list[SuggestionOut])

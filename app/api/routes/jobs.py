@@ -1,9 +1,29 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from app.schemas.job import JobStatus
+from app.api.deps import get_db
+from app.models import JobRun, Site
+from app.schemas.job import JobRunOut, JobStatus
 from app.services.job_service import get_job_status
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+@router.get("/site/{site_id}", response_model=list[JobRunOut])
+def list_job_runs(
+    site_id: int,
+    kind: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+) -> list[JobRun]:
+    if db.get(Site, site_id) is None:
+        raise HTTPException(404, f"site {site_id} not found")
+    query = select(JobRun).where(JobRun.site_id == site_id)
+    if kind:
+        query = query.where(JobRun.kind == kind)
+    return db.scalars(query.order_by(JobRun.enqueued_at.desc()).limit(limit).offset(offset)).all()
 
 
 @router.get("/{job_id}", response_model=JobStatus)

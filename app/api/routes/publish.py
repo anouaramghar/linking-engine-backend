@@ -5,8 +5,8 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
+from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.publication import publish_approved
-from app.tasks.queues import default_queue
 
 router = APIRouter(prefix="/publish", tags=["publish"])
 
@@ -15,8 +15,11 @@ router = APIRouter(prefix="/publish", tags=["publish"])
 def trigger_publication(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
     if db.get(Site, site_id) is None:
         raise HTTPException(404, f"site {site_id} not found")
-    job = default_queue.enqueue(publish_approved, site_id, job_timeout=3600)
-    return JobAccepted(job_id=job.id)
+    try:
+        run = enqueue_job(db, site_id, "publication", publish_approved, job_timeout=3600)
+    except DuplicateJobError as e:
+        raise HTTPException(409, str(e)) from e
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
 @router.get("/{site_id}/status")

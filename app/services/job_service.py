@@ -1,14 +1,135 @@
+"""Durable job runs (Phase 0, finding 7): every ingestion, analysis, and publication
+job gets a job_runs row at enqueue time, updated by the task body as it executes.
+A job Redis loses is still visible as 'queued' and is reconciled to 'failed' on the
+next enqueue. Duplicate triggers are refused while a run is active. RQ retries are
+limited and safe — all three task bodies are idempotent (upserts, cached embeddings,
+publication claims)."""
+
+from datetime import datetime, timezone
+
+from rq import Retry
 from rq.exceptions import NoSuchJobError
 from rq.job import Job
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
-from app.tasks.queues import redis_conn
+from app.db import SessionLocal
+from app.models import JobRun
+from app.tasks.queues import analysis_queue, ingestion_queue, publication_queue, redis_conn
+
+_ENQUEUE_LOCK_NAMESPACE = 0x4C4A  # "LJ" — serializes enqueues per site
+
+_QUEUES = {
+    "ingestion": ingestion_queue,
+    "analysis": analysis_queue,
+    "publication": publication_queue,
+}
+_RQ_ACTIVE_STATUSES = {"queued", "started", "deferred", "scheduled"}
+
+
+class DuplicateJobError(Exception):
+    def __init__(self, run: JobRun):
+        self.run = run
+        super().__init__(f"{run.kind} job already {run.status} for site {run.site_id}")
+
+
+def _still_in_queue(run: JobRun) -> bool:
+    if run.queue_job_id is None:  # crashed between insert and enqueue
+        return False
+    try:
+        job = Job.fetch(run.queue_job_id, connection=redis_conn)
+    except NoSuchJobError:
+        return False
+    return job.get_status() in _RQ_ACTIVE_STATUSES
+
+
+def enqueue_job(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
+    """Create the durable run row, then enqueue. Raises DuplicateJobError while an
+    active run of this kind exists for the site."""
+    db.execute(select(func.pg_advisory_xact_lock(_ENQUEUE_LOCK_NAMESPACE, site_id))).scalar_one()
+    active = db.scalars(
+        select(JobRun).where(
+            JobRun.site_id == site_id,
+            JobRun.kind == kind,
+            JobRun.status.in_(["queued", "running"]),
+        )
+    ).all()
+    for run in active:
+        if not _still_in_queue(run):  # finding 7's exact failure: the job disappeared
+            run.status = "failed"
+            run.error = "lost from queue before completion"
+            run.finished_at = datetime.now(timezone.utc)
+    still_active = [run for run in active if run.status in ("queued", "running")]
+    if still_active:
+        db.commit()  # keep the reconciliations
+        raise DuplicateJobError(still_active[0])
+
+    run = JobRun(site_id=site_id, kind=kind)
+    db.add(run)
+    db.flush()
+    job = _QUEUES[kind].enqueue(
+        fn,
+        site_id,
+        job_run_id=run.id,
+        job_timeout=job_timeout,
+        retry=Retry(max=2, interval=[30, 120]),  # limited automatic retries
+    )
+    run.queue_job_id = job.id
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
+    """Task-body wrapper: records start, attempt count, result or error. Re-raises so
+    RQ can retry; the final attempt's failure stays recorded. Tolerates a missing row
+    (job enqueued before this table existed, or site deleted meanwhile)."""
+    db = SessionLocal()
+    try:
+        run = db.get(JobRun, job_run_id) if job_run_id is not None else None
+        if run is not None:
+            run.status = "running"
+            run.attempts += 1
+            run.started_at = datetime.now(timezone.utc)
+            db.commit()
+        try:
+            result = fn(site_id)
+        except Exception as e:
+            if run is not None:
+                run.status = "failed"
+                run.error = str(e)[:2000]
+                run.finished_at = datetime.now(timezone.utc)
+                db.commit()
+            raise
+        if run is not None:
+            run.status = "succeeded"
+            run.result = result
+            run.finished_at = datetime.now(timezone.utc)
+            db.commit()
+        return result
+    finally:
+        db.close()
 
 
 def get_job_status(job_id: str) -> dict | None:
+    """RQ's live view when the job is still in Redis; the durable job_runs row after
+    Redis has evicted it (Phase 0, finding 7)."""
     try:
         job = Job.fetch(job_id, connection=redis_conn)
     except NoSuchJobError:
-        return None
+        db = SessionLocal()
+        try:
+            run = db.scalars(select(JobRun).where(JobRun.queue_job_id == job_id)).first()
+            if run is None:
+                return None
+            return {
+                "job_id": job_id,
+                "status": run.status,
+                "result": run.result,
+                "error": run.error,
+            }
+        finally:
+            db.close()
     status = job.get_status()
     return {
         "job_id": job_id,

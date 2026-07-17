@@ -23,13 +23,18 @@ from sqlalchemy.orm import joinedload
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
 from app.models import Site, Suggestion
+from app.services.job_service import run_durably
 
 logger = logging.getLogger(__name__)
 
 _PUBLISH_LOCK_NAMESPACE = 0x4C50  # "LP" — keyed by source article; ingestion uses 0x4C4D
 
 
-def publish_approved(site_id: int) -> dict:
+def publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
+    return run_durably(job_run_id, _publish_approved, site_id)
+
+
+def _publish_approved(site_id: int) -> dict:
     db = SessionLocal()
     try:
         site = db.get(Site, site_id)
