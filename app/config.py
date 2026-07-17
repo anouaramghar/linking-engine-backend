@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     # External search (v3)
     tavily_api_key: str = ""
 
+    # Best-effort operations alerting; empty logs alerts locally.
+    alert_webhook_url: str = ""
+
     # Embeddings
     embedding_model: str = "BAAI/bge-m3"
     embedding_device: str = "cpu"

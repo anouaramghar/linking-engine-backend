@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-from rq import Retry
+from rq import Retry, get_current_job
 from rq.exceptions import NoSuchJobError
 from rq.job import Job
 from sqlalchemy import func, select
@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, engine
 from app.models import JobRun
+from app.services.alerts import send_alert
 from app.tasks.queues import analysis_queue, ingestion_queue, publication_queue, redis_conn
 
 _ENQUEUE_LOCK_NAMESPACE = 0x4C4A  # "LJ" — serializes enqueues per site
@@ -73,6 +74,16 @@ def _enqueue_job_locked(
             run.status = "failed"
             run.error = "lost from queue before completion"
             run.finished_at = datetime.now(timezone.utc)
+            send_alert(
+                f"LinkMesh {run.kind} job lost",
+                {
+                    "site_id": run.site_id,
+                    "kind": run.kind,
+                    "job_run_id": run.id,
+                    "attempts": run.attempts,
+                    "error": run.error,
+                },
+            )
     still_active = [run for run in active if run.status in ("queued", "running")]
     if still_active:
         db.commit()  # keep the reconciliations
@@ -114,11 +125,29 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
         try:
             result = fn(site_id)
         except Exception as e:
+            error = str(e)[:2000]
             if run is not None:
                 run.status = "failed"
-                run.error = str(e)[:2000]
+                run.error = error
                 run.finished_at = datetime.now(timezone.utc)
                 db.commit()
+            current_job = get_current_job()
+            retries_left = getattr(current_job, "retries_left", None)
+            if current_job is None or retries_left is None or retries_left <= 0:
+                send_alert(
+                    f"LinkMesh {run.kind if run is not None else 'unknown'} job failed",
+                    {
+                        "site_id": site_id,
+                        "kind": (
+                            run.kind
+                            if run is not None
+                            else getattr(current_job, "origin", "unknown")
+                        ),
+                        "job_run_id": job_run_id,
+                        "attempts": run.attempts if run is not None else 1,
+                        "error": error,
+                    },
+                )
             raise
         if run is not None:
             run.status = "succeeded"

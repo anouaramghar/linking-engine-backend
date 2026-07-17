@@ -2,6 +2,8 @@
 lost-job reconciliation, durable status after Redis eviction. Real Redis + PostgreSQL;
 nothing listens on the per-stage queues during tests, so enqueued jobs never execute."""
 
+from types import SimpleNamespace
+
 import pytest
 from rq.exceptions import NoSuchJobError
 from rq.job import Job
@@ -94,7 +96,13 @@ def test_duplicate_trigger_rejected_while_active(client, db, site, cleanup_rq):
     cleanup_rq.append(analysis.json()["job_id"])
 
 
-def test_lost_job_is_reconciled_and_retriggerable(client, db, site, cleanup_rq):
+def test_lost_job_is_reconciled_and_retriggerable(
+    client, db, site, cleanup_rq, monkeypatch
+):
+    alerts = []
+    monkeypatch.setattr(
+        job_service, "send_alert", lambda subject, payload: alerts.append((subject, payload))
+    )
     first = client.post(f"/api/v1/sites/{site.id}/ingest")
     assert first.status_code == 202
     first_body = first.json()
@@ -109,6 +117,69 @@ def test_lost_job_is_reconciled_and_retriggerable(client, db, site, cleanup_rq):
     assert lost.status == "failed"
     assert "lost from queue" in lost.error
     assert lost.finished_at is not None
+    assert alerts == [
+        (
+            "LinkMesh ingestion job lost",
+            {
+                "site_id": site.id,
+                "kind": "ingestion",
+                "job_run_id": lost.id,
+                "attempts": 0,
+                "error": "lost from queue before completion",
+            },
+        )
+    ]
+
+
+def test_final_job_failure_sends_alert(db, site, monkeypatch):
+    run = JobRun(site_id=site.id, kind="analysis")
+    db.add(run)
+    db.commit()
+    sent = []
+    monkeypatch.setattr(
+        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=0)
+    )
+    monkeypatch.setattr(
+        job_service, "send_alert", lambda subject, payload: sent.append((subject, payload))
+    )
+
+    error = "x" * 2100
+    with pytest.raises(RuntimeError, match="x+"):
+        run_durably(run.id, lambda _site_id: (_ for _ in ()).throw(RuntimeError(error)), site.id)
+
+    assert sent == [
+        (
+            "LinkMesh analysis job failed",
+            {
+                "site_id": site.id,
+                "kind": "analysis",
+                "job_run_id": run.id,
+                "attempts": 1,
+                "error": "x" * 2000,
+            },
+        )
+    ]
+
+
+def test_nonfinal_job_failure_does_not_send_alert(db, site, monkeypatch):
+    run = JobRun(site_id=site.id, kind="analysis")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1)
+    )
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda *_args: pytest.fail("non-final retry must not alert"),
+    )
+
+    with pytest.raises(RuntimeError, match="retry me"):
+        run_durably(
+            run.id,
+            lambda _site_id: (_ for _ in ()).throw(RuntimeError("retry me")),
+            site.id,
+        )
 
 
 def test_run_durably_records_attempts_result_and_error(db, site):
