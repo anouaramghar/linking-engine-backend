@@ -147,8 +147,8 @@ def test_successful_recrawl_deactivates_article_not_seen(db, site, monkeypatch):
         .order_by(IngestionRun.id)
     ).all()
 
-    assert getattr(articles["1"], "is_active", None) is True
-    assert getattr(articles["2"], "is_active", None) is False
+    assert articles["1"].is_active is True
+    assert articles["2"].is_active is False
     assert getattr(articles["1"], "last_seen_run_id", None) == runs[-1].id
     assert getattr(articles["2"], "last_seen_run_id", None) == runs[0].id
 
@@ -249,7 +249,7 @@ def test_successful_recrawl_expires_links_and_preserves_transient_empty_taxonomi
     ).all()
 
     assert len(links) == 2
-    assert all(getattr(link, "is_active", None) is False for link in links)
+    assert all(link.is_active is False for link in links)
     assert len(memberships) == 1
 
 
@@ -400,14 +400,14 @@ def test_failed_recrawl_preserves_previous_snapshot(db, site, monkeypatch):
     previous_articles = [article for article in articles if article.external_id in {"1", "2"}]
     partial_articles = [article for article in articles if article.external_id not in {"1", "2"}]
 
-    assert all(getattr(article, "is_active", None) is True for article in previous_articles)
+    assert all(article.is_active is True for article in previous_articles)
     assert len(partial_articles) == 49
-    assert all(getattr(article, "is_active", None) is False for article in partial_articles)
+    assert all(article.is_active is False for article in partial_articles)
     assert all(
         getattr(article, "last_seen_run_id", None) == runs[-1].id
         for article in partial_articles
     )
-    assert all(getattr(link, "is_active", None) is True for link in links)
+    assert all(link.is_active is True for link in links)
     assert set(membership_names) == {"New", "SEO"}
 
 
