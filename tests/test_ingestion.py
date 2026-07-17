@@ -291,7 +291,14 @@ def test_reconcile_skips_stable_article_and_link_updates(db, site):
         is_active=True,
         last_seen_run_id=run.id,
     )
-    db.add_all([source, target])
+    stale_inactive = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/stale-inactive",
+        title="Stale inactive",
+        content_text="inactive",
+        is_active=False,
+    )
+    db.add_all([source, target, stale_inactive])
     db.flush()
     db.add(
         InternalLink(
@@ -317,6 +324,7 @@ def test_reconcile_skips_stable_article_and_link_updates(db, site):
         event.remove(engine, "after_cursor_execute", record_update_rowcounts)
 
     assert update_rowcounts == {"articles": [0, 0], "internal_links": [0]}
+    assert stale_inactive.is_active is False
 
 
 def test_recrawl_expires_inactive_article_suggestions(db, site, client, monkeypatch):

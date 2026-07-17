@@ -23,7 +23,9 @@ from app.models import (
     Taxonomy,
 )
 
-_ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C4D  # "LM"
+# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 ingestion run,
+# 0x4C4A enqueue, 0x4C4D analysis, and 0x4C50 publication.
+_ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C41  # "LA"
 _INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI"
 
 
@@ -203,6 +205,7 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
         .where(
             Article.site_id == site_id,
             Article.last_seen_run_id.is_distinct_from(run_id),
+            Article.is_active.is_(True),
         )
         .values(is_active=False)
     )

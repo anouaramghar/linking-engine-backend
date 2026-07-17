@@ -27,7 +27,7 @@ from app.services.job_service import run_durably
 
 logger = logging.getLogger(__name__)
 
-_PUBLISH_LOCK_NAMESPACE = 0x4C50  # "LP" — keyed by source article; ingestion uses 0x4C4D
+_PUBLISH_LOCK_NAMESPACE = 0x4C50  # "LP" - keyed by source article; see namespace registry
 
 
 def publish_approved(site_id: int, job_run_id: int | None = None) -> dict:

@@ -18,9 +18,11 @@ WHERE a1.id = :article_id
       WHERE il.source_article_id = a1.id
         AND il.target_article_id = a2.id
         AND il.is_active IS TRUE)
-  AND NOT EXISTS (          -- already suggested (any status) — re-runs don't duplicate
+  AND NOT EXISTS (          -- non-expired decisions keep the pair blocked
       SELECT 1 FROM suggestions s
-      WHERE s.source_article_id = a1.id AND s.target_article_id = a2.id)
+      WHERE s.source_article_id = a1.id
+        AND s.target_article_id = a2.id
+        AND s.status != 'expired')
 ORDER BY e2.vector <=> e1.vector
 LIMIT :k
 """)

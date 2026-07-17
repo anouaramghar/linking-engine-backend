@@ -254,6 +254,51 @@ def test_expired_suggestion_frees_source_quota(db, site):
     assert len(replacements) == 1
 
 
+def test_expired_pair_is_suggested_again_after_article_reactivation(db, site):
+    source, target = _make_articles(db, site, [_vec(0), _vec(0)])
+    generate_suggestions(site.id)
+    original = db.scalar(
+        select(Suggestion).where(
+            Suggestion.source_article_id == source.id,
+            Suggestion.target_article_id == target.id,
+        )
+    )
+
+    deactivate_run = IngestionRun(site_id=site.id)
+    db.add(deactivate_run)
+    db.flush()
+    source.last_seen_run_id = deactivate_run.id
+    db.flush()
+    _reconcile_snapshot(db, site.id, deactivate_run.id)
+    db.commit()
+    assert db.get(Suggestion, original.id).status == "expired"
+    assert target.is_active is False
+
+    reactivate_run = IngestionRun(site_id=site.id)
+    db.add(reactivate_run)
+    db.flush()
+    source.last_seen_run_id = reactivate_run.id
+    target.last_seen_run_id = reactivate_run.id
+    db.flush()
+    _reconcile_snapshot(db, site.id, reactivate_run.id)
+    db.commit()
+    assert target.is_active is True
+
+    generate_suggestions(site.id)
+
+    matching = db.scalars(
+        select(Suggestion)
+        .where(
+            Suggestion.source_article_id == source.id,
+            Suggestion.target_article_id == target.id,
+        )
+        .order_by(Suggestion.id)
+    ).all()
+    assert [suggestion.status for suggestion in matching] == ["expired", "pending"]
+    assert matching[0].id == original.id
+    assert matching[1].id != original.id
+
+
 def test_rejected_source_target_pair_is_not_recreated(db, site):
     source, target = _make_articles(db, site, [_vec(0), _vec(0)])
     generate_suggestions(site.id)
