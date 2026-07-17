@@ -35,6 +35,7 @@ def _embed_missing(db, site_id: int, model: str) -> int:
             select(Article.id, Article.title, Article.content_text)
             .where(
                 Article.site_id == site_id,
+                Article.is_active.is_(True),
                 ~exists().where(Embedding.article_id == Article.id, Embedding.model == model),
             )
             .limit(BATCH_SIZE)
@@ -58,7 +59,12 @@ def generate_suggestions(site_id: int) -> dict:
             model = settings.embedding_model
             encoded = _embed_missing(db, site_id, model)
 
-            article_ids = db.scalars(select(Article.id).where(Article.site_id == site_id)).all()
+            article_ids = db.scalars(
+                select(Article.id).where(
+                    Article.site_id == site_id,
+                    Article.is_active.is_(True),
+                )
+            ).all()
             existing_counts = dict(
                 db.execute(
                     select(Suggestion.source_article_id, func.count())

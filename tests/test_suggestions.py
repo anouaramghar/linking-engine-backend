@@ -77,6 +77,34 @@ def test_baseline_suggestions(db, site):
     assert len(total) == len(suggestions)
 
 
+def test_analysis_uses_only_current_articles_and_links(db, site):
+    source, inactive, target = _make_articles(
+        db,
+        site,
+        [_vec(0), _mix(0, 1, 0.99, 0.1), _mix(0, 1, 0.98, 0.2)],
+    )
+    inactive.is_active = False
+    expired_link = InternalLink(
+        source_article_id=source.id,
+        target_article_id=target.id,
+    )
+    expired_link.is_active = False
+    db.add(expired_link)
+    db.commit()
+
+    generate_suggestions(site.id)
+
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    assert suggestions
+    assert inactive.id not in {suggestion.source_article_id for suggestion in suggestions}
+    assert inactive.id not in {suggestion.target_article_id for suggestion in suggestions}
+    assert target.id in {
+        suggestion.target_article_id
+        for suggestion in suggestions
+        if suggestion.source_article_id == source.id
+    }
+
+
 def test_reanalysis_respects_total_suggestion_cap(db, site):
     _make_articles(db, site, [_vec(0) for _ in range(7)])
 

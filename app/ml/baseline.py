@@ -12,9 +12,12 @@ JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
 JOIN articles a2 ON a2.id = e2.article_id AND a2.site_id = a1.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
+  AND a2.is_active IS TRUE
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
-      WHERE il.source_article_id = a1.id AND il.target_article_id = a2.id)
+      WHERE il.source_article_id = a1.id
+        AND il.target_article_id = a2.id
+        AND il.is_active IS TRUE)
   AND NOT EXISTS (          -- already suggested (any status) — re-runs don't duplicate
       SELECT 1 FROM suggestions s
       WHERE s.source_article_id = a1.id AND s.target_article_id = a2.id)

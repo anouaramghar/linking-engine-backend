@@ -3,11 +3,11 @@
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.connectors.base import ArticleData
+from app.connectors.base import ArticleData, TaxonomyData
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
 from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Site, Taxonomy
@@ -21,7 +21,9 @@ def normalize_url(url: str) -> str:
     return f"{p.netloc.lower()}{p.path.rstrip('/')}"
 
 
-def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
+def _upsert_article(
+    db: Session, site_id: int, art: ArticleData, run_id: int | None = None
+) -> int:
     db.execute(select(func.pg_advisory_xact_lock(_ARTICLE_UPSERT_LOCK_NAMESPACE, site_id)))
 
     identity_filters = [Article.url == art.url]
@@ -46,6 +48,9 @@ def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
 
     if article is None:
         article = Article(site_id=site_id, url=art.url, title="", content_text="")
+        if run_id is not None:
+            # New rows stay hidden until successful reconciliation (Phase 0, finding 3).
+            article.is_active = False
         db.add(article)
     elif by_external_id is not None and by_url is not None and by_external_id.id != by_url.id:
         previous_url = by_external_id.url
@@ -63,12 +68,20 @@ def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
     article.content_html = art.content_html
     article.language = art.language
     article.published_at = art.published_at
+    if run_id is not None:
+        article.last_seen_run_id = run_id
     db.flush()
     return article.id
 
 
-def _upsert_taxonomies(db: Session, site_id: int, article_id: int, art: ArticleData) -> None:
-    for tax in art.taxonomies:
+def _upsert_taxonomies(
+    db: Session,
+    site_id: int,
+    article_id: int,
+    taxonomies: list[TaxonomyData],
+    run_id: int,
+) -> None:
+    for tax in taxonomies:
         tax_id = db.execute(
             pg_insert(Taxonomy)
             .values(site_id=site_id, kind=tax.kind, name=tax.name, external_id=tax.external_id)
@@ -79,18 +92,66 @@ def _upsert_taxonomies(db: Session, site_id: int, article_id: int, art: ArticleD
         ).scalar_one()
         db.execute(
             pg_insert(ArticleTaxonomy)
-            .values(article_id=article_id, taxonomy_id=tax_id)
-            .on_conflict_do_nothing()
+            .values(
+                article_id=article_id,
+                taxonomy_id=tax_id,
+                last_seen_run_id=run_id,
+            )
+            .on_conflict_do_update(
+                index_elements=["article_id", "taxonomy_id"],
+                set_={"last_seen_run_id": run_id},
+            )
         )
 
 
-def _upsert_link(db: Session, source_id: int, target_id: int) -> None:
+def _upsert_link(db: Session, source_id: int, target_id: int, run_id: int) -> None:
     db.execute(
         pg_insert(InternalLink)
-        .values(source_article_id=source_id, target_article_id=target_id)
+        .values(
+            source_article_id=source_id,
+            target_article_id=target_id,
+            is_active=True,
+            last_seen_run_id=run_id,
+        )
         .on_conflict_do_update(
             index_elements=["source_article_id", "target_article_id"],
-            set_={"last_seen_at": func.now()},  # first_seen_at untouched — temporal split
+            # first_seen_at stays immutable for history (Phase 0, finding 3).
+            set_={
+                "is_active": True,
+                "last_seen_at": func.now(),
+                "last_seen_run_id": run_id,
+            },
+        )
+    )
+
+
+def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
+    site_article_ids = select(Article.id).where(Article.site_id == site_id)
+    db.execute(
+        update(Article)
+        .where(Article.site_id == site_id, Article.last_seen_run_id == run_id)
+        .values(is_active=True)
+    )
+    db.execute(
+        update(Article)
+        .where(
+            Article.site_id == site_id,
+            Article.last_seen_run_id.is_distinct_from(run_id),
+        )
+        .values(is_active=False)
+    )
+    db.execute(
+        update(InternalLink)
+        .where(
+            InternalLink.source_article_id.in_(site_article_ids),
+            InternalLink.last_seen_run_id.is_distinct_from(run_id),
+        )
+        .values(is_active=False)
+    )
+    db.execute(
+        delete(ArticleTaxonomy).where(
+            ArticleTaxonomy.article_id.in_(site_article_ids),
+            ArticleTaxonomy.last_seen_run_id.is_distinct_from(run_id),
         )
     )
 
@@ -109,15 +170,20 @@ def run_ingestion(site_id: int) -> dict:
 
         url_to_id: dict[str, int] = {}
         outbound: list[tuple[int, list[str]]] = []
+        taxonomy_memberships: list[tuple[int, list[TaxonomyData]]] = []
         articles = 0
         for art in connector.fetch_articles():
-            article_id = _upsert_article(db, site_id, art)
-            _upsert_taxonomies(db, site_id, article_id, art)
+            article_id = _upsert_article(db, site_id, art, run.id)
             url_to_id[normalize_url(art.url)] = article_id
             outbound.append((article_id, art.outbound_internal_urls))
+            taxonomy_memberships.append((article_id, list(art.taxonomies)))
             articles += 1
             if articles % 50 == 0:
                 db.commit()  # batch commit — resumable, bounded transaction size
+
+        # Membership writes wait for the final transaction (Phase 0, finding 3).
+        for article_id, taxonomies in taxonomy_memberships:
+            _upsert_taxonomies(db, site_id, article_id, taxonomies, run.id)
 
         # Resolve links once all articles are known (forward references)
         links = 0
@@ -126,10 +192,12 @@ def run_ingestion(site_id: int) -> dict:
             for url in urls:
                 target_id = url_to_id.get(normalize_url(url))
                 if target_id and target_id != source_id and (source_id, target_id) not in seen:
-                    _upsert_link(db, source_id, target_id)
+                    _upsert_link(db, source_id, target_id, run.id)
                     seen.add((source_id, target_id))
                     links += 1
 
+        # Reconciliation is success-gated after link resolution (Phase 0, finding 3).
+        _reconcile_snapshot(db, site_id, run.id)
         run.status = "succeeded"
         run.articles_upserted = articles
         run.links_found = links

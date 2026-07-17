@@ -61,6 +61,23 @@ def test_publish_applies_approved_suggestion(db, site, articles, monkeypatch):
     assert db.get(Suggestion, suggestion.id).applied_at is not None
 
 
+@pytest.mark.parametrize("inactive_index", [0, 1], ids=["source", "target"])
+def test_publish_skips_inactive_pair_without_claiming(
+    db, site, articles, monkeypatch, inactive_index
+):
+    articles[inactive_index].is_active = False
+    db.commit()
+    suggestion = _suggestion(db, site, *articles)
+    calls = []
+    _stub_connector(monkeypatch, lambda s: calls.append(s.id))
+
+    result = publish_approved(site.id)
+
+    assert result == {"applied": 0, "failed": 0, "skipped": 1}
+    assert calls == []
+    assert _status(db, suggestion.id) == "approved"
+
+
 def test_double_publish_applies_exactly_once(db, site, articles, monkeypatch):
     suggestion = _suggestion(db, site, *articles)
     calls = []

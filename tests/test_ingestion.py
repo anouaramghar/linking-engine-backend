@@ -3,12 +3,13 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError
 
+import pytest
 from sqlalchemy import event, select
 
 import app.services.ingestion_service as ingestion_service
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
 from app.db import SessionLocal, engine
-from app.models import Article, IngestionRun, InternalLink, Taxonomy
+from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Taxonomy
 
 
 class StubConnector(ContentConnector):
@@ -43,6 +44,35 @@ class StubConnector(ContentConnector):
         pass
 
 
+class ReducedStubConnector(StubConnector):
+    def fetch_articles(self):
+        yield ArticleData(
+            url=f"{self.site.base_url}/a",
+            title="Article A",
+            content_text="text a",
+            external_id="1",
+        )
+
+
+class FailingStubConnector(ReducedStubConnector):
+    def fetch_articles(self):
+        yield ArticleData(
+            url=f"{self.site.base_url}/a",
+            title="Article A",
+            content_text="text a",
+            external_id="1",
+            taxonomies=[TaxonomyData(kind="category", name="New")],
+        )
+        for index in range(49):
+            yield ArticleData(
+                url=f"{self.site.base_url}/partial-{index}",
+                title=f"Partial {index}",
+                content_text="partial",
+                external_id=f"partial-{index}",
+            )
+        raise RuntimeError("crawl interrupted")
+
+
 def test_ingestion_idempotent(db, site, monkeypatch):
     monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
 
@@ -68,6 +98,102 @@ def test_ingestion_idempotent(db, site, monkeypatch):
     runs = db.scalars(select(IngestionRun).where(IngestionRun.site_id == site.id)).all()
     assert len(runs) == 2
     assert all(r.status == "succeeded" and r.finished_at is not None for r in runs)
+
+
+def test_successful_recrawl_deactivates_article_not_seen(db, site, monkeypatch):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    ingestion_service.run_ingestion(site.id)
+
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: ReducedStubConnector(s)
+    )
+    ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    articles = {
+        article.external_id: article
+        for article in db.scalars(select(Article).where(Article.site_id == site.id)).all()
+    }
+    runs = db.scalars(
+        select(IngestionRun)
+        .where(IngestionRun.site_id == site.id)
+        .order_by(IngestionRun.id)
+    ).all()
+
+    assert getattr(articles["1"], "is_active", None) is True
+    assert getattr(articles["2"], "is_active", None) is False
+    assert getattr(articles["1"], "last_seen_run_id", None) == runs[-1].id
+    assert getattr(articles["2"], "last_seen_run_id", None) == runs[0].id
+
+
+def test_successful_recrawl_expires_links_and_removes_taxonomy_memberships(
+    db, site, monkeypatch
+):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    ingestion_service.run_ingestion(site.id)
+
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: ReducedStubConnector(s)
+    )
+    ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    links = db.scalars(
+        select(InternalLink)
+        .join(Article, InternalLink.source_article_id == Article.id)
+        .where(Article.site_id == site.id)
+    ).all()
+    memberships = db.scalars(
+        select(ArticleTaxonomy)
+        .join(Article, ArticleTaxonomy.article_id == Article.id)
+        .where(Article.site_id == site.id)
+    ).all()
+
+    assert len(links) == 2
+    assert all(getattr(link, "is_active", None) is False for link in links)
+    assert memberships == []
+
+
+def test_failed_recrawl_preserves_previous_snapshot(db, site, monkeypatch):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    ingestion_service.run_ingestion(site.id)
+
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: FailingStubConnector(s)
+    )
+    with pytest.raises(RuntimeError, match="crawl interrupted"):
+        ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    articles = db.scalars(select(Article).where(Article.site_id == site.id)).all()
+    links = db.scalars(
+        select(InternalLink)
+        .join(Article, InternalLink.source_article_id == Article.id)
+        .where(Article.site_id == site.id)
+    ).all()
+    membership_names = db.scalars(
+        select(Taxonomy.name)
+        .join(ArticleTaxonomy, ArticleTaxonomy.taxonomy_id == Taxonomy.id)
+        .join(Article, ArticleTaxonomy.article_id == Article.id)
+        .where(Article.site_id == site.id)
+    ).all()
+    runs = db.scalars(
+        select(IngestionRun)
+        .where(IngestionRun.site_id == site.id)
+        .order_by(IngestionRun.id)
+    ).all()
+    previous_articles = [article for article in articles if article.external_id in {"1", "2"}]
+    partial_articles = [article for article in articles if article.external_id not in {"1", "2"}]
+
+    assert all(getattr(article, "is_active", None) is True for article in previous_articles)
+    assert len(partial_articles) == 49
+    assert all(getattr(article, "is_active", None) is False for article in partial_articles)
+    assert all(
+        getattr(article, "last_seen_run_id", None) == runs[-1].id
+        for article in partial_articles
+    )
+    assert all(getattr(link, "is_active", None) is True for link in links)
+    assert membership_names == ["SEO"]
 
 
 def test_permalink_change_updates_in_place(db, site):

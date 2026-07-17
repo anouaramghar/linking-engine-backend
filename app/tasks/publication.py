@@ -22,7 +22,7 @@ from sqlalchemy.orm import joinedload
 
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
-from app.models import Site, Suggestion
+from app.models import Article, Site, Suggestion
 from app.services.job_service import run_durably
 
 logger = logging.getLogger(__name__)
@@ -57,10 +57,15 @@ def _publish_approved(site_id: int) -> dict:
                 ).scalar_one()
                 claim = db.execute(
                     update(Suggestion)
-                    .where(Suggestion.id == suggestion_id, Suggestion.status == "approved")
+                    .where(
+                        Suggestion.id == suggestion_id,
+                        Suggestion.status == "approved",
+                        Suggestion.source_article.has(Article.is_active.is_(True)),
+                        Suggestion.target_article.has(Article.is_active.is_(True)),
+                    )
                     .values(status="applying")
                 )
-                if claim.rowcount == 0:  # rejected or claimed by another worker meanwhile
+                if claim.rowcount == 0:  # Rejected, claimed, or inactive (Phase 0, finding 3).
                     db.rollback()
                     skipped += 1
                     continue
