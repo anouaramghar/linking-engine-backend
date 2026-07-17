@@ -9,7 +9,7 @@ from sqlalchemy import event, func, select
 import app.services.ingestion_service as ingestion_service
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
 from app.db import SessionLocal, engine
-from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Taxonomy
+from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Suggestion, Taxonomy
 
 
 class StubConnector(ContentConnector):
@@ -240,6 +240,56 @@ def test_successful_recrawl_expires_links_and_removes_taxonomy_memberships(
     assert len(links) == 2
     assert all(getattr(link, "is_active", None) is False for link in links)
     assert memberships == []
+
+
+def test_recrawl_expires_inactive_article_suggestions(db, site, client, monkeypatch):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    ingestion_service.run_ingestion(site.id)
+    articles = {
+        article.external_id: article
+        for article in db.scalars(select(Article).where(Article.site_id == site.id)).all()
+    }
+    suggestions = [
+        Suggestion(
+            site_id=site.id,
+            source_article_id=articles["1"].id,
+            target_article_id=articles["2"].id,
+            method="baseline_cosine",
+            score=0.9,
+            status=status,
+        )
+        for status in ("pending", "approved", "applying", "applied")
+    ]
+    db.add_all(suggestions)
+    db.commit()
+
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: ReducedStubConnector(s)
+    )
+    ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    statuses = {suggestion.id: db.get(Suggestion, suggestion.id).status for suggestion in suggestions}
+    assert [statuses[suggestion.id] for suggestion in suggestions] == [
+        "expired",
+        "expired",
+        "applying",
+        "applied",
+    ]
+
+    listed_ids = {
+        item["id"] for item in client.get(f"/api/v1/suggestions/{site.id}").json()
+    }
+    assert suggestions[0].id not in listed_ids
+    assert suggestions[1].id not in listed_ids
+    review = client.put(
+        f"/api/v1/suggestions/{suggestions[0].id}", json={"status": "approved"}
+    )
+    assert review.status_code == 409
+    assert client.get(f"/api/v1/publish/{site.id}/status").json() == {
+        "applied": 1,
+        "awaiting_publication": 0,
+    }
 
 
 def test_failed_recrawl_preserves_previous_snapshot(db, site, monkeypatch):

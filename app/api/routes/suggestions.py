@@ -20,11 +20,14 @@ def _review(db: Session, suggestion: Suggestion, status: str) -> None:
     # then matches zero rows — a reject can never land on top of a publish.
     updated = db.execute(
         update(Suggestion)
-        .where(Suggestion.id == suggestion.id, Suggestion.status.notin_(["applying", "applied"]))
+        .where(
+            Suggestion.id == suggestion.id,
+            Suggestion.status.notin_(["applying", "applied", "expired"]),
+        )
         .values(status=status, reviewed_at=datetime.now(timezone.utc))
     ).rowcount
     if updated == 0:
-        raise HTTPException(409, f"suggestion {suggestion.id} is already applied")
+        raise HTTPException(409, f"suggestion {suggestion.id} is no longer reviewable")
     db.expire(suggestion)
 
 
@@ -68,6 +71,8 @@ def list_suggestions(
     )
     if status:
         query = query.where(Suggestion.status == status)
+    else:
+        query = query.where(Suggestion.status != "expired")
     if method:
         query = query.where(Suggestion.method == method)
     return db.scalars(query.limit(limit).offset(offset)).all()

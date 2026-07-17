@@ -13,7 +13,15 @@ from app.config import settings
 from app.connectors.base import ArticleData, TaxonomyData
 from app.connectors.registry import get_connector
 from app.db import SessionLocal, engine
-from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Site, Taxonomy
+from app.models import (
+    Article,
+    ArticleTaxonomy,
+    IngestionRun,
+    InternalLink,
+    Site,
+    Suggestion,
+    Taxonomy,
+)
 
 _ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C4D  # "LM"
 _INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI"
@@ -174,6 +182,10 @@ def _upsert_link(db: Session, source_id: int, target_id: int, run_id: int) -> No
 
 def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
     site_article_ids = select(Article.id).where(Article.site_id == site_id)
+    inactive_article_ids = select(Article.id).where(
+        Article.site_id == site_id,
+        Article.last_seen_run_id.is_distinct_from(run_id),
+    )
     db.execute(
         update(Article)
         .where(Article.site_id == site_id, Article.last_seen_run_id == run_id)
@@ -186,6 +198,18 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
             Article.last_seen_run_id.is_distinct_from(run_id),
         )
         .values(is_active=False)
+    )
+    db.execute(
+        update(Suggestion)
+        .where(
+            Suggestion.site_id == site_id,
+            Suggestion.status.in_(("pending", "approved")),
+            or_(
+                Suggestion.source_article_id.in_(inactive_article_ids),
+                Suggestion.target_article_id.in_(inactive_article_ids),
+            ),
+        )
+        .values(status="expired")
     )
     db.execute(
         update(InternalLink)

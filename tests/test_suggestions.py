@@ -9,8 +9,9 @@ from sqlalchemy import event, select
 
 from app.config import settings
 from app.db import engine
-from app.models import Article, Embedding, InternalLink, Suggestion
+from app.models import Article, Embedding, IngestionRun, InternalLink, Suggestion
 from app.models.article import EMBEDDING_DIM
+from app.services.ingestion_service import _reconcile_snapshot
 from app.services.suggestion_service import generate_suggestions
 
 
@@ -175,6 +176,51 @@ def test_rejected_and_applied_suggestions_free_active_quota(db, site):
     assert decided_target_ids.isdisjoint(
         {suggestion.target_article_id for suggestion in replacements}
     )
+
+
+def test_expired_suggestion_frees_source_quota(db, site):
+    articles = _make_articles(
+        db,
+        site,
+        [_vec(0) for _ in range(settings.max_suggestions_per_article + 2)],
+    )
+    generate_suggestions(site.id)
+    source = articles[0]
+    original = db.scalars(
+        select(Suggestion)
+        .where(Suggestion.source_article_id == source.id)
+        .order_by(Suggestion.id)
+    ).all()
+    expired = original[0]
+    inactive_target = db.get(Article, expired.target_article_id)
+    original_ids = {suggestion.id for suggestion in original}
+
+    run = IngestionRun(site_id=site.id)
+    db.add(run)
+    db.flush()
+    for article in articles:
+        if article.id != inactive_target.id:
+            article.last_seen_run_id = run.id
+    db.flush()
+    _reconcile_snapshot(db, site.id, run.id)
+    db.commit()
+
+    assert db.get(Suggestion, expired.id).status == "expired"
+    generate_suggestions(site.id)
+
+    source_suggestions = db.scalars(
+        select(Suggestion).where(Suggestion.source_article_id == source.id)
+    ).all()
+    active = [
+        suggestion
+        for suggestion in source_suggestions
+        if suggestion.status in {"pending", "approved", "applying"}
+    ]
+    replacements = [
+        suggestion for suggestion in source_suggestions if suggestion.id not in original_ids
+    ]
+    assert len(active) == settings.max_suggestions_per_article
+    assert len(replacements) == 1
 
 
 def test_rejected_source_target_pair_is_not_recreated(db, site):

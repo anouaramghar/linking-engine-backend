@@ -9,7 +9,7 @@ from app.models.article import Article
 SuggestionMethod = Enum(
     "baseline_cosine", "gnn_graphsage", name="suggestion_method", native_enum=False, length=30
 )
-# pending -> approved | rejected; approved -> applying -> applied.
+# pending -> approved | rejected; pending/approved -> expired; approved -> applying -> applied.
 # 'applying' is the publication worker's claim: written only inside the publish
 # transaction (never visible committed), so a crash rolls it back to 'approved'.
 # 'applied' is set only by the publication worker.
@@ -17,6 +17,7 @@ SuggestionStatus = Enum(
     "pending",
     "approved",
     "rejected",
+    "expired",
     "applying",
     "applied",
     name="suggestion_status",
