@@ -1,6 +1,6 @@
 from typing import Self
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,9 @@ class Settings(BaseSettings):
 
     # Editorial rules (A4)
     max_suggestions_per_article: int = 5
+
+    # Reject suspiciously incomplete crawls before they can replace a healthy snapshot.
+    ingestion_min_previous_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
 
     # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/
     # metadata destinations and require HTTPS when WP credentials are used.

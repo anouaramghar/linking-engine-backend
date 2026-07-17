@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError
 
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import event, func, select
 
 import app.services.ingestion_service as ingestion_service
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
@@ -52,6 +52,22 @@ class ReducedStubConnector(StubConnector):
             content_text="text a",
             external_id="1",
         )
+
+
+class EmptyStubConnector(StubConnector):
+    def fetch_articles(self):
+        return iter(())
+
+
+class FourArticleStubConnector(StubConnector):
+    def fetch_articles(self):
+        for index in range(4):
+            yield ArticleData(
+                url=f"{self.site.base_url}/article-{index}",
+                title=f"Article {index}",
+                content_text=f"text {index}",
+                external_id=str(index + 1),
+            )
 
 
 class FailingStubConnector(ReducedStubConnector):
@@ -124,6 +140,78 @@ def test_successful_recrawl_deactivates_article_not_seen(db, site, monkeypatch):
     assert getattr(articles["2"], "is_active", None) is False
     assert getattr(articles["1"], "last_seen_run_id", None) == runs[-1].id
     assert getattr(articles["2"], "last_seen_run_id", None) == runs[0].id
+
+
+def test_empty_recrawl_fails_without_reconciling_snapshot(db, site, monkeypatch):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    ingestion_service.run_ingestion(site.id)
+
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: EmptyStubConnector(s))
+    with pytest.raises(ValueError, match="zero articles.*snapshot not reconciled"):
+        ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    articles = db.scalars(select(Article).where(Article.site_id == site.id)).all()
+    runs = db.scalars(
+        select(IngestionRun).where(IngestionRun.site_id == site.id).order_by(IngestionRun.id)
+    ).all()
+    assert all(article.is_active is True for article in articles)
+    assert [run.status for run in runs] == ["succeeded", "failed"]
+    assert "zero articles" in runs[-1].error
+
+
+def test_truncated_recrawl_fails_below_previous_success_floor(db, site, monkeypatch):
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: FourArticleStubConnector(s)
+    )
+    ingestion_service.run_ingestion(site.id)
+
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: ReducedStubConnector(s)
+    )
+    with pytest.raises(ValueError, match=r"1 articles.*50%.*previous.*\(4\)"):
+        ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    articles = db.scalars(select(Article).where(Article.site_id == site.id)).all()
+    runs = db.scalars(
+        select(IngestionRun).where(IngestionRun.site_id == site.id).order_by(IngestionRun.id)
+    ).all()
+    assert len(articles) == 4
+    assert all(article.is_active is True for article in articles)
+    assert [run.status for run in runs] == ["succeeded", "failed"]
+    assert "snapshot not reconciled" in runs[-1].error
+
+
+def test_overlapping_ingestion_fails_fast_and_records_failed_run(db, site, monkeypatch):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+
+    with engine.connect() as lock_connection:
+        lock_connection.execute(
+            select(
+                func.pg_advisory_lock(
+                    ingestion_service._INGESTION_LOCK_NAMESPACE,
+                    site.id,
+                )
+            )
+        ).scalar_one()
+        try:
+            with pytest.raises(RuntimeError, match=f"ingestion already running for site {site.id}"):
+                ingestion_service.run_ingestion(site.id)
+        finally:
+            lock_connection.execute(
+                select(
+                    func.pg_advisory_unlock(
+                        ingestion_service._INGESTION_LOCK_NAMESPACE,
+                        site.id,
+                    )
+                )
+            ).scalar_one()
+
+    db.expire_all()
+    run = db.scalar(select(IngestionRun).where(IngestionRun.site_id == site.id))
+    assert run.status == "failed"
+    assert "ingestion already running" in run.error
 
 
 def test_successful_recrawl_expires_links_and_removes_taxonomy_memberships(

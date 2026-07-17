@@ -79,7 +79,8 @@ class WordPressConnector(ContentConnector):
             if not items:
                 return
             yield from items
-            if page >= int(resp.headers.get("X-WP-TotalPages", page)):
+            total_pages = resp.headers.get("X-WP-TotalPages")
+            if total_pages is not None and page >= int(total_pages):
                 return
             page += 1
 

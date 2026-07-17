@@ -1,5 +1,7 @@
 """Ingestion pipeline: connector -> idempotent upsert -> internal link graph (sequence 4.1)."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -7,12 +9,57 @@ from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.connectors.base import ArticleData, TaxonomyData
 from app.connectors.registry import get_connector
-from app.db import SessionLocal
+from app.db import SessionLocal, engine
 from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Site, Taxonomy
 
 _ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C4D  # "LM"
+_INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI"
+
+
+@contextmanager
+def _site_ingestion_lock(site_id: int) -> Iterator[None]:
+    # Batch commits use the work session, while this dedicated connection keeps
+    # the session-level lock for the complete crawl and reconciliation window.
+    with engine.connect() as lock_connection:
+        acquired = lock_connection.execute(
+            select(func.pg_try_advisory_lock(_INGESTION_LOCK_NAMESPACE, site_id))
+        ).scalar_one()
+        if not acquired:
+            raise RuntimeError(f"ingestion already running for site {site_id}")
+        try:
+            yield
+        finally:
+            lock_connection.execute(
+                select(func.pg_advisory_unlock(_INGESTION_LOCK_NAMESPACE, site_id))
+            ).scalar_one()
+
+
+def _validate_snapshot_completeness(
+    db: Session, site_id: int, run_id: int, article_count: int
+) -> None:
+    if article_count == 0:
+        raise ValueError(f"crawl returned zero articles for site {site_id}; snapshot not reconciled")
+
+    previous_count = db.scalar(
+        select(IngestionRun.articles_upserted)
+        .where(
+            IngestionRun.site_id == site_id,
+            IngestionRun.status == "succeeded",
+            IngestionRun.id != run_id,
+        )
+        .order_by(IngestionRun.id.desc())
+        .limit(1)
+    )
+    minimum_ratio = settings.ingestion_min_previous_ratio
+    if previous_count and article_count < previous_count * minimum_ratio:
+        raise ValueError(
+            f"crawl returned {article_count} articles for site {site_id}, below "
+            f"{minimum_ratio:.0%} of the previous successful crawl ({previous_count}); "
+            "snapshot not reconciled"
+        )
 
 
 def normalize_url(url: str) -> str:
@@ -156,7 +203,7 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
     )
 
 
-def run_ingestion(site_id: int) -> dict:
+def _run_ingestion_locked(site_id: int) -> dict:
     """RQ task body. A run never stays 'running' (sequence 4.1 alt success/failure)."""
     db = SessionLocal()
     run = IngestionRun(site_id=site_id)
@@ -182,6 +229,8 @@ def run_ingestion(site_id: int) -> dict:
                 db.commit()  # batch commit — resumable, bounded transaction size
 
         # Membership writes wait for the final transaction (Phase 0, finding 3).
+        _validate_snapshot_completeness(db, site_id, run.id, articles)
+
         for article_id, taxonomies in taxonomy_memberships:
             _upsert_taxonomies(db, site_id, article_id, taxonomies, run.id)
 
@@ -213,6 +262,31 @@ def run_ingestion(site_id: int) -> dict:
         raise
     finally:
         db.close()
+
+
+def run_ingestion(site_id: int) -> dict:
+    """Run one site crawl at a time and record lock contention as a failed run."""
+    lock_acquired = False
+    try:
+        with _site_ingestion_lock(site_id):
+            lock_acquired = True
+            return _run_ingestion_locked(site_id)
+    except Exception as error:
+        if lock_acquired:
+            raise
+        db = SessionLocal()
+        try:
+            run = IngestionRun(
+                site_id=site_id,
+                status="failed",
+                error=str(error)[:2000],
+                finished_at=datetime.now(timezone.utc),
+            )
+            db.add(run)
+            db.commit()
+        finally:
+            db.close()
+        raise
 
 
 def latest_run(db: Session, site_id: int) -> IngestionRun | None:

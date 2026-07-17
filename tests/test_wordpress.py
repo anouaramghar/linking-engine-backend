@@ -48,6 +48,25 @@ def test_to_article_handles_comment_only_rendered_content():
     assert article.outbound_internal_urls == []
 
 
+def test_paginate_continues_when_total_pages_header_is_missing():
+    connector = make_connector()
+    requested_pages = []
+
+    def handler(request):
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+        if page > 2:
+            return httpx.Response(400, json={"code": "rest_post_invalid_page_number"})
+        return httpx.Response(200, json=[{"id": page}])
+
+    connector.client = httpx.Client(
+        base_url="https://example.com", transport=httpx.MockTransport(handler)
+    )
+
+    assert list(connector._paginate("/wp-json/wp/v2/posts")) == [{"id": 1}, {"id": 2}]
+    assert requested_pages == [1, 2, 3]
+
+
 def _mock_publish(connector, raw_content):
     """Route GET -> post with raw_content; capture the update POST body, if any."""
     captured = {}
