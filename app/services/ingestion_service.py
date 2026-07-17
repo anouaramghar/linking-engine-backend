@@ -186,9 +186,16 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
         Article.site_id == site_id,
         Article.last_seen_run_id.is_distinct_from(run_id),
     )
+    taxonomy_reporter_ids = select(ArticleTaxonomy.article_id).where(
+        ArticleTaxonomy.last_seen_run_id == run_id
+    )
     db.execute(
         update(Article)
-        .where(Article.site_id == site_id, Article.last_seen_run_id == run_id)
+        .where(
+            Article.site_id == site_id,
+            Article.last_seen_run_id == run_id,
+            Article.is_active.is_(False),
+        )
         .values(is_active=True)
     )
     db.execute(
@@ -216,6 +223,7 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
         .where(
             InternalLink.source_article_id.in_(site_article_ids),
             InternalLink.last_seen_run_id.is_distinct_from(run_id),
+            InternalLink.is_active.is_(True),
         )
         .values(is_active=False)
     )
@@ -223,6 +231,10 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
         delete(ArticleTaxonomy).where(
             ArticleTaxonomy.article_id.in_(site_article_ids),
             ArticleTaxonomy.last_seen_run_id.is_distinct_from(run_id),
+            or_(
+                ArticleTaxonomy.article_id.in_(inactive_article_ids),
+                ArticleTaxonomy.article_id.in_(taxonomy_reporter_ids),
+            ),
         )
     )
 
@@ -241,22 +253,17 @@ def _run_ingestion_locked(site_id: int) -> dict:
 
         url_to_id: dict[str, int] = {}
         outbound: list[tuple[int, list[str]]] = []
-        taxonomy_memberships: list[tuple[int, list[TaxonomyData]]] = []
         articles = 0
         for art in connector.fetch_articles():
             article_id = _upsert_article(db, site_id, art, run.id)
+            _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id
             outbound.append((article_id, art.outbound_internal_urls))
-            taxonomy_memberships.append((article_id, list(art.taxonomies)))
             articles += 1
             if articles % 50 == 0:
                 db.commit()  # batch commit — resumable, bounded transaction size
 
-        # Membership writes wait for the final transaction (Phase 0, finding 3).
         _validate_snapshot_completeness(db, site_id, run.id, articles)
-
-        for article_id, taxonomies in taxonomy_memberships:
-            _upsert_taxonomies(db, site_id, article_id, taxonomies, run.id)
 
         # Resolve links once all articles are known (forward references)
         links = 0

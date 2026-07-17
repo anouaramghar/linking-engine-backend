@@ -54,6 +54,17 @@ class ReducedStubConnector(StubConnector):
         )
 
 
+class ChangedTaxonomyStubConnector(ReducedStubConnector):
+    def fetch_articles(self):
+        yield ArticleData(
+            url=f"{self.site.base_url}/a",
+            title="Article A",
+            content_text="text a",
+            external_id="1",
+            taxonomies=[TaxonomyData(kind="category", name="Content")],
+        )
+
+
 class EmptyStubConnector(StubConnector):
     def fetch_articles(self):
         return iter(())
@@ -214,7 +225,7 @@ def test_overlapping_ingestion_fails_fast_and_records_failed_run(db, site, monke
     assert "ingestion already running" in run.error
 
 
-def test_successful_recrawl_expires_links_and_removes_taxonomy_memberships(
+def test_successful_recrawl_expires_links_and_preserves_transient_empty_taxonomies(
     db, site, monkeypatch
 ):
     monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
@@ -239,7 +250,73 @@ def test_successful_recrawl_expires_links_and_removes_taxonomy_memberships(
 
     assert len(links) == 2
     assert all(getattr(link, "is_active", None) is False for link in links)
-    assert memberships == []
+    assert len(memberships) == 1
+
+
+def test_nonempty_taxonomy_snapshot_removes_stale_memberships(db, site, monkeypatch):
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    ingestion_service.run_ingestion(site.id)
+
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: ChangedTaxonomyStubConnector(s)
+    )
+    ingestion_service.run_ingestion(site.id)
+
+    membership_names = db.scalars(
+        select(Taxonomy.name)
+        .join(ArticleTaxonomy, ArticleTaxonomy.taxonomy_id == Taxonomy.id)
+        .join(Article, ArticleTaxonomy.article_id == Article.id)
+        .where(Article.site_id == site.id)
+    ).all()
+    assert membership_names == ["Content"]
+
+
+def test_reconcile_skips_stable_article_and_link_updates(db, site):
+    run = IngestionRun(site_id=site.id)
+    db.add(run)
+    db.flush()
+    source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/stable-source",
+        title="Stable source",
+        content_text="source",
+        is_active=True,
+        last_seen_run_id=run.id,
+    )
+    target = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/stable-target",
+        title="Stable target",
+        content_text="target",
+        is_active=True,
+        last_seen_run_id=run.id,
+    )
+    db.add_all([source, target])
+    db.flush()
+    db.add(
+        InternalLink(
+            source_article_id=source.id,
+            target_article_id=target.id,
+            is_active=False,
+        )
+    )
+    db.commit()
+    update_rowcounts = {"articles": [], "internal_links": []}
+
+    def record_update_rowcounts(_conn, cursor, statement, _params, _context, _many):
+        normalized = statement.lstrip().lower()
+        for table in update_rowcounts:
+            if normalized.startswith(f"update {table}"):
+                update_rowcounts[table].append(cursor.rowcount)
+
+    event.listen(engine, "after_cursor_execute", record_update_rowcounts)
+    try:
+        ingestion_service._reconcile_snapshot(db, site.id, run.id)
+        db.commit()
+    finally:
+        event.remove(engine, "after_cursor_execute", record_update_rowcounts)
+
+    assert update_rowcounts == {"articles": [0, 0], "internal_links": [0]}
 
 
 def test_recrawl_expires_inactive_article_suggestions(db, site, client, monkeypatch):
@@ -331,7 +408,7 @@ def test_failed_recrawl_preserves_previous_snapshot(db, site, monkeypatch):
         for article in partial_articles
     )
     assert all(getattr(link, "is_active", None) is True for link in links)
-    assert membership_names == ["SEO"]
+    assert set(membership_names) == {"New", "SEO"}
 
 
 def test_permalink_change_updates_in_place(db, site):
