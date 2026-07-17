@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db
@@ -15,10 +15,17 @@ router = APIRouter(tags=["suggestions"])
 
 
 def _review(db: Session, suggestion: Suggestion, status: str) -> None:
-    if suggestion.status == "applied":
+    # Guarded transition (Phase 0, finding 5): a suggestion being published holds a
+    # row lock on its claim, so this update blocks until the publish commits and
+    # then matches zero rows — a reject can never land on top of a publish.
+    updated = db.execute(
+        update(Suggestion)
+        .where(Suggestion.id == suggestion.id, Suggestion.status.notin_(["applying", "applied"]))
+        .values(status=status, reviewed_at=datetime.now(timezone.utc))
+    ).rowcount
+    if updated == 0:
         raise HTTPException(409, f"suggestion {suggestion.id} is already applied")
-    suggestion.status = status
-    suggestion.reviewed_at = datetime.now(timezone.utc)
+    db.expire(suggestion)
 
 
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
