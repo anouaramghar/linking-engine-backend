@@ -226,8 +226,8 @@ def validate_url(
 ) -> None:
     """Raise UnsafeURLError unless `url` is a safe crawl target.
 
-    resolve_dns=False limits the address check to IP literals — used at site
-    creation, where the crawl-time hook re-validates with full resolution.
+    resolve_dns=False limits the address check to IP literals. It is used when
+    the pinned crawl transport will resolve and validate the hostname at connect time.
     """
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):

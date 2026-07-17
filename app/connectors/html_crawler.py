@@ -64,7 +64,7 @@ class HTMLConnector(ContentConnector):
     def _same_origin(self, url: str) -> bool:
         """Sitemap traversal stays on the site's own host (Phase 0, finding #1)."""
         try:
-            # host check only here — the request guard does the address check at fetch time
+            # Host check only here; the pinned transport checks addresses at fetch time.
             validate_url(url, allow_private=True, same_host_as=self.site.base_url)
         except UnsafeURLError as e:
             logger.warning("skipping sitemap URL: %s", e)

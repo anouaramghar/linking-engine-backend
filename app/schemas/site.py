@@ -22,7 +22,7 @@ class SiteCreate(BaseModel):
                 self.base_url,
                 allow_private=allow,
                 require_https=bool(self.wp_username or self.wp_app_password) and not allow,
-                resolve_dns=False,  # hostnames are resolved at crawl time by the request guard
+                resolve_dns=False,  # the pinned crawl transport resolves hostnames at connect time
             )
         except UnsafeURLError as e:
             raise ValueError(str(e)) from e
