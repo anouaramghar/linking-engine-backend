@@ -258,6 +258,22 @@ def test_job_status_survives_redis_eviction(client, db, site):
     assert client.get("/api/v1/jobs/never-existed").status_code == 404
 
 
+def test_job_status_reports_progress_while_job_is_live_in_redis(client, db, site, cleanup_rq):
+    # A UI polls /jobs/{job_id} while the job is still in Redis — progress must
+    # come from the durable row even on that live branch.
+    accepted = client.post(f"/api/v1/sites/{site.id}/ingest").json()
+    cleanup_rq.append(accepted["job_id"])
+    run = db.get(JobRun, accepted["job_run_id"])
+    run.progress = {"stage": "crawling", "articles": 150}
+    run.progress_at = datetime.now(timezone.utc)
+    db.commit()
+
+    body = client.get(f"/api/v1/jobs/{accepted['job_id']}").json()
+    assert body["status"] == "queued"  # live RQ vocabulary — the job was never drained
+    assert body["progress"] == {"stage": "crawling", "articles": 150}
+    assert body["progress_at"] is not None
+
+
 def test_list_job_runs_per_site(client, db, site):
     db.add_all(
         [

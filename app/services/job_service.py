@@ -219,9 +219,20 @@ def get_job_status(job_id: str) -> dict | None:
         finally:
             db.close()
     status = job.get_status()
+    db = SessionLocal()
+    try:
+        # The live RQ view knows nothing of progress — merge it from the durable row,
+        # because a UI polls this endpoint precisely while the job is still in Redis.
+        run = db.scalars(select(JobRun).where(JobRun.queue_job_id == job_id)).first()
+        progress = run.progress if run is not None else None
+        progress_at = run.progress_at if run is not None else None
+    finally:
+        db.close()
     return {
         "job_id": job_id,
         "status": status,
         "result": job.return_value() if status == "finished" else None,
+        "progress": progress,
+        "progress_at": progress_at,
         "error": job.exc_info.strip().splitlines()[-1] if job.exc_info else None,
     }

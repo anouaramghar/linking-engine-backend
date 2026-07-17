@@ -91,17 +91,18 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
                 # 'applied' is set exclusively here — lifecycle guarantee
                 suggestion.status = "applied"
                 suggestion.applied_at = datetime.now(timezone.utc)
-                applied += 1
                 record_progress(
                     db,
                     job_run_id,
                     stage="publishing",
-                    applied=applied,
+                    applied=applied + 1,
                     failed=failed,
                     skipped=skipped,
                     total=total,
                 )
                 db.commit()  # releases the advisory and row locks
+                # counted only after the commit — a failed commit is a 'failed', not an 'applied'
+                applied += 1
             except Exception:
                 db.rollback()  # claim undone — suggestion is 'approved' again for retry
                 logger.exception("apply_link failed for suggestion %s", suggestion_id)
