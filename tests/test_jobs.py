@@ -226,6 +226,12 @@ def test_run_durably_records_attempts_result_and_error(db, site):
     assert (run.status, run.attempts) == ("failed", 2)
     assert "embedding model OOM" in run.error
 
+    # a successful retry clears the earlier attempt's error
+    run_durably(run.id, lambda site_id: {"suggestions_created": 7}, site.id)
+    db.expire_all()
+    run = db.get(JobRun, run.id)
+    assert (run.status, run.attempts, run.error) == ("succeeded", 3, None)
+
 
 def test_run_durably_tolerates_missing_row(site):
     # pre-table enqueues and cascade-deleted sites must still execute

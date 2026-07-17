@@ -190,6 +190,7 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
         if run is not None:
             run.status = "succeeded"
             run.result = result
+            run.error = None  # clear any earlier attempt's failure
             run.finished_at = datetime.now(timezone.utc)
             db.commit()
         return result
