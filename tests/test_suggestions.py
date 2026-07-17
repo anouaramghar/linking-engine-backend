@@ -5,8 +5,10 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError, Lock
 
+import pytest
 from sqlalchemy import event, select
 
+import app.services.suggestion_service as suggestion_service
 from app.config import settings
 from app.db import engine
 from app.models import Article, Embedding, IngestionRun, InternalLink, Suggestion
@@ -19,6 +21,14 @@ def _vec(direction: int, weight: float = 1.0) -> list[float]:
     v = [0.0] * EMBEDDING_DIM
     v[direction] = weight
     return v
+
+
+@pytest.fixture(autouse=True)
+def valid_dimension_probe(monkeypatch):
+    monkeypatch.setattr(
+        "app.ml.embeddings.encode",
+        lambda texts: [_vec(0) for _text in texts],
+    )
 
 
 def _mix(a: int, b: int, wa: float, wb: float) -> list[float]:
@@ -92,6 +102,27 @@ def test_baseline_suggestions(db, site):
     generate_suggestions(site.id)
     total = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     assert len(total) == len(suggestions)
+
+
+def test_dimension_mismatch_fails_before_article_embedding(db, site, monkeypatch):
+    produced_size = EMBEDDING_DIM - 1
+    probe_calls = []
+
+    def wrong_dimension(texts):
+        probe_calls.append(texts)
+        return [[0.0] * produced_size]
+
+    monkeypatch.setattr("app.ml.embeddings.encode", wrong_dimension)
+    monkeypatch.setattr(
+        suggestion_service,
+        "_embed_missing",
+        lambda *_args: pytest.fail("article scan must not start after a failed probe"),
+    )
+
+    with pytest.raises(ValueError, match=rf"{produced_size}.*{EMBEDDING_DIM}"):
+        generate_suggestions(site.id)
+
+    assert probe_calls == [[suggestion_service._DIMENSION_PROBE_INPUT]]
 
 
 def test_analysis_uses_only_current_articles_and_links(db, site):

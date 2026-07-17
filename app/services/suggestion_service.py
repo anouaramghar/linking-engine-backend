@@ -16,6 +16,7 @@ from app.ml.baseline import top_candidates
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
 _ANALYSIS_LOCK_NAMESPACE = 0x4C4D
+_DIMENSION_PROBE_INPUT = "LinkMesh dimension probe"
 
 
 @contextmanager
@@ -71,12 +72,11 @@ def _embed_missing(db, site_id: int, model: str) -> int:
         ) in rows:
             encode_input = f"{title}\n{text}"
             fingerprint = hashlib.sha256(encode_input.encode()).hexdigest()
-            if embedding_id is None or any(
-                (
-                    stored_fingerprint != fingerprint,
-                    stored_recipe_version != INPUT_RECIPE_VERSION,
-                    stored_vector_size != EMBEDDING_DIM,
-                )
+            if (
+                embedding_id is None
+                or stored_fingerprint != fingerprint
+                or stored_recipe_version != INPUT_RECIPE_VERSION
+                or stored_vector_size != EMBEDDING_DIM
             ):
                 batch.append((article_id, encode_input, fingerprint, embedding_id))
         if not batch:
@@ -112,12 +112,30 @@ def _embed_missing(db, site_id: int, model: str) -> int:
         encoded += len(batch)
 
 
+def _validate_embedding_dimension(model: str) -> None:
+    from app.ml.embeddings import encode  # lazy - heavy import
+
+    vectors = list(encode([_DIMENSION_PROBE_INPUT]))
+    if len(vectors) != 1:
+        raise ValueError(
+            f"Embedding configuration error for model {model!r}: produced "
+            f"{len(vectors)} vectors for one probe input"
+        )
+    produced_size = len(vectors[0])
+    if produced_size != EMBEDDING_DIM:
+        raise ValueError(
+            f"Embedding configuration error for model {model!r}: produced dimension "
+            f"{produced_size}, storage dimension {EMBEDDING_DIM}"
+        )
+
+
 def generate_suggestions(site_id: int) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
         db = SessionLocal()
         try:
             model = settings.embedding_model
+            _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model)
 
             article_ids = db.scalars(
