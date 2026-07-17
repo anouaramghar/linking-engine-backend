@@ -12,7 +12,7 @@ from lxml.html import HtmlElement
 
 from app.config import settings
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
-from app.connectors.url_guard import request_guard, validate_url
+from app.connectors.url_guard import SSRFProtectedTransport, request_guard, validate_url
 from app.models.suggestion import Suggestion
 
 
@@ -45,8 +45,8 @@ class WordPressConnector(ContentConnector):
         auth = (site.wp_username, site.wp_app_password) if site.wp_username else None
         allow_private = settings.allow_unsafe_crawl_targets
         require_https = auth is not None and not allow_private
-        # Fail fast on scheme/credential problems; addresses are re-checked per
-        # request (incl. redirect hops) by the guard hook, which also resolves DNS.
+        # Fail fast on scheme/credential problems. The request hook repeats those
+        # checks per redirect; the transport validates and pins the connected IP.
         validate_url(
             site.base_url,
             allow_private=allow_private,
@@ -54,6 +54,8 @@ class WordPressConnector(ContentConnector):
             resolve_dns=False,
         )
         self.client = httpx.Client(
+            transport=SSRFProtectedTransport(allow_private=allow_private),
+            trust_env=False,
             base_url=site.base_url.rstrip("/"),
             auth=auth,
             timeout=30,

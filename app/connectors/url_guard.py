@@ -1,21 +1,23 @@
-"""Crawl-target URL validation (Phase 0, finding #1 — SSRF).
+"""Crawl-target validation and connect-time IP pinning (Phase 0 SSRF safety).
 
-Every URL the crawler touches — base URLs, redirect hops, child sitemaps, page
-URLs — must be http(s), credential-free, and point at a public address.
-`request_guard` installs the check as an httpx request event hook, which fires
-for every request in a redirect chain, so redirect targets are validated
-exactly like first-party requests.
-
-DNS is checked at validation time. A host that swaps records between
-validation and connect (DNS rebinding) is out of scope here and would need
-connection-time IP pinning.
+Every URL the crawler touches — base URLs, redirect hops, child sitemaps, and
+page URLs — must be HTTP(S), credential-free, and point at a permitted address.
+`request_guard` cheaply validates URL shape on every redirect hop. The custom
+network backend resolves hostnames once at connection time, validates every
+answer, and opens the socket directly to an approved address. This mitigates
+DNS rebinding while preserving the original hostname for TLS SNI and certificate
+verification.
 """
 
 import ipaddress
+import select
 import socket
-from collections.abc import Callable
+import ssl
+from collections.abc import Callable, Iterable
+from typing import Any
 from urllib.parse import urlsplit
 
+import httpcore
 import httpx
 
 _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -23,6 +25,177 @@ _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 
 class UnsafeURLError(Exception):
     """URL failed crawl-safety validation."""
+
+
+class _SocketStream(httpcore.NetworkStream):
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        try:
+            self._sock.settimeout(timeout)
+            return self._sock.recv(max_bytes)
+        except socket.timeout as error:
+            raise httpcore.ReadTimeout(str(error)) from error
+        except OSError as error:
+            raise httpcore.ReadError(str(error)) from error
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        try:
+            self._sock.settimeout(timeout)
+            self._sock.sendall(buffer)
+        except socket.timeout as error:
+            raise httpcore.WriteTimeout(str(error)) from error
+        except OSError as error:
+            raise httpcore.WriteError(str(error)) from error
+
+    def close(self) -> None:
+        self._sock.close()
+
+    def start_tls(
+        self,
+        ssl_context: ssl.SSLContext,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.NetworkStream:
+        try:
+            self._sock.settimeout(timeout)
+            wrapped = ssl_context.wrap_socket(self._sock, server_hostname=server_hostname)
+        except socket.timeout as error:
+            self.close()
+            raise httpcore.ConnectTimeout(str(error)) from error
+        except OSError as error:
+            self.close()
+            raise httpcore.ConnectError(str(error)) from error
+        except Exception:
+            self.close()
+            raise
+        return _SocketStream(wrapped)
+
+    def get_extra_info(self, info: str) -> Any:
+        if info == "ssl_object" and isinstance(self._sock, ssl.SSLSocket):
+            return self._sock._sslobj  # type: ignore[attr-defined]
+        if info == "client_addr":
+            return self._sock.getsockname()
+        if info == "server_addr":
+            return self._sock.getpeername()
+        if info == "socket":
+            return self._sock
+        if info == "is_readable":
+            if isinstance(self._sock, ssl.SSLSocket) and self._sock.pending():
+                return True
+            try:
+                return bool(select.select([self._sock], [], [], 0)[0])
+            except (OSError, TypeError, ValueError):
+                return True
+        return None
+
+
+class ValidatingNetworkBackend(httpcore.NetworkBackend):
+    """Resolve, validate, and connect to the exact approved socket address."""
+
+    def __init__(
+        self,
+        *,
+        allow_private: bool = False,
+        resolver: Callable[..., list[tuple]] | None = None,
+        socket_factory: Callable[..., socket.socket] | None = None,
+    ) -> None:
+        self._allow_private = allow_private
+        self._resolver = resolver or socket.getaddrinfo
+        self._socket_factory = socket_factory or socket.socket
+
+    def _resolve(self, host: str, port: int) -> list[tuple]:
+        try:
+            infos = self._resolver(
+                host,
+                port,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+        except socket.gaierror as error:
+            raise UnsafeURLError(f"cannot resolve host {host!r}") from error
+        if not infos:
+            raise UnsafeURLError(f"cannot resolve host {host!r}")
+
+        for _family, _sock_type, _proto, _canonname, sockaddr in infos:
+            address_text = str(sockaddr[0]).split("%", 1)[0]
+            try:
+                address = ipaddress.ip_address(address_text)
+            except ValueError as error:
+                raise UnsafeURLError(
+                    f"host {host!r} resolved to invalid address {sockaddr[0]!r}"
+                ) from error
+            if not self._allow_private and not address.is_global:
+                raise UnsafeURLError(
+                    f"host {host!r} resolves to non-public address {address}"
+                )
+        return infos
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[tuple] | None = None,
+    ) -> httpcore.NetworkStream:
+        infos = self._resolve(host, port)
+        last_error: Exception | None = None
+        for family, sock_type, proto, _canonname, sockaddr in infos:
+            sock: socket.socket | None = None
+            try:
+                sock = self._socket_factory(family, sock_type, proto)
+                sock.settimeout(timeout)
+                if local_address is not None:
+                    bind_address = (
+                        (local_address, 0, 0, 0)
+                        if family == socket.AF_INET6
+                        else (local_address, 0)
+                    )
+                    sock.bind(bind_address)
+                for option in socket_options or ():
+                    sock.setsockopt(*option)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.connect(sockaddr)
+                return _SocketStream(sock)
+            except socket.timeout as error:
+                last_error = httpcore.ConnectTimeout(str(error))
+            except OSError as error:
+                last_error = httpcore.ConnectError(str(error))
+            if sock is not None:
+                sock.close()
+        if last_error is not None:
+            raise last_error
+        raise httpcore.ConnectError(f"no usable address for host {host!r}")
+
+    def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[tuple] | None = None,
+    ) -> httpcore.NetworkStream:
+        raise RuntimeError("UNIX sockets are not supported by the crawl transport")
+
+
+class SSRFProtectedTransport(httpx.HTTPTransport):
+    """Synchronous HTTP transport backed by connect-time address validation."""
+
+    def __init__(
+        self,
+        *,
+        allow_private: bool = False,
+        network_backend: httpcore.NetworkBackend | None = None,
+    ) -> None:
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=httpx.create_ssl_context(verify=True, trust_env=False),
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=5.0,
+            network_backend=(
+                network_backend or ValidatingNetworkBackend(allow_private=allow_private)
+            ),
+        )
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -85,6 +258,11 @@ def request_guard(
     """httpx request event hook — validates every request, including redirect hops."""
 
     def _check(request: httpx.Request) -> None:
-        validate_url(str(request.url), allow_private=allow_private, require_https=require_https)
+        validate_url(
+            str(request.url),
+            allow_private=allow_private,
+            require_https=require_https,
+            resolve_dns=False,
+        )
 
     return _check

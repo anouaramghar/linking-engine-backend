@@ -15,7 +15,12 @@ from lxml import etree, html as lxml_html
 
 from app.config import settings
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata
-from app.connectors.url_guard import UnsafeURLError, request_guard, validate_url
+from app.connectors.url_guard import (
+    SSRFProtectedTransport,
+    UnsafeURLError,
+    request_guard,
+    validate_url,
+)
 from app.models.suggestion import Suggestion
 
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -31,6 +36,8 @@ class HTMLConnector(ContentConnector):
         allow_private = settings.allow_unsafe_crawl_targets
         validate_url(site.base_url, allow_private=allow_private, resolve_dns=False)
         self.client = httpx.Client(
+            transport=SSRFProtectedTransport(allow_private=allow_private),
+            trust_env=False,
             timeout=30,
             follow_redirects=True,
             max_redirects=5,
