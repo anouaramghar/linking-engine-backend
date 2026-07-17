@@ -1,12 +1,12 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
 
-EMBEDDING_DIM = 1024  # BAAI/bge-m3
+EMBEDDING_DIM = 1024  # Storage contract (Phase 0, finding 4).
 
 TaxonomyKind = Enum("category", "tag", name="taxonomy_kind", native_enum=False, length=20)
 
@@ -40,12 +40,15 @@ class Article(Base):
 
 class Embedding(Base):
     __tablename__ = "embeddings"
-    __table_args__ = (UniqueConstraint("article_id", "model"),)  # encode-once cache
+    __table_args__ = (UniqueConstraint("article_id", "model"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), index=True)
     model: Mapped[str] = mapped_column(String(100))
     vector: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
+    content_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    input_recipe_version: Mapped[int | None] = mapped_column(Integer)
+    vector_size: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

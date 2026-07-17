@@ -1,5 +1,6 @@
 """Baseline cosine + review lifecycle — hand-crafted embeddings, no torch needed."""
 
+import hashlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError, Lock
@@ -28,11 +29,26 @@ def _mix(a: int, b: int, wa: float, wb: float) -> list[float]:
 def _make_articles(db, site, vectors):
     articles = []
     for i, vector in enumerate(vectors):
-        art = Article(site_id=site.id, url=f"{site.base_url}/art-{i}", title=f"art {i}",
-                      content_text=f"content {i}")
+        title = f"art {i}"
+        text = f"content {i}"
+        art = Article(
+            site_id=site.id,
+            url=f"{site.base_url}/art-{i}",
+            title=title,
+            content_text=text,
+        )
         db.add(art)
         db.flush()
-        db.add(Embedding(article_id=art.id, model=settings.embedding_model, vector=vector))
+        db.add(
+            Embedding(
+                article_id=art.id,
+                model=settings.embedding_model,
+                vector=vector,
+                content_fingerprint=hashlib.sha256(f"{title}\n{text}".encode()).hexdigest(),
+                input_recipe_version=1,
+                vector_size=EMBEDDING_DIM,
+            )
+        )
         articles.append(art)
     db.commit()
     return articles
