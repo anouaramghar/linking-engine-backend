@@ -68,6 +68,8 @@ def test_rejects_malformed_and_credentialed_urls(url):
         "http://192.168.1.1/",
         "http://169.254.169.254/latest/meta-data/",  # cloud metadata
         "http://[::1]/",
+        "http://[::7f00:1]/",  # IPv4-compatible loopback address
+        "http://[::a9fe:a9fe]/",  # IPv4-compatible metadata address
         "http://[::ffff:169.254.169.254]/",  # IPv4-mapped metadata address
         "http://[64:ff9b::a9fe:a9fe]/",  # NAT64-encoded metadata address
         "http://0.0.0.0/",
@@ -100,6 +102,10 @@ def test_accepts_hostname_resolving_to_public_address(monkeypatch):
 
 def test_accepts_nat64_literal_embedding_public_ipv4():
     validate_url("http://[64:ff9b::5db8:d822]/")
+
+
+def test_accepts_ipv4_compatible_literal_embedding_public_ipv4():
+    validate_url("http://[::5db8:d822]/")
 
 
 def test_rejects_unresolvable_hostname(monkeypatch):
@@ -250,7 +256,12 @@ def test_connect_backend_rejects_if_any_resolved_address_is_private():
 
 @pytest.mark.parametrize(
     "address",
-    ["::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe"],
+    [
+        "::7f00:1",
+        "::a9fe:a9fe",
+        "::ffff:169.254.169.254",
+        "64:ff9b::a9fe:a9fe",
+    ],
 )
 def test_connect_backend_rejects_non_public_embedded_ipv4(address):
     backend = ValidatingNetworkBackend(

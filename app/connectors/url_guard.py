@@ -21,6 +21,7 @@ import httpcore
 import httpx
 
 _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+_IPV4_COMPATIBLE_PREFIX = ipaddress.ip_network("::/96")
 _NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 
@@ -29,8 +30,14 @@ class UnsafeURLError(Exception):
 
 
 def _is_public_address(address: _IPAddress) -> bool:
-    """Apply IPv4 safety rules to mapped and well-known-prefix NAT64 addresses."""
+    """Apply IPv4 safety rules to compatible, mapped, and well-known NAT64 addresses."""
     embedded_ipv4 = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    if (
+        isinstance(address, ipaddress.IPv6Address)
+        and embedded_ipv4 is None
+        and address in _IPV4_COMPATIBLE_PREFIX
+    ):
+        embedded_ipv4 = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
     if isinstance(address, ipaddress.IPv6Address) and address in _NAT64_WELL_KNOWN_PREFIX:
         embedded_ipv4 = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
     return embedded_ipv4.is_global if embedded_ipv4 is not None else address.is_global

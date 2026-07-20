@@ -255,6 +255,9 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             raise ValueError(f"site {site_id} not found")
         connector = get_connector(site)
 
+        # Snapshot writes remain in one transaction so a failed crawl cannot alter
+        # live content. This deliberately trades bounded, resumable batch commits
+        # for atomicity; use staging and promotion before scaling to very large crawls.
         url_to_id: dict[str, int] = {}
         outbound: list[tuple[int, list[str]]] = []
         article_ids: set[int] = set()

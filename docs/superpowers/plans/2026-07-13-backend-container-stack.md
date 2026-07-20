@@ -278,7 +278,7 @@ services:
 
   worker:
     <<: *app-service
-    command: ["rq", "worker", "--url", "redis://redis:6379/0", "default"]
+    command: ["rq", "worker", "--with-scheduler", "--url", "redis://redis:6379/0", "ingestion", "analysis", "publication", "default"]
     depends_on:
       db:
         condition: service_healthy

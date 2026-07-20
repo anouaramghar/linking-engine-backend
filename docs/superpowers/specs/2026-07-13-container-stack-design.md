@@ -79,7 +79,7 @@ A `.dockerignore` file will exclude Git metadata, virtual environments, Python/t
 ### `worker`
 
 - Use the shared application image.
-- Run `rq worker --url redis://redis:6379/0 default`.
+- Run `rq worker --with-scheduler --url redis://redis:6379/0 ingestion analysis publication default`.
 - Start only after PostgreSQL and Redis are healthy and `migrate` completed successfully.
 - Mount a persistent Hugging Face cache volume so the lazily downloaded embedding model survives container recreation.
 
