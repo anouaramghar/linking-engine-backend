@@ -90,12 +90,24 @@ class FourArticleStubConnector(StubConnector):
             )
 
 
+class DuplicateArticleStubConnector(StubConnector):
+    def fetch_articles(self):
+        article = ArticleData(
+            url=f"{self.site.base_url}/article-0",
+            title="Duplicate article",
+            content_text="duplicate",
+            external_id="1",
+        )
+        for _ in range(4):
+            yield article
+
+
 class FailingStubConnector(ReducedStubConnector):
     def fetch_articles(self):
         yield ArticleData(
             url=f"{self.site.base_url}/a",
-            title="Article A",
-            content_text="text a",
+            title="Uncommitted Article A",
+            content_text="content from failed crawl",
             external_id="1",
             taxonomies=[TaxonomyData(kind="category", name="New")],
         )
@@ -244,6 +256,24 @@ def test_truncated_recrawl_fails_below_previous_success_floor(db, site, monkeypa
     assert all(article.is_active is True for article in articles)
     assert [run.status for run in runs] == ["succeeded", "failed"]
     assert "snapshot not reconciled" in runs[-1].error
+
+
+def test_duplicate_records_do_not_bypass_snapshot_completeness(db, site, monkeypatch):
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: FourArticleStubConnector(s)
+    )
+    ingestion_service.run_ingestion(site.id)
+
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: DuplicateArticleStubConnector(s)
+    )
+    with pytest.raises(ValueError, match=r"1 articles.*50%.*previous.*\(4\)"):
+        ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    articles = db.scalars(select(Article).where(Article.site_id == site.id)).all()
+    assert len(articles) == 4
+    assert all(article.is_active is True for article in articles)
 
 
 def test_overlapping_ingestion_fails_fast_and_records_failed_run(db, site, monkeypatch):
@@ -459,16 +489,16 @@ def test_failed_recrawl_preserves_previous_snapshot(db, site, monkeypatch):
     ).all()
     previous_articles = [article for article in articles if article.external_id in {"1", "2"}]
     partial_articles = [article for article in articles if article.external_id not in {"1", "2"}]
+    article_a = next(article for article in previous_articles if article.external_id == "1")
 
     assert all(article.is_active is True for article in previous_articles)
-    assert len(partial_articles) == 49
-    assert all(article.is_active is False for article in partial_articles)
-    assert all(
-        getattr(article, "last_seen_run_id", None) == runs[-1].id
-        for article in partial_articles
-    )
+    assert article_a.title == "Article A"
+    assert article_a.content_text == "text a"
+    assert article_a.last_seen_run_id == runs[0].id
+    assert partial_articles == []
     assert all(link.is_active is True for link in links)
-    assert set(membership_names) == {"New", "SEO"}
+    assert set(membership_names) == {"SEO"}
+    assert [run.status for run in runs] == ["succeeded", "failed"]
 
 
 def test_permalink_change_updates_in_place(db, site):

@@ -136,6 +136,21 @@ def record_progress(
         logger.exception("failed to record progress for job run %s", job_run_id)
 
 
+def record_progress_durably(job_run_id: int | None, **fields) -> None:
+    """Commit progress independently from a task transaction that may roll back."""
+    if job_run_id is None:
+        return
+    db = SessionLocal()
+    try:
+        record_progress(db, job_run_id, **fields)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("failed to commit progress for job run %s", job_run_id)
+    finally:
+        db.close()
+
+
 def _run_task_body(fn, site_id: int, job_run_id: int | None) -> dict:
     parameters = signature(fn).parameters.values()
     if any(
@@ -157,19 +172,25 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
             run.status = "running"
             run.attempts += 1
             run.started_at = datetime.now(timezone.utc)
+            run.finished_at = None
+            run.result = None
             db.commit()
         try:
             result = _run_task_body(fn, site_id, job_run_id)
         except Exception as e:
             error = str(e)[:2000]
-            if run is not None:
-                run.status = "failed"
-                run.error = error
-                run.finished_at = datetime.now(timezone.utc)
-                db.commit()
             current_job = get_current_job()
             retries_left = getattr(current_job, "retries_left", None)
-            if current_job is None or retries_left is None or retries_left <= 0:
+            final_attempt = current_job is None or retries_left is None or retries_left <= 0
+            if run is not None:
+                # RQ schedules the retry only after the task raises. Keep the durable
+                # row active during that window so another API trigger cannot enqueue
+                # a duplicate job for the same site and stage.
+                run.status = "failed" if final_attempt else "queued"
+                run.error = error
+                run.finished_at = datetime.now(timezone.utc) if final_attempt else None
+                db.commit()
+            if final_attempt:
                 send_alert(
                     f"LinkMesh {run.kind if run is not None else 'unknown'} job failed",
                     {

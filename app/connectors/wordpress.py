@@ -42,7 +42,11 @@ def _strip_html(fragment: str) -> str:
 class WordPressConnector(ContentConnector):
     def __init__(self, site):
         super().__init__(site)
-        auth = (site.wp_username, site.wp_app_password) if site.wp_username else None
+        has_username = bool(site.wp_username)
+        has_password = bool(site.wp_app_password)
+        if has_username != has_password:
+            raise ValueError("wp_username and wp_app_password must be provided together")
+        auth = (site.wp_username, site.wp_app_password) if has_username else None
         allow_private = settings.allow_unsafe_crawl_targets
         require_https = auth is not None and not allow_private
         # Fail fast on scheme/credential problems. The request hook repeats those
@@ -86,12 +90,16 @@ class WordPressConnector(ContentConnector):
                 return
             page += 1
 
-    def _taxonomy_map(self) -> dict[int, TaxonomyData]:
-        """WP term id -> TaxonomyData, for categories and tags (A14 — free from the API)."""
-        out: dict[int, TaxonomyData] = {}
+    def _taxonomy_map(self) -> dict[tuple[str, int], TaxonomyData]:
+        """Map (kind, WP term id) to taxonomy; category and tag ids can overlap."""
+        out: dict[tuple[str, int], TaxonomyData] = {}
         for path, kind in [("/wp-json/wp/v2/categories", "category"), ("/wp-json/wp/v2/tags", "tag")]:
             for term in self._paginate(path):
-                out[term["id"]] = TaxonomyData(kind=kind, name=term["name"], external_id=str(term["id"]))
+                out[(kind, term["id"])] = TaxonomyData(
+                    kind=kind,
+                    name=term["name"],
+                    external_id=str(term["id"]),
+                )
         return out
 
     def _internal_hrefs(self, content_html: str, page_url: str) -> list[str]:
@@ -110,10 +118,15 @@ class WordPressConnector(ContentConnector):
                 hrefs.append(absolute)
         return hrefs
 
-    def _to_article(self, post: dict, taxonomy_map: dict[int, TaxonomyData]) -> ArticleData:
+    def _to_article(
+        self, post: dict, taxonomy_map: dict[tuple[str, int], TaxonomyData]
+    ) -> ArticleData:
         content_html = post["content"]["rendered"]
         content_tree = _parse_html(content_html)
-        term_ids = post.get("categories", []) + post.get("tags", [])
+        term_refs = [
+            *(("category", term_id) for term_id in post.get("categories", [])),
+            *(("tag", term_id) for term_id in post.get("tags", [])),
+        ]
         return ArticleData(
             url=post["link"],
             external_id=str(post["id"]),
@@ -122,7 +135,7 @@ class WordPressConnector(ContentConnector):
             content_html=content_html,
             language=None,  # language filter disabled (A5) — fleet is 100% English
             published_at=_iso(post.get("date_gmt")),
-            taxonomies=[taxonomy_map[tid] for tid in term_ids if tid in taxonomy_map],
+            taxonomies=[taxonomy_map[ref] for ref in term_refs if ref in taxonomy_map],
             outbound_internal_urls=self._internal_hrefs_from_tree(content_tree, post["link"]),
         )
 

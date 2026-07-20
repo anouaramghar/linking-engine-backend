@@ -179,6 +179,16 @@ def test_nonfinal_job_failure_does_not_send_alert(db, site, monkeypatch):
             site.id,
         )
 
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert (stored.status, stored.attempts) == ("queued", 1)
+    assert stored.error == "retry me"
+    assert stored.finished_at is None
+
+    monkeypatch.setattr(job_service, "_still_in_queue", lambda candidate: candidate.id == run.id)
+    with pytest.raises(job_service.DuplicateJobError, match="already queued"):
+        enqueue_job(db, site.id, "analysis", lambda: None, job_timeout=60)
+
 
 def test_alert_db_failure_preserves_original_job_error(db, site, monkeypatch, caplog):
     run = JobRun(site_id=site.id, kind="analysis")

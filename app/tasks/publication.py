@@ -47,6 +47,7 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
             .order_by(Suggestion.id)
         ).all()
         applied = failed = skipped = 0
+        failure_details: list[str] = []
         total = len(batch)
         record_progress(
             db,
@@ -103,10 +104,19 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
                 db.commit()  # releases the advisory and row locks
                 # counted only after the commit — a failed commit is a 'failed', not an 'applied'
                 applied += 1
-            except Exception:
+            except Exception as error:
                 db.rollback()  # claim undone — suggestion is 'approved' again for retry
                 logger.exception("apply_link failed for suggestion %s", suggestion_id)
                 failed += 1
+                failure_details.append(
+                    f"suggestion {suggestion_id}: {type(error).__name__}: {error}"
+                )
+        if failed:
+            # Successful suggestions were committed individually and are skipped on
+            # retry. Failed claims rolled back to "approved", so raising lets RQ
+            # retry them and emit the exhausted-retry alert if they keep failing.
+            details = "; ".join(failure_details[:3])
+            raise RuntimeError(f"{failed} publication suggestion(s) failed: {details}")
         return {"applied": applied, "failed": failed, "skipped": skipped}
     finally:
         db.close()

@@ -68,6 +68,8 @@ def test_rejects_malformed_and_credentialed_urls(url):
         "http://192.168.1.1/",
         "http://169.254.169.254/latest/meta-data/",  # cloud metadata
         "http://[::1]/",
+        "http://[::ffff:169.254.169.254]/",  # IPv4-mapped metadata address
+        "http://[64:ff9b::a9fe:a9fe]/",  # NAT64-encoded metadata address
         "http://0.0.0.0/",
         "http://100.64.0.1/",  # CGNAT
     ],
@@ -94,6 +96,10 @@ def test_accepts_hostname_resolving_to_public_address(monkeypatch):
         lambda *a, **kw: [(2, 1, 6, "", ("93.184.216.34", 0))],
     )
     validate_url("https://example.com/")
+
+
+def test_accepts_nat64_literal_embedding_public_ipv4():
+    validate_url("http://[64:ff9b::5db8:d822]/")
 
 
 def test_rejects_unresolvable_hostname(monkeypatch):
@@ -242,6 +248,22 @@ def test_connect_backend_rejects_if_any_resolved_address_is_private():
         backend.connect_tcp("mixed.example", 80)
 
 
+@pytest.mark.parametrize(
+    "address",
+    ["::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe"],
+)
+def test_connect_backend_rejects_non_public_embedded_ipv4(address):
+    backend = ValidatingNetworkBackend(
+        resolver=lambda _host, port, **_kwargs: [
+            (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, port, 0, 0))
+        ],
+        socket_factory=lambda *_args: pytest.fail("unsafe embedded IPv4 must not connect"),
+    )
+
+    with pytest.raises(UnsafeURLError, match="non-public"):
+        backend.connect_tcp("translated.example", 80)
+
+
 def test_connect_backend_honors_allow_private():
     fake_socket = _FakeSocket()
     backend = ValidatingNetworkBackend(
@@ -320,6 +342,23 @@ def test_wordpress_connector_requires_https_with_credentials(no_dns):
     WordPressConnector(_site("http://example.com"))
 
 
+@pytest.mark.parametrize(
+    ("wp_username", "wp_app_password"),
+    [("admin", None), (None, "password")],
+)
+def test_wordpress_connector_rejects_partial_credentials(
+    no_dns, wp_username, wp_app_password
+):
+    with pytest.raises(ValueError, match="provided together"):
+        WordPressConnector(
+            _site(
+                "https://example.com",
+                wp_username=wp_username,
+                wp_app_password=wp_app_password,
+            )
+        )
+
+
 def test_connectors_use_connect_time_ssrf_transport(no_dns):
     wordpress = WordPressConnector(_site("https://example.com"))
     html = HTMLConnector(_site("https://example.com"))
@@ -392,6 +431,15 @@ def test_site_create_rejects_credentialed_url():
 def test_site_create_rejects_http_with_wp_credentials():
     with pytest.raises(ValidationError, match="HTTPS"):
         SiteCreate(**_payload(base_url="http://example.com", wp_username="a", wp_app_password="b"))
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [{"wp_username": "admin"}, {"wp_app_password": "password"}],
+)
+def test_site_create_rejects_partial_wp_credentials(credentials):
+    with pytest.raises(ValidationError, match="provided together"):
+        SiteCreate(**_payload(**credentials))
 
 
 def test_site_create_rejects_private_ip_literal():
