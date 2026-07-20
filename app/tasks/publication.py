@@ -8,10 +8,11 @@ blocks on the row lock and gets a clean 409 once the publish commits. Any failur
 or crash rolls the claim back to 'approved' for retry (A8); apply_link's exact-href
 check keeps retries idempotent when WordPress succeeded but the commit didn't.
 
-One suggestion's failure never interrupts the batch. Publication never writes
-internal_links — the applied link is detected at the next crawl (A9, ingestion is
-the single source of truth). Durable per-attempt records land with the job-run
-slice (finding 7); until then failures go to the log.
+A suggestion failure does not stop later batch entries; after the loop, any
+failure is re-raised so RQ retries it and terminal failures produce durable alerts.
+Publication never writes internal_links — the applied link is detected at the next
+crawl (A9, ingestion is the single source of truth). Durable per-attempt state is
+recorded through the job-run wrapper (finding 7).
 """
 
 import logging
