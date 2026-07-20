@@ -64,7 +64,15 @@ def list_articles(
     db: Session = Depends(get_db),
 ) -> list[Article]:
     _get_site_or_404(db, site_id)
-    query = select(Article).where(Article.site_id == site_id)
-    if orphans:  # no internal link points to them
-        query = query.where(~exists().where(InternalLink.target_article_id == Article.id))
+    query = select(Article).where(
+        Article.site_id == site_id,
+        Article.is_active.is_(True),
+    )
+    if orphans:  # Expired links do not count (Phase 0, finding 3).
+        query = query.where(
+            ~exists().where(
+                InternalLink.target_article_id == Article.id,
+                InternalLink.is_active.is_(True),
+            )
+        )
     return db.scalars(query.order_by(Article.id).limit(limit).offset(offset)).all()

@@ -1,18 +1,76 @@
 """Ingestion pipeline: connector -> idempotent upsert -> internal link graph (sequence 4.1)."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.connectors.base import ArticleData
+from app.config import settings
+from app.connectors.base import ArticleData, TaxonomyData
 from app.connectors.registry import get_connector
-from app.db import SessionLocal
-from app.models import Article, ArticleTaxonomy, IngestionRun, InternalLink, Site, Taxonomy
+from app.db import SessionLocal, engine
+from app.models import (
+    Article,
+    ArticleTaxonomy,
+    IngestionRun,
+    InternalLink,
+    Site,
+    Suggestion,
+    Taxonomy,
+)
+from app.services.job_service import record_progress
 
-_ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C4D  # "LM"
+# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 ingestion run,
+# 0x4C4A enqueue, 0x4C4D analysis, and 0x4C50 publication.
+_ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C41  # "LA"
+_INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI"
+
+
+@contextmanager
+def _site_ingestion_lock(site_id: int) -> Iterator[None]:
+    # Batch commits use the work session, while this dedicated connection keeps
+    # the session-level lock for the complete crawl and reconciliation window.
+    with engine.connect() as lock_connection:
+        acquired = lock_connection.execute(
+            select(func.pg_try_advisory_lock(_INGESTION_LOCK_NAMESPACE, site_id))
+        ).scalar_one()
+        if not acquired:
+            raise RuntimeError(f"ingestion already running for site {site_id}")
+        try:
+            yield
+        finally:
+            lock_connection.execute(
+                select(func.pg_advisory_unlock(_INGESTION_LOCK_NAMESPACE, site_id))
+            ).scalar_one()
+
+
+def _validate_snapshot_completeness(
+    db: Session, site_id: int, run_id: int, article_count: int
+) -> None:
+    if article_count == 0:
+        raise ValueError(f"crawl returned zero articles for site {site_id}; snapshot not reconciled")
+
+    previous_count = db.scalar(
+        select(IngestionRun.articles_upserted)
+        .where(
+            IngestionRun.site_id == site_id,
+            IngestionRun.status == "succeeded",
+            IngestionRun.id != run_id,
+        )
+        .order_by(IngestionRun.id.desc())
+        .limit(1)
+    )
+    minimum_ratio = settings.ingestion_min_previous_ratio
+    if previous_count and article_count < previous_count * minimum_ratio:
+        raise ValueError(
+            f"crawl returned {article_count} articles for site {site_id}, below "
+            f"{minimum_ratio:.0%} of the previous successful crawl ({previous_count}); "
+            "snapshot not reconciled"
+        )
 
 
 def normalize_url(url: str) -> str:
@@ -21,7 +79,9 @@ def normalize_url(url: str) -> str:
     return f"{p.netloc.lower()}{p.path.rstrip('/')}"
 
 
-def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
+def _upsert_article(
+    db: Session, site_id: int, art: ArticleData, run_id: int | None = None
+) -> int:
     db.execute(select(func.pg_advisory_xact_lock(_ARTICLE_UPSERT_LOCK_NAMESPACE, site_id)))
 
     identity_filters = [Article.url == art.url]
@@ -46,6 +106,9 @@ def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
 
     if article is None:
         article = Article(site_id=site_id, url=art.url, title="", content_text="")
+        if run_id is not None:
+            # New rows stay hidden until successful reconciliation (Phase 0, finding 3).
+            article.is_active = False
         db.add(article)
     elif by_external_id is not None and by_url is not None and by_external_id.id != by_url.id:
         previous_url = by_external_id.url
@@ -63,12 +126,20 @@ def _upsert_article(db: Session, site_id: int, art: ArticleData) -> int:
     article.content_html = art.content_html
     article.language = art.language
     article.published_at = art.published_at
+    if run_id is not None:
+        article.last_seen_run_id = run_id
     db.flush()
     return article.id
 
 
-def _upsert_taxonomies(db: Session, site_id: int, article_id: int, art: ArticleData) -> None:
-    for tax in art.taxonomies:
+def _upsert_taxonomies(
+    db: Session,
+    site_id: int,
+    article_id: int,
+    taxonomies: list[TaxonomyData],
+    run_id: int,
+) -> None:
+    for tax in taxonomies:
         tax_id = db.execute(
             pg_insert(Taxonomy)
             .values(site_id=site_id, kind=tax.kind, name=tax.name, external_id=tax.external_id)
@@ -79,23 +150,100 @@ def _upsert_taxonomies(db: Session, site_id: int, article_id: int, art: ArticleD
         ).scalar_one()
         db.execute(
             pg_insert(ArticleTaxonomy)
-            .values(article_id=article_id, taxonomy_id=tax_id)
-            .on_conflict_do_nothing()
+            .values(
+                article_id=article_id,
+                taxonomy_id=tax_id,
+                last_seen_run_id=run_id,
+            )
+            .on_conflict_do_update(
+                index_elements=["article_id", "taxonomy_id"],
+                set_={"last_seen_run_id": run_id},
+            )
         )
 
 
-def _upsert_link(db: Session, source_id: int, target_id: int) -> None:
+def _upsert_link(db: Session, source_id: int, target_id: int, run_id: int) -> None:
     db.execute(
         pg_insert(InternalLink)
-        .values(source_article_id=source_id, target_article_id=target_id)
+        .values(
+            source_article_id=source_id,
+            target_article_id=target_id,
+            is_active=True,
+            last_seen_run_id=run_id,
+        )
         .on_conflict_do_update(
             index_elements=["source_article_id", "target_article_id"],
-            set_={"last_seen_at": func.now()},  # first_seen_at untouched — temporal split
+            # first_seen_at stays immutable for history (Phase 0, finding 3).
+            set_={
+                "is_active": True,
+                "last_seen_at": func.now(),
+                "last_seen_run_id": run_id,
+            },
         )
     )
 
 
-def run_ingestion(site_id: int) -> dict:
+def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
+    site_article_ids = select(Article.id).where(Article.site_id == site_id)
+    inactive_article_ids = select(Article.id).where(
+        Article.site_id == site_id,
+        Article.last_seen_run_id.is_distinct_from(run_id),
+    )
+    taxonomy_reporter_ids = select(ArticleTaxonomy.article_id).where(
+        ArticleTaxonomy.last_seen_run_id == run_id
+    )
+    db.execute(
+        update(Article)
+        .where(
+            Article.site_id == site_id,
+            Article.last_seen_run_id == run_id,
+            Article.is_active.is_(False),
+        )
+        .values(is_active=True)
+    )
+    db.execute(
+        update(Article)
+        .where(
+            Article.site_id == site_id,
+            Article.last_seen_run_id.is_distinct_from(run_id),
+            Article.is_active.is_(True),
+        )
+        .values(is_active=False)
+    )
+    db.execute(
+        update(Suggestion)
+        .where(
+            Suggestion.site_id == site_id,
+            Suggestion.status.in_(("pending", "approved")),
+            or_(
+                Suggestion.source_article_id.in_(inactive_article_ids),
+                Suggestion.target_article_id.in_(inactive_article_ids),
+            ),
+        )
+        .values(status="expired")
+    )
+    db.execute(
+        update(InternalLink)
+        .where(
+            InternalLink.source_article_id.in_(site_article_ids),
+            InternalLink.last_seen_run_id.is_distinct_from(run_id),
+            InternalLink.is_active.is_(True),
+        )
+        .values(is_active=False)
+    )
+    db.execute(
+        delete(ArticleTaxonomy).where(
+            ArticleTaxonomy.article_id.in_(site_article_ids),
+            ArticleTaxonomy.last_seen_run_id.is_distinct_from(run_id),
+            or_(
+                ArticleTaxonomy.article_id.in_(inactive_article_ids),
+                ArticleTaxonomy.article_id.in_(taxonomy_reporter_ids),
+            ),
+        )
+    )
+
+
+def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
     """RQ task body. A run never stays 'running' (sequence 4.1 alt success/failure)."""
     db = SessionLocal()
     run = IngestionRun(site_id=site_id)
@@ -111,25 +259,43 @@ def run_ingestion(site_id: int) -> dict:
         outbound: list[tuple[int, list[str]]] = []
         articles = 0
         for art in connector.fetch_articles():
-            article_id = _upsert_article(db, site_id, art)
-            _upsert_taxonomies(db, site_id, article_id, art)
+            article_id = _upsert_article(db, site_id, art, run.id)
+            _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id
             outbound.append((article_id, art.outbound_internal_urls))
             articles += 1
             if articles % 50 == 0:
+                record_progress(
+                    db,
+                    job_run_id,
+                    stage="crawling",
+                    articles=articles,
+                )
                 db.commit()  # batch commit — resumable, bounded transaction size
 
+        _validate_snapshot_completeness(db, site_id, run.id, articles)
+
         # Resolve links once all articles are known (forward references)
+        record_progress(db, job_run_id, stage="resolving_links")
         links = 0
         seen: set[tuple[int, int]] = set()
         for source_id, urls in outbound:
             for url in urls:
                 target_id = url_to_id.get(normalize_url(url))
                 if target_id and target_id != source_id and (source_id, target_id) not in seen:
-                    _upsert_link(db, source_id, target_id)
+                    _upsert_link(db, source_id, target_id, run.id)
                     seen.add((source_id, target_id))
                     links += 1
 
+        # Reconciliation is success-gated after link resolution (Phase 0, finding 3).
+        record_progress(
+            db,
+            job_run_id,
+            stage="reconciling",
+            articles=articles,
+            links=links,
+        )
+        _reconcile_snapshot(db, site_id, run.id)
         run.status = "succeeded"
         run.articles_upserted = articles
         run.links_found = links
@@ -145,6 +311,31 @@ def run_ingestion(site_id: int) -> dict:
         raise
     finally:
         db.close()
+
+
+def run_ingestion(site_id: int, job_run_id: int | None = None) -> dict:
+    """Run one site crawl at a time and record lock contention as a failed run."""
+    lock_acquired = False
+    try:
+        with _site_ingestion_lock(site_id):
+            lock_acquired = True
+            return _run_ingestion_locked(site_id, job_run_id)
+    except Exception as error:
+        if lock_acquired:
+            raise
+        db = SessionLocal()
+        try:
+            run = IngestionRun(
+                site_id=site_id,
+                status="failed",
+                error=str(error)[:2000],
+                finished_at=datetime.now(timezone.utc),
+            )
+            db.add(run)
+            db.commit()
+        finally:
+            db.close()
+        raise
 
 
 def latest_run(db: Session, site_id: int) -> IngestionRun | None:

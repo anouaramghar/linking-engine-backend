@@ -1,7 +1,10 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, model_validator
+
+from app.config import settings
+from app.connectors.url_guard import UnsafeURLError, validate_url
 
 
 class SiteCreate(BaseModel):
@@ -11,12 +14,20 @@ class SiteCreate(BaseModel):
     wp_username: str | None = None
     wp_app_password: str | None = None
 
-    @field_validator("base_url")
-    @classmethod
-    def valid_url(cls, v: str) -> str:
-        if not v.startswith(("http://", "https://")):
-            raise ValueError("base_url must start with http:// or https://")
-        return v.rstrip("/")
+    @model_validator(mode="after")
+    def safe_base_url(self) -> "SiteCreate":
+        allow = settings.allow_unsafe_crawl_targets
+        try:
+            validate_url(
+                self.base_url,
+                allow_private=allow,
+                require_https=bool(self.wp_username or self.wp_app_password) and not allow,
+                resolve_dns=False,  # the pinned crawl transport resolves hostnames at connect time
+            )
+        except UnsafeURLError as e:
+            raise ValueError(str(e)) from e
+        self.base_url = self.base_url.rstrip("/")
+        return self
 
 
 class SiteOut(BaseModel):

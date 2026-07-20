@@ -7,8 +7,8 @@ from app.models import IngestionRun, Site
 from app.schemas.job import JobAccepted
 from app.schemas.site import IngestionRunOut
 from app.services.ingestion_service import latest_run
+from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.ingestion import ingest_site
-from app.tasks.queues import default_queue
 
 router = APIRouter(prefix="/sites", tags=["ingestion"])
 
@@ -17,8 +17,11 @@ router = APIRouter(prefix="/sites", tags=["ingestion"])
 def trigger_ingestion(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
     if db.get(Site, site_id) is None:
         raise HTTPException(404, f"site {site_id} not found")
-    job = default_queue.enqueue(ingest_site, site_id, job_timeout=3600)
-    return JobAccepted(job_id=job.id)
+    try:
+        run = enqueue_job(db, site_id, "ingestion", ingest_site, job_timeout=3600)
+    except DuplicateJobError as e:
+        raise HTTPException(409, str(e)) from e
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
 @router.get("/{site_id}/ingestion-runs/latest", response_model=IngestionRunOut)

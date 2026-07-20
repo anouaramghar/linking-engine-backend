@@ -15,11 +15,10 @@ dependencies = [
     "pgvector>=0.3",
     # Task queue
     "rq>=2.0",
-    "rq-scheduler>=0.14",
     "redis>=5.0",
     # Ingestion
-    "scrapy>=2.11",
     "trafilatura>=1.12",
+    "httpcore>=1.0,<2",
     "httpx>=0.27",
 ]
 

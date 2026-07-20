@@ -1,15 +1,19 @@
 """Baseline cosine + review lifecycle — hand-crafted embeddings, no torch needed."""
 
+import hashlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError, Lock
 
+import pytest
 from sqlalchemy import event, select
 
+import app.services.suggestion_service as suggestion_service
 from app.config import settings
 from app.db import engine
-from app.models import Article, Embedding, InternalLink, Suggestion
+from app.models import Article, Embedding, IngestionRun, InternalLink, Suggestion
 from app.models.article import EMBEDDING_DIM
+from app.services.ingestion_service import _reconcile_snapshot
 from app.services.suggestion_service import generate_suggestions
 
 
@@ -17,6 +21,14 @@ def _vec(direction: int, weight: float = 1.0) -> list[float]:
     v = [0.0] * EMBEDDING_DIM
     v[direction] = weight
     return v
+
+
+@pytest.fixture(autouse=True)
+def valid_dimension_probe(monkeypatch):
+    monkeypatch.setattr(
+        "app.ml.embeddings.encode",
+        lambda texts: [_vec(0) for _text in texts],
+    )
 
 
 def _mix(a: int, b: int, wa: float, wb: float) -> list[float]:
@@ -28,11 +40,26 @@ def _mix(a: int, b: int, wa: float, wb: float) -> list[float]:
 def _make_articles(db, site, vectors):
     articles = []
     for i, vector in enumerate(vectors):
-        art = Article(site_id=site.id, url=f"{site.base_url}/art-{i}", title=f"art {i}",
-                      content_text=f"content {i}")
+        title = f"art {i}"
+        text = f"content {i}"
+        art = Article(
+            site_id=site.id,
+            url=f"{site.base_url}/art-{i}",
+            title=title,
+            content_text=text,
+        )
         db.add(art)
         db.flush()
-        db.add(Embedding(article_id=art.id, model=settings.embedding_model, vector=vector))
+        db.add(
+            Embedding(
+                article_id=art.id,
+                model=settings.embedding_model,
+                vector=vector,
+                content_fingerprint=hashlib.sha256(f"{title}\n{text}".encode()).hexdigest(),
+                input_recipe_version=1,
+                vector_size=EMBEDDING_DIM,
+            )
+        )
         articles.append(art)
     db.commit()
     return articles
@@ -77,6 +104,55 @@ def test_baseline_suggestions(db, site):
     assert len(total) == len(suggestions)
 
 
+def test_dimension_mismatch_fails_before_article_embedding(db, site, monkeypatch):
+    produced_size = EMBEDDING_DIM - 1
+    probe_calls = []
+
+    def wrong_dimension(texts):
+        probe_calls.append(texts)
+        return [[0.0] * produced_size]
+
+    monkeypatch.setattr("app.ml.embeddings.encode", wrong_dimension)
+    monkeypatch.setattr(
+        suggestion_service,
+        "_embed_missing",
+        lambda *_args: pytest.fail("article scan must not start after a failed probe"),
+    )
+
+    with pytest.raises(ValueError, match=rf"{produced_size}.*{EMBEDDING_DIM}"):
+        generate_suggestions(site.id)
+
+    assert probe_calls == [[suggestion_service._DIMENSION_PROBE_INPUT]]
+
+
+def test_analysis_uses_only_current_articles_and_links(db, site):
+    source, inactive, target = _make_articles(
+        db,
+        site,
+        [_vec(0), _mix(0, 1, 0.99, 0.1), _mix(0, 1, 0.98, 0.2)],
+    )
+    inactive.is_active = False
+    expired_link = InternalLink(
+        source_article_id=source.id,
+        target_article_id=target.id,
+    )
+    expired_link.is_active = False
+    db.add(expired_link)
+    db.commit()
+
+    generate_suggestions(site.id)
+
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    assert suggestions
+    assert inactive.id not in {suggestion.source_article_id for suggestion in suggestions}
+    assert inactive.id not in {suggestion.target_article_id for suggestion in suggestions}
+    assert target.id in {
+        suggestion.target_article_id
+        for suggestion in suggestions
+        if suggestion.source_article_id == source.id
+    }
+
+
 def test_reanalysis_respects_total_suggestion_cap(db, site):
     _make_articles(db, site, [_vec(0) for _ in range(7)])
 
@@ -88,6 +164,164 @@ def test_reanalysis_respects_total_suggestion_cap(db, site):
     assert first == {"articles_encoded": 0, "suggestions_created": 35}
     assert second == {"articles_encoded": 0, "suggestions_created": 0}
     assert set(counts.values()) == {settings.max_suggestions_per_article}
+
+
+def test_rejected_and_applied_suggestions_free_active_quota(db, site):
+    articles = _make_articles(
+        db,
+        site,
+        [_vec(0) for _ in range(settings.max_suggestions_per_article + 3)],
+    )
+    source_id = articles[0].id
+    generate_suggestions(site.id)
+
+    original = db.scalars(
+        select(Suggestion)
+        .where(Suggestion.source_article_id == source_id)
+        .order_by(Suggestion.id)
+    ).all()
+    assert len(original) == settings.max_suggestions_per_article
+    rejected, applied = original[:2]
+    rejected.status = "rejected"
+    applied.status = "applied"
+    decided_target_ids = {rejected.target_article_id, applied.target_article_id}
+    original_ids = {suggestion.id for suggestion in original}
+    db.commit()
+
+    result = generate_suggestions(site.id)
+
+    suggestions = db.scalars(
+        select(Suggestion)
+        .where(Suggestion.source_article_id == source_id)
+        .order_by(Suggestion.id)
+    ).all()
+    active = [
+        suggestion
+        for suggestion in suggestions
+        if suggestion.status in {"pending", "approved", "applying"}
+    ]
+    replacements = [suggestion for suggestion in suggestions if suggestion.id not in original_ids]
+    assert result == {"articles_encoded": 0, "suggestions_created": 2}
+    assert len(active) == settings.max_suggestions_per_article
+    assert len(replacements) == 2
+    assert decided_target_ids.isdisjoint(
+        {suggestion.target_article_id for suggestion in replacements}
+    )
+
+
+def test_expired_suggestion_frees_source_quota(db, site):
+    articles = _make_articles(
+        db,
+        site,
+        [_vec(0) for _ in range(settings.max_suggestions_per_article + 2)],
+    )
+    generate_suggestions(site.id)
+    source = articles[0]
+    original = db.scalars(
+        select(Suggestion)
+        .where(Suggestion.source_article_id == source.id)
+        .order_by(Suggestion.id)
+    ).all()
+    expired = original[0]
+    inactive_target = db.get(Article, expired.target_article_id)
+    original_ids = {suggestion.id for suggestion in original}
+
+    run = IngestionRun(site_id=site.id)
+    db.add(run)
+    db.flush()
+    for article in articles:
+        if article.id != inactive_target.id:
+            article.last_seen_run_id = run.id
+    db.flush()
+    _reconcile_snapshot(db, site.id, run.id)
+    db.commit()
+
+    assert db.get(Suggestion, expired.id).status == "expired"
+    generate_suggestions(site.id)
+
+    source_suggestions = db.scalars(
+        select(Suggestion).where(Suggestion.source_article_id == source.id)
+    ).all()
+    active = [
+        suggestion
+        for suggestion in source_suggestions
+        if suggestion.status in {"pending", "approved", "applying"}
+    ]
+    replacements = [
+        suggestion for suggestion in source_suggestions if suggestion.id not in original_ids
+    ]
+    assert len(active) == settings.max_suggestions_per_article
+    assert len(replacements) == 1
+
+
+def test_expired_pair_is_suggested_again_after_article_reactivation(db, site):
+    source, target = _make_articles(db, site, [_vec(0), _vec(0)])
+    generate_suggestions(site.id)
+    original = db.scalar(
+        select(Suggestion).where(
+            Suggestion.source_article_id == source.id,
+            Suggestion.target_article_id == target.id,
+        )
+    )
+
+    deactivate_run = IngestionRun(site_id=site.id)
+    db.add(deactivate_run)
+    db.flush()
+    source.last_seen_run_id = deactivate_run.id
+    db.flush()
+    _reconcile_snapshot(db, site.id, deactivate_run.id)
+    db.commit()
+    assert db.get(Suggestion, original.id).status == "expired"
+    assert target.is_active is False
+
+    reactivate_run = IngestionRun(site_id=site.id)
+    db.add(reactivate_run)
+    db.flush()
+    source.last_seen_run_id = reactivate_run.id
+    target.last_seen_run_id = reactivate_run.id
+    db.flush()
+    _reconcile_snapshot(db, site.id, reactivate_run.id)
+    db.commit()
+    assert target.is_active is True
+
+    generate_suggestions(site.id)
+
+    matching = db.scalars(
+        select(Suggestion)
+        .where(
+            Suggestion.source_article_id == source.id,
+            Suggestion.target_article_id == target.id,
+        )
+        .order_by(Suggestion.id)
+    ).all()
+    assert [suggestion.status for suggestion in matching] == ["expired", "pending"]
+    assert matching[0].id == original.id
+    assert matching[1].id != original.id
+
+
+def test_rejected_source_target_pair_is_not_recreated(db, site):
+    source, target = _make_articles(db, site, [_vec(0), _vec(0)])
+    generate_suggestions(site.id)
+    suggestion = db.scalar(
+        select(Suggestion).where(
+            Suggestion.source_article_id == source.id,
+            Suggestion.target_article_id == target.id,
+        )
+    )
+    suggestion.status = "rejected"
+    db.commit()
+
+    result = generate_suggestions(site.id)
+
+    matching = db.scalars(
+        select(Suggestion).where(
+            Suggestion.source_article_id == source.id,
+            Suggestion.target_article_id == target.id,
+        )
+    ).all()
+    assert result == {"articles_encoded": 0, "suggestions_created": 0}
+    assert len(matching) == 1
+    assert matching[0].status == "rejected"
 
 
 def test_concurrent_analysis_respects_total_suggestion_cap(db, site):

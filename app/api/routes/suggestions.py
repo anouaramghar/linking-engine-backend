@@ -1,24 +1,34 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
 from app.schemas.suggestion import BulkReview, SuggestionOut, SuggestionReview
+from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.analysis import analyze_site
-from app.tasks.queues import default_queue
 
 router = APIRouter(tags=["suggestions"])
 
 
 def _review(db: Session, suggestion: Suggestion, status: str) -> None:
-    if suggestion.status == "applied":
-        raise HTTPException(409, f"suggestion {suggestion.id} is already applied")
-    suggestion.status = status
-    suggestion.reviewed_at = datetime.now(timezone.utc)
+    # Guarded transition (Phase 0, finding 5): a suggestion being published holds a
+    # row lock on its claim, so this update blocks until the publish commits and
+    # then matches zero rows — a reject can never land on top of a publish.
+    updated = db.execute(
+        update(Suggestion)
+        .where(
+            Suggestion.id == suggestion.id,
+            Suggestion.status.notin_(["applying", "applied", "expired"]),
+        )
+        .values(status=status, reviewed_at=datetime.now(timezone.utc))
+    ).rowcount
+    if updated == 0:
+        raise HTTPException(409, f"suggestion {suggestion.id} is no longer reviewable")
+    db.expire(suggestion)
 
 
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
@@ -37,8 +47,11 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
 def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
     if db.get(Site, site_id) is None:
         raise HTTPException(404, f"site {site_id} not found")
-    job = default_queue.enqueue(analyze_site, site_id, job_timeout=7200)
-    return JobAccepted(job_id=job.id)
+    try:
+        run = enqueue_job(db, site_id, "analysis", analyze_site, job_timeout=7200)
+    except DuplicateJobError as e:
+        raise HTTPException(409, str(e)) from e
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
 @router.get("/suggestions/{site_id}", response_model=list[SuggestionOut])
@@ -58,6 +71,8 @@ def list_suggestions(
     )
     if status:
         query = query.where(Suggestion.status == status)
+    else:
+        query = query.where(Suggestion.status != "expired")
     if method:
         query = query.where(Suggestion.method == method)
     return db.scalars(query.limit(limit).offset(offset)).all()
