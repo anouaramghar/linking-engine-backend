@@ -10,11 +10,11 @@ MAX_BULK_SITES = 1000
 
 
 class SiteCreate(BaseModel):
-    name: str
-    base_url: str
+    name: str = Field(min_length=1, max_length=255)
+    base_url: str = Field(min_length=1, max_length=2048)
     platform: Literal["wordpress", "html"]
-    wp_username: str | None = None
-    wp_app_password: str | None = None
+    wp_username: str | None = Field(default=None, max_length=255)
+    wp_app_password: str | None = Field(default=None, max_length=255)
 
     @model_validator(mode="after")
     def safe_base_url(self) -> "SiteCreate":

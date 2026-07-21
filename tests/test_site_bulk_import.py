@@ -152,6 +152,39 @@ def test_bulk_import_rejects_a_half_filled_credential_pair(client, imported):
     assert "together" in body["rejected"][0]["reason"]
 
 
+def test_bulk_import_rejects_oversized_fields_without_rolling_back_valid_rows(client, db, imported):
+    rows = [
+        _row(imported, "valid"),
+        _row(imported, "long-name", name="x" * 256),
+        _row(
+            imported,
+            "long-url",
+            base_url=f"{imported}-long-url.example.com/{'x' * 2048}",
+        ),
+        _row(
+            imported,
+            "long-user",
+            wp_username="x" * 256,
+            wp_app_password="secret",
+        ),
+        _row(
+            imported,
+            "long-password",
+            wp_username="editor",
+            wp_app_password="x" * 256,
+        ),
+    ]
+
+    response = client.post(BULK_URL, json={"sites": rows})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [entry["row"] for entry in body["created"]] == [1]
+    assert [entry["row"] for entry in body["rejected"]] == [2, 3, 4, 5]
+    persisted = db.scalars(select(Site.base_url).where(Site.base_url.like(f"{imported}%"))).all()
+    assert persisted == [rows[0]["base_url"]]
+
+
 def test_bulk_import_rejects_an_empty_or_oversized_batch(client, imported):
     assert client.post(BULK_URL, json={"sites": []}).status_code == 422
 
