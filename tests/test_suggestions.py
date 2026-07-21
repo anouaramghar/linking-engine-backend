@@ -9,7 +9,9 @@ import pytest
 from sqlalchemy import event, select, update
 
 import app.services.suggestion_service as suggestion_service
+from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
+from app.schemas.suggestion import MAX_BULK_REVIEW
 from app.db import engine
 from app.models import Article, Embedding, IngestionRun, InternalLink, Suggestion
 from app.models.article import EMBEDDING_DIM
@@ -381,7 +383,7 @@ def test_review_lifecycle(client, db, site):
         "/api/v1/suggestions/bulk-review",
         json={"suggestion_ids": [second.id], "status": "rejected"},
     )
-    assert resp.json() == {"reviewed": 1, "status": "rejected"}
+    assert resp.json() == {"reviewed": 1, "skipped": [], "status": "rejected"}
 
     # 'applied' can never be set via the API
     resp = client.put(f"/api/v1/suggestions/{first.id}", json={"status": "applied"})
@@ -412,12 +414,12 @@ def test_review_can_be_undone(client, db, site):
         "/api/v1/suggestions/bulk-review",
         json={"suggestion_ids": [second.id], "status": "rejected"},
     )
-    assert resp.json() == {"reviewed": 1, "status": "rejected"}
+    assert resp.json() == {"reviewed": 1, "skipped": [], "status": "rejected"}
     resp = client.post(
         "/api/v1/suggestions/bulk-review",
         json={"suggestion_ids": [second.id], "status": "pending"},
     )
-    assert resp.json() == {"reviewed": 1, "status": "pending"}
+    assert resp.json() == {"reviewed": 1, "skipped": [], "status": "pending"}
 
     # undo restores the unreviewed state, timestamp included
     db.expire_all()
@@ -434,10 +436,118 @@ def test_review_can_be_undone(client, db, site):
     assert resp.status_code == 409
 
 
+def test_bulk_review_applies_the_rows_it_can_and_reports_the_rest(client, db, site):
+    """One row the worker already claimed must not discard the other decisions.
+
+    Undo races the publication worker by design — the editor can hit Undo while
+    a publish is picking the batch up — so the batch reports what it skipped
+    instead of failing whole.
+    """
+    _make_articles(db, site, [_vec(0), _mix(0, 1, 0.9, 0.3)])
+    generate_suggestions(site.id)
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    first, second = suggestions[0], suggestions[1]
+
+    client.post(
+        "/api/v1/suggestions/bulk-review",
+        json={"suggestion_ids": [first.id, second.id], "status": "approved"},
+    )
+    # the worker claims one of them mid-flight
+    db.execute(update(Suggestion).where(Suggestion.id == first.id).values(status="applied"))
+    db.commit()
+
+    resp = client.post(
+        "/api/v1/suggestions/bulk-review",
+        json={"suggestion_ids": [first.id, second.id], "status": "pending"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"reviewed": 1, "skipped": [first.id], "status": "pending"}
+
+    db.expire_all()
+    assert db.get(Suggestion, first.id).status == "applied"
+    assert db.get(Suggestion, second.id).status == "pending"
+
+
+def test_bulk_review_round_trips_do_not_scale_with_the_batch(client, db, site):
+    """A batch of any size costs a fixed number of statements.
+
+    Both halves have been one-per-suggestion at some point: the reviews used to
+    be a loop of single-row UPDATEs, and reviewing expires each row, so reading
+    any attribute afterwards silently reloads it. At the 1000-row bound either
+    one is 1000 round trips inside a single synchronous request.
+    """
+    _make_articles(db, site, [_vec(0), _mix(0, 1, 0.9, 0.3), _mix(0, 1, 0.8, 0.4)])
+    generate_suggestions(site.id)
+    ids = [s.id for s in db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()]
+    assert len(ids) > 2, "need a batch large enough for per-row work to show up"
+
+    selects: list[str] = []
+    updates: list[str] = []
+
+    def record(conn, cursor, statement, params, context, executemany):
+        verb = statement.lstrip().upper()
+        if verb.startswith("SELECT"):
+            selects.append(statement)
+        elif verb.startswith("UPDATE"):
+            updates.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        resp = client.post(
+            "/api/v1/suggestions/bulk-review",
+            json={"suggestion_ids": ids, "status": "approved"},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert resp.status_code == 200
+    # One SELECT for which ids exist, one UPDATE ... RETURNING for the reviews.
+    assert len(selects) == 1, f"{len(selects)} SELECTs for {len(ids)} suggestions"
+    assert len(updates) == 1, f"{len(updates)} UPDATEs for {len(ids)} suggestions"
+
+
 def test_list_endpoints_reject_an_unbounded_limit(client, site):
     """A single request must not be able to ask for the whole table."""
     assert client.get(f"/api/v1/suggestions/{site.id}", params={"limit": 10_000_000}).status_code == 422
     assert client.get("/api/v1/sites", params={"limit": 10_000_000}).status_code == 422
     assert client.get(f"/api/v1/suggestions/{site.id}", params={"offset": -1}).status_code == 422
-    # the page size the dashboard actually uses stays valid
-    assert client.get(f"/api/v1/suggestions/{site.id}", params={"limit": 1000}).status_code == 200
+
+
+def test_bulk_review_bound_matches_the_page_size(client, site):
+    """A batch must be bounded, and bounded at the size the dashboard chunks to.
+
+    The queue is read a page at a time and reviewed in one go, so the batch is
+    not limited by any single read. Left unbounded, an "approve all" over a real
+    fleet exceeds PostgreSQL's 65535-parameter limit and 500s; bounded to
+    anything below the page size, the dashboard's chunking starts 422ing.
+    """
+    assert MAX_BULK_REVIEW == MAX_PAGE_SIZE
+
+    def review(count: int) -> int:
+        return client.post(
+            "/api/v1/suggestions/bulk-review",
+            json={"suggestion_ids": list(range(1, count + 1)), "status": "approved"},
+        ).status_code
+
+    assert review(MAX_BULK_REVIEW) == 200
+    assert review(MAX_BULK_REVIEW + 1) == 422
+    # an empty batch is a client bug, not a silent no-op
+    assert review(0) == 422
+
+
+def test_every_list_endpoint_accepts_exactly_max_page_size(client, site):
+    """Pins the boundary the dashboard pages against.
+
+    The client walks these endpoints in pages of MAX_PAGE_SIZE, so the cap has
+    to admit that exact value on every one of them — lowering it, or raising the
+    client's page size past it, turns every list call into a 422.
+    """
+    paths = [
+        "/api/v1/sites",
+        f"/api/v1/sites/{site.id}/articles",
+        f"/api/v1/suggestions/{site.id}",
+        f"/api/v1/jobs/site/{site.id}",
+    ]
+    for path in paths:
+        assert client.get(path, params={"limit": MAX_PAGE_SIZE}).status_code == 200, path
+        assert client.get(path, params={"limit": MAX_PAGE_SIZE + 1}).status_code == 422, path

@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,36 +16,59 @@ from app.tasks.analysis import analyze_site
 router = APIRouter(tags=["suggestions"])
 
 
-def _review(db: Session, suggestion: Suggestion, status: str) -> None:
+UNREVIEWABLE = ("applying", "applied", "expired")
+
+
+def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[int]:
+    """Move every reviewable id to ``status``; returns the ids that actually moved.
+
+    Guarded transition (Phase 0, finding 5): a suggestion being published holds a
+    row lock on its claim, so this update blocks until the publish commits and
+    then matches zero rows — a reject can never land on top of a publish.
+
+    One statement for the whole batch, so the round trips do not scale with the
+    size of the review. `synchronize_session=False` keeps it that way: the ORM
+    would otherwise re-fetch the touched rows to update its identity map, and
+    nothing here reads them back through it.
+    """
     # Undoing a decision returns the suggestion to the unreviewed state, so the
     # review timestamp is cleared rather than advanced.
     reviewed_at = None if status == "pending" else datetime.now(timezone.utc)
-    # Guarded transition (Phase 0, finding 5): a suggestion being published holds a
-    # row lock on its claim, so this update blocks until the publish commits and
-    # then matches zero rows — a reject can never land on top of a publish.
-    updated = db.execute(
-        update(Suggestion)
-        .where(
-            Suggestion.id == suggestion.id,
-            Suggestion.status.notin_(["applying", "applied", "expired"]),
+    return set(
+        db.scalars(
+            update(Suggestion)
+            .where(
+                Suggestion.id.in_(suggestion_ids),
+                Suggestion.status.notin_(UNREVIEWABLE),
+            )
+            .values(status=status, reviewed_at=reviewed_at)
+            .returning(Suggestion.id)
+            .execution_options(synchronize_session=False)
         )
-        .values(status=status, reviewed_at=reviewed_at)
-    ).rowcount
-    if updated == 0:
-        raise HTTPException(409, f"suggestion {suggestion.id} is no longer reviewable")
-    db.expire(suggestion)
+    )
 
 
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
 @router.post("/suggestions/bulk-review")
 def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
-    suggestions = db.scalars(
-        select(Suggestion).where(Suggestion.id.in_(payload.suggestion_ids))
-    ).all()
-    for suggestion in suggestions:
-        _review(db, suggestion, payload.status)
+    # Partial success, not all-or-nothing: a batch is a set of independent
+    # decisions, and one row the publication worker has already claimed must not
+    # discard the rest. Undo hits this routinely — the worker can pick up an
+    # approval while the undo affordance is still on screen, and failing the
+    # whole batch would leave the editor with no way to walk back the others.
+    #
+    # Read the ids that exist first, so "skipped" means the worker got there
+    # first rather than lumping in ids that were never rows at all.
+    existing = set(
+        db.scalars(select(Suggestion.id).where(Suggestion.id.in_(payload.suggestion_ids)))
+    )
+    reviewed = _review_ids(db, payload.suggestion_ids, payload.status)
     db.commit()
-    return {"reviewed": len(suggestions), "status": payload.status}
+    return {
+        "reviewed": len(reviewed),
+        "skipped": sorted(existing - reviewed),
+        "status": payload.status,
+    }
 
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)
@@ -93,7 +117,8 @@ def review_suggestion(
     )
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
-    _review(db, suggestion, payload.status)
+    if not _review_ids(db, [suggestion_id], payload.status):
+        raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
     db.commit()
     db.refresh(suggestion)
     return suggestion
