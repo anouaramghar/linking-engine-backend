@@ -1,5 +1,5 @@
 """Durable job runs (Phase 0, finding 7): every ingestion, analysis, and publication
-job gets a job_runs row at enqueue time, updated by the task body as it executes.
+job gets a job_runs row at enqueue time, updated by task and worker lifecycle hooks.
 A job Redis loses is still visible as 'queued' and is reconciled to 'failed' on the
 next enqueue. Duplicate triggers are refused while a run is active. RQ retries are
 limited and safe — all three task bodies are idempotent (upserts, cached embeddings,
@@ -12,13 +12,13 @@ import logging
 from inspect import Parameter, signature
 
 from rq import Retry, get_current_job
-from rq.exceptions import NoSuchJobError
-from rq.job import Job
+from rq.exceptions import AbandonedJobError, NoSuchJobError
+from rq.job import Callback, Job
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal, engine
-from app.models import JobRun
+from app.models import IngestionRun, JobRun
 from app.services.alerts import send_alert
 from app.tasks.queues import analysis_queue, ingestion_queue, publication_queue, redis_conn
 
@@ -102,6 +102,7 @@ def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: i
         job_run_id=run.id,
         job_timeout=job_timeout,
         retry=Retry(max=2, interval=[30, 120]),  # limited automatic retries
+        on_stopped=Callback(handle_job_stopped),
     )
     run.queue_job_id = job.id
     db.commit()
@@ -136,6 +137,21 @@ def record_progress(
         logger.exception("failed to record progress for job run %s", job_run_id)
 
 
+def record_progress_durably(job_run_id: int | None, **fields) -> None:
+    """Commit progress independently from a task transaction that may roll back."""
+    if job_run_id is None:
+        return
+    db = SessionLocal()
+    try:
+        record_progress(db, job_run_id, **fields)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("failed to commit progress for job run %s", job_run_id)
+    finally:
+        db.close()
+
+
 def _run_task_body(fn, site_id: int, job_run_id: int | None) -> dict:
     parameters = signature(fn).parameters.values()
     if any(
@@ -157,19 +173,25 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
             run.status = "running"
             run.attempts += 1
             run.started_at = datetime.now(timezone.utc)
+            run.finished_at = None
+            run.result = None
             db.commit()
         try:
             result = _run_task_body(fn, site_id, job_run_id)
         except Exception as e:
             error = str(e)[:2000]
-            if run is not None:
-                run.status = "failed"
-                run.error = error
-                run.finished_at = datetime.now(timezone.utc)
-                db.commit()
             current_job = get_current_job()
             retries_left = getattr(current_job, "retries_left", None)
-            if current_job is None or retries_left is None or retries_left <= 0:
+            final_attempt = current_job is None or retries_left is None or retries_left <= 0
+            if run is not None:
+                # RQ schedules the retry only after the task raises. Keep the durable
+                # row active during that window so another API trigger cannot enqueue
+                # a duplicate job for the same site and stage.
+                run.status = "failed" if final_attempt else "queued"
+                run.error = error
+                run.finished_at = datetime.now(timezone.utc) if final_attempt else None
+                db.commit()
+            if final_attempt:
                 send_alert(
                     f"LinkMesh {run.kind if run is not None else 'unknown'} job failed",
                     {
@@ -196,6 +218,178 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
         return result
     finally:
         db.close()
+
+
+def _reconcile_interrupted_job(
+    job: Job,
+    error: str,
+    *,
+    will_retry: bool | None = None,
+    alert_kind: str = "job_failed",
+    alert_verb: str = "failed",
+) -> None:
+    """Idempotently reconcile a task RQ cannot finish recording.
+
+    Unexpected-child and abandoned-job hooks run before RQ decrements retries, so
+    ``retries_left`` describes the transition RQ is about to make. Intentional stop
+    callbacks override it because RQ never retries a stopped job.
+    """
+    job_id = getattr(job, "id", None)
+    error = error[:2000]
+    alert_payload: dict | None = None
+    alert_subject: str | None = None
+    db: Session | None = None
+    try:
+        db = SessionLocal()
+        run = db.scalars(
+            select(JobRun)
+            .where(JobRun.queue_job_id == job_id)
+            .with_for_update()
+        ).first()
+        if run is None:
+            # A fast worker can dequeue before enqueue_job has committed the RQ id
+            # back to job_runs. The durable id is already present in RQ kwargs.
+            try:
+                job_kwargs = getattr(job, "kwargs", {})
+            except Exception:
+                job_kwargs = {}
+            job_run_id = job_kwargs.get("job_run_id") if isinstance(job_kwargs, dict) else None
+            if isinstance(job_run_id, int):
+                candidate = db.get(JobRun, job_run_id, with_for_update=True)
+                if candidate is not None and candidate.queue_job_id in (None, job_id):
+                    run = candidate
+                    run.queue_job_id = job_id
+        if run is None:
+            return
+
+        if will_retry is None:
+            retries_left = getattr(job, "retries_left", None)
+            will_retry = retries_left is not None and retries_left > 0
+        if run.status == "failed":
+            return
+        if run.status == "succeeded" and not will_retry:
+            # run_durably commits success only after the task's application work
+            # returns. A terminal interruption after that commit must not rewrite
+            # known-good work because RQ missed its FINISHED write.
+            logger.warning(
+                "preserving durable success for RQ job %s after terminal interruption",
+                job_id,
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+
+        # Each ingestion attempt persists its logical job id in the IngestionRun
+        # INSERT. Never guess by site or timestamp. Under normal execution there is
+        # one running row; updating all running rows also closes any stale attempt
+        # from the same RQ job without touching another logical job.
+        if run.kind == "ingestion" and run.started_at is not None:
+            ingestion_runs = db.scalars(
+                select(IngestionRun)
+                .where(
+                    IngestionRun.job_run_id == run.id,
+                    IngestionRun.site_id == run.site_id,
+                    IngestionRun.status == "running",
+                )
+                .with_for_update()
+            ).all()
+            for ingestion_run in ingestion_runs:
+                ingestion_run.status = "failed"
+                ingestion_run.error = error
+                ingestion_run.finished_at = now
+
+        run.status = "queued" if will_retry else "failed"
+        run.error = error
+        run.finished_at = None if will_retry else now
+        # This includes the narrow case where the child died after committing
+        # durable success but before RQ recorded FINISHED. Do not expose a stale
+        # successful result while RQ retries, or after an intentional stop.
+        run.result = None
+
+        if not will_retry:
+            alert_subject = f"LinkMesh {run.kind} job {alert_verb}"
+            alert_payload = {
+                "site_id": run.site_id,
+                "kind": run.kind,
+                "job_run_id": run.id,
+                "attempts": run.attempts,
+                "error": error,
+            }
+        db.commit()
+    except Exception:
+        if db is not None:
+            db.rollback()
+        logger.exception("failed to reconcile interrupted RQ job %s", job_id)
+        return
+    finally:
+        if db is not None:
+            db.close()
+
+    # Only the callback that performs the terminal state transition sends an alert.
+    # A duplicate callback sees the already-failed row above and returns early.
+    if alert_payload is not None and alert_subject is not None:
+        try:
+            send_alert(
+                alert_subject,
+                alert_payload,
+                kind=alert_kind,
+                site_id=alert_payload["site_id"],
+            )
+        except Exception:
+            # send_alert is best-effort itself, but preserve RQ's failure handling if
+            # a replacement/test implementation unexpectedly raises.
+            logger.exception("failed to alert for interrupted RQ job %s", job_id)
+
+
+def handle_work_horse_killed(job: Job, retpid: int, ret_val: int, rusage) -> None:
+    """Reconcile durable state when RQ's task child exits unexpectedly."""
+    del retpid, rusage  # Included in RQ's callback contract; not needed for persistence.
+    try:
+        _reconcile_interrupted_job(
+            job,
+            f"work horse terminated unexpectedly (waitpid status {ret_val})",
+        )
+    except Exception:
+        logger.exception(
+            "unexpected error in killed work horse callback for RQ job %s",
+            getattr(job, "id", None),
+        )
+
+
+def handle_abandoned_job(job: Job, exc_type, exc_value, traceback) -> bool:
+    """Reconcile a job abandoned by a dead worker, then preserve handler fallthrough."""
+    del traceback
+    if exc_type is not AbandonedJobError and not isinstance(exc_value, AbandonedJobError):
+        return True
+    try:
+        _reconcile_interrupted_job(
+            job,
+            "job abandoned after worker termination",
+        )
+    except Exception:
+        logger.exception(
+            "unexpected error in abandoned job handler for RQ job %s",
+            getattr(job, "id", None),
+        )
+    return True
+
+
+def handle_job_stopped(job: Job, connection) -> None:
+    """Mark an intentionally stopped RQ job terminal; this callback never raises."""
+    del connection
+    try:
+        _reconcile_interrupted_job(
+            job,
+            "job stopped intentionally",
+            will_retry=False,
+            alert_kind="job_stopped",
+            alert_verb="stopped",
+        )
+    except Exception:
+        logger.exception(
+            "unexpected error in stopped job callback for RQ job %s",
+            getattr(job, "id", None),
+        )
 
 
 def get_job_status(job_id: str) -> dict | None:

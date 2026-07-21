@@ -16,6 +16,8 @@ class SiteCreate(BaseModel):
 
     @model_validator(mode="after")
     def safe_base_url(self) -> "SiteCreate":
+        if bool(self.wp_username) != bool(self.wp_app_password):
+            raise ValueError("wp_username and wp_app_password must be provided together")
         allow = settings.allow_unsafe_crawl_targets
         try:
             validate_url(

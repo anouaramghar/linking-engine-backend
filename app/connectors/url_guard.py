@@ -21,10 +21,35 @@ import httpcore
 import httpx
 
 _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+_IPV4_COMPATIBLE_PREFIX = ipaddress.ip_network("::/96")
+_IPV4_TRANSLATED_PREFIX = ipaddress.ip_network("::ffff:0:0:0/96")
+_NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 
 class UnsafeURLError(Exception):
     """URL failed crawl-safety validation."""
+
+
+def _is_public_address(address: _IPAddress) -> bool:
+    """Accept only public unicast, including safe IPv4-embedding forms."""
+    if address.is_multicast or (
+        isinstance(address, ipaddress.IPv6Address) and address.is_site_local
+    ):
+        return False
+
+    embedded_ipv4 = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    if (
+        isinstance(address, ipaddress.IPv6Address)
+        and embedded_ipv4 is None
+        and address in _IPV4_COMPATIBLE_PREFIX
+    ):
+        embedded_ipv4 = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    if isinstance(address, ipaddress.IPv6Address) and address in _IPV4_TRANSLATED_PREFIX:
+        embedded_ipv4 = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    if isinstance(address, ipaddress.IPv6Address) and address in _NAT64_WELL_KNOWN_PREFIX:
+        embedded_ipv4 = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    candidate: _IPAddress = embedded_ipv4 if embedded_ipv4 is not None else address
+    return candidate.is_global and not candidate.is_multicast
 
 
 class _SocketStream(httpcore.NetworkStream):
@@ -126,7 +151,7 @@ class ValidatingNetworkBackend(httpcore.NetworkBackend):
                 raise UnsafeURLError(
                     f"host {host!r} resolved to invalid address {sockaddr[0]!r}"
                 ) from error
-            if not self._allow_private and not address.is_global:
+            if not self._allow_private and not _is_public_address(address):
                 raise UnsafeURLError(
                     f"host {host!r} resolves to non-public address {address}"
                 )
@@ -246,9 +271,9 @@ def validate_url(
     if allow_private or (not resolve_dns and not _is_ip_literal(host)):
         return
     for addr in _addresses(host):
-        # is_global is False for loopback, private, link-local (incl. cloud
-        # metadata 169.254.169.254), CGNAT, multicast, reserved, unspecified
-        if not addr.is_global:
+        # The classifier excludes multicast explicitly because ipaddress treats
+        # multicast as globally scoped even though it is not public unicast.
+        if not _is_public_address(addr):
             raise UnsafeURLError(f"{url!r} resolves to non-public address {addr}")
 
 

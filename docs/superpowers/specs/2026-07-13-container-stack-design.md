@@ -79,7 +79,7 @@ A `.dockerignore` file will exclude Git metadata, virtual environments, Python/t
 ### `worker`
 
 - Use the shared application image.
-- Run `rq worker --url redis://redis:6379/0 default`.
+- Run `rq worker --with-scheduler --url redis://redis:6379/0 ingestion analysis publication default`.
 - Start only after PostgreSQL and Redis are healthy and `migrate` completed successfully.
 - Mount a persistent Hugging Face cache volume so the lazily downloaded embedding model survives container recreation.
 
@@ -94,7 +94,7 @@ The `.env` file must not be copied into the image or committed. WordPress creden
 1. A client calls a FastAPI endpoint.
 2. Synchronous API operations read or write PostgreSQL directly.
 3. Ingestion, analysis, and publication endpoints enqueue RQ jobs in Redis.
-4. The worker consumes jobs from the `default` queue.
+4. The worker consumes jobs from the `ingestion`, `analysis`, `publication`, and legacy `default` queues.
 5. Ingestion jobs crawl WordPress or sitemap content and update the article/link graph in PostgreSQL.
 6. Analysis jobs lazily load `BAAI/bge-m3`, store missing 1024-dimensional embeddings through pgvector, and generate link suggestions.
 7. Publication jobs apply approved suggestions through the site's connector and persist job outcomes.

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import httpx
 
+from app.connectors.base import TaxonomyData
 from app.connectors.wordpress import WordPressConnector
 
 
@@ -46,6 +47,27 @@ def test_to_article_handles_comment_only_rendered_content():
 
     assert article.content_text == ""
     assert article.outbound_internal_urls == []
+
+
+def test_to_article_keeps_category_and_tag_with_same_wordpress_id():
+    c = make_connector()
+    category = TaxonomyData(kind="category", name="News", external_id="7")
+    tag = TaxonomyData(kind="tag", name="Featured", external_id="7")
+
+    article = c._to_article(
+        {
+            "id": 10,
+            "link": "https://example.com/post",
+            "title": {"rendered": "Post"},
+            "content": {"rendered": "<p>body</p>"},
+            "categories": [7],
+            "tags": [7],
+            "date_gmt": None,
+        },
+        {("category", 7): category, ("tag", 7): tag},
+    )
+
+    assert article.taxonomies == [category, tag]
 
 
 def test_paginate_continues_when_total_pages_header_is_missing():

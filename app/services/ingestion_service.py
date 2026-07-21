@@ -22,7 +22,7 @@ from app.models import (
     Suggestion,
     Taxonomy,
 )
-from app.services.job_service import record_progress
+from app.services.job_service import record_progress_durably
 
 # Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 ingestion run,
 # 0x4C4A enqueue, 0x4C4D analysis, and 0x4C50 publication.
@@ -32,8 +32,8 @@ _INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI"
 
 @contextmanager
 def _site_ingestion_lock(site_id: int) -> Iterator[None]:
-    # Batch commits use the work session, while this dedicated connection keeps
-    # the session-level lock for the complete crawl and reconciliation window.
+    # A dedicated connection keeps the session-level lock for the complete crawl
+    # and atomic reconciliation transaction.
     with engine.connect() as lock_connection:
         acquired = lock_connection.execute(
             select(func.pg_try_advisory_lock(_INGESTION_LOCK_NAMESPACE, site_id))
@@ -246,7 +246,7 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
 def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
     """RQ task body. A run never stays 'running' (sequence 4.1 alt success/failure)."""
     db = SessionLocal()
-    run = IngestionRun(site_id=site_id)
+    run = IngestionRun(site_id=site_id, job_run_id=job_run_id)
     db.add(run)
     db.commit()
     try:
@@ -255,28 +255,35 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             raise ValueError(f"site {site_id} not found")
         connector = get_connector(site)
 
+        # Snapshot writes remain in one transaction so a failed crawl cannot alter
+        # live content. This deliberately trades bounded, resumable batch commits
+        # for atomicity; use staging and promotion before scaling to very large crawls.
         url_to_id: dict[str, int] = {}
         outbound: list[tuple[int, list[str]]] = []
-        articles = 0
+        article_ids: set[int] = set()
+        last_progress_count = 0
         for art in connector.fetch_articles():
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id
             outbound.append((article_id, art.outbound_internal_urls))
-            articles += 1
-            if articles % 50 == 0:
-                record_progress(
-                    db,
+            article_ids.add(article_id)
+            articles = len(article_ids)
+            if articles % 50 == 0 and articles != last_progress_count:
+                # Keep progress visible without committing any live snapshot data.
+                record_progress_durably(
                     job_run_id,
                     stage="crawling",
                     articles=articles,
                 )
-                db.commit()  # batch commit — resumable, bounded transaction size
+                last_progress_count = articles
+
+        articles = len(article_ids)
 
         _validate_snapshot_completeness(db, site_id, run.id, articles)
 
         # Resolve links once all articles are known (forward references)
-        record_progress(db, job_run_id, stage="resolving_links")
+        record_progress_durably(job_run_id, stage="resolving_links")
         links = 0
         seen: set[tuple[int, int]] = set()
         for source_id, urls in outbound:
@@ -288,8 +295,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                     links += 1
 
         # Reconciliation is success-gated after link resolution (Phase 0, finding 3).
-        record_progress(
-            db,
+        record_progress_durably(
             job_run_id,
             stage="reconciling",
             articles=articles,
@@ -327,6 +333,7 @@ def run_ingestion(site_id: int, job_run_id: int | None = None) -> dict:
         try:
             run = IngestionRun(
                 site_id=site_id,
+                job_run_id=job_run_id,
                 status="failed",
                 error=str(error)[:2000],
                 finished_at=datetime.now(timezone.utc),

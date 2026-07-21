@@ -4,11 +4,13 @@ races, and retry semantics. Connector is stubbed; locking runs against real Post
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import OperationalError
 
+from app.config import settings
 from app.db import SessionLocal
-from app.models import Article, Suggestion
+from app.models import Alert, Article, JobRun, Suggestion
+from app.services import job_service
 from app.tasks import publication
 from app.tasks.publication import publish_approved
 
@@ -166,15 +168,40 @@ def test_failed_apply_rolls_back_to_approved_for_retry(db, site, articles, monke
         raise RuntimeError("WP returned 500")
 
     _stub_connector(monkeypatch, boom)
-    result = publish_approved(site.id)
+    with pytest.raises(RuntimeError, match="1 publication.*failed"):
+        publish_approved(site.id)
 
-    assert result == {"applied": 0, "failed": 1, "skipped": 0}
     assert _status(db, suggestion.id) == "approved"  # retryable, not stuck in 'applying'
 
     _stub_connector(monkeypatch, lambda s: None)
     retry = publish_approved(site.id)
     assert retry["applied"] == 1
     assert _status(db, suggestion.id) == "applied"
+
+
+def test_final_publication_failure_records_job_and_alerts(
+    db, site, articles, monkeypatch
+):
+    suggestion = _suggestion(db, site, *articles)
+    run = JobRun(site_id=site.id, kind="publication")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(settings, "alert_webhook_url", "")
+    monkeypatch.setattr(job_service, "get_current_job", lambda: SimpleNamespace(retries_left=0))
+    _stub_connector(
+        monkeypatch,
+        lambda _suggestion: (_ for _ in ()).throw(RuntimeError("WP stayed unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="1 publication.*failed"):
+        publish_approved(site.id, job_run_id=run.id)
+
+    db.expire_all()
+    assert _status(db, suggestion.id) == "approved"
+    assert db.get(JobRun, run.id).status == "failed"
+    alert = db.scalar(select(Alert).where(Alert.site_id == site.id))
+    assert alert.kind == "job_failed"
+    assert alert.subject == "LinkMesh publication job failed"
 
 
 def test_review_endpoint_rejects_applied_and_applying(client, db, site, articles):

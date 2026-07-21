@@ -28,6 +28,9 @@ class IngestionRun(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    job_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_runs.id", ondelete="SET NULL"), index=True
+    )
     status: Mapped[str] = mapped_column(RunStatus, default="running", server_default="running")
     articles_upserted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     links_found: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
