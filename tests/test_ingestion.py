@@ -159,12 +159,16 @@ def test_durable_ingestion_records_final_progress(db, site, monkeypatch):
     assert result == {"articles": 2, "links": 2}
     db.expire_all()
     job_run = db.get(JobRun, job_run.id)
+    ingestion_run = db.scalar(
+        select(IngestionRun).where(IngestionRun.site_id == site.id)
+    )
     assert job_run.status == "succeeded"
     assert job_run.progress == {
         "stage": "reconciling",
         "articles": 2,
         "links": 2,
     }
+    assert ingestion_run.job_run_id == job_run.id
     assert job_run.progress_at is not None
 
 
@@ -189,6 +193,10 @@ def test_progress_write_failure_does_not_fail_ingestion(db, site, monkeypatch):
     job_run = db.get(JobRun, job_run.id)
     assert job_run.status == "succeeded"
     assert job_run.progress is None
+    ingestion_run = db.scalar(
+        select(IngestionRun).where(IngestionRun.site_id == site.id)
+    )
+    assert ingestion_run.job_run_id == job_run.id
 
 
 def test_successful_recrawl_deactivates_article_not_seen(db, site, monkeypatch):

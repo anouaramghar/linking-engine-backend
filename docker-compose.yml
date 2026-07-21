@@ -72,7 +72,7 @@ services:
     <<: *app-service
     # one worker drains all stage queues; split into dedicated workers when load justifies it
     # ("default" kept last to drain jobs enqueued before the per-stage queues existed)
-    command: ["rq", "worker", "--with-scheduler", "--url", "redis://redis:6379/0", "ingestion", "analysis", "publication", "default"]
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "ingestion", "analysis", "publication", "default"]
     depends_on:
       db:
         condition: service_healthy

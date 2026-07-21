@@ -71,9 +71,17 @@ def test_rejects_malformed_and_credentialed_urls(url):
         "http://[::7f00:1]/",  # IPv4-compatible loopback address
         "http://[::a9fe:a9fe]/",  # IPv4-compatible metadata address
         "http://[::ffff:169.254.169.254]/",  # IPv4-mapped metadata address
+        "http://[::ffff:0:127.0.0.1]/",  # IPv4-translated loopback address
+        "http://[::ffff:0:169.254.169.254]/",  # IPv4-translated metadata address
         "http://[64:ff9b::a9fe:a9fe]/",  # NAT64-encoded metadata address
         "http://0.0.0.0/",
         "http://100.64.0.1/",  # CGNAT
+        "http://224.0.0.1/",  # IPv4 multicast
+        "http://[ff02::1]/",  # IPv6 multicast
+        "http://[fec0::1]/",  # deprecated IPv6 site-local
+        "http://[::ffff:224.0.0.1]/",  # mapped IPv4 multicast
+        "http://[::ffff:0:224.0.0.1]/",  # translated IPv4 multicast
+        "http://[64:ff9b::224.0.0.1]/",  # NAT64-encoded IPv4 multicast
     ],
 )
 def test_rejects_non_public_ip_literals(url):
@@ -106,6 +114,22 @@ def test_accepts_nat64_literal_embedding_public_ipv4():
 
 def test_accepts_ipv4_compatible_literal_embedding_public_ipv4():
     validate_url("http://[::5db8:d822]/")
+
+
+def test_accepts_ipv4_translated_literal_embedding_public_ipv4():
+    validate_url("http://[::ffff:0:93.184.216.34]/")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://93.184.216.34/",
+        "http://[2606:4700:4700::1111]/",
+        "http://[::ffff:93.184.216.34]/",
+    ],
+)
+def test_accepts_public_unicast_literals(url):
+    validate_url(url)
 
 
 def test_rejects_unresolvable_hostname(monkeypatch):
@@ -255,24 +279,69 @@ def test_connect_backend_rejects_if_any_resolved_address_is_private():
 
 
 @pytest.mark.parametrize(
-    "address",
+    ("family", "address"),
     [
-        "::7f00:1",
-        "::a9fe:a9fe",
-        "::ffff:169.254.169.254",
-        "64:ff9b::a9fe:a9fe",
+        (socket.AF_INET6, "::7f00:1"),
+        (socket.AF_INET6, "::a9fe:a9fe"),
+        (socket.AF_INET6, "::ffff:169.254.169.254"),
+        (socket.AF_INET6, "::ffff:0:127.0.0.1"),
+        (socket.AF_INET6, "::ffff:0:169.254.169.254"),
+        (socket.AF_INET6, "64:ff9b::a9fe:a9fe"),
+        (socket.AF_INET, "224.0.0.1"),
+        (socket.AF_INET6, "ff02::1"),
+        (socket.AF_INET6, "fec0::1"),
+        (socket.AF_INET6, "::ffff:224.0.0.1"),
+        (socket.AF_INET6, "::ffff:0:224.0.0.1"),
+        (socket.AF_INET6, "64:ff9b::224.0.0.1"),
     ],
 )
-def test_connect_backend_rejects_non_public_embedded_ipv4(address):
+def test_connect_backend_rejects_non_public_address(family, address):
     backend = ValidatingNetworkBackend(
         resolver=lambda _host, port, **_kwargs: [
-            (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, port, 0, 0))
+            (
+                family,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (address, port, 0, 0) if family == socket.AF_INET6 else (address, port),
+            )
         ],
         socket_factory=lambda *_args: pytest.fail("unsafe embedded IPv4 must not connect"),
     )
 
     with pytest.raises(UnsafeURLError, match="non-public"):
         backend.connect_tcp("translated.example", 80)
+
+
+@pytest.mark.parametrize(
+    ("family", "address"),
+    [
+        (socket.AF_INET, "93.184.216.34"),
+        (socket.AF_INET6, "2606:4700:4700::1111"),
+        (socket.AF_INET6, "::ffff:93.184.216.34"),
+        (socket.AF_INET6, "::ffff:0:93.184.216.34"),
+        (socket.AF_INET6, "64:ff9b::93.184.216.34"),
+    ],
+)
+def test_connect_backend_accepts_public_unicast_addresses(family, address):
+    fake_socket = _FakeSocket()
+    backend = ValidatingNetworkBackend(
+        resolver=lambda _host, port, **_kwargs: [
+            (
+                family,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                (address, port, 0, 0) if family == socket.AF_INET6 else (address, port),
+            )
+        ],
+        socket_factory=lambda *_args: fake_socket,
+    )
+
+    backend.connect_tcp("public.example", 80).close()
+
+    expected = (address, 80, 0, 0) if family == socket.AF_INET6 else (address, 80)
+    assert fake_socket.connected_to == expected
 
 
 def test_connect_backend_honors_allow_private():

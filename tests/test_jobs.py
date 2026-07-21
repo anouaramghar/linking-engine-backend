@@ -6,17 +6,23 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from rq.exceptions import NoSuchJobError
-from rq.job import Job
+from rq.exceptions import AbandonedJobError, NoSuchJobError
+from rq.job import Callback, Job
 from sqlalchemy import select
 
 import app.services.job_service as job_service
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Alert, JobRun
+from app.models import Alert, IngestionRun, JobRun
 from app.schemas.job import JobRunOut
 from app.services import alerts as alert_service
-from app.services.job_service import enqueue_job, run_durably
+from app.services.job_service import (
+    enqueue_job,
+    handle_abandoned_job,
+    handle_job_stopped,
+    handle_work_horse_killed,
+    run_durably,
+)
 from app.tasks.queues import redis_conn
 
 
@@ -57,13 +63,17 @@ def test_job_run_is_committed_before_enqueue(db, site, monkeypatch):
                 visible_run = observer.get(JobRun, kwargs["job_run_id"])
                 observed["status"] = visible_run.status
                 observed["queue_job_id"] = visible_run.queue_job_id
+                observed["on_stopped"] = kwargs["on_stopped"]
             return type("QueuedJob", (), {"id": "committed-before-enqueue"})()
 
     monkeypatch.setitem(job_service._QUEUES, "ingestion", InspectingQueue())
 
     run = enqueue_job(db, site.id, "ingestion", lambda: None, job_timeout=60)
 
-    assert observed == {"status": "queued", "queue_job_id": None}
+    assert observed["status"] == "queued"
+    assert observed["queue_job_id"] is None
+    assert isinstance(observed["on_stopped"], Callback)
+    assert observed["on_stopped"].func is handle_job_stopped
     assert run.queue_job_id == "committed-before-enqueue"
 
 
@@ -188,6 +198,460 @@ def test_nonfinal_job_failure_does_not_send_alert(db, site, monkeypatch):
     monkeypatch.setattr(job_service, "_still_in_queue", lambda candidate: candidate.id == run.id)
     with pytest.raises(job_service.DuplicateJobError, match="already queued"):
         enqueue_job(db, site.id, "analysis", lambda: None, job_timeout=60)
+
+
+def test_killed_work_horse_keeps_job_queued_and_reconciles_ingestion(
+    db, site, monkeypatch
+):
+    started_at = datetime.now(timezone.utc)
+    run = JobRun(
+        site_id=site.id,
+        kind="ingestion",
+        status="running",
+        queue_job_id="killed-ingestion",
+        attempts=1,
+        started_at=started_at,
+    )
+    unrelated_job_run = JobRun(
+        site_id=site.id,
+        kind="ingestion",
+        status="running",
+        queue_job_id="unrelated-ingestion-job",
+        attempts=1,
+        started_at=started_at,
+    )
+    db.add_all([run, unrelated_job_run])
+    db.flush()
+    ingestion_run = IngestionRun(
+        site_id=site.id,
+        job_run_id=run.id,
+        status="running",
+        started_at=started_at,
+    )
+    stale_same_job_ingestion_run = IngestionRun(
+        site_id=site.id,
+        job_run_id=run.id,
+        status="running",
+        started_at=started_at,
+    )
+    unrelated_ingestion_run = IngestionRun(
+        site_id=site.id,
+        job_run_id=unrelated_job_run.id,
+        status="running",
+        started_at=started_at,
+    )
+    db.add_all(
+        [ingestion_run, stale_same_job_ingestion_run, unrelated_ingestion_run]
+    )
+    db.commit()
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda *_args, **_kwargs: pytest.fail("a retried work horse must not alert"),
+    )
+
+    handle_work_horse_killed(
+        SimpleNamespace(id=run.queue_job_id, retries_left=1),
+        retpid=123,
+        ret_val=9,
+        rusage=None,
+    )
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    stored_ingestion = db.get(IngestionRun, ingestion_run.id)
+    assert stored.status == "queued"
+    assert stored.finished_at is None
+    assert "waitpid status 9" in stored.error
+    assert stored_ingestion.status == "failed"
+    assert stored_ingestion.finished_at is not None
+    assert stored_ingestion.error == stored.error
+    assert db.get(IngestionRun, stale_same_job_ingestion_run.id).status == "failed"
+    assert db.get(IngestionRun, unrelated_ingestion_run.id).status == "running"
+
+
+def test_terminal_killed_work_horse_fails_once_and_alerts_once(db, site, monkeypatch):
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="running",
+        queue_job_id="terminally-killed-analysis",
+        attempts=3,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    alerts = []
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda subject, payload, **metadata: alerts.append((subject, payload, metadata)),
+    )
+    rq_job = SimpleNamespace(id=run.queue_job_id, retries_left=0)
+
+    handle_work_horse_killed(rq_job, retpid=123, ret_val=9, rusage=None)
+    handle_work_horse_killed(rq_job, retpid=123, ret_val=9, rusage=None)
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "failed"
+    assert stored.finished_at is not None
+    assert stored.error == "work horse terminated unexpectedly (waitpid status 9)"
+    assert alerts == [
+        (
+            "LinkMesh analysis job failed",
+            {
+                "site_id": site.id,
+                "kind": "analysis",
+                "job_run_id": run.id,
+                "attempts": 3,
+                "error": stored.error,
+            },
+            {"kind": "job_failed", "site_id": site.id},
+        )
+    ]
+
+
+def test_killed_work_horse_requeues_durable_success_when_rq_will_retry(
+    db, site, monkeypatch
+):
+    finished_at = datetime.now(timezone.utc)
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="succeeded",
+        queue_job_id="killed-after-durable-success",
+        attempts=1,
+        result={"suggestions_created": 7},
+        started_at=finished_at,
+        finished_at=finished_at,
+    )
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda *_args, **_kwargs: pytest.fail("a retried work horse must not alert"),
+    )
+
+    handle_work_horse_killed(
+        SimpleNamespace(id=run.queue_job_id, retries_left=1),
+        retpid=123,
+        ret_val=9,
+        rusage=None,
+    )
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "queued"
+    assert stored.result is None
+    assert stored.finished_at is None
+    assert "waitpid status 9" in stored.error
+
+
+def test_terminal_killed_work_horse_preserves_committed_success(
+    db, site, monkeypatch, caplog
+):
+    finished_at = datetime.now(timezone.utc)
+    result = {"suggestions_created": 7}
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="succeeded",
+        queue_job_id="terminal-kill-after-durable-success",
+        attempts=1,
+        result=result,
+        started_at=finished_at,
+        finished_at=finished_at,
+    )
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda *_args, **_kwargs: pytest.fail("committed success must not alert as failed"),
+    )
+
+    handle_work_horse_killed(
+        SimpleNamespace(id=run.queue_job_id, retries_left=0),
+        retpid=123,
+        ret_val=9,
+        rusage=None,
+    )
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "succeeded"
+    assert stored.result == result
+    assert stored.finished_at == finished_at
+    assert stored.error is None
+    assert "preserving durable success" in caplog.text
+
+
+def test_abandoned_job_stays_queued_when_rq_will_retry(db, site, monkeypatch):
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="running",
+        queue_job_id="abandoned-with-retry",
+        attempts=1,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda *_args, **_kwargs: pytest.fail("an abandoned retry must not alert"),
+    )
+
+    fallthrough = handle_abandoned_job(
+        SimpleNamespace(id=run.queue_job_id, retries_left=1),
+        AbandonedJobError,
+        AbandonedJobError(),
+        None,
+    )
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert fallthrough is True
+    assert stored.status == "queued"
+    assert stored.finished_at is None
+    assert stored.error == "job abandoned after worker termination"
+
+
+def test_abandoned_handler_ignores_other_exceptions(db, site, monkeypatch):
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="running",
+        queue_job_id="ordinary-task-error",
+        attempts=1,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda *_args, **_kwargs: pytest.fail("ordinary errors are not handled here"),
+    )
+
+    fallthrough = handle_abandoned_job(
+        SimpleNamespace(id=run.queue_job_id, retries_left=0),
+        RuntimeError,
+        RuntimeError("ordinary task failure"),
+        None,
+    )
+
+    db.expire_all()
+    assert fallthrough is True
+    assert db.get(JobRun, run.id).status == "running"
+
+
+def test_terminal_abandoned_job_fails_and_alerts_once(db, site, monkeypatch):
+    run = JobRun(
+        site_id=site.id,
+        kind="publication",
+        status="running",
+        queue_job_id="terminally-abandoned",
+        attempts=3,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    alerts = []
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda subject, payload, **metadata: alerts.append((subject, payload, metadata)),
+    )
+    rq_job = SimpleNamespace(id=run.queue_job_id, retries_left=0)
+
+    for _ in range(2):
+        assert (
+            handle_abandoned_job(
+                rq_job,
+                AbandonedJobError,
+                AbandonedJobError(),
+                None,
+            )
+            is True
+        )
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "failed"
+    assert stored.finished_at is not None
+    assert alerts == [
+        (
+            "LinkMesh publication job failed",
+            {
+                "site_id": site.id,
+                "kind": "publication",
+                "job_run_id": run.id,
+                "attempts": 3,
+                "error": "job abandoned after worker termination",
+            },
+            {"kind": "job_failed", "site_id": site.id},
+        )
+    ]
+
+
+def test_stopped_job_fails_linked_ingestion_and_alerts_once(db, site, monkeypatch):
+    started_at = datetime.now(timezone.utc)
+    run = JobRun(
+        site_id=site.id,
+        kind="ingestion",
+        status="running",
+        queue_job_id="intentionally-stopped",
+        attempts=1,
+        started_at=started_at,
+    )
+    db.add(run)
+    db.flush()
+    ingestion_run = IngestionRun(
+        site_id=site.id,
+        job_run_id=run.id,
+        status="running",
+        started_at=started_at,
+    )
+    db.add(ingestion_run)
+    db.commit()
+    alerts = []
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda subject, payload, **metadata: alerts.append((subject, payload, metadata)),
+    )
+    rq_job = SimpleNamespace(id=run.queue_job_id, retries_left=2)
+
+    handle_job_stopped(rq_job, connection=None)
+    handle_job_stopped(rq_job, connection=None)
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    stored_ingestion = db.get(IngestionRun, ingestion_run.id)
+    assert stored.status == "failed"
+    assert stored.error == "job stopped intentionally"
+    assert stored.finished_at is not None
+    assert stored_ingestion.status == "failed"
+    assert stored_ingestion.error == stored.error
+    assert alerts == [
+        (
+            "LinkMesh ingestion job stopped",
+            {
+                "site_id": site.id,
+                "kind": "ingestion",
+                "job_run_id": run.id,
+                "attempts": 1,
+                "error": "job stopped intentionally",
+            },
+            {"kind": "job_stopped", "site_id": site.id},
+        )
+    ]
+
+
+def test_stopped_job_preserves_success_committed_before_rq_stop(
+    db, site, monkeypatch
+):
+    finished_at = datetime.now(timezone.utc)
+    result = {"suggestions_created": 7}
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="succeeded",
+        queue_job_id="stopped-after-durable-success",
+        attempts=1,
+        result=result,
+        started_at=finished_at,
+        finished_at=finished_at,
+    )
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda *_args, **_kwargs: pytest.fail("committed success must not alert as stopped"),
+    )
+
+    handle_job_stopped(
+        SimpleNamespace(id=run.queue_job_id, retries_left=0),
+        connection=None,
+    )
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "succeeded"
+    assert stored.result == result
+    assert stored.finished_at == finished_at
+    assert stored.error is None
+
+
+def test_killed_work_horse_falls_back_to_job_run_id_from_rq_kwargs(
+    db, site, monkeypatch
+):
+    run = JobRun(
+        site_id=site.id,
+        kind="publication",
+        status="running",
+        queue_job_id=None,
+        attempts=1,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(job_service, "send_alert", lambda *_args, **_kwargs: None)
+
+    handle_work_horse_killed(
+        SimpleNamespace(
+            id="dequeued-before-rq-id-commit",
+            kwargs={"job_run_id": run.id},
+            retries_left=0,
+        ),
+        retpid=123,
+        ret_val=9,
+        rusage=None,
+    )
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.queue_job_id == "dequeued-before-rq-id-commit"
+    assert stored.status == "failed"
+    assert stored.finished_at is not None
+
+
+def test_killed_ingestion_without_started_attempt_does_not_guess_run(
+    db, site, monkeypatch
+):
+    run = JobRun(
+        site_id=site.id,
+        kind="ingestion",
+        status="queued",
+        queue_job_id="killed-before-task-start",
+        started_at=None,
+    )
+    db.add(run)
+    db.flush()
+    ingestion_run = IngestionRun(
+        site_id=site.id,
+        job_run_id=run.id,
+        status="running",
+    )
+    db.add(ingestion_run)
+    db.commit()
+    monkeypatch.setattr(job_service, "send_alert", lambda *_args, **_kwargs: None)
+
+    handle_work_horse_killed(
+        SimpleNamespace(id=run.queue_job_id, retries_left=0),
+        retpid=123,
+        ret_val=9,
+        rusage=None,
+    )
+
+    db.expire_all()
+    assert db.get(JobRun, run.id).status == "failed"
+    assert db.get(IngestionRun, ingestion_run.id).status == "running"
 
 
 def test_alert_db_failure_preserves_original_job_error(db, site, monkeypatch, caplog):

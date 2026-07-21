@@ -246,7 +246,7 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
 def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
     """RQ task body. A run never stays 'running' (sequence 4.1 alt success/failure)."""
     db = SessionLocal()
-    run = IngestionRun(site_id=site_id)
+    run = IngestionRun(site_id=site_id, job_run_id=job_run_id)
     db.add(run)
     db.commit()
     try:
@@ -333,6 +333,7 @@ def run_ingestion(site_id: int, job_run_id: int | None = None) -> dict:
         try:
             run = IngestionRun(
                 site_id=site_id,
+                job_run_id=job_run_id,
                 status="failed",
                 error=str(error)[:2000],
                 finished_at=datetime.now(timezone.utc),
