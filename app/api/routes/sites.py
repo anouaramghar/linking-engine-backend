@@ -1,13 +1,25 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import ValidationError
 from sqlalchemy import exists, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.models import Article, InternalLink, Site
-from app.schemas.site import ArticleOut, SiteCreate, SiteOut
+from app.schemas.site import (
+    ArticleOut,
+    SiteBulkCreated,
+    SiteBulkFailure,
+    SiteBulkRequest,
+    SiteBulkResult,
+    SiteCreate,
+    SiteOut,
+)
 from app.services.ingestion_service import latest_run
 
 router = APIRouter(prefix="/sites", tags=["sites"])
+
+DUPLICATE_REASON = "a site with this base_url already exists"
 
 
 def _get_site_or_404(db: Session, site_id: int) -> Site:
@@ -17,15 +29,82 @@ def _get_site_or_404(db: Session, site_id: int) -> Site:
     return site
 
 
+def _first_error(exc: ValidationError) -> str:
+    """Flatten a row's validation failure into one reviewer-readable line."""
+    error = exc.errors()[0]
+    message = error["msg"].removeprefix("Value error, ")
+    location = ".".join(str(part) for part in error["loc"])
+    return f"{location}: {message}" if location else message
+
+
 @router.post("", status_code=201, response_model=SiteOut)
 def create_site(payload: SiteCreate, db: Session = Depends(get_db)) -> Site:
     if db.scalar(select(Site).where(Site.base_url == payload.base_url)):
-        raise HTTPException(409, "a site with this base_url already exists")
+        raise HTTPException(409, DUPLICATE_REASON)
     site = Site(**payload.model_dump())
     db.add(site)
     db.commit()
     db.refresh(site)
     return site
+
+
+@router.post("/bulk", response_model=SiteBulkResult)
+def bulk_create_sites(payload: SiteBulkRequest, db: Session = Depends(get_db)) -> SiteBulkResult:
+    """Create many sites in one request, reporting the outcome of every row.
+
+    Partial success is the contract: a row that fails validation or collides with an
+    existing site is reported and skipped, and the rest of the upload still lands. Each
+    insert runs in its own savepoint so one collision cannot poison the batch.
+    """
+    created: list[SiteBulkCreated] = []
+    skipped: list[SiteBulkFailure] = []
+    rejected: list[SiteBulkFailure] = []
+    seen: set[str] = set()
+
+    for index, row in enumerate(payload.sites, start=1):
+        try:
+            item = SiteCreate.model_validate(row.model_dump())
+        except ValidationError as exc:
+            rejected.append(
+                SiteBulkFailure(row=index, base_url=row.base_url, reason=_first_error(exc))
+            )
+            continue
+
+        # `item.base_url` is normalized by SiteCreate, so both checks compare like for like.
+        if item.base_url in seen:
+            skipped.append(
+                SiteBulkFailure(
+                    row=index,
+                    base_url=item.base_url,
+                    reason="duplicate base_url within this upload",
+                )
+            )
+            continue
+        seen.add(item.base_url)
+
+        if db.scalar(select(Site.id).where(Site.base_url == item.base_url)):
+            skipped.append(
+                SiteBulkFailure(row=index, base_url=item.base_url, reason=DUPLICATE_REASON)
+            )
+            continue
+
+        site = Site(**item.model_dump())
+        try:
+            with db.begin_nested():
+                db.add(site)
+                db.flush()
+        except IntegrityError:  # a concurrent import claimed the same base_url
+            skipped.append(
+                SiteBulkFailure(row=index, base_url=item.base_url, reason=DUPLICATE_REASON)
+            )
+            continue
+
+        created.append(
+            SiteBulkCreated(row=index, id=site.id, name=site.name, base_url=site.base_url)
+        )
+
+    db.commit()
+    return SiteBulkResult(created=created, skipped=skipped, rejected=rejected)
 
 
 @router.get("", response_model=list[SiteOut])
