@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
 from sqlalchemy import exists, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.api.pagination import MAX_PAGE_SIZE
 from app.models import Article, InternalLink, Site
 from app.schemas.site import (
     ArticleOut,
@@ -108,7 +109,11 @@ def bulk_create_sites(payload: SiteBulkRequest, db: Session = Depends(get_db)) -
 
 
 @router.get("", response_model=list[SiteOut])
-def list_sites(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)) -> list[SiteOut]:
+def list_sites(
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[SiteOut]:
     sites = db.scalars(select(Site).order_by(Site.id).limit(limit).offset(offset)).all()
     out = []
     for site in sites:
@@ -138,8 +143,8 @@ def delete_site(site_id: int, db: Session = Depends(get_db)) -> None:
 def list_articles(
     site_id: int,
     orphans: bool = False,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[Article]:
     _get_site_or_404(db, site_id)

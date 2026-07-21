@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db
+from app.api.pagination import MAX_PAGE_SIZE
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
 from app.schemas.suggestion import BulkReview, SuggestionOut, SuggestionReview
@@ -15,6 +16,9 @@ router = APIRouter(tags=["suggestions"])
 
 
 def _review(db: Session, suggestion: Suggestion, status: str) -> None:
+    # Undoing a decision returns the suggestion to the unreviewed state, so the
+    # review timestamp is cleared rather than advanced.
+    reviewed_at = None if status == "pending" else datetime.now(timezone.utc)
     # Guarded transition (Phase 0, finding 5): a suggestion being published holds a
     # row lock on its claim, so this update blocks until the publish commits and
     # then matches zero rows — a reject can never land on top of a publish.
@@ -24,7 +28,7 @@ def _review(db: Session, suggestion: Suggestion, status: str) -> None:
             Suggestion.id == suggestion.id,
             Suggestion.status.notin_(["applying", "applied", "expired"]),
         )
-        .values(status=status, reviewed_at=datetime.now(timezone.utc))
+        .values(status=status, reviewed_at=reviewed_at)
     ).rowcount
     if updated == 0:
         raise HTTPException(409, f"suggestion {suggestion.id} is no longer reviewable")
@@ -59,8 +63,8 @@ def list_suggestions(
     site_id: int,
     status: str | None = None,
     method: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[Suggestion]:
     query = (

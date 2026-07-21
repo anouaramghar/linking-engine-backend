@@ -20,11 +20,15 @@ class SuggestionOut(BaseModel):
     created_at: datetime
 
 
+# 'pending' lets an editor undo a decision; 'applied' is set exclusively by the
+# publication worker — contract-level guarantee.
+ReviewStatus = Literal["approved", "rejected", "pending"]
+
+
 class SuggestionReview(BaseModel):
-    # 'applied' is set exclusively by the publication worker — contract-level guarantee
-    status: Literal["approved", "rejected"]
+    status: ReviewStatus
 
 
 class BulkReview(BaseModel):
     suggestion_ids: list[int]
-    status: Literal["approved", "rejected"]
+    status: ReviewStatus

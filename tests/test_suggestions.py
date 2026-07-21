@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError, Lock
 
 import pytest
-from sqlalchemy import event, select
+from sqlalchemy import event, select, update
 
 import app.services.suggestion_service as suggestion_service
 from app.config import settings
@@ -394,3 +394,50 @@ def test_review_lifecycle(client, db, site):
     # publication status counts
     status = client.get(f"/api/v1/publish/{site.id}/status").json()
     assert status == {"applied": 0, "awaiting_publication": 1}
+
+
+def test_review_can_be_undone(client, db, site):
+    """An editor can return a reviewed suggestion to the pending queue."""
+    _make_articles(db, site, [_vec(0), _mix(0, 1, 0.9, 0.3)])
+    generate_suggestions(site.id)
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    first, second = suggestions[0], suggestions[1]
+
+    client.put(f"/api/v1/suggestions/{first.id}", json={"status": "approved"})
+    resp = client.put(f"/api/v1/suggestions/{first.id}", json={"status": "pending"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "pending"
+
+    resp = client.post(
+        "/api/v1/suggestions/bulk-review",
+        json={"suggestion_ids": [second.id], "status": "rejected"},
+    )
+    assert resp.json() == {"reviewed": 1, "status": "rejected"}
+    resp = client.post(
+        "/api/v1/suggestions/bulk-review",
+        json={"suggestion_ids": [second.id], "status": "pending"},
+    )
+    assert resp.json() == {"reviewed": 1, "status": "pending"}
+
+    # undo restores the unreviewed state, timestamp included
+    db.expire_all()
+    restored = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    assert {s.status for s in restored} == {"pending"}
+    assert all(s.reviewed_at is None for s in restored)
+
+    # a published suggestion still cannot be walked back
+    db.execute(
+        update(Suggestion).where(Suggestion.id == first.id).values(status="applied")
+    )
+    db.commit()
+    resp = client.put(f"/api/v1/suggestions/{first.id}", json={"status": "pending"})
+    assert resp.status_code == 409
+
+
+def test_list_endpoints_reject_an_unbounded_limit(client, site):
+    """A single request must not be able to ask for the whole table."""
+    assert client.get(f"/api/v1/suggestions/{site.id}", params={"limit": 10_000_000}).status_code == 422
+    assert client.get("/api/v1/sites", params={"limit": 10_000_000}).status_code == 422
+    assert client.get(f"/api/v1/suggestions/{site.id}", params={"offset": -1}).status_code == 422
+    # the page size the dashboard actually uses stays valid
+    assert client.get(f"/api/v1/suggestions/{site.id}", params={"limit": 1000}).status_code == 200
