@@ -5,4 +5,6 @@ database for the whole table. The dashboard pages through at 1000, so that is
 the ceiling; anything larger is a client bug rather than a real need.
 """
 
-MAX_PAGE_SIZE = 1000
+from app.limits import MAX_ENGINE_PAGE_SIZE
+
+MAX_PAGE_SIZE = MAX_ENGINE_PAGE_SIZE

@@ -383,7 +383,7 @@ def test_review_lifecycle(client, db, site):
         "/api/v1/suggestions/bulk-review",
         json={"suggestion_ids": [second.id], "status": "rejected"},
     )
-    assert resp.json() == {"reviewed": 1, "skipped": [], "status": "rejected"}
+    assert resp.json() == {"reviewed": [second.id], "skipped": [], "status": "rejected"}
 
     # 'applied' can never be set via the API
     resp = client.put(f"/api/v1/suggestions/{first.id}", json={"status": "applied"})
@@ -414,12 +414,12 @@ def test_review_can_be_undone(client, db, site):
         "/api/v1/suggestions/bulk-review",
         json={"suggestion_ids": [second.id], "status": "rejected"},
     )
-    assert resp.json() == {"reviewed": 1, "skipped": [], "status": "rejected"}
+    assert resp.json() == {"reviewed": [second.id], "skipped": [], "status": "rejected"}
     resp = client.post(
         "/api/v1/suggestions/bulk-review",
         json={"suggestion_ids": [second.id], "status": "pending"},
     )
-    assert resp.json() == {"reviewed": 1, "skipped": [], "status": "pending"}
+    assert resp.json() == {"reviewed": [second.id], "skipped": [], "status": "pending"}
 
     # undo restores the unreviewed state, timestamp included
     db.expire_all()
@@ -461,7 +461,11 @@ def test_bulk_review_applies_the_rows_it_can_and_reports_the_rest(client, db, si
         json={"suggestion_ids": [first.id, second.id], "status": "pending"},
     )
     assert resp.status_code == 200
-    assert resp.json() == {"reviewed": 1, "skipped": [first.id], "status": "pending"}
+    assert resp.json() == {
+        "reviewed": [second.id],
+        "skipped": [first.id],
+        "status": "pending",
+    }
 
     db.expire_all()
     assert db.get(Suggestion, first.id).status == "applied"
@@ -513,16 +517,8 @@ def test_list_endpoints_reject_an_unbounded_limit(client, site):
     assert client.get(f"/api/v1/suggestions/{site.id}", params={"offset": -1}).status_code == 422
 
 
-def test_bulk_review_bound_matches_the_page_size(client, site):
-    """A batch must be bounded, and bounded at the size the dashboard chunks to.
-
-    The queue is read a page at a time and reviewed in one go, so the batch is
-    not limited by any single read. Left unbounded, an "approve all" over a real
-    fleet exceeds PostgreSQL's 65535-parameter limit and 500s; bounded to
-    anything below the page size, the dashboard's chunking starts 422ing.
-    """
-    assert MAX_BULK_REVIEW == MAX_PAGE_SIZE
-
+def test_bulk_review_enforces_batch_bounds(client, site):
+    """A batch accepts the configured maximum but rejects larger or empty input."""
     def review(count: int) -> int:
         return client.post(
             "/api/v1/suggestions/bulk-review",
@@ -547,6 +543,8 @@ def test_every_list_endpoint_accepts_exactly_max_page_size(client, site):
         f"/api/v1/sites/{site.id}/articles",
         f"/api/v1/suggestions/{site.id}",
         f"/api/v1/jobs/site/{site.id}",
+        "/api/v1/alerts",
+        f"/api/v1/sites/{site.id}/ingestion-runs",
     ]
     for path in paths:
         assert client.get(path, params={"limit": MAX_PAGE_SIZE}).status_code == 200, path

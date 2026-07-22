@@ -65,7 +65,7 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
     reviewed = _review_ids(db, payload.suggestion_ids, payload.status)
     db.commit()
     return {
-        "reviewed": len(reviewed),
+        "reviewed": sorted(reviewed),
         "skipped": sorted(existing - reviewed),
         "status": payload.status,
     }

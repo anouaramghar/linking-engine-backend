@@ -3,14 +3,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.limits import MAX_ENGINE_PAGE_SIZE
 from app.schemas.site import ArticleBrief
 
 # The dashboard accumulates the whole queue a page at a time and then reviews
 # what the editor selected, so a batch is not bounded by any single read. It
 # chunks at the page size instead; the API has to agree, or a large "approve
-# all" exceeds PostgreSQL's 65535-parameter limit and 500s. Pinned equal to
-# MAX_PAGE_SIZE by `test_bulk_review_bound_matches_the_page_size`.
-MAX_BULK_REVIEW = 1000
+# all" exceeds PostgreSQL's 65535-parameter limit and 500s.
+MAX_BULK_REVIEW = MAX_ENGINE_PAGE_SIZE
 
 
 class SuggestionOut(BaseModel):

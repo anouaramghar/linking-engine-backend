@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.api.pagination import MAX_PAGE_SIZE
 from app.models import IngestionRun, Site
 from app.schemas.job import JobAccepted
 from app.schemas.site import IngestionRunOut
@@ -34,7 +35,10 @@ def latest_ingestion_run(site_id: int, db: Session = Depends(get_db)) -> Ingesti
 
 @router.get("/{site_id}/ingestion-runs", response_model=list[IngestionRunOut])
 def list_ingestion_runs(
-    site_id: int, limit: int = 50, offset: int = 0, db: Session = Depends(get_db)
+    site_id: int,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = 0,
+    db: Session = Depends(get_db),
 ) -> list[IngestionRun]:
     return db.scalars(
         select(IngestionRun)
