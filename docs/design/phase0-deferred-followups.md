@@ -7,16 +7,17 @@ its acceptance checks pass.
 ## Medium: publication retry accounting
 
 Status: complete. Publication progress preserves the first attempt's total and
-cumulative committed successes across retries. Skip and attempt-failure progress is
-committed independently after task rollbacks; `attempt_failures` remains cumulative,
-while `failure_state` and `failed` distinguish a queued retry from terminal unresolved
-items.
+cumulative committed successes across retries, expanding the total when reviewers
+approve more work before a retry. Skip and attempt-failure progress is committed
+independently after task rollbacks; `failed` describes the latest unresolved attempt,
+while `attempt_failures` and `failure_state` distinguish cumulative events, queued
+retries, and terminal unresolved items.
 
 Acceptance: a 10-item run that applies 9 suggestions, fails 1, then applies the last
 suggestion on retry finishes with `total=10` and `applied=10`; progress never resets
 or regresses between attempts. All-skipped and terminal-failure runs persist accurate
 final counters. Covered by publication retry, all-skipped, and terminal-failure
-regression tests.
+regression tests, including approvals added between attempts.
 
 ## Medium: terminal post-success status consistency
 

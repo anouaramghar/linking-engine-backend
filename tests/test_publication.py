@@ -204,7 +204,7 @@ def test_retry_preserves_original_total_and_cumulative_applied(
     assert first_attempt == {
         "stage": "publishing",
         "applied": 9,
-        "failed": 0,
+        "failed": 1,
         "skipped": 0,
         "total": 10,
         "attempt_skipped": 0,
@@ -242,6 +242,66 @@ def test_retry_preserves_original_total_and_cumulative_applied(
         "attempt_failures": 1,
         "failure_state": None,
     }
+
+
+def test_retry_grows_total_for_suggestions_approved_between_attempts(
+    db, site, articles, monkeypatch
+):
+    suggestions = [_suggestion(db, site, *articles) for _ in range(10)]
+    final_suggestion_id = suggestions[-1].id
+    run = JobRun(site_id=site.id, kind="publication")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1)
+    )
+
+    def fail_last(suggestion):
+        if suggestion.id == final_suggestion_id:
+            raise RuntimeError("transient WordPress failure")
+
+    _stub_connector(monkeypatch, fail_last)
+    with pytest.raises(RuntimeError, match="1 publication.*failed"):
+        publish_approved(site.id, job_run_id=run.id)
+
+    for _ in range(5):
+        _suggestion(db, site, *articles)
+    _stub_connector(monkeypatch, lambda _suggestion: None)
+    result = publish_approved(site.id, job_run_id=run.id)
+
+    assert result == {"applied": 15, "failed": 0, "skipped": 0}
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.result == result
+    assert stored.progress["total"] == 15
+    assert stored.progress["applied"] == 15
+
+
+def test_retry_progress_exposes_latest_attempt_failure_count(
+    db, site, articles, monkeypatch
+):
+    for _ in range(3):
+        _suggestion(db, site, *articles)
+    run = JobRun(site_id=site.id, kind="publication")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1)
+    )
+    _stub_connector(
+        monkeypatch,
+        lambda _suggestion: (_ for _ in ()).throw(RuntimeError("WordPress unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="3 publication.*failed"):
+        publish_approved(site.id, job_run_id=run.id)
+
+    db.expire_all()
+    progress = db.get(JobRun, run.id).progress
+    assert progress["failed"] == 3
+    assert progress["attempt_failed"] == 3
+    assert progress["attempt_failures"] == 3
+    assert progress["failure_state"] == "retrying"
 
 
 def test_all_skipped_publication_persists_final_progress(

@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.db import SessionLocal, engine
 from app.models import IngestionRun, JobRun
 from app.services.alerts import send_alert
+from app.services.publication_progress import mark_publication_failure
 from app.tasks.queues import analysis_queue, ingestion_queue, publication_queue, redis_conn
 
 _ENQUEUE_LOCK_NAMESPACE = 0x4C4A  # "LJ" — serializes enqueues per site
@@ -138,11 +139,21 @@ def record_progress(
         logger.exception("failed to record progress for job run %s", job_run_id)
 
 
-def record_progress_durably(job_run_id: int | None, **fields) -> None:
-    """Commit progress independently from a task transaction that may roll back."""
+def record_progress_durably(
+    job_run_id: int | None,
+    *,
+    session: Session | None = None,
+    **fields,
+) -> None:
+    """Commit progress independently from a task transaction that may roll back.
+
+    A caller may reuse a session to avoid per-item construction; every call still
+    commits so the latest checkpoint survives a task-session rollback or worker death.
+    """
     if job_run_id is None:
         return
-    db = SessionLocal()
+    owns_session = session is None
+    db = session if session is not None else SessionLocal()
     try:
         record_progress(db, job_run_id, **fields)
         db.commit()
@@ -150,27 +161,18 @@ def record_progress_durably(job_run_id: int | None, **fields) -> None:
         db.rollback()
         logger.exception("failed to commit progress for job run %s", job_run_id)
     finally:
-        db.close()
+        if owns_session:
+            db.close()
 
 
-def _mark_publication_failure_progress(
+def _mark_job_failure_progress(
     run: JobRun, *, terminal: bool, progress_at: datetime
 ) -> None:
-    progress = run.progress
-    if not isinstance(progress, dict) or progress.get("stage") != "publishing":
+    if run.kind != "publication":
         return
-    updated = {
-        **progress,
-        "failed": 0,
-        "failure_state": "terminal" if terminal else "retrying",
-    }
-    if terminal:
-        total = updated.get("total", 0)
-        applied = updated.get("applied", 0)
-        skipped = updated.get("skipped", 0)
-        attempt_failed = updated.get("attempt_failed", 0)
-        updated["failed"] = max(total - applied - skipped, attempt_failed, 0)
-        updated["skipped"] = max(total - applied - updated["failed"], 0)
+    updated = mark_publication_failure(run.progress, terminal=terminal)
+    if updated is None:
+        return
     run.progress = updated
     run.progress_at = progress_at
 
@@ -208,14 +210,15 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
             final_attempt = current_job is None or retries_left is None or retries_left <= 0
             if run is not None:
                 now = datetime.now(timezone.utc)
-                # Task progress is committed through independent sessions, while this
-                # wrapper deliberately keeps its JobRun identity across the attempt.
-                db.refresh(run, attribute_names=["progress", "progress_at"])
-                _mark_publication_failure_progress(
-                    run,
-                    terminal=final_attempt,
-                    progress_at=now,
-                )
+                if run.kind == "publication":
+                    # Publication progress commits through an independent session,
+                    # while this wrapper retains its JobRun identity for the attempt.
+                    db.refresh(run, attribute_names=["progress", "progress_at"])
+                    _mark_job_failure_progress(
+                        run,
+                        terminal=final_attempt,
+                        progress_at=now,
+                    )
                 # RQ schedules the retry only after the task raises. Keep the durable
                 # row active during that window so another API trigger cannot enqueue
                 # a duplicate job for the same site and stage.
@@ -333,11 +336,12 @@ def _reconcile_interrupted_job(
         run.status = "queued" if will_retry else "failed"
         run.error = error
         run.finished_at = None if will_retry else now
-        _mark_publication_failure_progress(
-            run,
-            terminal=not will_retry,
-            progress_at=now,
-        )
+        if run.kind == "publication":
+            _mark_job_failure_progress(
+                run,
+                terminal=not will_retry,
+                progress_at=now,
+            )
         # This includes the narrow case where the child died after committing
         # durable success but before RQ recorded FINISHED. Do not expose a stale
         # successful result while RQ retries, or after an intentional stop.
