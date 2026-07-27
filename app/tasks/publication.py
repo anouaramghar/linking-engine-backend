@@ -23,8 +23,8 @@ from sqlalchemy.orm import joinedload
 
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
-from app.models import Article, Site, Suggestion
-from app.services.job_service import record_progress, run_durably
+from app.models import Article, JobRun, Site, Suggestion
+from app.services.job_service import record_progress, record_progress_durably, run_durably
 
 logger = logging.getLogger(__name__)
 
@@ -47,17 +47,33 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
             .where(Suggestion.site_id == site_id, Suggestion.status == "approved")
             .order_by(Suggestion.id)
         ).all()
-        applied = failed = skipped = 0
+        run = db.get(JobRun, job_run_id) if job_run_id is not None else None
+        previous = (
+            run.progress
+            if run is not None
+            and isinstance(run.progress, dict)
+            and run.progress.get("stage") == "publishing"
+            else {}
+        )
+        applied = previous.get("applied", 0)
+        skipped = previous.get("skipped", 0)
+        attempt_skipped = 0
+        attempt_failures = previous.get("attempt_failures", previous.get("failed", 0))
+        attempt_failed = 0
         failure_details: list[str] = []
-        total = len(batch)
+        total = previous.get("total", len(batch))
         record_progress(
             db,
             job_run_id,
             stage="publishing",
             applied=applied,
-            failed=failed,
+            failed=0,
             skipped=skipped,
             total=total,
+            attempt_skipped=attempt_skipped,
+            attempt_failed=attempt_failed,
+            attempt_failures=attempt_failures,
+            failure_state=None,
         )
         db.commit()  # end the read transaction — each claim below gets its own
 
@@ -79,7 +95,20 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
                 )
                 if claim.rowcount == 0:  # Rejected, claimed, or inactive (Phase 0, finding 3).
                     db.rollback()
-                    skipped += 1
+                    attempt_skipped += 1
+                    skipped = max(skipped, attempt_skipped)
+                    record_progress_durably(
+                        job_run_id,
+                        stage="publishing",
+                        applied=applied,
+                        failed=0,
+                        skipped=skipped,
+                        total=total,
+                        attempt_skipped=attempt_skipped,
+                        attempt_failed=attempt_failed,
+                        attempt_failures=attempt_failures,
+                        failure_state=None,
+                    )
                     continue
                 suggestion = db.get(
                     Suggestion,
@@ -98,9 +127,13 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
                     job_run_id,
                     stage="publishing",
                     applied=applied + 1,
-                    failed=failed,
+                    failed=0,
                     skipped=skipped,
                     total=total,
+                    attempt_skipped=attempt_skipped,
+                    attempt_failed=attempt_failed,
+                    attempt_failures=attempt_failures,
+                    failure_state=None,
                 )
                 db.commit()  # releases the advisory and row locks
                 # counted only after the commit — a failed commit is a 'failed', not an 'applied'
@@ -108,16 +141,44 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
             except Exception as error:
                 db.rollback()  # claim undone — suggestion is 'approved' again for retry
                 logger.exception("apply_link failed for suggestion %s", suggestion_id)
-                failed += 1
+                attempt_failed += 1
+                attempt_failures += 1
                 failure_details.append(
                     f"suggestion {suggestion_id}: {type(error).__name__}: {error}"
                 )
-        if failed:
+                record_progress_durably(
+                    job_run_id,
+                    stage="publishing",
+                    applied=applied,
+                    failed=0,
+                    skipped=skipped,
+                    total=total,
+                    attempt_skipped=attempt_skipped,
+                    attempt_failed=attempt_failed,
+                    attempt_failures=attempt_failures,
+                    failure_state=None,
+                )
+        if attempt_failed:
             # Successful suggestions were committed individually and are skipped on
             # retry. Failed claims rolled back to "approved", so raising lets RQ
             # retry them and emit the exhausted-retry alert if they keep failing.
             details = "; ".join(failure_details[:3])
-            raise RuntimeError(f"{failed} publication suggestion(s) failed: {details}")
-        return {"applied": applied, "failed": failed, "skipped": skipped}
+            raise RuntimeError(
+                f"{attempt_failed} publication suggestion(s) failed: {details}"
+            )
+        skipped = max(total - applied, 0)
+        record_progress_durably(
+            job_run_id,
+            stage="publishing",
+            applied=applied,
+            failed=0,
+            skipped=skipped,
+            total=total,
+            attempt_skipped=attempt_skipped,
+            attempt_failed=0,
+            attempt_failures=attempt_failures,
+            failure_state=None,
+        )
+        return {"applied": applied, "failed": 0, "skipped": skipped}
     finally:
         db.close()

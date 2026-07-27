@@ -179,6 +179,102 @@ def test_failed_apply_rolls_back_to_approved_for_retry(db, site, articles, monke
     assert _status(db, suggestion.id) == "applied"
 
 
+def test_retry_preserves_original_total_and_cumulative_applied(
+    db, site, articles, monkeypatch
+):
+    suggestions = [_suggestion(db, site, *articles) for _ in range(10)]
+    final_suggestion_id = suggestions[-1].id
+    run = JobRun(site_id=site.id, kind="publication")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1)
+    )
+
+    def fail_last(suggestion):
+        if suggestion.id == final_suggestion_id:
+            raise RuntimeError("transient WordPress failure")
+
+    _stub_connector(monkeypatch, fail_last)
+    with pytest.raises(RuntimeError, match="1 publication.*failed"):
+        publish_approved(site.id, job_run_id=run.id)
+
+    db.expire_all()
+    first_attempt = dict(db.get(JobRun, run.id).progress)
+    assert first_attempt == {
+        "stage": "publishing",
+        "applied": 9,
+        "failed": 0,
+        "skipped": 0,
+        "total": 10,
+        "attempt_skipped": 0,
+        "attempt_failed": 1,
+        "attempt_failures": 1,
+        "failure_state": "retrying",
+    }
+
+    retry_start = {}
+
+    def observe_retry_start(_suggestion):
+        with SessionLocal() as observer:
+            retry_start.update(observer.get(JobRun, run.id).progress)
+
+    _stub_connector(monkeypatch, observe_retry_start)
+    result = publish_approved(site.id, job_run_id=run.id)
+
+    assert retry_start["total"] == first_attempt["total"] == 10
+    assert retry_start["applied"] == first_attempt["applied"] == 9
+    assert retry_start["attempt_failures"] == first_attempt["attempt_failures"] == 1
+    assert result == {"applied": 10, "failed": 0, "skipped": 0}
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "succeeded"
+    assert stored.attempts == 2
+    assert stored.result == result
+    assert stored.progress == {
+        "stage": "publishing",
+        "applied": 10,
+        "failed": 0,
+        "skipped": 0,
+        "total": 10,
+        "attempt_skipped": 0,
+        "attempt_failed": 0,
+        "attempt_failures": 1,
+        "failure_state": None,
+    }
+
+
+def test_all_skipped_publication_persists_final_progress(
+    db, site, articles, monkeypatch
+):
+    articles[0].is_active = False
+    db.commit()
+    _suggestion(db, site, *articles)
+    run = JobRun(site_id=site.id, kind="publication")
+    db.add(run)
+    db.commit()
+    _stub_connector(
+        monkeypatch,
+        lambda _suggestion: pytest.fail("inactive suggestions must not be published"),
+    )
+
+    result = publish_approved(site.id, job_run_id=run.id)
+
+    assert result == {"applied": 0, "failed": 0, "skipped": 1}
+    db.expire_all()
+    assert db.get(JobRun, run.id).progress == {
+        "stage": "publishing",
+        "applied": 0,
+        "failed": 0,
+        "skipped": 1,
+        "total": 1,
+        "attempt_skipped": 1,
+        "attempt_failed": 0,
+        "attempt_failures": 0,
+        "failure_state": None,
+    }
+
+
 def test_final_publication_failure_records_job_and_alerts(
     db, site, articles, monkeypatch
 ):
@@ -198,7 +294,19 @@ def test_final_publication_failure_records_job_and_alerts(
 
     db.expire_all()
     assert _status(db, suggestion.id) == "approved"
-    assert db.get(JobRun, run.id).status == "failed"
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "failed"
+    assert stored.progress == {
+        "stage": "publishing",
+        "applied": 0,
+        "failed": 1,
+        "skipped": 0,
+        "total": 1,
+        "attempt_skipped": 0,
+        "attempt_failed": 1,
+        "attempt_failures": 1,
+        "failure_state": "terminal",
+    }
     alert = db.scalar(select(Alert).where(Alert.site_id == site.id))
     assert alert.kind == "job_failed"
     assert alert.subject == "LinkMesh publication job failed"

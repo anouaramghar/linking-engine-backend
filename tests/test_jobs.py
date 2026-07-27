@@ -420,6 +420,47 @@ def test_abandoned_job_stays_queued_when_rq_will_retry(db, site, monkeypatch):
     assert stored.error == "job abandoned after worker termination"
 
 
+def test_terminal_abandoned_job_preserves_committed_success(
+    db, site, monkeypatch
+):
+    finished_at = datetime.now(timezone.utc)
+    result = {"suggestions_created": 7}
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="succeeded",
+        queue_job_id="abandoned-after-durable-success",
+        attempts=1,
+        result=result,
+        started_at=finished_at,
+        finished_at=finished_at,
+    )
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        job_service,
+        "send_alert",
+        lambda *_args, **_kwargs: pytest.fail("committed success must not alert as failed"),
+    )
+
+    assert (
+        handle_abandoned_job(
+            SimpleNamespace(id=run.queue_job_id, retries_left=0),
+            AbandonedJobError,
+            AbandonedJobError(),
+            None,
+        )
+        is True
+    )
+
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "succeeded"
+    assert stored.result == result
+    assert stored.finished_at == finished_at
+    assert stored.error is None
+
+
 def test_abandoned_handler_ignores_other_exceptions(db, site, monkeypatch):
     run = JobRun(
         site_id=site.id,
@@ -752,6 +793,76 @@ def test_job_status_reports_progress_while_job_is_live_in_redis(client, db, site
     assert body["status"] == "queued"  # live RQ vocabulary — the job was never drained
     assert body["progress"] == {"stage": "crawling", "articles": 150}
     assert body["progress_at"] is not None
+
+
+@pytest.mark.parametrize("rq_status", ["failed", "stopped", "canceled"])
+def test_live_terminal_rq_status_prefers_committed_durable_success(
+    client, db, site, monkeypatch, rq_status
+):
+    result = {"suggestions_created": 7}
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="succeeded",
+        queue_job_id=f"split-brain-{rq_status}",
+        attempts=1,
+        result=result,
+        started_at=datetime.now(timezone.utc),
+        finished_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    live_job = SimpleNamespace(
+        get_status=lambda: rq_status,
+        latest_result=lambda: pytest.fail("durable success must bypass the RQ result"),
+        return_value=lambda: pytest.fail("durable success must bypass the RQ result"),
+    )
+    monkeypatch.setattr(
+        job_service.Job,
+        "fetch",
+        staticmethod(lambda _job_id, connection: live_job),
+    )
+
+    body = client.get(f"/api/v1/jobs/{run.queue_job_id}").json()
+
+    assert body["status"] == "succeeded"
+    assert body["result"] == result
+    runs = client.get(f"/api/v1/jobs/site/{site.id}").json()
+    listed = next(candidate for candidate in runs if candidate["id"] == run.id)
+    assert listed["status"] == body["status"]
+    assert listed["result"] == body["result"]
+
+
+def test_live_failure_is_not_masked_without_durable_success(
+    client, db, site, monkeypatch
+):
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="queued",
+        queue_job_id="retry-will-not-mask-live-failure",
+        attempts=1,
+    )
+    db.add(run)
+    db.commit()
+    live_job = SimpleNamespace(
+        get_status=lambda: "failed",
+        latest_result=lambda: SimpleNamespace(
+            exc_string="Traceback (most recent call last):\nRuntimeError: live failure"
+        ),
+        return_value=lambda: None,
+    )
+    monkeypatch.setattr(
+        job_service.Job,
+        "fetch",
+        staticmethod(lambda _job_id, connection: live_job),
+    )
+
+    body = client.get(f"/api/v1/jobs/{run.queue_job_id}").json()
+
+    assert body["status"] == "failed"
+    assert body["result"] is None
+    assert body["error"] == "RuntimeError: live failure"
 
 
 def test_list_job_runs_per_site(client, db, site):

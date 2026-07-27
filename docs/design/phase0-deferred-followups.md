@@ -6,27 +6,30 @@ its acceptance checks pass.
 
 ## Medium: publication retry accounting
 
-Publication counters currently describe one RQ attempt instead of the complete
-`JobRun`. Preserve the original batch total and cumulative committed successes across
-retries, persist skip/failure progress after rollback, and distinguish transient
-attempt failures from terminal unresolved failures.
+Status: complete. Publication progress preserves the first attempt's total and
+cumulative committed successes across retries. Skip and attempt-failure progress is
+committed independently after task rollbacks; `attempt_failures` remains cumulative,
+while `failure_state` and `failed` distinguish a queued retry from terminal unresolved
+items.
 
 Acceptance: a 10-item run that applies 9 suggestions, fails 1, then applies the last
 suggestion on retry finishes with `total=10` and `applied=10`; progress never resets
 or regresses between attempts. All-skipped and terminal-failure runs persist accurate
-final counters.
+final counters. Covered by publication retry, all-skipped, and terminal-failure
+regression tests.
 
 ## Medium: terminal post-success status consistency
 
-If a task commits its durable `succeeded` result and the work horse is then killed,
-abandoned, or intentionally stopped before RQ records completion, the durable row
-correctly preserves success while the still-live Redis job becomes `failed` or
-`stopped`. Make `get_job_status()` prefer the committed durable success for this
-terminal split-brain case so polling agrees with `JobRun` listings.
+Status: complete. If a task commits its durable `succeeded` result and the work horse
+is then killed, abandoned, or intentionally stopped before RQ records completion,
+`get_job_status()` prefers that committed success over a terminal failed, stopped, or
+canceled Redis state. Non-success durable rows and queued retries continue to expose
+the live RQ failure.
 
 Acceptance: terminal killed, abandoned, and stopped callbacks after a committed
 success all leave the durable result intact, and both the live job-status endpoint
 and durable run APIs report `succeeded` with the same result until Redis eviction.
+Covered by callback and live/durable API consistency regression tests.
 
 ## Lower: platform credential invariant
 
@@ -51,6 +54,8 @@ kind and name.
 Align `JobRun` transition comments and runtime documentation with queued retries and
 the custom `LinkMeshWorker`; document the live RQ `scheduled` state; replace the
 deprecated `job.exc_info` access; and add a real-Redis delayed-retry integration test.
+The deprecated access is now replaced with `job.latest_result()`; the other items in
+this section remain open.
 
 Acceptance: documentation matches the Compose worker command, the suite has no RQ
 `exc_info` deprecation warning, and a scheduled retry is rescheduled and drained by
