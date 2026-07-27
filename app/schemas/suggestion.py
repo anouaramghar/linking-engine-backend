@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.limits import MAX_ENGINE_PAGE_SIZE
 from app.schemas.site import ArticleBrief
@@ -38,4 +38,79 @@ class SuggestionReview(BaseModel):
 
 class BulkReview(BaseModel):
     suggestion_ids: list[int] = Field(min_length=1, max_length=MAX_BULK_REVIEW)
+    status: ReviewStatus
+
+
+class SuggestionPage(BaseModel):
+    """One page of the queue, plus the size of the full match behind it.
+
+    `total` counts every row the same filters select, not the page, so the client
+    can size the queue without reading it.
+    """
+
+    items: list[SuggestionOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class SuggestionCounts(BaseModel):
+    """Per-status totals for one filter, so status chips cost a single query.
+
+    `total` deliberately excludes `expired` — it is what the list endpoint returns
+    when no status is given, so the two agree without the caller adding up chips.
+    """
+
+    pending: int = 0
+    approved: int = 0
+    rejected: int = 0
+    applying: int = 0
+    applied: int = 0
+    expired: int = 0
+    total: int = 0
+
+
+class BulkReviewFilter(BaseModel):
+    """Server-side form of the queue's bulk rule.
+
+    The rule has always applied to the whole fleet rather than the rows on screen.
+    Once the queue is paged, the client can no longer enumerate its own targets, so
+    it sends the rule instead — which also keeps a six-figure id list off the wire.
+
+    Bounds mirror the dashboard: `min_score` is inclusive for "approve at or above",
+    `max_score` exclusive for "reject below". Both omitted means every matching row.
+    """
+
+    status: ReviewStatus
+    # Only reviewable rows can be matched; `applying`/`applied`/`expired` are the
+    # worker's and are excluded by the guarded transition regardless.
+    match_status: ReviewStatus = "pending"
+    site_id: int | None = None
+    all_sites: bool = False
+    method: str | None = None
+    min_score: float | None = Field(None, ge=0, le=1)
+    max_score: float | None = Field(None, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _fleet_scope_must_be_deliberate(self) -> "BulkReviewFilter":
+        """Omitting `site_id` reviews every site, so it has to be said out loud.
+
+        Every other field narrows the match; a missing one widens it. That makes a
+        dropped `site_id` — a client bug, a hand-written request — indistinguishable
+        from a real fleet-wide rule, and the result is the entire backlog reviewed
+        in one statement with no per-row record of what it used to be.
+        """
+        if self.site_id is None and not self.all_sites:
+            raise ValueError("set site_id, or all_sites=true to review every site at once")
+        if self.site_id is not None and self.all_sites:
+            raise ValueError("site_id and all_sites=true contradict each other")
+        return self
+
+
+class BulkReviewFilterResult(BaseModel):
+    """Counts rather than ids: a fleet-wide rule can match far more than a client
+    could usefully be handed back."""
+
+    reviewed: int
+    skipped: int
     status: ReviewStatus

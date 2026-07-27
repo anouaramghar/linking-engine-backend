@@ -2,14 +2,22 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
-from app.schemas.suggestion import BulkReview, SuggestionOut, SuggestionReview
+from app.schemas.suggestion import (
+    BulkReview,
+    BulkReviewFilter,
+    BulkReviewFilterResult,
+    SuggestionCounts,
+    SuggestionOut,
+    SuggestionPage,
+    SuggestionReview,
+)
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.analysis import analyze_site
 
@@ -19,8 +27,9 @@ router = APIRouter(tags=["suggestions"])
 UNREVIEWABLE = ("applying", "applied", "expired")
 
 
-def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[int]:
-    """Move every reviewable id to ``status``; returns the ids that actually moved.
+def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]:
+    """Move every reviewable row matching ``conditions`` to ``status``; returns the
+    ids that actually moved.
 
     Guarded transition (Phase 0, finding 5): a suggestion being published holds a
     row lock on its claim, so this update blocks until the publish commits and
@@ -37,15 +46,45 @@ def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[
     return set(
         db.scalars(
             update(Suggestion)
-            .where(
-                Suggestion.id.in_(suggestion_ids),
-                Suggestion.status.notin_(UNREVIEWABLE),
-            )
+            .where(*conditions, Suggestion.status.notin_(UNREVIEWABLE))
             .values(status=status, reviewed_at=reviewed_at)
             .returning(Suggestion.id)
             .execution_options(synchronize_session=False)
         )
     )
+
+
+def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[int]:
+    return _review_matching(db, [Suggestion.id.in_(suggestion_ids)], status)
+
+
+def _queue_conditions(
+    *,
+    site_id: int | None = None,
+    status: str | None = None,
+    method: str | None = None,
+    min_score: float | None = None,
+    max_score: float | None = None,
+) -> list:
+    """Only the bounds the caller gave. Whether an absent status means "every
+    status" or "everything but expired" differs per route, so it is decided there.
+
+    The score bounds are asymmetric on purpose: the dashboard rule approves at or
+    above a threshold and rejects below the same number, so a shared threshold
+    must not put one row in both halves.
+    """
+    conditions = []
+    if site_id is not None:
+        conditions.append(Suggestion.site_id == site_id)
+    if status is not None:
+        conditions.append(Suggestion.status == status)
+    if method is not None:
+        conditions.append(Suggestion.method == method)
+    if min_score is not None:
+        conditions.append(Suggestion.score >= min_score)
+    if max_score is not None:
+        conditions.append(Suggestion.score < max_score)
+    return conditions
 
 
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
@@ -69,6 +108,96 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
         "skipped": sorted(existing - reviewed),
         "status": payload.status,
     }
+
+
+# also declared before /suggestions/{site_id}, for the same reason as bulk-review
+@router.post("/suggestions/bulk-review-by-filter", response_model=BulkReviewFilterResult)
+def bulk_review_by_filter(
+    payload: BulkReviewFilter, db: Session = Depends(get_db)
+) -> BulkReviewFilterResult:
+    """Apply a bulk rule to every row it matches, however many that is.
+
+    The id-list endpoint above stays the path for an explicit selection. This one
+    exists because the queue is read a page at a time: the client knows the rule
+    but can no longer name its targets, and a fleet-wide rule matches far more
+    rows than PostgreSQL will accept as bound parameters.
+    """
+    conditions = _queue_conditions(
+        site_id=payload.site_id,
+        status=payload.match_status,
+        method=payload.method,
+        min_score=payload.min_score,
+        max_score=payload.max_score,
+    )
+    # Counted before the update, so a row the publication worker claims in between
+    # is reported as skipped rather than silently dropped from both numbers.
+    matched = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
+    reviewed = _review_matching(db, conditions, payload.status)
+    db.commit()
+    return BulkReviewFilterResult(
+        reviewed=len(reviewed),
+        skipped=max(matched - len(reviewed), 0),
+        status=payload.status,
+    )
+
+
+@router.get("/suggestions/counts", response_model=SuggestionCounts)
+def count_suggestions(
+    site_id: int | None = None,
+    method: str | None = None,
+    min_score: float | None = Query(None, ge=0, le=1),
+    max_score: float | None = Query(None, ge=0, le=1),
+    db: Session = Depends(get_db),
+) -> SuggestionCounts:
+    conditions = _queue_conditions(
+        site_id=site_id, method=method, min_score=min_score, max_score=max_score
+    )
+    rows = db.execute(
+        select(Suggestion.status, func.count())
+        .where(*conditions)
+        .group_by(Suggestion.status)
+    ).all()
+    counts = {status: count for status, count in rows}
+    return SuggestionCounts(
+        **counts,
+        total=sum(count for status, count in counts.items() if status != "expired"),
+    )
+
+
+@router.get("/suggestions", response_model=SuggestionPage)
+def list_suggestion_page(
+    site_id: int | None = None,
+    status: str | None = None,
+    method: str | None = None,
+    min_score: float | None = Query(None, ge=0, le=1),
+    max_score: float | None = Query(None, ge=0, le=1),
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> SuggestionPage:
+    """The queue across every site, or one of them, a page at a time."""
+    conditions = _queue_conditions(
+        site_id=site_id,
+        status=status,
+        method=method,
+        min_score=min_score,
+        max_score=max_score,
+    )
+    if status is None:
+        conditions.append(Suggestion.status != "expired")
+    items = db.scalars(
+        select(Suggestion)
+        .where(*conditions)
+        .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
+        # Score alone is not unique, and equal scores are common. Without the id
+        # tiebreaker PostgreSQL may order tied rows differently per statement, so
+        # paging through would repeat some rows and never show others.
+        .order_by(Suggestion.score.desc(), Suggestion.id.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    total = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
+    return SuggestionPage(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)

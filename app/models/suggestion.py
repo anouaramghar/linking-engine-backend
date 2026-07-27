@@ -28,7 +28,16 @@ SuggestionStatus = Enum(
 
 class Suggestion(Base):
     __tablename__ = "suggestions"
-    __table_args__ = (Index("ix_suggestions_status_created_at", "status", "created_at"),)
+    # The review queue reads one status at a time, best score first, either across
+    # the fleet or within a site. `score` had no index at all, so a paged read
+    # sorted the whole matching set on every request. Both are stored ascending:
+    # the ordering is uniformly descending, which PostgreSQL serves by walking the
+    # index backwards, and the trailing id is what makes tied scores page stably.
+    __table_args__ = (
+        Index("ix_suggestions_status_created_at", "status", "created_at"),
+        Index("ix_suggestions_queue", "status", "score", "id"),
+        Index("ix_suggestions_site_queue", "site_id", "status", "score", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
