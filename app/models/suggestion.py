@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, String, Text, func
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -28,15 +28,27 @@ SuggestionStatus = Enum(
 
 class Suggestion(Base):
     __tablename__ = "suggestions"
-    # The review queue reads one status at a time, best score first, either across
-    # the fleet or within a site. `score` had no index at all, so a paged read
-    # sorted the whole matching set on every request. Both are stored ascending:
-    # the ordering is uniformly descending, which PostgreSQL serves by walking the
-    # index backwards, and the trailing id is what makes tied scores page stably.
+    # Exact-status and default active-queue reads need different leading columns:
+    # status-first serves a selected chip, while the partial indexes preserve
+    # global score order across every non-expired status. All are ascending because
+    # PostgreSQL can walk them backwards for the uniformly descending queue.
     __table_args__ = (
         Index("ix_suggestions_status_created_at", "status", "created_at"),
         Index("ix_suggestions_queue", "status", "score", "id"),
         Index("ix_suggestions_site_queue", "site_id", "status", "score", "id"),
+        Index(
+            "ix_suggestions_active_queue",
+            "score",
+            "id",
+            postgresql_where=text("status <> 'expired'"),
+        ),
+        Index(
+            "ix_suggestions_site_active_queue",
+            "site_id",
+            "score",
+            "id",
+            postgresql_where=text("status <> 'expired'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

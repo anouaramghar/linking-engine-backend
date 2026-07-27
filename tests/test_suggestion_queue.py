@@ -13,12 +13,17 @@ or review a row it did not create. Dropping that filter from a bulk rule is not 
 flaky test — it reviews the whole development backlog.
 """
 
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text, update
 
 from app.api.pagination import MAX_PAGE_SIZE
+from app.api.routes.suggestions import _review_matching_counts
+from app.db import SessionLocal
 from app.models import Article, Site, Suggestion
 
 # The seed data is entirely `baseline_cosine`, so the other method is a free
@@ -94,11 +99,12 @@ def test_queue_spans_sites_best_score_first(client, db, site, other_site):
     middle = _suggest(db, site, pair, 0.50)
     db.commit()
 
-    body = _get(client, "/api/v1/suggestions")
+    body = _get(client, "/api/v1/suggestions", include_total=True)
 
     assert [item["id"] for item in body["items"]] == [high.id, middle.id, low.id]
     assert body["total"] == 3
-    assert (body["limit"], body["offset"]) == (50, 0)
+    assert body["limit"] == 50
+    assert body["next_cursor"] is None
 
 
 def test_site_filter_narrows_the_queue_and_its_total(client, db, site, other_site):
@@ -107,7 +113,7 @@ def test_site_filter_narrows_the_queue_and_its_total(client, db, site, other_sit
     _suggest(db, other_site, other_pair, 0.80)
     db.commit()
 
-    body = _get(client, "/api/v1/suggestions", site_id=site.id)
+    body = _get(client, "/api/v1/suggestions", site_id=site.id, include_total=True)
 
     assert [item["id"] for item in body["items"]] == [mine.id]
     # The total describes the filtered match, not the table.
@@ -120,7 +126,7 @@ def test_expired_is_hidden_unless_asked_for(client, db, site):
     expired = _suggest(db, site, pair, 0.95, status="expired")
     db.commit()
 
-    default = _get(client, "/api/v1/suggestions", site_id=site.id)
+    default = _get(client, "/api/v1/suggestions", site_id=site.id, include_total=True)
     assert [item["id"] for item in default["items"]] == [live.id]
     assert default["total"] == 1
 
@@ -139,16 +145,84 @@ def test_tied_scores_page_without_repeating_or_losing_rows(client, db, site):
     expected = {_suggest(db, site, pair, 0.75).id for _ in range(10)}
     db.commit()
 
-    seen = []
-    for offset in range(0, 12, 3):
-        page = _get(client, "/api/v1/suggestions", site_id=site.id, limit=3, offset=offset)
-        assert page["total"] == 10
+    seen, cursor = [], None
+    while True:
+        params = {"site_id": site.id, "limit": 3, "include_total": not seen}
+        if cursor is not None:
+            params |= {
+                "after_score": cursor["score"],
+                "after_id": cursor["id"],
+            }
+        page = _get(client, "/api/v1/suggestions", **params)
+        assert page["total"] == (10 if not seen else None)
         seen.extend(item["id"] for item in page["items"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
 
     assert len(seen) == len(set(seen)) == 10
     assert set(seen) == expected
     # Ties resolve by descending id, so the whole read is one stable sequence.
     assert seen == sorted(expected, reverse=True)
+
+
+def test_cursor_does_not_shift_when_rows_above_it_change(client, db, site):
+    pair = _pair(db, site)
+    suggestions = [_suggest(db, site, pair, score) for score in (0.90, 0.80, 0.70, 0.60)]
+    db.commit()
+
+    first = _get(
+        client,
+        "/api/v1/suggestions",
+        site_id=site.id,
+        status="pending",
+        limit=2,
+    )
+    assert [item["id"] for item in first["items"]] == [
+        suggestions[0].id,
+        suggestions[1].id,
+    ]
+
+    # A review removes one row above the boundary and a new best row appears.
+    # OFFSET would now either skip or repeat an existing row.
+    suggestions[0].status = "approved"
+    newcomer = _suggest(db, site, pair, 0.99)
+    db.commit()
+
+    second = _get(
+        client,
+        "/api/v1/suggestions",
+        site_id=site.id,
+        status="pending",
+        limit=2,
+        after_score=first["next_cursor"]["score"],
+        after_id=first["next_cursor"]["id"],
+    )
+    assert [item["id"] for item in second["items"]] == [
+        suggestions[2].id,
+        suggestions[3].id,
+    ]
+    assert newcomer.id not in {item["id"] for item in second["items"]}
+
+
+def test_cursor_contract_rejects_offsets_and_partial_boundaries(client):
+    path = "/api/v1/suggestions"
+
+    assert client.get(path, params={"offset": 0}).status_code == 422
+    assert client.get(path, params={"after_score": 0.5}).status_code == 422
+    assert client.get(path, params={"after_id": 1}).status_code == 422
+
+
+def test_total_is_opt_in(client, db, site):
+    pair = _pair(db, site)
+    _suggest(db, site, pair, 0.50)
+    db.commit()
+
+    without_total = _get(client, "/api/v1/suggestions", site_id=site.id)
+    with_total = _get(client, "/api/v1/suggestions", site_id=site.id, include_total=True)
+
+    assert without_total["total"] is None
+    assert with_total["total"] == 1
 
 
 def test_page_size_is_capped(client, site):
@@ -184,7 +258,15 @@ def test_counts_report_every_status_and_a_total_matching_the_list(
         "total": 4,
     }
     # The advertised contract: `total` is what the list returns with no status.
-    assert _get(client, "/api/v1/suggestions", site_id=site.id)["total"] == counts["total"]
+    assert (
+        _get(
+            client,
+            "/api/v1/suggestions",
+            site_id=site.id,
+            include_total=True,
+        )["total"]
+        == counts["total"]
+    )
 
 
 def test_counts_respect_the_score_window(client, db, site):
@@ -244,7 +326,7 @@ def test_bulk_rule_can_be_scoped_to_one_site(client, db, site, other_site):
     assert _status(db, theirs.id) == "pending"
 
 
-def test_bulk_rule_never_touches_what_the_publication_worker_owns(client, db, site):
+def test_bulk_rule_default_match_status_is_pending(client, db, site):
     pair = _pair(db, site)
     applying = _suggest(db, site, pair, 0.99, status="applying")
     applied = _suggest(db, site, pair, 0.99, status="applied")
@@ -254,7 +336,7 @@ def test_bulk_rule_never_touches_what_the_publication_worker_owns(client, db, si
 
     body = _rule(client, status="rejected", site_id=site.id, max_score=1.0).json()
 
-    assert body["reviewed"] == 1
+    assert body == {"reviewed": 1, "skipped": 0, "status": "rejected"}
     assert _status(db, pending.id) == "rejected"
     for untouched, expected in (
         (applying, "applying"),
@@ -262,6 +344,64 @@ def test_bulk_rule_never_touches_what_the_publication_worker_owns(client, db, si
         (expired, "expired"),
     ):
         assert _status(db, untouched.id) == expected
+
+
+def test_filtered_review_counts_one_snapshot_and_skips_a_concurrent_claim(db, site):
+    pair = _pair(db, site)
+    claimed = _suggest(db, site, pair, 0.90)
+    reviewable = _suggest(db, site, pair, 0.80)
+    db.commit()
+
+    claim = SessionLocal()
+    observer = SessionLocal()
+    backend_pid: Queue[int] = Queue()
+
+    def review_in_other_transaction():
+        other = SessionLocal()
+        try:
+            backend_pid.put(other.scalar(select(text("pg_backend_pid()"))))
+            conditions = [
+                Suggestion.site_id == site.id,
+                Suggestion.status == "pending",
+                Suggestion.method == QUEUE_METHOD,
+            ]
+            result = _review_matching_counts(other, conditions, "rejected")
+            other.commit()
+            return result
+        finally:
+            other.close()
+
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        claim.execute(
+            update(Suggestion).where(Suggestion.id == claimed.id).values(status="applied")
+        )
+        future = executor.submit(review_in_other_transaction)
+        pid = backend_pid.get(timeout=2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            waiting = observer.execute(
+                text("SELECT wait_event_type FROM pg_stat_activity WHERE pid = :pid"),
+                {"pid": pid},
+            ).scalar_one()
+            observer.rollback()
+            if waiting == "Lock":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("filtered review did not wait on the publication claim")
+
+        claim.commit()
+        matched, reviewed = future.result(timeout=2)
+    finally:
+        claim.rollback()
+        claim.close()
+        observer.close()
+        executor.shutdown(wait=True)
+
+    assert (matched, reviewed, matched - reviewed) == (2, 1, 1)
+    assert _status(db, claimed.id) == "applied"
+    assert _status(db, reviewable.id) == "rejected"
 
 
 def test_bulk_rule_can_undo_a_previous_decision(client, db, site):
@@ -321,7 +461,12 @@ def test_paged_queue_and_bulk_rule_agree_on_the_same_filter(client, db, site):
     db.commit()
 
     listed = _get(
-        client, "/api/v1/suggestions", site_id=site.id, status="pending", min_score=0.85
+        client,
+        "/api/v1/suggestions",
+        site_id=site.id,
+        status="pending",
+        min_score=0.85,
+        include_total=True,
     )
     reviewed = _rule(client, status="approved", site_id=site.id, min_score=0.85).json()
 

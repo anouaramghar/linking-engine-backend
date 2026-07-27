@@ -19,12 +19,33 @@ def upgrade() -> None:
     # matching row per request. Ascending is deliberate: the query orders by
     # score and id both descending, which PostgreSQL serves by reading the index
     # backwards, so a second descending copy would earn nothing.
-    op.create_index("ix_suggestions_queue", "suggestions", ["status", "score", "id"])
-    op.create_index(
-        "ix_suggestions_site_queue", "suggestions", ["site_id", "status", "score", "id"]
-    )
+    # CONCURRENTLY keeps ingestion, publication, and review writes moving while
+    # PostgreSQL scans the existing production table. It cannot run inside
+    # Alembic's normal migration transaction.
+    with op.get_context().autocommit_block():
+        op.create_index(
+            "ix_suggestions_queue",
+            "suggestions",
+            ["status", "score", "id"],
+            postgresql_concurrently=True,
+        )
+        op.create_index(
+            "ix_suggestions_site_queue",
+            "suggestions",
+            ["site_id", "status", "score", "id"],
+            postgresql_concurrently=True,
+        )
 
 
 def downgrade() -> None:
-    op.drop_index("ix_suggestions_site_queue", table_name="suggestions")
-    op.drop_index("ix_suggestions_queue", table_name="suggestions")
+    with op.get_context().autocommit_block():
+        op.drop_index(
+            "ix_suggestions_site_queue",
+            table_name="suggestions",
+            postgresql_concurrently=True,
+        )
+        op.drop_index(
+            "ix_suggestions_queue",
+            table_name="suggestions",
+            postgresql_concurrently=True,
+        )

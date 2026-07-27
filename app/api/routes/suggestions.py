@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select, update
+from sqlalchemy import func, literal, select, tuple_, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db
@@ -14,6 +14,7 @@ from app.schemas.suggestion import (
     BulkReviewFilter,
     BulkReviewFilterResult,
     SuggestionCounts,
+    SuggestionCursor,
     SuggestionOut,
     SuggestionPage,
     SuggestionReview,
@@ -56,6 +57,45 @@ def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]
 
 def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[int]:
     return _review_matching(db, [Suggestion.id.in_(suggestion_ids)], status)
+
+
+def _review_matching_counts(db: Session, conditions: Sequence, status: str) -> tuple[int, int]:
+    """Count one stable candidate cohort and update its still-reviewable rows.
+
+    Unlike the explicit-id path, the caller needs counts rather than identities.
+    Keeping both aggregates in PostgreSQL avoids sending a fleet-sized RETURNING
+    result to Python. MATERIALIZED also gives `matched` a precise meaning: rows in
+    the statement's initial snapshot, not a count from an earlier snapshot.
+    """
+    if not conditions:
+        raise ValueError("filtered review requires at least one match condition")
+
+    reviewed_at = None if status == "pending" else datetime.now(timezone.utc)
+    candidates = (
+        select(Suggestion.id)
+        .where(*conditions)
+        .cte("review_candidates")
+        .prefix_with("MATERIALIZED")
+    )
+    reviewed_rows = (
+        update(Suggestion)
+        .where(
+            Suggestion.id == candidates.c.id,
+            *conditions,
+            Suggestion.status.notin_(UNREVIEWABLE),
+        )
+        .values(status=status, reviewed_at=reviewed_at)
+        .returning(literal(1).label("reviewed"))
+        .execution_options(synchronize_session=False)
+        .cte("reviewed_rows")
+    )
+    result = db.execute(
+        select(
+            select(func.count()).select_from(candidates).scalar_subquery().label("matched"),
+            select(func.count()).select_from(reviewed_rows).scalar_subquery().label("reviewed"),
+        )
+    ).one()
+    return result.matched, result.reviewed
 
 
 def _queue_conditions(
@@ -129,14 +169,11 @@ def bulk_review_by_filter(
         min_score=payload.min_score,
         max_score=payload.max_score,
     )
-    # Counted before the update, so a row the publication worker claims in between
-    # is reported as skipped rather than silently dropped from both numbers.
-    matched = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
-    reviewed = _review_matching(db, conditions, payload.status)
+    matched, reviewed = _review_matching_counts(db, conditions, payload.status)
     db.commit()
     return BulkReviewFilterResult(
-        reviewed=len(reviewed),
-        skipped=max(matched - len(reviewed), 0),
+        reviewed=reviewed,
+        skipped=matched - reviewed,
         status=payload.status,
     )
 
@@ -171,11 +208,14 @@ def list_suggestion_page(
     method: str | None = None,
     min_score: float | None = Query(None, ge=0, le=1),
     max_score: float | None = Query(None, ge=0, le=1),
+    after_score: float | None = Query(None, ge=0, le=1),
+    after_id: int | None = Query(None, ge=1),
+    include_total: bool = False,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
-    offset: int = Query(0, ge=0),
+    offset: int | None = Query(None, ge=0, deprecated=True),
     db: Session = Depends(get_db),
 ) -> SuggestionPage:
-    """The queue across every site, or one of them, a page at a time."""
+    """The queue across every site, or one of them, a cursor page at a time."""
     conditions = _queue_conditions(
         site_id=site_id,
         status=status,
@@ -184,20 +224,49 @@ def list_suggestion_page(
         max_score=max_score,
     )
     if status is None:
-        conditions.append(Suggestion.status != "expired")
+        # Render the fixed predicate literally so PostgreSQL can prove that the
+        # query implies the partial-index predicate even for a generic prepared
+        # plan; a bound `$1` could be any status at plan time.
+        conditions.append(Suggestion.status != literal("expired", literal_execute=True))
+    if offset is not None:
+        raise HTTPException(
+            422,
+            "offset pagination is not supported; continue with after_score and after_id",
+        )
+    if (after_score is None) != (after_id is None):
+        raise HTTPException(422, "after_score and after_id must be provided together")
+
+    page_conditions = list(conditions)
+    if after_score is not None and after_id is not None:
+        # Both sort keys descend, so the next page is strictly below the last
+        # tuple returned. Removing or inserting rows above it cannot shift this
+        # boundary as it can with OFFSET.
+        page_conditions.append(
+            tuple_(Suggestion.score, Suggestion.id) < tuple_(after_score, after_id)
+        )
     items = db.scalars(
         select(Suggestion)
-        .where(*conditions)
+        .where(*page_conditions)
         .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
-        # Score alone is not unique, and equal scores are common. Without the id
-        # tiebreaker PostgreSQL may order tied rows differently per statement, so
-        # paging through would repeat some rows and never show others.
         .order_by(Suggestion.score.desc(), Suggestion.id.desc())
-        .limit(limit)
-        .offset(offset)
+        # One look-ahead row tells the client whether another request is useful
+        # without paying for COUNT(*) on every page.
+        .limit(limit + 1)
     ).all()
-    total = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
-    return SuggestionPage(items=items, total=total, limit=limit, offset=offset)
+    has_more = len(items) > limit
+    items = items[:limit]
+    next_cursor = None
+    if has_more and items:
+        next_cursor = SuggestionCursor(score=items[-1].score, id=items[-1].id)
+    total = None
+    if include_total:
+        total = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
+    return SuggestionPage(
+        items=items,
+        total=total,
+        limit=limit,
+        next_cursor=next_cursor,
+    )
 
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)

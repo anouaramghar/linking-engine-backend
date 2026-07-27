@@ -41,17 +41,24 @@ class BulkReview(BaseModel):
     status: ReviewStatus
 
 
-class SuggestionPage(BaseModel):
-    """One page of the queue, plus the size of the full match behind it.
+class SuggestionCursor(BaseModel):
+    """The last ordered row from a page, used to continue strictly below it."""
 
-    `total` counts every row the same filters select, not the page, so the client
-    can size the queue without reading it.
+    score: float
+    id: int
+
+
+class SuggestionPage(BaseModel):
+    """One cursor page of the queue.
+
+    `total` is optional because counting the full match on every page defeats the
+    cheap index continuation. Callers that need it request it once or use `/counts`.
     """
 
     items: list[SuggestionOut]
-    total: int
+    total: int | None = None
     limit: int
-    offset: int
+    next_cursor: SuggestionCursor | None = None
 
 
 class SuggestionCounts(BaseModel):
