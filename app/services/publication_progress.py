@@ -2,6 +2,8 @@
 
 `applied` is a monotonic count of committed suggestion updates. `failed` keeps its
 original caller-facing meaning: failures still unresolved in the latest attempt.
+A terminal run widens it to every original item neither applied nor skipped, because
+a killed work horse leaves entries the loop never reached and no later attempt will.
 `attempt_failures` is the monotonic event count across attempts, so a transient
 failure that later applies is not also reported as a terminally failed item.
 
