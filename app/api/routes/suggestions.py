@@ -10,6 +10,7 @@ from app.api.pagination import MAX_PAGE_SIZE
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
 from app.schemas.suggestion import (
+    MAX_BULK_REVIEW,
     BulkReview,
     BulkReviewFilter,
     BulkReviewFilterResult,
@@ -59,13 +60,16 @@ def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[
     return _review_matching(db, [Suggestion.id.in_(suggestion_ids)], status)
 
 
-def _review_matching_counts(db: Session, conditions: Sequence, status: str) -> tuple[int, int]:
-    """Count one stable candidate cohort and update its still-reviewable rows.
+def _review_matching_counts(
+    db: Session, conditions: Sequence, status: str
+) -> tuple[int, int, list[int] | None]:
+    """Summarize one stable candidate cohort and update its reviewable rows.
 
-    Unlike the explicit-id path, the caller needs counts rather than identities.
-    Keeping both aggregates in PostgreSQL avoids sending a fleet-sized RETURNING
-    result to Python. MATERIALIZED also gives `matched` a precise meaning: rows in
-    the statement's initial snapshot, not a count from an earlier snapshot.
+    The explicit-id path always returns identities because the caller supplied
+    them. A filtered review does not have that bound, so this path returns at most
+    MAX_BULK_REVIEW ids and otherwise keeps only counts. MATERIALIZED gives
+    `matched` a precise meaning: rows in the statement's initial snapshot, not a
+    count from an earlier snapshot.
     """
     if not conditions:
         raise ValueError("filtered review requires at least one match condition")
@@ -82,20 +86,40 @@ def _review_matching_counts(db: Session, conditions: Sequence, status: str) -> t
         .where(
             Suggestion.id == candidates.c.id,
             *conditions,
-            Suggestion.status.notin_(UNREVIEWABLE),
         )
         .values(status=status, reviewed_at=reviewed_at)
-        .returning(literal(1).label("reviewed"))
+        .returning(Suggestion.id)
         .execution_options(synchronize_session=False)
         .cte("reviewed_rows")
+    )
+    bounded_reviewed_ids = (
+        select(reviewed_rows.c.id).limit(MAX_BULK_REVIEW).subquery()
     )
     result = db.execute(
         select(
             select(func.count()).select_from(candidates).scalar_subquery().label("matched"),
             select(func.count()).select_from(reviewed_rows).scalar_subquery().label("reviewed"),
+            select(func.array_agg(bounded_reviewed_ids.c.id))
+            .select_from(bounded_reviewed_ids)
+            .scalar_subquery()
+            .label("reviewed_ids"),
         )
     ).one()
-    return result.matched, result.reviewed
+    reviewed_ids = (
+        sorted(result.reviewed_ids or []) if result.reviewed <= MAX_BULK_REVIEW else None
+    )
+    return result.matched, result.reviewed, reviewed_ids
+
+
+def _percent_boundary(percent: int) -> float:
+    """Raw-score boundary equivalent to JavaScript's Math.round(score * 100).
+
+    Scores are non-negative, so Math.round(score * 100) >= P is exactly
+    score >= (P - 0.5) / 100. Comparing the indexed column with that constant
+    preserves index scans and avoids PostgreSQL's different half-rounding rule.
+    """
+
+    return (percent - 0.5) / 100
 
 
 def _queue_conditions(
@@ -103,8 +127,8 @@ def _queue_conditions(
     site_id: int | None = None,
     status: str | None = None,
     method: str | None = None,
-    min_score: float | None = None,
-    max_score: float | None = None,
+    min_percent: int | None = None,
+    max_percent: int | None = None,
 ) -> list:
     """Only the bounds the caller gave. Whether an absent status means "every
     status" or "everything but expired" differs per route, so it is decided there.
@@ -120,10 +144,10 @@ def _queue_conditions(
         conditions.append(Suggestion.status == status)
     if method is not None:
         conditions.append(Suggestion.method == method)
-    if min_score is not None:
-        conditions.append(Suggestion.score >= min_score)
-    if max_score is not None:
-        conditions.append(Suggestion.score < max_score)
+    if min_percent is not None:
+        conditions.append(Suggestion.score >= _percent_boundary(min_percent))
+    if max_percent is not None:
+        conditions.append(Suggestion.score < _percent_boundary(max_percent))
     return conditions
 
 
@@ -166,14 +190,15 @@ def bulk_review_by_filter(
         site_id=payload.site_id,
         status=payload.match_status,
         method=payload.method,
-        min_score=payload.min_score,
-        max_score=payload.max_score,
+        min_percent=payload.threshold_percent if payload.status == "approved" else None,
+        max_percent=payload.threshold_percent if payload.status == "rejected" else None,
     )
-    matched, reviewed = _review_matching_counts(db, conditions, payload.status)
+    matched, reviewed, reviewed_ids = _review_matching_counts(db, conditions, payload.status)
     db.commit()
     return BulkReviewFilterResult(
         reviewed=reviewed,
         skipped=matched - reviewed,
+        reviewed_ids=reviewed_ids,
         status=payload.status,
     )
 
@@ -182,12 +207,12 @@ def bulk_review_by_filter(
 def count_suggestions(
     site_id: int | None = None,
     method: str | None = None,
-    min_score: float | None = Query(None, ge=0, le=1),
-    max_score: float | None = Query(None, ge=0, le=1),
+    min_percent: int | None = Query(None, ge=0, le=100),
+    max_percent: int | None = Query(None, ge=0, le=100),
     db: Session = Depends(get_db),
 ) -> SuggestionCounts:
     conditions = _queue_conditions(
-        site_id=site_id, method=method, min_score=min_score, max_score=max_score
+        site_id=site_id, method=method, min_percent=min_percent, max_percent=max_percent
     )
     rows = db.execute(
         select(Suggestion.status, func.count())
@@ -206,8 +231,8 @@ def list_suggestion_page(
     site_id: int | None = None,
     status: str | None = None,
     method: str | None = None,
-    min_score: float | None = Query(None, ge=0, le=1),
-    max_score: float | None = Query(None, ge=0, le=1),
+    min_percent: int | None = Query(None, ge=0, le=100),
+    max_percent: int | None = Query(None, ge=0, le=100),
     after_score: float | None = Query(None, ge=0, le=1),
     after_id: int | None = Query(None, ge=1),
     include_total: bool = False,
@@ -220,8 +245,8 @@ def list_suggestion_page(
         site_id=site_id,
         status=status,
         method=method,
-        min_score=min_score,
-        max_score=max_score,
+        min_percent=min_percent,
+        max_percent=max_percent,
     )
     if status is None:
         # Render the fixed predicate literally so PostgreSQL can prove that the

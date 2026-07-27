@@ -5,10 +5,33 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
+from app.schemas.publication import PendingPublicationSite
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.publication import publish_approved
 
 router = APIRouter(prefix="/publish", tags=["publish"])
+
+
+@router.get("/pending", response_model=list[PendingPublicationSite])
+def pending_publication_sites(
+    db: Session = Depends(get_db),
+) -> list[PendingPublicationSite]:
+    rows = db.execute(
+        select(
+            Suggestion.site_id,
+            func.count().label("awaiting_publication"),
+        )
+        .where(Suggestion.status == "approved")
+        .group_by(Suggestion.site_id)
+        .order_by(Suggestion.site_id)
+    ).all()
+    return [
+        PendingPublicationSite(
+            site_id=site_id,
+            awaiting_publication=awaiting_publication,
+        )
+        for site_id, awaiting_publication in rows
+    ]
 
 
 @router.post("/{site_id}", status_code=202, response_model=JobAccepted)

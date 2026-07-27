@@ -30,6 +30,7 @@ class SuggestionOut(BaseModel):
 # 'pending' lets an editor undo a decision; 'applied' is set exclusively by the
 # publication worker — contract-level guarantee.
 ReviewStatus = Literal["approved", "rejected", "pending"]
+BulkRuleStatus = Literal["approved", "rejected"]
 
 
 class SuggestionReview(BaseModel):
@@ -84,19 +85,19 @@ class BulkReviewFilter(BaseModel):
     Once the queue is paged, the client can no longer enumerate its own targets, so
     it sends the rule instead — which also keeps a six-figure id list off the wire.
 
-    Bounds mirror the dashboard: `min_score` is inclusive for "approve at or above",
-    `max_score` exclusive for "reject below". Both omitted means every matching row.
+    The wire carries the same whole-percent threshold the editor displays. The
+    backend translates it to the complementary raw-score boundary shared by list,
+    counts, and review queries.
     """
 
-    status: ReviewStatus
+    status: BulkRuleStatus
     # Only reviewable rows can be matched; `applying`/`applied`/`expired` are the
     # worker's and are excluded by the guarded transition regardless.
     match_status: ReviewStatus = "pending"
     site_id: int | None = None
     all_sites: bool = False
     method: str | None = None
-    min_score: float | None = Field(None, ge=0, le=1)
-    max_score: float | None = Field(None, ge=0, le=1)
+    threshold_percent: int = Field(ge=0, le=100)
 
     @model_validator(mode="after")
     def _fleet_scope_must_be_deliberate(self) -> "BulkReviewFilter":
@@ -115,9 +116,9 @@ class BulkReviewFilter(BaseModel):
 
 
 class BulkReviewFilterResult(BaseModel):
-    """Counts rather than ids: a fleet-wide rule can match far more than a client
-    could usefully be handed back."""
+    """Counts for every review, plus ids while an exact undo remains practical."""
 
     reviewed: int
     skipped: int
+    reviewed_ids: list[int] | None
     status: ReviewStatus

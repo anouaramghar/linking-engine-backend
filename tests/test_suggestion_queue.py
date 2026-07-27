@@ -19,12 +19,14 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select, text, update
 
 from app.api.pagination import MAX_PAGE_SIZE
 from app.api.routes.suggestions import _review_matching_counts
 from app.db import SessionLocal
 from app.models import Article, Site, Suggestion
+from app.schemas.suggestion import BulkReviewFilter, MAX_BULK_REVIEW
 
 # The seed data is entirely `baseline_cosine`, so the other method is a free
 # namespace for rows this module owns.
@@ -269,46 +271,101 @@ def test_counts_report_every_status_and_a_total_matching_the_list(
     )
 
 
-def test_counts_respect_the_score_window(client, db, site):
+def test_counts_respect_the_displayed_percent_window(client, db, site):
     pair = _pair(db, site)
     _suggest(db, site, pair, 0.20)
     _suggest(db, site, pair, 0.80)
     _suggest(db, site, pair, 0.90)
     db.commit()
 
-    counts = _get(client, "/api/v1/suggestions/counts", site_id=site.id, min_score=0.8)
+    counts = _get(client, "/api/v1/suggestions/counts", site_id=site.id, min_percent=80)
 
     assert (counts["pending"], counts["total"]) == (2, 2)
 
 
-def test_bulk_rule_approves_the_whole_fleet_at_or_above_the_threshold(
+def test_percent_threshold_partitions_exact_half_boundary(
+    client, db, site
+):
+    pair = _pair(db, site)
+    below = _suggest(db, site, pair, 0.7949)
+    at = _suggest(db, site, pair, 0.795)
+    above = _suggest(db, site, pair, 0.7951)
+    db.commit()
+
+    approve_half = _get(
+        client,
+        "/api/v1/suggestions",
+        site_id=site.id,
+        status="pending",
+        min_percent=80,
+        include_total=True,
+    )
+    reject_half = _get(
+        client,
+        "/api/v1/suggestions",
+        site_id=site.id,
+        status="pending",
+        max_percent=80,
+        include_total=True,
+    )
+    approve_ids = {item["id"] for item in approve_half["items"]}
+    reject_ids = {item["id"] for item in reject_half["items"]}
+
+    assert approve_ids == {at.id, above.id}
+    assert reject_ids == {below.id}
+    assert approve_ids.isdisjoint(reject_ids)
+    assert approve_half["total"] + reject_half["total"] == 3
+
+
+def test_bulk_rule_approves_displayed_threshold_with_reviewed_ids(
     client, db, site, other_site
 ):
     pair, other_pair = _pair(db, site), _pair(db, other_site)
-    below = _suggest(db, site, pair, 0.79)
-    at = _suggest(db, site, pair, 0.80)
-    above = _suggest(db, other_site, other_pair, 0.95)
+    below = _suggest(db, site, pair, 0.7949)
+    at = _suggest(db, site, pair, 0.795)
+    above = _suggest(db, site, pair, 0.80)
+    out_of_scope = _suggest(db, other_site, other_pair, 0.95)
     db.commit()
 
-    body = _rule(client, status="approved", all_sites=True, min_score=0.8).json()
+    body = _rule(
+        client,
+        status="approved",
+        site_id=site.id,
+        threshold_percent=80,
+    ).json()
 
-    assert body == {"reviewed": 2, "skipped": 0, "status": "approved"}
-    # Inclusive at the threshold, and it crossed the site boundary.
+    assert body == {
+        "reviewed": 2,
+        "skipped": 0,
+        "reviewed_ids": sorted([at.id, above.id]),
+        "status": "approved",
+    }
+    # 0.795 displays as 80%, so it belongs in the inclusive half.
     assert _status(db, at.id) == "approved"
     assert _status(db, above.id) == "approved"
     assert _status(db, below.id) == "pending"
+    assert _status(db, out_of_scope.id) == "pending"
 
 
 def test_bulk_rule_rejects_strictly_below_the_same_threshold(client, db, site):
     pair = _pair(db, site)
-    below = _suggest(db, site, pair, 0.79)
-    at = _suggest(db, site, pair, 0.80)
+    below = _suggest(db, site, pair, 0.7949)
+    at = _suggest(db, site, pair, 0.795)
     db.commit()
 
-    body = _rule(client, status="rejected", site_id=site.id, max_score=0.8).json()
+    body = _rule(
+        client,
+        status="rejected",
+        site_id=site.id,
+        threshold_percent=80,
+    ).json()
 
-    assert body["reviewed"] == 1
-    # Exclusive above, inclusive below: one threshold cannot claim the same row twice.
+    assert body == {
+        "reviewed": 1,
+        "skipped": 0,
+        "reviewed_ids": [below.id],
+        "status": "rejected",
+    }
     assert _status(db, below.id) == "rejected"
     assert _status(db, at.id) == "pending"
 
@@ -319,7 +376,12 @@ def test_bulk_rule_can_be_scoped_to_one_site(client, db, site, other_site):
     theirs = _suggest(db, other_site, other_pair, 0.90)
     db.commit()
 
-    body = _rule(client, status="approved", site_id=site.id).json()
+    body = _rule(
+        client,
+        status="approved",
+        site_id=site.id,
+        threshold_percent=80,
+    ).json()
 
     assert body["reviewed"] == 1
     assert _status(db, mine.id) == "approved"
@@ -334,9 +396,19 @@ def test_bulk_rule_default_match_status_is_pending(client, db, site):
     pending = _suggest(db, site, pair, 0.99)
     db.commit()
 
-    body = _rule(client, status="rejected", site_id=site.id, max_score=1.0).json()
+    body = _rule(
+        client,
+        status="rejected",
+        site_id=site.id,
+        threshold_percent=100,
+    ).json()
 
-    assert body == {"reviewed": 1, "skipped": 0, "status": "rejected"}
+    assert body == {
+        "reviewed": 1,
+        "skipped": 0,
+        "reviewed_ids": [pending.id],
+        "status": "rejected",
+    }
     assert _status(db, pending.id) == "rejected"
     for untouched, expected in (
         (applying, "applying"),
@@ -392,7 +464,7 @@ def test_filtered_review_counts_one_snapshot_and_skips_a_concurrent_claim(db, si
             pytest.fail("filtered review did not wait on the publication claim")
 
         claim.commit()
-        matched, reviewed = future.result(timeout=2)
+        matched, reviewed, reviewed_ids = future.result(timeout=2)
     finally:
         claim.rollback()
         claim.close()
@@ -400,22 +472,53 @@ def test_filtered_review_counts_one_snapshot_and_skips_a_concurrent_claim(db, si
         executor.shutdown(wait=True)
 
     assert (matched, reviewed, matched - reviewed) == (2, 1, 1)
+    assert reviewed_ids == [reviewable.id]
     assert _status(db, claimed.id) == "applied"
     assert _status(db, reviewable.id) == "rejected"
 
 
-def test_bulk_rule_can_undo_a_previous_decision(client, db, site):
+def test_small_filtered_review_can_be_undone_by_returned_ids(client, db, site):
     pair = _pair(db, site)
-    approved = _suggest(db, site, pair, 0.90, status="approved")
+    pending = _suggest(db, site, pair, 0.90)
+    db.commit()
+
+    reviewed = _rule(
+        client,
+        status="approved",
+        site_id=site.id,
+        threshold_percent=80,
+    ).json()
+    assert reviewed["reviewed_ids"] == [pending.id]
+
+    undone = client.post(
+        "/api/v1/suggestions/bulk-review",
+        json={"suggestion_ids": reviewed["reviewed_ids"], "status": "pending"},
+    ).json()
+
+    assert undone == {"reviewed": [pending.id], "skipped": [], "status": "pending"}
+    assert _status(db, pending.id) == "pending"
+    assert db.get(Suggestion, pending.id).reviewed_at is None
+
+
+def test_large_filtered_review_returns_counts_without_ids(client, db, site):
+    pair = _pair(db, site)
+    for _ in range(MAX_BULK_REVIEW + 1):
+        _suggest(db, site, pair, 0.90)
     db.commit()
 
     body = _rule(
-        client, status="pending", match_status="approved", site_id=site.id
+        client,
+        status="approved",
+        site_id=site.id,
+        threshold_percent=80,
     ).json()
 
-    assert body["reviewed"] == 1
-    assert _status(db, approved.id) == "pending"
-    assert db.get(Suggestion, approved.id).reviewed_at is None
+    assert body == {
+        "reviewed": MAX_BULK_REVIEW + 1,
+        "skipped": 0,
+        "reviewed_ids": None,
+        "status": "approved",
+    }
 
 
 def test_bulk_rule_matching_nothing_is_not_an_error(client, db, site):
@@ -423,13 +526,28 @@ def test_bulk_rule_matching_nothing_is_not_an_error(client, db, site):
     _suggest(db, site, pair, 0.10)
     db.commit()
 
-    body = _rule(client, status="approved", site_id=site.id, min_score=0.99).json()
+    body = _rule(
+        client,
+        status="approved",
+        site_id=site.id,
+        threshold_percent=100,
+    ).json()
 
-    assert body == {"reviewed": 0, "skipped": 0, "status": "approved"}
+    assert body == {
+        "reviewed": 0,
+        "skipped": 0,
+        "reviewed_ids": [],
+        "status": "approved",
+    }
 
 
 def test_bulk_rule_cannot_set_a_worker_owned_status(client, site):
-    assert _rule(client, status="applied", site_id=site.id).status_code == 422
+    assert _rule(
+        client,
+        status="applied",
+        site_id=site.id,
+        threshold_percent=80,
+    ).status_code == 422
 
 
 def test_fleet_wide_bulk_rule_must_be_asked_for_explicitly(client, db, site):
@@ -443,14 +561,19 @@ def test_fleet_wide_bulk_rule_must_be_asked_for_explicitly(client, db, site):
     untouched = _suggest(db, site, pair, 0.90)
     db.commit()
 
-    resp = _rule(client, status="approved", min_score=0.8)
+    resp = _rule(client, status="approved", threshold_percent=80)
 
     assert resp.status_code == 422
     assert _status(db, untouched.id) == "pending"
-    # And the two scopes cannot be given at once.
-    assert _rule(
-        client, status="approved", site_id=site.id, all_sites=True
-    ).status_code == 422
+    # Validate the contradictory shape without ever issuing an all-sites request
+    # against the shared seeded database.
+    with pytest.raises(ValidationError):
+        BulkReviewFilter(
+            status="approved",
+            threshold_percent=80,
+            site_id=site.id,
+            all_sites=True,
+        )
 
 
 def test_paged_queue_and_bulk_rule_agree_on_the_same_filter(client, db, site):
@@ -465,13 +588,41 @@ def test_paged_queue_and_bulk_rule_agree_on_the_same_filter(client, db, site):
         "/api/v1/suggestions",
         site_id=site.id,
         status="pending",
-        min_score=0.85,
+        min_percent=85,
         include_total=True,
     )
-    reviewed = _rule(client, status="approved", site_id=site.id, min_score=0.85).json()
+    reviewed = _rule(
+        client,
+        status="approved",
+        site_id=site.id,
+        threshold_percent=85,
+    ).json()
 
     assert listed["total"] == reviewed["reviewed"] == 3
     remaining = db.scalars(
         select(Suggestion.status).where(Suggestion.site_id == site.id)
     ).all()
     assert sorted(remaining) == ["approved", "approved", "approved", "pending"]
+
+
+def test_pending_publication_lists_only_sites_with_approved_backlogs(
+    client, db, site, other_site
+):
+    pair, other_pair = _pair(db, site), _pair(db, other_site)
+    _suggest(db, site, pair, 0.90, status="approved")
+    _suggest(db, site, pair, 0.80, status="approved")
+    _suggest(db, site, pair, 0.70, status="applied")
+    _suggest(db, other_site, other_pair, 0.60, status="pending")
+    db.commit()
+
+    pending = client.get("/api/v1/publish/pending").json()
+    owned = {
+        row["site_id"]: row["awaiting_publication"]
+        for row in pending
+        if row["site_id"] in {site.id, other_site.id}
+    }
+
+    assert owned == {site.id: 2}
+    assert client.get(f"/api/v1/publish/{site.id}/status").json()[
+        "awaiting_publication"
+    ] == owned[site.id]
