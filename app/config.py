@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     alert_webhook_url: str = ""
 
     # Embeddings
-    embedding_model: str = "BAAI/bge-m3"
+    embedding_model: str = "BAAI/bge-base-en-v1.5"
     embedding_device: str = "cpu"
 
     # Editorial rules (A4)

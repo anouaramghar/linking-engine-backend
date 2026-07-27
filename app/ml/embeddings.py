@@ -1,4 +1,4 @@
-"""bge-m3 encoding — CPU by default (A7), lazy import so the API runs without the ml extra.
+"""BGE-base encoding — CPU by default (A7), lazy import so the API runs without the ml extra.
 
 Install the heavy stack with: uv sync --extra ml
 """
