@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.api.pagination import MAX_PAGE_SIZE
 from app.models import JobRun, Site
 from app.schemas.job import JobRunOut, JobStatus
 from app.services.job_service import get_job_status
@@ -14,8 +15,8 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 def list_job_runs(
     site_id: int,
     kind: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[JobRun]:
     if db.get(Site, site_id) is None:

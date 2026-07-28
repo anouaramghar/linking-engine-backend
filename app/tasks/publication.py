@@ -11,8 +11,8 @@ check keeps retries idempotent when WordPress succeeded but the commit didn't.
 A suggestion failure does not stop later batch entries; after the loop, any
 failure is re-raised so RQ retries it and terminal failures produce durable alerts.
 Publication never writes internal_links — the applied link is detected at the next
-crawl (A9, ingestion is the single source of truth). Durable per-attempt state is
-recorded through the job-run wrapper (finding 7).
+crawl (A9, ingestion is the single source of truth). Durable accounting spans all
+attempts while retaining latest-attempt failure and skip diagnostics.
 """
 
 import logging
@@ -23,8 +23,15 @@ from sqlalchemy.orm import joinedload
 
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
-from app.models import Article, Site, Suggestion
-from app.services.job_service import record_progress, run_durably
+from app.models import Article, JobRun, Site, Suggestion
+from app.services.publication_progress import (
+    begin_publication_attempt,
+    complete_publication_success,
+    record_publication_applied,
+    record_publication_failure,
+    record_publication_skip,
+)
+from app.services.job_service import record_progress, record_progress_durably, run_durably
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +44,7 @@ def publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
 
 def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
     db = SessionLocal()
+    progress_db = SessionLocal() if job_run_id is not None else None
     try:
         site = db.get(Site, site_id)
         if site is None:
@@ -47,18 +55,13 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
             .where(Suggestion.site_id == site_id, Suggestion.status == "approved")
             .order_by(Suggestion.id)
         ).all()
-        applied = failed = skipped = 0
-        failure_details: list[str] = []
-        total = len(batch)
-        record_progress(
-            db,
-            job_run_id,
-            stage="publishing",
-            applied=applied,
-            failed=failed,
-            skipped=skipped,
-            total=total,
+        run = db.get(JobRun, job_run_id) if job_run_id is not None else None
+        progress = begin_publication_attempt(
+            run.progress if run is not None else None,
+            len(batch),
         )
+        failure_details: list[str] = []
+        record_progress(db, job_run_id, **progress)
         db.commit()  # end the read transaction — each claim below gets its own
 
         for suggestion_id, source_article_id in batch:
@@ -79,7 +82,15 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
                 )
                 if claim.rowcount == 0:  # Rejected, claimed, or inactive (Phase 0, finding 3).
                     db.rollback()
-                    skipped += 1
+                    progress = record_publication_skip(progress)
+                    # The claim rollback also discards same-session progress. Reusing
+                    # one independent session avoids connection churn; committing each
+                    # skip keeps a killed all-skipped attempt fully accounted for.
+                    record_progress_durably(
+                        job_run_id,
+                        session=progress_db,
+                        **progress,
+                    )
                     continue
                 suggestion = db.get(
                     Suggestion,
@@ -93,31 +104,43 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
                 # 'applied' is set exclusively here — lifecycle guarantee
                 suggestion.status = "applied"
                 suggestion.applied_at = datetime.now(timezone.utc)
-                record_progress(
-                    db,
-                    job_run_id,
-                    stage="publishing",
-                    applied=applied + 1,
-                    failed=failed,
-                    skipped=skipped,
-                    total=total,
-                )
+                committed_progress = record_publication_applied(progress)
+                record_progress(db, job_run_id, **committed_progress)
                 db.commit()  # releases the advisory and row locks
                 # counted only after the commit — a failed commit is a 'failed', not an 'applied'
-                applied += 1
+                progress = committed_progress
             except Exception as error:
                 db.rollback()  # claim undone — suggestion is 'approved' again for retry
                 logger.exception("apply_link failed for suggestion %s", suggestion_id)
-                failed += 1
+                progress = record_publication_failure(progress)
                 failure_details.append(
                     f"suggestion {suggestion_id}: {type(error).__name__}: {error}"
                 )
-        if failed:
+                record_progress_durably(
+                    job_run_id,
+                    session=progress_db,
+                    **progress,
+                )
+        if progress["attempt_failed"]:
             # Successful suggestions were committed individually and are skipped on
             # retry. Failed claims rolled back to "approved", so raising lets RQ
             # retry them and emit the exhausted-retry alert if they keep failing.
             details = "; ".join(failure_details[:3])
-            raise RuntimeError(f"{failed} publication suggestion(s) failed: {details}")
-        return {"applied": applied, "failed": failed, "skipped": skipped}
+            raise RuntimeError(
+                f"{progress['attempt_failed']} publication suggestion(s) failed: {details}"
+            )
+        progress = complete_publication_success(progress)
+        record_progress_durably(
+            job_run_id,
+            session=progress_db,
+            **progress,
+        )
+        return {
+            "applied": progress["applied"],
+            "failed": progress["failed"],
+            "skipped": progress["skipped"],
+        }
     finally:
         db.close()
+        if progress_db is not None:
+            progress_db.close()
