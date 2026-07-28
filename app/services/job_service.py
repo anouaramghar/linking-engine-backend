@@ -32,6 +32,20 @@ _QUEUES = {
 }
 _RQ_ACTIVE_STATUSES = {"queued", "started", "deferred", "scheduled"}
 _RQ_TERMINAL_FAILURE_STATUSES = {"failed", "stopped", "canceled"}
+_PUBLIC_JOB_STATUSES = {
+    "queued": "queued",
+    "deferred": "queued",
+    "scheduled": "queued",
+    "started": "running",
+    "running": "running",
+    "finished": "succeeded",
+    "succeeded": "succeeded",
+    "failed": "failed",
+    "stopped": "failed",
+    "canceled": "failed",
+    "cancelled": "failed",
+}
+_UNASSIGNED_QUEUE_ID_GRACE_SECONDS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +77,70 @@ def _still_in_queue(run: JobRun) -> bool:
     return job.get_status() in _RQ_ACTIVE_STATUSES
 
 
+def _mark_run_lost(run: JobRun) -> None:
+    run.status = "failed"
+    run.error = "lost from queue before completion"
+    run.finished_at = datetime.now(timezone.utc)
+    send_alert(
+        f"LinkMesh {run.kind} job lost",
+        {
+            "site_id": run.site_id,
+            "kind": run.kind,
+            "job_run_id": run.id,
+            "attempts": run.attempts,
+            "error": run.error,
+        },
+        kind="job_lost",
+        site_id=run.site_id,
+    )
+
+
+def reconcile_active_job_runs(db: Session, runs: list[JobRun]) -> list[JobRun]:
+    """Keep only active work, failing rows whose RQ job has disappeared.
+
+    A newly inserted row briefly has no queue id while enqueueing happens outside
+    its first transaction, so that narrow window receives a short grace period.
+    If Redis itself is unavailable, retain the durable state instead of falsely
+    declaring every job lost.
+    """
+    now = datetime.now(timezone.utc)
+    active: list[JobRun] = []
+    changed = False
+    for run in runs:
+        enqueued_at = run.enqueued_at
+        if enqueued_at.tzinfo is None:
+            enqueued_at = enqueued_at.replace(tzinfo=timezone.utc)
+        if (
+            run.queue_job_id is None
+            and (now - enqueued_at).total_seconds() < _UNASSIGNED_QUEUE_ID_GRACE_SECONDS
+        ):
+            active.append(run)
+            continue
+        try:
+            still_in_queue = _still_in_queue(run)
+        except Exception:
+            logger.exception(
+                "could not reconcile active job run %s against Redis; preserving durable state",
+                run.id,
+            )
+            active.append(run)
+            continue
+        if still_in_queue:
+            active.append(run)
+            continue
+        # The worker commits the durable terminal state before RQ records its own
+        # terminal state. Refresh after checking RQ so a completion racing this
+        # request is not mislabeled as a lost job from our earlier query snapshot.
+        db.refresh(run)
+        if run.status not in ("queued", "running"):
+            continue
+        _mark_run_lost(run)
+        changed = True
+    if changed:
+        db.commit()
+    return active
+
+
 def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
     """Create the durable run row, then enqueue. Raises DuplicateJobError while an
     active run of this kind exists for the site."""
@@ -75,21 +153,9 @@ def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: i
     ).all()
     for run in active:
         if not _still_in_queue(run):  # finding 7's exact failure: the job disappeared
-            run.status = "failed"
-            run.error = "lost from queue before completion"
-            run.finished_at = datetime.now(timezone.utc)
-            send_alert(
-                f"LinkMesh {run.kind} job lost",
-                {
-                    "site_id": run.site_id,
-                    "kind": run.kind,
-                    "job_run_id": run.id,
-                    "attempts": run.attempts,
-                    "error": run.error,
-                },
-                kind="job_lost",
-                site_id=run.site_id,
-            )
+            db.refresh(run)
+            if run.status in ("queued", "running"):
+                _mark_run_lost(run)
     still_active = [run for run in active if run.status in ("queued", "running")]
     if still_active:
         db.commit()  # keep the reconciliations
@@ -434,8 +500,7 @@ def handle_job_stopped(job: Job, connection) -> None:
 
 
 def get_job_status(job_id: str) -> dict | None:
-    """RQ's live view when the job is still in Redis; the durable job_runs row after
-    Redis has evicted it (Phase 0, finding 7)."""
+    """Return one stable status vocabulary across live RQ and durable DB views."""
     try:
         job = Job.fetch(job_id, connection=redis_conn)
     except NoSuchJobError:
@@ -454,7 +519,10 @@ def get_job_status(job_id: str) -> dict | None:
             }
         finally:
             db.close()
-    status = job.get_status()
+    rq_status = job.get_status()
+    status_value = getattr(rq_status, "value", rq_status)
+    rq_status_name = str(status_value)
+    status = _PUBLIC_JOB_STATUSES.get(rq_status_name, "failed")
     db = SessionLocal()
     try:
         # The live RQ view knows nothing of progress — merge it from the durable row,
@@ -462,10 +530,11 @@ def get_job_status(job_id: str) -> dict | None:
         run = db.scalars(select(JobRun).where(JobRun.queue_job_id == job_id)).first()
         progress = run.progress if run is not None else None
         progress_at = run.progress_at if run is not None else None
+        durable_error = run.error if run is not None else None
         if (
             run is not None
             and run.status == "succeeded"
-            and status in _RQ_TERMINAL_FAILURE_STATUSES
+            and rq_status_name in _RQ_TERMINAL_FAILURE_STATUSES
         ):
             return {
                 "job_id": job_id,
@@ -481,12 +550,12 @@ def get_job_status(job_id: str) -> dict | None:
     error = (
         latest_result.exc_string.strip().splitlines()[-1]
         if latest_result is not None and latest_result.exc_string
-        else None
+        else durable_error
     )
     return {
         "job_id": job_id,
         "status": status,
-        "result": job.return_value() if status == "finished" else None,
+        "result": job.return_value() if status == "succeeded" else None,
         "progress": progress,
         "progress_at": progress_at,
         "error": error,

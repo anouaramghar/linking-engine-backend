@@ -2,7 +2,7 @@
 lost-job reconciliation, durable status after Redis eviction. Real Redis + PostgreSQL;
 nothing listens on the per-stage queues during tests, so enqueued jobs never execute."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -790,9 +790,53 @@ def test_job_status_reports_progress_while_job_is_live_in_redis(client, db, site
     db.commit()
 
     body = client.get(f"/api/v1/jobs/{accepted['job_id']}").json()
-    assert body["status"] == "queued"  # live RQ vocabulary — the job was never drained
+    # A developer worker may pick the job up between enqueue and this request.
+    assert body["status"] in {"queued", "running"}
     assert body["progress"] == {"stage": "crawling", "articles": 150}
     assert body["progress_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("rq_status", "public_status"),
+    [
+        ("queued", "queued"),
+        ("deferred", "queued"),
+        ("scheduled", "queued"),
+        ("started", "running"),
+        ("finished", "succeeded"),
+        ("failed", "failed"),
+        ("stopped", "failed"),
+        ("canceled", "failed"),
+    ],
+)
+def test_live_rq_status_uses_stable_public_vocabulary(
+    client, db, site, monkeypatch, rq_status, public_status
+):
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="queued",
+        queue_job_id=f"normalize-{rq_status}",
+    )
+    db.add(run)
+    db.commit()
+    live_job = SimpleNamespace(
+        get_status=lambda: rq_status,
+        latest_result=lambda: None,
+        return_value=lambda: {"suggestions_created": 2},
+    )
+    monkeypatch.setattr(
+        job_service.Job,
+        "fetch",
+        staticmethod(lambda _job_id, connection: live_job),
+    )
+
+    body = client.get(f"/api/v1/jobs/{run.queue_job_id}").json()
+
+    assert body["status"] == public_status
+    assert body["result"] == (
+        {"suggestions_created": 2} if public_status == "succeeded" else None
+    )
 
 
 @pytest.mark.parametrize("rq_status", ["failed", "stopped", "canceled"])
@@ -880,6 +924,79 @@ def test_list_job_runs_per_site(client, db, site):
     only_analysis = client.get(f"/api/v1/jobs/site/{site.id}", params={"kind": "analysis"}).json()
     assert [r["kind"] for r in only_analysis] == ["analysis"]
     assert only_analysis[0]["error"] == "x"
+
+
+def test_list_active_job_runs_excludes_terminal_work(client, db, site):
+    queued = JobRun(site_id=site.id, kind="ingestion", status="queued")
+    running = JobRun(site_id=site.id, kind="analysis", status="running")
+    succeeded = JobRun(site_id=site.id, kind="publication", status="succeeded")
+    failed = JobRun(site_id=site.id, kind="analysis", status="failed")
+    db.add_all([queued, running, succeeded, failed])
+    db.commit()
+
+    response = client.get("/api/v1/jobs/active")
+
+    assert response.status_code == 200, response.text
+    active = response.json()
+    assert {item["id"] for item in active} == {queued.id, running.id}
+    assert {item["status"] for item in active} == {"queued", "running"}
+
+
+def test_list_active_job_runs_reconciles_stale_unqueued_work(
+    client, db, site, monkeypatch
+):
+    stale = JobRun(
+        site_id=site.id,
+        kind="ingestion",
+        status="queued",
+        enqueued_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    db.add(stale)
+    db.commit()
+    monkeypatch.setattr(job_service, "send_alert", lambda *_args, **_kwargs: None)
+
+    response = client.get("/api/v1/jobs/active")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+    db.refresh(stale)
+    assert stale.status == "failed"
+    assert stale.error == "lost from queue before completion"
+    assert stale.finished_at is not None
+
+
+def test_list_active_job_runs_preserves_state_when_redis_is_unavailable(
+    client, db, site, monkeypatch
+):
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="running",
+        queue_job_id="redis-unavailable",
+        enqueued_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    db.add(run)
+    db.commit()
+
+    def redis_unavailable(_run):
+        raise ConnectionError("redis unavailable")
+
+    monkeypatch.setattr(job_service, "_still_in_queue", redis_unavailable)
+
+    response = client.get("/api/v1/jobs/active")
+
+    assert response.status_code == 200, response.text
+    assert [item["id"] for item in response.json()] == [run.id]
+    db.refresh(run)
+    assert run.status == "running"
+    assert run.error is None
+
+
+@pytest.mark.parametrize("limit", [0, 1001])
+def test_list_active_job_runs_validates_limit(client, limit):
+    response = client.get(f"/api/v1/jobs/active?limit={limit}")
+
+    assert response.status_code == 422
 
 
 def test_job_run_out_serializes_progress(db, site):

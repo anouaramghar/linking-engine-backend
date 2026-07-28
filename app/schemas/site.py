@@ -97,6 +97,9 @@ class SiteOut(BaseModel):
     crawl_frequency: str
     created_at: datetime
     last_ingestion_status: str | None = None
+    article_count: int = 0
+    internal_link_count: int = 0
+    last_crawl_at: datetime | None = None
 
 
 class ArticleBrief(BaseModel):

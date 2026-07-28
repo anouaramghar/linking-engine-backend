@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
-from sqlalchemy import exists, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
-from app.models import Article, InternalLink, Site
+from app.models import Article, IngestionRun, InternalLink, Site
 from app.schemas.site import (
     ArticleOut,
     SiteBulkCreated,
@@ -36,6 +36,54 @@ def _first_error(exc: ValidationError) -> str:
     message = error["msg"].removeprefix("Value error, ")
     location = ".".join(str(part) for part in error["loc"])
     return f"{location}: {message}" if location else message
+
+
+def _site_counts(
+    db: Session,
+    site_ids: list[int],
+) -> tuple[dict[int, int], dict[int, int]]:
+    if not site_ids:
+        return {}, {}
+
+    article_counts = dict(
+        db.execute(
+            select(Article.site_id, func.count(Article.id))
+            .where(
+                Article.site_id.in_(site_ids),
+                Article.is_active.is_(True),
+            )
+            .group_by(Article.site_id)
+        ).all()
+    )
+    internal_link_counts = dict(
+        db.execute(
+            select(Article.site_id, func.count(InternalLink.id))
+            .join(InternalLink, InternalLink.source_article_id == Article.id)
+            .where(
+                Article.site_id.in_(site_ids),
+                Article.is_active.is_(True),
+                InternalLink.is_active.is_(True),
+            )
+            .group_by(Article.site_id)
+        ).all()
+    )
+    return article_counts, internal_link_counts
+
+
+def _site_out(
+    site: Site,
+    *,
+    article_count: int,
+    internal_link_count: int,
+    run: IngestionRun | None,
+) -> SiteOut:
+    item = SiteOut.model_validate(site)
+    item.article_count = article_count
+    item.internal_link_count = internal_link_count
+    if run is not None:
+        item.last_ingestion_status = run.status
+        item.last_crawl_at = run.finished_at or run.started_at
+    return item
 
 
 @router.post("", status_code=201, response_model=SiteOut)
@@ -115,22 +163,32 @@ def list_sites(
     db: Session = Depends(get_db),
 ) -> list[SiteOut]:
     sites = db.scalars(select(Site).order_by(Site.id).limit(limit).offset(offset)).all()
+    article_counts, internal_link_counts = _site_counts(db, [site.id for site in sites])
     out = []
     for site in sites:
-        item = SiteOut.model_validate(site)
         run = latest_run(db, site.id)
-        item.last_ingestion_status = run.status if run else None
-        out.append(item)
+        out.append(
+            _site_out(
+                site,
+                article_count=article_counts.get(site.id, 0),
+                internal_link_count=internal_link_counts.get(site.id, 0),
+                run=run,
+            )
+        )
     return out
 
 
 @router.get("/{site_id}", response_model=SiteOut)
 def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
     site = _get_site_or_404(db, site_id)
-    item = SiteOut.model_validate(site)
+    article_counts, internal_link_counts = _site_counts(db, [site.id])
     run = latest_run(db, site.id)
-    item.last_ingestion_status = run.status if run else None
-    return item
+    return _site_out(
+        site,
+        article_count=article_counts.get(site.id, 0),
+        internal_link_count=internal_link_counts.get(site.id, 0),
+        run=run,
+    )
 
 
 @router.delete("/{site_id}", status_code=204)
