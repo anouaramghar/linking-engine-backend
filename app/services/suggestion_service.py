@@ -156,6 +156,15 @@ def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[tupl
     return top_candidates(db, article_id, model, remaining)
 
 
+def _evenly_spaced_ids(article_ids: list[int], maximum: int) -> set[int]:
+    selected_count = min(maximum, len(article_ids))
+    if not selected_count:
+        return set()
+    return {
+        article_ids[index * len(article_ids) // selected_count] for index in range(selected_count)
+    }
+
+
 def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
@@ -182,11 +191,18 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                     )
 
             article_ids = db.scalars(
-                select(Article.id).where(
+                select(Article.id)
+                .where(
                     Article.site_id == site_id,
                     Article.is_active.is_(True),
                 )
+                .order_by(Article.id)
             ).all()
+            shadow_source_ids = (
+                _evenly_spaced_ids(article_ids, settings.v1_shadow_max_sources)
+                if ranking_mode == "shadow"
+                else set()
+            )
             existing_counts = dict(
                 db.execute(
                     select(Suggestion.source_article_id, func.count())
@@ -210,12 +226,15 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                 remaining = settings.max_suggestions_per_article - existing_counts.get(
                     article_id, 0
                 )
-                if remaining <= 0:
+                has_capacity = remaining > 0
+                shadow_selected = ranking_mode == "shadow" and article_id in shadow_source_ids
+                if not has_capacity and not shadow_selected:
                     continue
-                eligible_sources += 1
+                if has_capacity:
+                    eligible_sources += 1
                 method = "baseline_cosine"
                 candidate_rows: list[tuple[int, float]]
-                if ranking_mode == "baseline":
+                if ranking_mode == "baseline" or (ranking_mode == "shadow" and not shadow_selected):
                     candidate_rows = _baseline_rows(
                         db,
                         article_id,
@@ -224,19 +243,26 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                     )
                 elif hybrid_ranker is None:
                     fallback_sources += 1
-                    candidate_rows = _baseline_rows(
-                        db,
-                        article_id,
-                        model,
-                        remaining,
+                    candidate_rows = (
+                        _baseline_rows(
+                            db,
+                            article_id,
+                            model,
+                            remaining,
+                        )
+                        if has_capacity
+                        else []
                     )
                 else:
                     try:
+                        ranking_limit = (
+                            settings.max_suggestions_per_article if shadow_selected else remaining
+                        )
                         ranking = hybrid_ranker.rank(
                             db,
                             source_id=article_id,
                             model=model,
-                            limit=remaining,
+                            limit=ranking_limit,
                         )
                         hybrid_sources += 1
                         dense_candidates_total += ranking.dense_count
@@ -252,19 +278,22 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                         else:
                             baseline_rows = [
                                 (candidate.target_id, candidate.semantic_score)
-                                for candidate in ranking.baseline_candidates[:remaining]
+                                for candidate in ranking.baseline_candidates[:ranking_limit]
                             ]
                             baseline_ids = [target_id for target_id, _score in baseline_rows]
                             hybrid_ids = [target_id for target_id, _score in hybrid_rows]
                             denominator = max(
                                 1,
-                                min(remaining, len(set(baseline_ids) | set(hybrid_ids))),
+                                min(
+                                    ranking_limit,
+                                    len(set(baseline_ids) | set(hybrid_ids)),
+                                ),
                             )
                             shadow_overlap_total += (
                                 len(set(baseline_ids) & set(hybrid_ids)) / denominator
                             )
                             shadow_exact_matches += baseline_ids == hybrid_ids
-                            candidate_rows = baseline_rows
+                            candidate_rows = baseline_rows[:remaining] if has_capacity else []
                     except Exception:
                         fallback_sources += 1
                         logger.exception(
@@ -272,11 +301,15 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                             site_id,
                             article_id,
                         )
-                        candidate_rows = _baseline_rows(
-                            db,
-                            article_id,
-                            model,
-                            remaining,
+                        candidate_rows = (
+                            _baseline_rows(
+                                db,
+                                article_id,
+                                model,
+                                remaining,
+                            )
+                            if has_capacity
+                            else []
                         )
 
                 for target_id, score in candidate_rows:
@@ -310,6 +343,7 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                         "ranking_mode": ranking_mode,
                         "hybrid_ranker_loaded": not hybrid_load_failed,
                         "eligible_sources": eligible_sources,
+                        "shadow_sources_selected": len(shadow_source_ids),
                         "hybrid_sources_evaluated": hybrid_sources,
                         "hybrid_fallback_sources": fallback_sources,
                         "mean_dense_candidates": (

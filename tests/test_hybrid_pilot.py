@@ -180,6 +180,45 @@ def test_shadow_site_persists_baseline_and_reports_overlap(db, site, monkeypatch
     assert result["shadow_exact_order_rate"] == 0.0
 
 
+def test_shadow_sample_runs_when_existing_queue_fills_the_quota(db, site, monkeypatch):
+    _make_articles(db, site)
+    monkeypatch.setattr(settings, "max_suggestions_per_article", 1)
+    baseline = generate_suggestions(site.id)
+    assert baseline["suggestions_created"] == 3
+
+    monkeypatch.setattr(settings, "v1_shadow_site_ids", frozenset({site.id}))
+    monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset())
+    monkeypatch.setattr(settings, "v1_shadow_max_sources", 2)
+    calls = []
+
+    class FakeRanker:
+        def rank(self, _db, *, source_id, model, limit):
+            del model
+            calls.append((source_id, limit))
+            candidate = RankedCandidate(target_id=source_id, semantic_score=1.0)
+            return HybridRanking(
+                candidates=(candidate,),
+                baseline_candidates=(candidate,),
+                dense_count=2,
+                lexical_count=2,
+                union_count=2,
+            )
+
+    monkeypatch.setattr(
+        "app.services.suggestion_service.HybridRanker.load",
+        lambda *_args, **_kwargs: FakeRanker(),
+    )
+
+    result = generate_suggestions(site.id)
+
+    assert result["suggestions_created"] == 0
+    assert result["eligible_sources"] == 0
+    assert result["shadow_sources_selected"] == 2
+    assert result["hybrid_sources_evaluated"] == 2
+    assert len(calls) == 2
+    assert {limit for _source_id, limit in calls} == {1}
+
+
 def test_pilot_initialization_failure_falls_back_to_baseline(db, site, monkeypatch):
     _make_articles(db, site)
     monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset({site.id}))

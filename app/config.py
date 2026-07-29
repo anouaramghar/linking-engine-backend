@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # for example V1_SHADOW_SITE_IDS='[12, 34]'.
     v1_shadow_site_ids: frozenset[int] = frozenset()
     v1_pilot_site_ids: frozenset[int] = frozenset()
+    v1_shadow_max_sources: int = Field(default=100, gt=0)
 
     # Reject suspiciously incomplete crawls before they can replace a healthy snapshot.
     ingestion_min_previous_ratio: float = Field(default=0.5, ge=0.0, le=1.0)

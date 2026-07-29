@@ -33,6 +33,7 @@ Both settings are JSON arrays of explicit site IDs and default to `[]`:
 ```dotenv
 V1_SHADOW_SITE_IDS=[12]
 V1_PILOT_SITE_IDS=[]
+V1_SHADOW_MAX_SOURCES=100
 ```
 
 A site cannot appear in both settings; startup validation rejects overlapping
@@ -54,7 +55,10 @@ The analysis job result records:
 - mean top-five overlap;
 - exact-order agreement rate.
 
-Shadow errors never replace or interrupt the baseline output.
+Shadow errors never replace or interrupt the baseline output. The comparison uses
+a deterministic evenly spaced sample, bounded by `V1_SHADOW_MAX_SOURCES`, and still
+runs when existing suggestions already fill the source quota. Sources outside that
+sample keep the normal baseline path.
 
 ### Pilot
 
