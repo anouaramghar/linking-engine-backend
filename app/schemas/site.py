@@ -1,0 +1,134 @@
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.config import settings
+from app.connectors.url_guard import UnsafeURLError, validate_url
+
+MAX_BULK_SITES = 1000
+
+
+class SiteCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    base_url: str = Field(min_length=1, max_length=2048)
+    platform: Literal["wordpress", "html"]
+    wp_username: str | None = Field(default=None, max_length=255)
+    wp_app_password: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def safe_base_url(self) -> "SiteCreate":
+        if bool(self.wp_username) != bool(self.wp_app_password):
+            raise ValueError("wp_username and wp_app_password must be provided together")
+        allow = settings.allow_unsafe_crawl_targets
+        try:
+            validate_url(
+                self.base_url,
+                allow_private=allow,
+                require_https=bool(self.wp_username or self.wp_app_password) and not allow,
+                resolve_dns=False,  # the pinned crawl transport resolves hostnames at connect time
+            )
+        except UnsafeURLError as e:
+            raise ValueError(str(e)) from e
+        self.base_url = self.base_url.rstrip("/")
+        return self
+
+
+class SiteBulkRow(BaseModel):
+    """One inbound row of a bulk import.
+
+    Deliberately lenient: every field is optional and untyped beyond `str` so that a
+    malformed row is reported against its own row number instead of rejecting the whole
+    upload with a 422. Each row is re-validated through `SiteCreate` in the route.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = None
+    base_url: str | None = None
+    platform: str | None = None
+    wp_username: str | None = None
+    wp_app_password: str | None = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def blank_to_none(cls, value: object) -> object:
+        # CSV cells arrive as "" rather than absent; treat them as unset.
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("platform", mode="after")
+    @classmethod
+    def normalize_platform(cls, value: str | None) -> str | None:
+        return value.lower() if value else value
+
+
+class SiteBulkRequest(BaseModel):
+    sites: list[SiteBulkRow] = Field(min_length=1, max_length=MAX_BULK_SITES)
+
+
+class SiteBulkCreated(BaseModel):
+    row: int  # 1-based index into the submitted list, not the CSV line number
+    id: int
+    name: str
+    base_url: str
+
+
+class SiteBulkFailure(BaseModel):
+    row: int
+    base_url: str | None
+    reason: str
+
+
+class SiteBulkResult(BaseModel):
+    created: list[SiteBulkCreated]
+    skipped: list[SiteBulkFailure]  # already present, or duplicated within the upload
+    rejected: list[SiteBulkFailure]  # failed validation, including the SSRF guard
+
+
+class SiteOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    base_url: str
+    platform: str
+    crawl_frequency: str
+    created_at: datetime
+    last_ingestion_status: str | None = None
+    article_count: int = 0
+    internal_link_count: int = 0
+    last_crawl_at: datetime | None = None
+
+
+class ArticleBrief(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    url: str
+
+
+class ArticleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    external_id: str | None
+    url: str
+    title: str
+    language: str | None
+    published_at: datetime | None
+
+
+class IngestionRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    site_id: int
+    status: str
+    articles_upserted: int
+    links_found: int
+    error: str | None
+    started_at: datetime
+    finished_at: datetime | None
