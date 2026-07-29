@@ -111,7 +111,9 @@ def test_hybrid_ranker_uses_bm25_for_final_order(monkeypatch):
 
 def test_pilot_site_persists_hybrid_method(db, site, monkeypatch):
     source, target, _other = _make_articles(db, site)
-    monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset({site.id}))
+    site.suggestion_mode = "experimental"
+    db.commit()
+    monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset())
     monkeypatch.setattr(settings, "v1_shadow_site_ids", frozenset())
 
     class FakeRanker:
@@ -140,6 +142,48 @@ def test_pilot_site_persists_hybrid_method(db, site, monkeypatch):
     assert result["ranking_mode"] == "pilot"
     assert result["hybrid_fallback_sources"] == 0
     assert result["mean_union_candidates"] == 3.0
+
+
+def test_explicit_comparison_never_persists_suggestions(db, site, monkeypatch):
+    source, target, other = _make_articles(db, site)
+    calls = []
+
+    class FakeRanker:
+        def rank(self, _db, *, source_id, model, limit):
+            del model, limit
+            calls.append(source_id)
+            available = [
+                article.id for article in (source, target, other) if article.id != source_id
+            ]
+            baseline = tuple(
+                RankedCandidate(target_id=target_id, semantic_score=0.8 - index * 0.1)
+                for index, target_id in enumerate(available)
+            )
+            return HybridRanking(
+                candidates=tuple(reversed(baseline)),
+                baseline_candidates=baseline,
+                dense_count=2,
+                lexical_count=2,
+                union_count=2,
+            )
+
+    monkeypatch.setattr(
+        "app.services.suggestion_service.HybridRanker.load",
+        lambda *_args, **_kwargs: FakeRanker(),
+    )
+
+    result = generate_suggestions(
+        site.id,
+        ranking_mode_override="shadow",
+        comparison_only=True,
+    )
+
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    assert suggestions == []
+    assert len(calls) == 3
+    assert result["ranking_mode"] == "shadow"
+    assert result["comparison_only"] is True
+    assert result["suggestions_created"] == 0
 
 
 def test_shadow_site_persists_baseline_and_reports_overlap(db, site, monkeypatch):

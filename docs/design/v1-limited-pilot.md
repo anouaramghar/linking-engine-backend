@@ -39,6 +39,15 @@ V1_SHADOW_MAX_SOURCES=100
 A site cannot appear in both settings; startup validation rejects overlapping
 configuration.
 
+Each site also stores a durable suggestion method:
+
+- `standard` uses the cosine baseline;
+- `experimental` uses the hybrid pilot.
+
+New and migrated sites default to `standard`. The environment lists remain the
+operator override: a site in either list is shown as server-managed and its method
+cannot be changed through the API or dashboard until the override is removed.
+
 ### Baseline
 
 Sites absent from both lists keep the existing cosine generation path and the
@@ -71,14 +80,27 @@ If index construction or one source ranking fails, the worker logs the error and
 creates that source's suggestions with the current cosine path. The job result
 reports the fallback count.
 
+### Explicit comparison
+
+`POST /suggestions/{site_id}/compare` queues the same bounded shadow calculation
+without persisting either method's suggestions. It runs even when the site's active
+queue is full and reports the comparison in the durable analysis job result with
+`comparison_only: true`.
+
+The normal site generation endpoint reads the site's saved method. Both endpoints
+share the existing per-site analysis job guard, so generation and comparison cannot
+run concurrently for the same site.
+
 ## Deployment order
 
-1. Deploy backend and frontend with both site lists empty.
+1. Deploy the migration, backend, and frontend with both site lists empty. Every site
+   starts on its existing or default `standard` method.
 2. Start the API and worker and verify health.
-3. Add one low-risk site to `V1_SHADOW_SITE_IDS`.
-4. Run analysis and review the durable job result and latency.
-5. Remove the site from shadow, add it to `V1_PILOT_SITE_IDS`, and restart the
-   worker.
+3. Use **Compare methods** on one low-risk site and review the durable job result
+   and latency.
+4. Set that site's suggestion method to **Experimental** in the dashboard, or use
+   `V1_PILOT_SITE_IDS` when the rollout must remain deployment-managed.
+5. Restart the worker only when an environment override changed.
 6. Trigger analysis only after confirming the site's current active suggestion
    quota has room for new candidates.
 7. Add a second low-risk site only after the first site's reliability is stable.
@@ -109,8 +131,9 @@ agreed numerical thresholds before enabling the second site.
 
 ## Rollback
 
-1. Remove the site ID from `V1_PILOT_SITE_IDS`.
-2. Restart the analysis worker.
+1. Set the site's suggestion method back to **Standard**. If it is server-managed,
+   remove its ID from `V1_PILOT_SITE_IDS`.
+2. Restart the analysis worker only when the environment override changed.
 3. Do not trigger another pilot analysis.
 4. Inspect pending and approved `hybrid_bm25` suggestions separately.
 5. Expire pending pilot rows only through a reviewed, site-specific operation.
@@ -122,10 +145,16 @@ choice.
 
 ## Dashboard behavior
 
-The queue requests all active suggestion methods so baseline and pilot rows are
-both visible during the mixed-version pilot. Cards label pilot rows as
-`hybrid BM25`. The displayed percentage is labelled semantic similarity in the
-preview; it is not presented as calibrated BM25 confidence.
+The Sites page has one **Generate suggestions** action. A visible badge identifies
+the saved **Standard** or **Experimental** method, and **Suggestion method…** changes
+future generation without replacing existing suggestions or editorial decisions.
+When the five-per-source quota has no open positions, generation is disabled with a
+queue-full explanation while **Compare methods** remains available.
+
+The queue requests all active suggestion methods so baseline and pilot rows are both
+visible during the mixed-version pilot. Cards label pilot rows as `hybrid BM25`. The
+displayed percentage is labelled semantic similarity in the preview; it is not
+presented as calibrated BM25 confidence.
 
 ## Known limitations
 

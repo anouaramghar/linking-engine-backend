@@ -10,7 +10,7 @@ from sqlalchemy import and_, func, select, update
 
 from app.config import settings
 from app.db import SessionLocal, engine
-from app.models import Article, Embedding, Suggestion
+from app.models import Article, Embedding, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
 from app.ml.hybrid import HybridRanker
@@ -144,12 +144,20 @@ def _validate_embedding_dimension(model: str) -> None:
         )
 
 
-def _ranking_mode(site_id: int) -> str:
+def _ranking_mode(
+    site_id: int,
+    configured_mode: str,
+    ranking_mode_override: str | None = None,
+) -> str:
+    if ranking_mode_override is not None:
+        if ranking_mode_override not in {"baseline", "shadow", "pilot"}:
+            raise ValueError(f"unsupported ranking mode override: {ranking_mode_override}")
+        return ranking_mode_override
     if site_id in settings.v1_pilot_site_ids:
         return "pilot"
     if site_id in settings.v1_shadow_site_ids:
         return "shadow"
-    return "baseline"
+    return "pilot" if configured_mode == "experimental" else "baseline"
 
 
 def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[tuple[int, float]]:
@@ -165,15 +173,30 @@ def _evenly_spaced_ids(article_ids: list[int], maximum: int) -> set[int]:
     }
 
 
-def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
+def generate_suggestions(
+    site_id: int,
+    job_run_id: int | None = None,
+    *,
+    ranking_mode_override: str | None = None,
+    comparison_only: bool = False,
+) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
         db = SessionLocal()
         try:
+            site = db.get(Site, site_id)
+            if site is None:
+                raise ValueError(f"site {site_id} not found")
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
-            ranking_mode = _ranking_mode(site_id)
+            ranking_mode = _ranking_mode(
+                site_id,
+                site.suggestion_mode,
+                ranking_mode_override,
+            )
+            if comparison_only and ranking_mode != "shadow":
+                raise ValueError("comparison-only analysis requires shadow ranking")
             hybrid_ranker = None
             hybrid_load_failed = False
             if ranking_mode != "baseline":
@@ -228,6 +251,8 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                 )
                 has_capacity = remaining > 0
                 shadow_selected = ranking_mode == "shadow" and article_id in shadow_source_ids
+                if comparison_only and not shadow_selected:
+                    continue
                 if not has_capacity and not shadow_selected:
                     continue
                 if has_capacity:
@@ -312,6 +337,8 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                             else []
                         )
 
+                if comparison_only:
+                    candidate_rows = []
                 for target_id, score in candidate_rows:
                     db.add(
                         Suggestion(
@@ -341,6 +368,7 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                 result.update(
                     {
                         "ranking_mode": ranking_mode,
+                        "comparison_only": comparison_only,
                         "hybrid_ranker_loaded": not hybrid_load_failed,
                         "eligible_sources": eligible_sources,
                         "shadow_sources_selected": len(shadow_source_ids),

@@ -21,7 +21,7 @@ from app.schemas.suggestion import (
     SuggestionReview,
 )
 from app.services.job_service import DuplicateJobError, enqueue_job
-from app.tasks.analysis import analyze_site
+from app.tasks.analysis import analyze_site, compare_site
 
 router = APIRouter(tags=["suggestions"])
 
@@ -300,6 +300,17 @@ def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted
         raise HTTPException(404, f"site {site_id} not found")
     try:
         run = enqueue_job(db, site_id, "analysis", analyze_site, job_timeout=7200)
+    except DuplicateJobError as e:
+        raise HTTPException(409, str(e)) from e
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
+
+
+@router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)
+def trigger_analysis_comparison(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
+    if db.get(Site, site_id) is None:
+        raise HTTPException(404, f"site {site_id} not found")
+    try:
+        run = enqueue_job(db, site_id, "analysis", compare_site, job_timeout=7200)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)

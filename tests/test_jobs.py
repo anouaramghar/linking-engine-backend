@@ -54,6 +54,19 @@ def test_trigger_creates_durable_run(client, db, site, cleanup_rq):
     assert Job.fetch(body["job_id"], connection=redis_conn).origin == "ingestion"
 
 
+def test_comparison_trigger_queues_shadow_comparison_task(client, db, site, cleanup_rq):
+    response = client.post(f"/api/v1/suggestions/{site.id}/compare")
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    cleanup_rq.append(body["job_id"])
+    run = db.get(JobRun, body["job_run_id"])
+    job = Job.fetch(body["job_id"], connection=redis_conn)
+    assert run.kind == "analysis"
+    assert job.origin == "analysis"
+    assert job.func_name == "app.tasks.analysis.compare_site"
+
+
 def test_job_run_is_committed_before_enqueue(db, site, monkeypatch):
     observed = {}
 
