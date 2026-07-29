@@ -134,3 +134,23 @@ preview; it is not presented as calibrated BM25 confidence.
 - The stored score is semantic similarity, while BM25 determines pilot selection.
 - Hybrid rows already in the queue remain visible after the site flag is removed
   until an explicit lifecycle action handles them.
+
+## Local shadow dry run — 29 July 2026
+
+WordPress News site `2469` was evaluated with temporary process-only shadow
+configuration after the implementation tests passed. Its existing queue already
+filled every source quota, so the run also exercised the full-queue path.
+
+- shadow sources selected/evaluated: 100 / 100;
+- eligible sources with free quota: 0;
+- suggestions created: 0;
+- hybrid fallbacks: 0;
+- mean dense candidates: 99.99;
+- mean lexical candidates: 100.00;
+- mean union candidates: 147.69;
+- mean top-five baseline/hybrid overlap: 20.8%;
+- exact top-five order agreement: 0%;
+- elapsed time, including model initialization and index construction: 14.015s.
+
+The site flag was not saved. The normal worker was restored after the temporary
+container exited.
