@@ -6,7 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
 
-EMBEDDING_DIM = 1024  # Storage contract (Phase 0, finding 4).
+EMBEDDING_DIM = 768  # BGE-base storage contract.
 
 TaxonomyKind = Enum("category", "tag", name="taxonomy_kind", native_enum=False, length=20)
 

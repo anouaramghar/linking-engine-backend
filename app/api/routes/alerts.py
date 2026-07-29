@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.api.pagination import MAX_PAGE_SIZE
 from app.models import Alert
 from app.schemas.alert import AlertOut
 
@@ -15,7 +16,7 @@ router = APIRouter(prefix="/alerts", tags=["alerts"])
 def list_alerts(
     site_id: int | None = None,
     unacknowledged: bool | None = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = 0,
     db: Session = Depends(get_db),
 ) -> list[Alert]:

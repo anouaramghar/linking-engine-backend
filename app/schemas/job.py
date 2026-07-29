@@ -1,6 +1,9 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
+
+JobStatusValue = Literal["queued", "running", "succeeded", "failed"]
 
 
 class JobAccepted(BaseModel):
@@ -10,9 +13,8 @@ class JobAccepted(BaseModel):
 
 class JobStatus(BaseModel):
     job_id: str
-    # RQ vocabulary while the job lives in Redis (queued | started | finished | failed),
-    # job_runs vocabulary once evicted (queued | running | succeeded | failed)
-    status: str
+    # Stable API vocabulary, independent of whether Redis still has the RQ job.
+    status: JobStatusValue
     result: dict | None = None
     progress: dict | None = None
     progress_at: datetime | None = None
@@ -25,7 +27,7 @@ class JobRunOut(BaseModel):
     id: int
     site_id: int
     kind: str
-    status: str
+    status: JobStatusValue
     queue_job_id: str | None
     attempts: int
     result: dict | None
