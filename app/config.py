@@ -29,6 +29,10 @@ class Settings(BaseSettings):
 
     # Editorial rules (A4)
     max_suggestions_per_article: int = 5
+    # V1 rollout is site-scoped and off by default. Environment values use JSON,
+    # for example V1_SHADOW_SITE_IDS='[12, 34]'.
+    v1_shadow_site_ids: frozenset[int] = frozenset()
+    v1_pilot_site_ids: frozenset[int] = frozenset()
 
     # Reject suspiciously incomplete crawls before they can replace a healthy snapshot.
     ingestion_min_previous_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -48,6 +52,16 @@ class Settings(BaseSettings):
     def forbid_unsafe_crawl_targets_outside_development(self) -> Self:
         if self.environment != "development" and self.allow_unsafe_crawl_targets:
             raise ValueError("ALLOW_UNSAFE_CRAWL_TARGETS is development-only")
+        return self
+
+    @model_validator(mode="after")
+    def keep_v1_site_scopes_disjoint(self) -> Self:
+        overlap = self.v1_shadow_site_ids & self.v1_pilot_site_ids
+        if overlap:
+            raise ValueError(
+                "V1_SHADOW_SITE_IDS and V1_PILOT_SITE_IDS overlap: "
+                + ", ".join(str(site_id) for site_id in sorted(overlap))
+            )
         return self
 
 

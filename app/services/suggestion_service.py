@@ -2,6 +2,7 @@
 (sequence 4.2)."""
 
 import hashlib
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -12,12 +13,14 @@ from app.db import SessionLocal, engine
 from app.models import Article, Embedding, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
+from app.ml.hybrid import HybridRanker
 from app.services.job_service import record_progress
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
 _ANALYSIS_LOCK_NAMESPACE = 0x4C4D
 _DIMENSION_PROBE_INPUT = "LinkMesh dimension probe"
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -141,6 +144,18 @@ def _validate_embedding_dimension(model: str) -> None:
         )
 
 
+def _ranking_mode(site_id: int) -> str:
+    if site_id in settings.v1_pilot_site_ids:
+        return "pilot"
+    if site_id in settings.v1_shadow_site_ids:
+        return "shadow"
+    return "baseline"
+
+
+def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[tuple[int, float]]:
+    return top_candidates(db, article_id, model, remaining)
+
+
 def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
@@ -149,6 +164,22 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
+            ranking_mode = _ranking_mode(site_id)
+            hybrid_ranker = None
+            hybrid_load_failed = False
+            if ranking_mode != "baseline":
+                try:
+                    hybrid_ranker = HybridRanker.load(
+                        db,
+                        site_id=site_id,
+                        model=model,
+                    )
+                except Exception:
+                    hybrid_load_failed = True
+                    logger.exception(
+                        "hybrid ranker initialization failed for site %s; using baseline cosine",
+                        site_id,
+                    )
 
             article_ids = db.scalars(
                 select(Article.id).where(
@@ -167,19 +198,94 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                 ).all()
             )
             created = 0
+            eligible_sources = 0
+            hybrid_sources = 0
+            fallback_sources = 0
+            dense_candidates_total = 0
+            lexical_candidates_total = 0
+            union_candidates_total = 0
+            shadow_overlap_total = 0.0
+            shadow_exact_matches = 0
             for article_id in article_ids:
                 remaining = settings.max_suggestions_per_article - existing_counts.get(
                     article_id, 0
                 )
                 if remaining <= 0:
                     continue
-                for target_id, score in top_candidates(db, article_id, model, remaining):
+                eligible_sources += 1
+                method = "baseline_cosine"
+                candidate_rows: list[tuple[int, float]]
+                if ranking_mode == "baseline":
+                    candidate_rows = _baseline_rows(
+                        db,
+                        article_id,
+                        model,
+                        remaining,
+                    )
+                elif hybrid_ranker is None:
+                    fallback_sources += 1
+                    candidate_rows = _baseline_rows(
+                        db,
+                        article_id,
+                        model,
+                        remaining,
+                    )
+                else:
+                    try:
+                        ranking = hybrid_ranker.rank(
+                            db,
+                            source_id=article_id,
+                            model=model,
+                            limit=remaining,
+                        )
+                        hybrid_sources += 1
+                        dense_candidates_total += ranking.dense_count
+                        lexical_candidates_total += ranking.lexical_count
+                        union_candidates_total += ranking.union_count
+                        hybrid_rows = [
+                            (candidate.target_id, candidate.semantic_score)
+                            for candidate in ranking.candidates
+                        ]
+                        if ranking_mode == "pilot":
+                            candidate_rows = hybrid_rows
+                            method = "hybrid_bm25"
+                        else:
+                            baseline_rows = [
+                                (candidate.target_id, candidate.semantic_score)
+                                for candidate in ranking.baseline_candidates[:remaining]
+                            ]
+                            baseline_ids = [target_id for target_id, _score in baseline_rows]
+                            hybrid_ids = [target_id for target_id, _score in hybrid_rows]
+                            denominator = max(
+                                1,
+                                min(remaining, len(set(baseline_ids) | set(hybrid_ids))),
+                            )
+                            shadow_overlap_total += (
+                                len(set(baseline_ids) & set(hybrid_ids)) / denominator
+                            )
+                            shadow_exact_matches += baseline_ids == hybrid_ids
+                            candidate_rows = baseline_rows
+                    except Exception:
+                        fallback_sources += 1
+                        logger.exception(
+                            "hybrid ranking failed for site %s source %s; using baseline cosine",
+                            site_id,
+                            article_id,
+                        )
+                        candidate_rows = _baseline_rows(
+                            db,
+                            article_id,
+                            model,
+                            remaining,
+                        )
+
+                for target_id, score in candidate_rows:
                     db.add(
                         Suggestion(
                             site_id=site_id,
                             source_article_id=article_id,
                             target_article_id=target_id,
-                            method="baseline_cosine",
+                            method=method,
                             score=score,
                             status="pending",
                         )
@@ -190,8 +296,54 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                     job_run_id,
                     stage="suggesting",
                     created=created,
+                    ranking_mode=ranking_mode,
+                    hybrid_fallback_sources=fallback_sources,
                 )
                 db.commit()
-            return {"articles_encoded": encoded, "suggestions_created": created}
+            result = {
+                "articles_encoded": encoded,
+                "suggestions_created": created,
+            }
+            if ranking_mode != "baseline":
+                result.update(
+                    {
+                        "ranking_mode": ranking_mode,
+                        "hybrid_ranker_loaded": not hybrid_load_failed,
+                        "eligible_sources": eligible_sources,
+                        "hybrid_sources_evaluated": hybrid_sources,
+                        "hybrid_fallback_sources": fallback_sources,
+                        "mean_dense_candidates": (
+                            round(dense_candidates_total / hybrid_sources, 2)
+                            if hybrid_sources
+                            else 0.0
+                        ),
+                        "mean_lexical_candidates": (
+                            round(lexical_candidates_total / hybrid_sources, 2)
+                            if hybrid_sources
+                            else 0.0
+                        ),
+                        "mean_union_candidates": (
+                            round(union_candidates_total / hybrid_sources, 2)
+                            if hybrid_sources
+                            else 0.0
+                        ),
+                    }
+                )
+                if ranking_mode == "shadow":
+                    result.update(
+                        {
+                            "shadow_mean_overlap_at_5": (
+                                round(shadow_overlap_total / hybrid_sources, 4)
+                                if hybrid_sources
+                                else 0.0
+                            ),
+                            "shadow_exact_order_rate": (
+                                round(shadow_exact_matches / hybrid_sources, 4)
+                                if hybrid_sources
+                                else 0.0
+                            ),
+                        }
+                    )
+            return result
         finally:
             db.close()
