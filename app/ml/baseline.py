@@ -1,11 +1,11 @@
-"""Baseline v1: cosine top-k over pgvector, exact search (A13 — no index below ~100k vectors).
+"""Cosine retrieval primitives over pgvector (exact below ~100k vectors).
 
 Two families of query live here.
 
-`top_candidates` is the long-standing baseline path and is left exactly as it
-was: every Standard site still gets the same rows it got before the pilot.
+`top_candidates` is the long-standing cosine query retained for frozen offline
+comparisons against the pre-global behavior.
 
-The pilot path uses `_PILOT_ELIGIBILITY_SQL` instead. Dense retrieval applies it
+The global Hybrid path uses `_HYBRID_ELIGIBILITY_SQL` instead. Dense retrieval applies it
 while choosing its own top k; `eligible_candidate_scores` applies the identical
 predicate to a candidate list produced elsewhere. That second use is the point.
 BM25 ranks documents — it has no way to know about existing links, prior
@@ -44,13 +44,13 @@ ORDER BY e2.vector <=> e1.vector
 LIMIT :k
 """)
 
-# The pilot's eligibility rules, in one place so both halves of the hybrid
+# The Hybrid eligibility rules, in one place so both halves of the
 # candidate union are filtered by the same predicate. Every clause is a rule the
 # baseline path applies somewhere — the link, decision, active, site, and model
 # rules in SQL; the fingerprint and title rules in the ranker's in-memory corpus
 # — plus the near-duplicate vector ceiling, which only a vector comparison can
 # express and which a lexical candidate would otherwise slip past entirely.
-_PILOT_ELIGIBILITY_SQL = """
+_HYBRID_ELIGIBILITY_SQL = """
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
 JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
@@ -76,10 +76,10 @@ WHERE a1.id = :article_id
         AND s.status != 'expired')
 """
 
-PILOT_TOP_K_SQL = text(f"""
+HYBRID_TOP_K_SQL = text(f"""
 SELECT a2.id AS target_id,
        1 - (e2.vector <=> e1.vector) AS score
-{_PILOT_ELIGIBILITY_SQL}
+{_HYBRID_ELIGIBILITY_SQL}
 ORDER BY e2.vector <=> e1.vector, a2.id
 LIMIT :k
 """)
@@ -87,7 +87,7 @@ LIMIT :k
 ELIGIBLE_SCORES_SQL = text(f"""
 SELECT a2.id AS target_id,
        1 - (e2.vector <=> e1.vector) AS score
-{_PILOT_ELIGIBILITY_SQL}
+{_HYBRID_ELIGIBILITY_SQL}
   AND a2.id IN :target_ids
 """).bindparams(bindparam("target_ids", expanding=True))
 
@@ -103,7 +103,7 @@ WHERE e1.article_id = :article_id
 
 
 def top_candidates(db: Session, article_id: int, model: str, k: int) -> list[tuple[int, float]]:
-    """The unchanged baseline query, still serving every Standard site."""
+    """The legacy cosine query retained for frozen offline comparisons."""
     rows = db.execute(TOP_K_SQL, {"article_id": article_id, "model": model, "k": k}).all()
     return [(r.target_id, float(r.score)) for r in rows]
 
@@ -115,9 +115,9 @@ def eligible_top_candidates(
     k: int,
     duplicate_similarity_threshold: float,
 ) -> list[tuple[int, float]]:
-    """The pilot's dense pool: the k closest targets that pass every pilot rule."""
+    """The Hybrid dense pool: the k closest targets that pass every rule."""
     rows = db.execute(
-        PILOT_TOP_K_SQL,
+        HYBRID_TOP_K_SQL,
         {
             "article_id": article_id,
             "model": model,

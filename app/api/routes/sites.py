@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
-from app.models import Article, IngestionRun, InternalLink, JobRun, Site, Suggestion
+from app.models import Article, IngestionRun, InternalLink, Site, Suggestion
 from app.schemas.site import (
     ArticleOut,
     SiteBulkCreated,
@@ -20,7 +20,6 @@ from app.schemas.site import (
     SiteSuggestionModeUpdate,
 )
 from app.services.ingestion_service import latest_run
-from app.services.job_service import reconcile_active_job_runs
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -71,34 +70,51 @@ def _site_counts(
             .group_by(Article.site_id)
         ).all()
     )
-    active_suggestion_counts = dict(
-        db.execute(
-            select(Suggestion.site_id, func.count(Suggestion.id))
-            .join(Article, Article.id == Suggestion.source_article_id)
-            .where(
-                Suggestion.site_id.in_(site_ids),
-                Article.is_active.is_(True),
-                Suggestion.status.in_(("pending", "approved", "applying")),
-            )
-            .group_by(Suggestion.site_id)
-        ).all()
+    active_counts_by_source = (
+        select(
+            Suggestion.site_id.label("site_id"),
+            Suggestion.source_article_id.label("source_article_id"),
+            func.count(Suggestion.id).label("active_count"),
+        )
+        .join(Article, Article.id == Suggestion.source_article_id)
+        .where(
+            Suggestion.site_id.in_(site_ids),
+            Article.is_active.is_(True),
+            Suggestion.status.in_(("pending", "approved", "applying")),
+        )
+        .group_by(Suggestion.site_id, Suggestion.source_article_id)
+        .subquery()
     )
-    return article_counts, internal_link_counts, active_suggestion_counts
+    used_slots = {
+        site_id: int(slot_count)
+        for site_id, slot_count in db.execute(
+            select(
+                active_counts_by_source.c.site_id,
+                func.sum(
+                    func.least(
+                        active_counts_by_source.c.active_count,
+                        settings.hybrid_max_suggestions_per_article,
+                    )
+                ),
+            ).group_by(active_counts_by_source.c.site_id)
+        )
+    }
+    suggestion_slots = {
+        site_id: (
+            article_count * settings.hybrid_max_suggestions_per_article
+            - used_slots.get(site_id, 0)
+        )
+        for site_id, article_count in article_counts.items()
+    }
+    return article_counts, internal_link_counts, suggestion_slots
 
 
-def _suggestion_mode_state(site: Site) -> SiteSuggestionModeState:
-    managed = site.id in settings.v1_shadow_site_ids or site.id in settings.v1_pilot_site_ids
-    if site.id in settings.v1_pilot_site_ids:
-        mode = "experimental"
-    elif site.id in settings.v1_shadow_site_ids:
-        # Shadow generation keeps the visible standard output.
-        mode = "standard"
-    else:
-        mode = site.suggestion_mode
+def _suggestion_mode_state(_site: Site) -> SiteSuggestionModeState:
+    """Backward-compatible API state for the now-global Hybrid method."""
     return SiteSuggestionModeState(
-        suggestion_mode=mode,
-        suggestion_mode_managed=managed,
-        suggestion_comparison_enabled=site.id in settings.v1_shadow_site_ids,
+        suggestion_mode="experimental",
+        suggestion_mode_managed=True,
+        suggestion_comparison_enabled=False,
     )
 
 
@@ -107,7 +123,7 @@ def _site_out(
     *,
     article_count: int,
     internal_link_count: int,
-    active_suggestion_count: int,
+    suggestion_slots_available: int,
     run: IngestionRun | None,
 ) -> SiteOut:
     item = SiteOut.model_validate(site)
@@ -115,10 +131,7 @@ def _site_out(
     item.suggestion_mode = mode.suggestion_mode
     item.suggestion_mode_managed = mode.suggestion_mode_managed
     item.suggestion_comparison_enabled = mode.suggestion_comparison_enabled
-    item.suggestion_slots_available = max(
-        0,
-        article_count * settings.max_suggestions_per_article - active_suggestion_count,
-    )
+    item.suggestion_slots_available = max(0, suggestion_slots_available)
     item.article_count = article_count
     item.internal_link_count = internal_link_count
     if run is not None:
@@ -204,7 +217,7 @@ def list_sites(
     db: Session = Depends(get_db),
 ) -> list[SiteOut]:
     sites = db.scalars(select(Site).order_by(Site.id).limit(limit).offset(offset)).all()
-    article_counts, internal_link_counts, active_suggestion_counts = _site_counts(
+    article_counts, internal_link_counts, suggestion_slots = _site_counts(
         db, [site.id for site in sites]
     )
     out = []
@@ -215,7 +228,7 @@ def list_sites(
                 site,
                 article_count=article_counts.get(site.id, 0),
                 internal_link_count=internal_link_counts.get(site.id, 0),
-                active_suggestion_count=active_suggestion_counts.get(site.id, 0),
+                suggestion_slots_available=suggestion_slots.get(site.id, 0),
                 run=run,
             )
         )
@@ -225,48 +238,32 @@ def list_sites(
 @router.get("/{site_id}", response_model=SiteOut)
 def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
     site = _get_site_or_404(db, site_id)
-    article_counts, internal_link_counts, active_suggestion_counts = _site_counts(db, [site.id])
+    article_counts, internal_link_counts, suggestion_slots = _site_counts(db, [site.id])
     run = latest_run(db, site.id)
     return _site_out(
         site,
         article_count=article_counts.get(site.id, 0),
         internal_link_count=internal_link_counts.get(site.id, 0),
-        active_suggestion_count=active_suggestion_counts.get(site.id, 0),
+        suggestion_slots_available=suggestion_slots.get(site.id, 0),
         run=run,
     )
 
 
-@router.put("/{site_id}/suggestion-mode", response_model=SiteSuggestionModeState)
+@router.put(
+    "/{site_id}/suggestion-mode",
+    response_model=SiteSuggestionModeState,
+    include_in_schema=False,
+)
 def update_suggestion_mode(
     site_id: int,
     payload: SiteSuggestionModeUpdate,
     db: Session = Depends(get_db),
 ) -> SiteSuggestionModeState:
-    site = _get_site_or_404(db, site_id)
-    state = _suggestion_mode_state(site)
-    if state.suggestion_mode_managed:
-        raise HTTPException(
-            409,
-            "suggestion method is managed by the server rollout configuration",
-        )
-    active_runs = list(
-        db.scalars(
-            select(JobRun).where(
-                JobRun.site_id == site_id,
-                JobRun.kind == "analysis",
-                JobRun.status.in_(("queued", "running")),
-            )
-        ).all()
+    _get_site_or_404(db, site_id)
+    raise HTTPException(
+        409,
+        "Hybrid/BM25 is the global suggestion method and cannot be changed per site",
     )
-    if reconcile_active_job_runs(db, active_runs):
-        raise HTTPException(
-            409,
-            "wait for the active suggestion job to finish before changing its method",
-        )
-    site.suggestion_mode = payload.suggestion_mode
-    db.commit()
-    db.refresh(site)
-    return _suggestion_mode_state(site)
 
 
 @router.delete("/{site_id}", status_code=204)

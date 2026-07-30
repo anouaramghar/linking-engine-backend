@@ -1,5 +1,4 @@
-"""Suggestion pipeline: encode missing embeddings, then cosine top-k -> pending suggestions
-(sequence 4.2)."""
+"""Global Hybrid/BM25 suggestion generation with a guarded cosine fallback."""
 
 import hashlib
 import logging
@@ -12,7 +11,7 @@ from app.config import settings
 from app.db import SessionLocal, engine
 from app.models import Article, Embedding, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
-from app.ml.baseline import top_candidates
+from app.ml.baseline import eligible_top_candidates
 from app.ml.hybrid import HybridRanker, RankedCandidate
 from app.services.job_service import record_progress
 
@@ -144,24 +143,8 @@ def _validate_embedding_dimension(model: str) -> None:
         )
 
 
-def _ranking_mode(
-    site_id: int,
-    configured_mode: str,
-    ranking_mode_override: str | None = None,
-) -> str:
-    if ranking_mode_override is not None:
-        if ranking_mode_override not in {"baseline", "shadow", "pilot"}:
-            raise ValueError(f"unsupported ranking mode override: {ranking_mode_override}")
-        return ranking_mode_override
-    if site_id in settings.v1_pilot_site_ids:
-        return "pilot"
-    if site_id in settings.v1_shadow_site_ids:
-        return "shadow"
-    return "pilot" if configured_mode == "experimental" else "baseline"
-
-
 def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[RankedCandidate]:
-    """The unchanged cosine path, in the shape the persistence loop expects.
+    """The cosine safety fallback, in the shape the persistence loop expects.
 
     Baseline rows carry no score components: `score` is cosine similarity and
     that is the entire explanation, so an empty component blob would only add
@@ -169,27 +152,21 @@ def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[Rank
     """
     return [
         RankedCandidate(target_id=target_id, semantic_score=score)
-        for target_id, score in top_candidates(db, article_id, model, remaining)
+        for target_id, score in eligible_top_candidates(
+            db,
+            article_id,
+            model,
+            remaining,
+            settings.suggestion_duplicate_similarity_threshold,
+        )
     ]
-
-
-def _evenly_spaced_ids(article_ids: list[int], maximum: int) -> set[int]:
-    selected_count = min(maximum, len(article_ids))
-    if not selected_count:
-        return set()
-    return {
-        article_ids[index * len(article_ids) // selected_count] for index in range(selected_count)
-    }
 
 
 def generate_suggestions(
     site_id: int,
     job_run_id: int | None = None,
-    *,
-    ranking_mode_override: str | None = None,
-    comparison_only: bool = False,
 ) -> dict:
-    """RQ task body."""
+    """Generate the global Hybrid/BM25 queue, with per-source cosine fallback."""
     with _site_analysis_lock(site_id):
         db = SessionLocal()
         try:
@@ -199,39 +176,28 @@ def generate_suggestions(
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
-            ranking_mode = _ranking_mode(
-                site_id,
-                site.suggestion_mode,
-                ranking_mode_override,
-            )
-            if comparison_only and ranking_mode != "shadow":
-                raise ValueError("comparison-only analysis requires shadow ranking")
-            suggestion_cap = (
-                settings.v1_pilot_max_suggestions_per_article
-                if ranking_mode == "pilot"
-                else settings.max_suggestions_per_article
-            )
+            suggestion_cap = settings.hybrid_max_suggestions_per_article
             hybrid_ranker = None
             hybrid_load_failed = False
-            if ranking_mode != "baseline":
-                try:
-                    hybrid_ranker = HybridRanker.load(
-                        db,
-                        site_id=site_id,
-                        model=model,
-                    )
-                except Exception:
-                    # A PostgreSQL statement error leaves the transaction aborted.
-                    # End that failed read transaction before the baseline path
-                    # issues its next query. Hybrid loading happens after
-                    # `_embed_missing` has committed, so there are no application
-                    # writes here for the rollback to discard.
-                    db.rollback()
-                    hybrid_load_failed = True
-                    logger.exception(
-                        "hybrid ranker initialization failed for site %s; using baseline cosine",
-                        site_id,
-                    )
+            try:
+                hybrid_ranker = HybridRanker.load(
+                    db,
+                    site_id=site_id,
+                    model=model,
+                )
+            except Exception:
+                # A PostgreSQL statement error leaves the transaction aborted.
+                # End that failed read transaction before the fallback path issues
+                # its next query. Hybrid loading happens after `_embed_missing`
+                # commits, so there are no application writes to discard.
+                db.rollback()
+                hybrid_load_failed = True
+                logger.exception(
+                    "hybrid ranker initialization failed for site %s; using baseline cosine",
+                    site_id,
+                )
+            if hybrid_ranker is None:
+                hybrid_load_failed = True
 
             article_ids = db.scalars(
                 select(Article.id)
@@ -241,11 +207,6 @@ def generate_suggestions(
                 )
                 .order_by(Article.id)
             ).all()
-            shadow_source_ids = (
-                _evenly_spaced_ids(article_ids, settings.v1_shadow_max_sources)
-                if ranking_mode == "shadow"
-                else set()
-            )
             existing_counts = dict(
                 db.execute(
                     select(Suggestion.source_article_id, func.count())
@@ -263,80 +224,40 @@ def generate_suggestions(
             dense_candidates_total = 0
             lexical_candidates_total = 0
             union_candidates_total = 0
-            shadow_overlap_total = 0.0
-            shadow_exact_matches = 0
             for article_id in article_ids:
                 remaining = suggestion_cap - existing_counts.get(article_id, 0)
                 has_capacity = remaining > 0
-                shadow_selected = ranking_mode == "shadow" and article_id in shadow_source_ids
-                if comparison_only and not shadow_selected:
+                if not has_capacity:
                     continue
-                if not has_capacity and not shadow_selected:
-                    continue
-                if has_capacity:
-                    eligible_sources += 1
+                eligible_sources += 1
                 method = "baseline_cosine"
                 candidate_rows: list[RankedCandidate]
-                if ranking_mode == "baseline" or (ranking_mode == "shadow" and not shadow_selected):
+                if hybrid_ranker is None:
+                    fallback_sources += 1
                     candidate_rows = _baseline_rows(
                         db,
                         article_id,
                         model,
                         remaining,
                     )
-                elif hybrid_ranker is None:
-                    fallback_sources += 1
-                    candidate_rows = (
-                        _baseline_rows(
-                            db,
-                            article_id,
-                            model,
-                            remaining,
-                        )
-                        if has_capacity
-                        else []
-                    )
                 else:
                     try:
-                        ranking_limit = (
-                            suggestion_cap if shadow_selected else remaining
-                        )
                         ranking = hybrid_ranker.rank(
                             db,
                             source_id=article_id,
                             model=model,
-                            limit=ranking_limit,
+                            limit=remaining,
                             duplicate_similarity_threshold=(
                                 settings.suggestion_duplicate_similarity_threshold
                             ),
-                            # Only the shadow comparison needs the baseline rows,
-                            # and fetching them costs a second dense query.
-                            include_baseline=ranking_mode == "shadow",
+                            include_baseline=False,
                         )
                         hybrid_sources += 1
                         dense_candidates_total += ranking.dense_count
                         lexical_candidates_total += ranking.lexical_count
                         union_candidates_total += ranking.union_count
-                        hybrid_rows = list(ranking.candidates)
-                        if ranking_mode == "pilot":
-                            candidate_rows = hybrid_rows
-                            method = "hybrid_bm25"
-                        else:
-                            baseline_rows = list(ranking.baseline_candidates[:ranking_limit])
-                            baseline_ids = [candidate.target_id for candidate in baseline_rows]
-                            hybrid_ids = [candidate.target_id for candidate in hybrid_rows]
-                            denominator = max(
-                                1,
-                                min(
-                                    ranking_limit,
-                                    len(set(baseline_ids) | set(hybrid_ids)),
-                                ),
-                            )
-                            shadow_overlap_total += (
-                                len(set(baseline_ids) & set(hybrid_ids)) / denominator
-                            )
-                            shadow_exact_matches += baseline_ids == hybrid_ids
-                            candidate_rows = baseline_rows[:remaining] if has_capacity else []
+                        candidate_rows = list(ranking.candidates)
+                        method = "hybrid_bm25"
                     except Exception:
                         # Ranking runs before this source adds suggestions or
                         # progress. Rolling back is therefore safe, and required
@@ -349,19 +270,13 @@ def generate_suggestions(
                             site_id,
                             article_id,
                         )
-                        candidate_rows = (
-                            _baseline_rows(
-                                db,
-                                article_id,
-                                model,
-                                remaining,
-                            )
-                            if has_capacity
-                            else []
+                        candidate_rows = _baseline_rows(
+                            db,
+                            article_id,
+                            model,
+                            remaining,
                         )
 
-                if comparison_only:
-                    candidate_rows = []
                 for candidate in candidate_rows:
                     db.add(
                         Suggestion(
@@ -384,57 +299,35 @@ def generate_suggestions(
                     job_run_id,
                     stage="suggesting",
                     created=created,
-                    ranking_mode=ranking_mode,
+                    ranking_mode="hybrid",
                     hybrid_fallback_sources=fallback_sources,
                 )
                 db.commit()
             result = {
                 "articles_encoded": encoded,
                 "suggestions_created": created,
+                "ranking_mode": "hybrid",
+                "suggestion_cap_per_source": suggestion_cap,
+                "hybrid_ranker_loaded": not hybrid_load_failed,
+                "eligible_sources": eligible_sources,
+                "hybrid_sources_evaluated": hybrid_sources,
+                "hybrid_fallback_sources": fallback_sources,
+                "mean_dense_candidates": (
+                    round(dense_candidates_total / hybrid_sources, 2)
+                    if hybrid_sources
+                    else 0.0
+                ),
+                "mean_lexical_candidates": (
+                    round(lexical_candidates_total / hybrid_sources, 2)
+                    if hybrid_sources
+                    else 0.0
+                ),
+                "mean_union_candidates": (
+                    round(union_candidates_total / hybrid_sources, 2)
+                    if hybrid_sources
+                    else 0.0
+                ),
             }
-            if ranking_mode != "baseline":
-                result.update(
-                    {
-                        "ranking_mode": ranking_mode,
-                        "comparison_only": comparison_only,
-                        "suggestion_cap_per_source": suggestion_cap,
-                        "hybrid_ranker_loaded": not hybrid_load_failed,
-                        "eligible_sources": eligible_sources,
-                        "shadow_sources_selected": len(shadow_source_ids),
-                        "hybrid_sources_evaluated": hybrid_sources,
-                        "hybrid_fallback_sources": fallback_sources,
-                        "mean_dense_candidates": (
-                            round(dense_candidates_total / hybrid_sources, 2)
-                            if hybrid_sources
-                            else 0.0
-                        ),
-                        "mean_lexical_candidates": (
-                            round(lexical_candidates_total / hybrid_sources, 2)
-                            if hybrid_sources
-                            else 0.0
-                        ),
-                        "mean_union_candidates": (
-                            round(union_candidates_total / hybrid_sources, 2)
-                            if hybrid_sources
-                            else 0.0
-                        ),
-                    }
-                )
-                if ranking_mode == "shadow":
-                    result.update(
-                        {
-                            "shadow_mean_overlap_at_5": (
-                                round(shadow_overlap_total / hybrid_sources, 4)
-                                if hybrid_sources
-                                else 0.0
-                            ),
-                            "shadow_exact_order_rate": (
-                                round(shadow_exact_matches / hybrid_sources, 4)
-                                if hybrid_sources
-                                else 0.0
-                            ),
-                        }
-                    )
             return result
         finally:
             db.close()

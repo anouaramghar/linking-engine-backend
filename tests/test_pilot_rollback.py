@@ -21,6 +21,7 @@ from app.config import settings
 from tests.conftest import TEST_DATABASE_URL, _database_name
 
 PILOT_REVISION = "b8e5f1a3c027"
+GLOBAL_HYBRID_REVISION = "c3d7a9f1e204"
 SITE_MODE_REVISION = "6a7d9e2c4b10"
 #: The last revision that predates the pilot entirely.
 PRE_PILOT_REVISION = "f3a8b1c2d4e5"
@@ -57,7 +58,7 @@ def scratch_database():
 
 @pytest.fixture
 def migrated(scratch_database, monkeypatch):
-    """The scratch database at head, with alembic pointed at it.
+    """The scratch database at the original pilot head, with Alembic redirected.
 
     `alembic/env.py` reads `settings.database_url` directly, so redirecting the
     setting is what redirects the migration.
@@ -65,7 +66,7 @@ def migrated(scratch_database, monkeypatch):
     monkeypatch.setattr(settings, "database_url", scratch_database)
     config = Config(str(REPO_ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(REPO_ROOT / "alembic"))
-    command.upgrade(config, "head")
+    command.upgrade(config, PILOT_REVISION)
     return config, scratch_database
 
 
@@ -147,6 +148,49 @@ def _statuses(url: str) -> dict[str, int]:
         ).all()
     engine.dispose()
     return {status: count for status, count in rows}
+
+
+def _site_modes(url: str) -> list[str]:
+    engine = create_engine(url)
+    with engine.connect() as connection:
+        modes = connection.execute(
+            text("SELECT suggestion_mode FROM sites ORDER BY id")
+        ).scalars().all()
+    engine.dispose()
+    return list(modes)
+
+
+def test_global_hybrid_migration_converts_existing_and_new_sites(migrated):
+    config, url = migrated
+    _seed(url, site_mode="standard")
+
+    command.upgrade(config, GLOBAL_HYBRID_REVISION)
+
+    assert _site_modes(url) == ["experimental"]
+    engine = create_engine(url)
+    with engine.begin() as connection:
+        new_mode = connection.execute(
+            text(
+                "INSERT INTO sites (name, base_url, platform) "
+                "VALUES ('new global site', 'https://new-global.example.com', 'html') "
+                "RETURNING suggestion_mode"
+            )
+        ).scalar_one()
+    engine.dispose()
+    assert new_mode == "experimental"
+
+
+def test_global_hybrid_downgrade_restores_standard_without_touching_rows(migrated):
+    config, url = migrated
+    _seed(url, hybrid_statuses=("pending", "approved"), site_mode="standard")
+    before = _statuses(url)
+    command.upgrade(config, GLOBAL_HYBRID_REVISION)
+
+    command.downgrade(config, PILOT_REVISION)
+
+    assert _site_modes(url) == ["standard"]
+    assert _statuses(url) == before
+    assert _has_column(url, "suggestions", "score_components")
 
 
 def test_the_pilot_migration_applies_and_reverts_on_a_clean_database(migrated):

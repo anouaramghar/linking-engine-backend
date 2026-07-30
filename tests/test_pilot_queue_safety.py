@@ -1,4 +1,4 @@
-"""The pilot must never take rows away from an editor.
+"""Global Hybrid generation must never take rows away from an editor.
 
 Two separate promises are covered here:
 
@@ -48,16 +48,9 @@ def valid_dimension_probe(monkeypatch):
     )
 
 
-@pytest.fixture(autouse=True)
-def no_site_is_enrolled_by_default(monkeypatch):
-    monkeypatch.setattr(settings, "v1_shadow_site_ids", frozenset())
-    monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset())
-
-
 @pytest.fixture
 def pilot_site(db, site):
-    """A site on the experimental method with one source and seven targets."""
-    site.suggestion_mode = "experimental"
+    """A Hybrid site with one source and seven targets."""
     articles = []
     for index in range(8):
         title = f"Canning topic {index}"
@@ -164,7 +157,7 @@ def _statuses(db, site) -> dict[str, int]:
 # --- generation never replaces the existing queue (correction 2) -------------
 
 
-def test_pilot_generation_never_expires_existing_pending_cosine_rows(db, pilot_site):
+def test_hybrid_generation_never_expires_existing_pending_cosine_rows(db, pilot_site):
     site, source, targets = pilot_site
     existing = [
         _add_suggestion(db, site, source, target, status="pending") for target in targets[:3]
@@ -181,11 +174,11 @@ def test_pilot_generation_never_expires_existing_pending_cosine_rows(db, pilot_s
     ) == 0
 
 
-def test_the_pilot_fills_only_the_slots_a_source_has_free(db, pilot_site, monkeypatch):
-    """Three of five slots are taken, so at most two new rows may appear."""
+def test_hybrid_fills_only_the_slots_a_source_has_free(db, pilot_site, monkeypatch):
+    """Two of three slots are taken, so at most one new row may appear."""
     site, source, targets = pilot_site
-    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 5)
-    for target in targets[:3]:
+    monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 3)
+    for target in targets[:2]:
         _add_suggestion(db, site, source, target, status="pending")
 
     generate_suggestions(site.id)
@@ -193,14 +186,14 @@ def test_the_pilot_fills_only_the_slots_a_source_has_free(db, pilot_site, monkey
     from_source = db.scalars(
         select(Suggestion).where(Suggestion.source_article_id == source.id)
     ).all()
-    assert len(from_source) == 5
+    assert len(from_source) == 3
     created = [row for row in from_source if row.method == "hybrid_bm25"]
-    assert len(created) == 2
+    assert len(created) == 1
 
 
 def test_a_full_queue_produces_nothing_rather_than_making_room(db, pilot_site, monkeypatch):
     site, source, targets = pilot_site
-    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 2)
+    monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 2)
     for target in targets[:2]:
         _add_suggestion(db, site, source, target, status="pending")
     before = _statuses(db, site)
