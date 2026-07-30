@@ -34,9 +34,9 @@ class Settings(BaseSettings):
     v1_shadow_site_ids: frozenset[int] = frozenset()
     v1_pilot_site_ids: frozenset[int] = frozenset()
     v1_shadow_max_sources: int = Field(default=100, gt=0)
-    # The first visible pilot deliberately exposes only BM25 rank 1. Standard
-    # cosine generation and read-only five-result comparisons keep the normal cap.
-    v1_pilot_max_suggestions_per_article: int = Field(default=1, gt=0)
+    # The visible Hybrid path exposes the top three BM25-ranked suggestions.
+    # Standard cosine generation and read-only comparisons keep the normal cap.
+    v1_pilot_max_suggestions_per_article: int = Field(default=3, gt=0)
     # A target this close to the source is the same page, not a link candidate.
     # Applied by the pilot ranking path to both halves of its candidate union;
     # the Standard cosine path is unchanged.

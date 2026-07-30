@@ -575,7 +575,7 @@ def test_committed_defaults_enroll_no_site():
 
     assert defaults.v1_shadow_site_ids == frozenset()
     assert defaults.v1_pilot_site_ids == frozenset()
-    assert defaults.v1_pilot_max_suggestions_per_article == 1
+    assert defaults.v1_pilot_max_suggestions_per_article == 3
     assert defaults.suggestion_duplicate_similarity_threshold == 0.99
 
 
@@ -595,7 +595,7 @@ def test_a_standard_site_still_gets_the_baseline_path(db, site):
 def test_a_standard_site_keeps_the_normal_per_source_cap(db, site, monkeypatch):
     articles = _make_articles(db, site)
     monkeypatch.setattr(settings, "max_suggestions_per_article", 2)
-    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 1)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 3)
 
     generate_suggestions(site.id)
 
@@ -639,11 +639,22 @@ def test_pilot_site_persists_hybrid_method(db, site, monkeypatch):
     assert result["mean_union_candidates"] == 3.0
 
 
-def test_pilot_site_persists_only_rank_one_per_source(db, site, monkeypatch):
+def test_pilot_site_persists_top_three_per_source(db, site, monkeypatch):
     articles = _make_articles(db, site)
+    articles.append(
+        _add_article(
+            db,
+            site,
+            slug="city-guide",
+            title="City guide",
+            content="museums restaurants parks",
+            vector=_vector(3),
+        )
+    )
     site.suggestion_mode = "experimental"
     db.commit()
     calls = []
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 3)
 
     class FakeRanker:
         def rank(self, _db, *, source_id, limit, **_kwargs):
@@ -673,16 +684,16 @@ def test_pilot_site_persists_only_rank_one_per_source(db, site, monkeypatch):
         article.id: sum(row.source_article_id == article.id for row in rows)
         for article in articles
     }
-    assert set(counts.values()) == {1}
-    assert {limit for _source_id, limit in calls} == {1}
-    assert result["suggestion_cap_per_source"] == 1
+    assert set(counts.values()) == {3}
+    assert {limit for _source_id, limit in calls} == {3}
+    assert result["suggestion_cap_per_source"] == 3
 
 
 def test_explicit_comparison_never_persists_suggestions(db, site, monkeypatch):
     source, target, other = _make_articles(db, site)
     calls = []
     monkeypatch.setattr(settings, "max_suggestions_per_article", 2)
-    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 1)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 3)
 
     class FakeRanker:
         def rank(self, _db, *, source_id, limit, **_kwargs):

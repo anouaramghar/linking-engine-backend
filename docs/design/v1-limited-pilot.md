@@ -13,7 +13,7 @@ The pilot uses the strongest frozen evaluation recipe:
 3. combine the candidate lists;
 4. prioritize the union with weighted reciprocal-rank fusion;
 5. order the evaluated top five by BM25;
-6. expose only BM25 rank 1 during the visible pilot.
+6. expose BM25 ranks 1-3 in the visible queue.
 
 Frozen parameters:
 
@@ -30,8 +30,8 @@ pilot.
 ## What the fusion does, measured
 
 **BM25-512 alone determines the evaluated top five.** The weighted RRF decides
-which candidates are considered, not their final order. The visible pilot then
-persists only rank 1; this safety cap does not change the frozen ranking recipe.
+which candidates are considered, not their final order. The visible queue then
+persists ranks 1-3; this delivery cap does not change the frozen ranking recipe.
 
 This is a property of the design rather than an observation about one corpus. A
 dense-only candidate can outrank the lexical top five only if its own BM25 score
@@ -64,7 +64,7 @@ Both settings are JSON arrays of explicit site IDs and default to `[]`:
 V1_SHADOW_SITE_IDS=[12]
 V1_PILOT_SITE_IDS=[]
 V1_SHADOW_MAX_SOURCES=100
-V1_PILOT_MAX_SUGGESTIONS_PER_ARTICLE=1
+V1_PILOT_MAX_SUGGESTIONS_PER_ARTICLE=3
 ```
 
 A site cannot appear in both settings; startup validation rejects overlapping
@@ -223,10 +223,11 @@ agreed numerical thresholds before enabling the second site.
 
 Generation never expires anything. Standard generation keeps
 `MAX_SUGGESTIONS_PER_ARTICLE` (five by default), while the visible pilot uses
-`V1_PILOT_MAX_SUGGESTIONS_PER_ARTICLE` (one). Enabling the pilot cannot retire an
-editor's existing queue as a side effect: a source that already has one or more
-active suggestions receives nothing new until normal review or expiration frees
-capacity.
+`V1_PILOT_MAX_SUGGESTIONS_PER_ARTICLE` (three). Enabling the pilot cannot retire
+an editor's existing queue as a side effect: a source that already has three or
+more active suggestions receives nothing new until normal review or expiration
+frees capacity. Sources below the cap receive only the remaining number of
+suggestions.
 
 Clearing a queue is therefore a separate, deliberate, site-scoped action:
 
@@ -351,3 +352,24 @@ A deterministic Codex-assisted review of 200 generated rank-1 pairs approved
 116 (58%). This is an engineering audit, not independent human editorial
 feedback, and does not satisfy the human expansion gate. The sampled queue rows
 were left pending.
+
+This validation establishes the quality of rank 1 only. The later product
+decision to expose ranks 1-3 increases queue coverage, but does not imply that
+ranks 2 and 3 independently achieved the same 58% audit result.
+
+## Local ranks 1-3 operational validation — 30 July 2026
+
+The three-per-source cap was then exercised on the same disposable database
+after removing its prior rank-1 queue. The developer and production databases
+were not changed.
+
+- active sources / suggestions created: 1,097 / 3,291;
+- minimum / maximum active suggestions per source: 3 / 3;
+- hybrid fallbacks: 0;
+- generation time including model loading: 43.9s;
+- proxied suggestion API: 50 requests, 0 errors, 50.1ms p95;
+- every row remained pending with `final_order: "bm25_512"` and
+  `score_is: "cosine_semantic_similarity"`.
+
+This rehearsal validates capacity and API behavior at the larger queue size. It
+does not replace the separate editorial-quality limitation for ranks 2 and 3.
