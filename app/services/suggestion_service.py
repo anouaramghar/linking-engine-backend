@@ -13,7 +13,7 @@ from app.db import SessionLocal, engine
 from app.models import Article, Embedding, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
-from app.ml.hybrid import HybridRanker
+from app.ml.hybrid import HybridRanker, RankedCandidate
 from app.services.job_service import record_progress
 
 BATCH_SIZE = 32
@@ -160,8 +160,17 @@ def _ranking_mode(
     return "pilot" if configured_mode == "experimental" else "baseline"
 
 
-def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[tuple[int, float]]:
-    return top_candidates(db, article_id, model, remaining)
+def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[RankedCandidate]:
+    """The unchanged cosine path, in the shape the persistence loop expects.
+
+    Baseline rows carry no score components: `score` is cosine similarity and
+    that is the entire explanation, so an empty component blob would only add
+    noise to the queue payload.
+    """
+    return [
+        RankedCandidate(target_id=target_id, semantic_score=score)
+        for target_id, score in top_candidates(db, article_id, model, remaining)
+    ]
 
 
 def _evenly_spaced_ids(article_ids: list[int], maximum: int) -> set[int]:
@@ -207,6 +216,12 @@ def generate_suggestions(
                         model=model,
                     )
                 except Exception:
+                    # A PostgreSQL statement error leaves the transaction aborted.
+                    # End that failed read transaction before the baseline path
+                    # issues its next query. Hybrid loading happens after
+                    # `_embed_missing` has committed, so there are no application
+                    # writes here for the rollback to discard.
+                    db.rollback()
                     hybrid_load_failed = True
                     logger.exception(
                         "hybrid ranker initialization failed for site %s; using baseline cosine",
@@ -258,7 +273,7 @@ def generate_suggestions(
                 if has_capacity:
                     eligible_sources += 1
                 method = "baseline_cosine"
-                candidate_rows: list[tuple[int, float]]
+                candidate_rows: list[RankedCandidate]
                 if ranking_mode == "baseline" or (ranking_mode == "shadow" and not shadow_selected):
                     candidate_rows = _baseline_rows(
                         db,
@@ -288,25 +303,25 @@ def generate_suggestions(
                             source_id=article_id,
                             model=model,
                             limit=ranking_limit,
+                            duplicate_similarity_threshold=(
+                                settings.suggestion_duplicate_similarity_threshold
+                            ),
+                            # Only the shadow comparison needs the baseline rows,
+                            # and fetching them costs a second dense query.
+                            include_baseline=ranking_mode == "shadow",
                         )
                         hybrid_sources += 1
                         dense_candidates_total += ranking.dense_count
                         lexical_candidates_total += ranking.lexical_count
                         union_candidates_total += ranking.union_count
-                        hybrid_rows = [
-                            (candidate.target_id, candidate.semantic_score)
-                            for candidate in ranking.candidates
-                        ]
+                        hybrid_rows = list(ranking.candidates)
                         if ranking_mode == "pilot":
                             candidate_rows = hybrid_rows
                             method = "hybrid_bm25"
                         else:
-                            baseline_rows = [
-                                (candidate.target_id, candidate.semantic_score)
-                                for candidate in ranking.baseline_candidates[:ranking_limit]
-                            ]
-                            baseline_ids = [target_id for target_id, _score in baseline_rows]
-                            hybrid_ids = [target_id for target_id, _score in hybrid_rows]
+                            baseline_rows = list(ranking.baseline_candidates[:ranking_limit])
+                            baseline_ids = [candidate.target_id for candidate in baseline_rows]
+                            hybrid_ids = [candidate.target_id for candidate in hybrid_rows]
                             denominator = max(
                                 1,
                                 min(
@@ -320,6 +335,11 @@ def generate_suggestions(
                             shadow_exact_matches += baseline_ids == hybrid_ids
                             candidate_rows = baseline_rows[:remaining] if has_capacity else []
                     except Exception:
+                        # Ranking runs before this source adds suggestions or
+                        # progress. Rolling back is therefore safe, and required
+                        # when the caught failure came from PostgreSQL: without it
+                        # the baseline query fails with InFailedSqlTransaction.
+                        db.rollback()
                         fallback_sources += 1
                         logger.exception(
                             "hybrid ranking failed for site %s source %s; using baseline cosine",
@@ -339,14 +359,19 @@ def generate_suggestions(
 
                 if comparison_only:
                     candidate_rows = []
-                for target_id, score in candidate_rows:
+                for candidate in candidate_rows:
                     db.add(
                         Suggestion(
                             site_id=site_id,
                             source_article_id=article_id,
-                            target_article_id=target_id,
+                            target_article_id=candidate.target_id,
                             method=method,
-                            score=score,
+                            # Cosine similarity for both methods, so one number keeps
+                            # one meaning across the mixed queue.
+                            score=candidate.semantic_score,
+                            score_components=(
+                                candidate.score_components() if method == "hybrid_bm25" else None
+                            ),
                             status="pending",
                         )
                     )

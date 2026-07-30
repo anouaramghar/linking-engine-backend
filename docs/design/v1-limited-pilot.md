@@ -26,6 +26,34 @@ The old V1 business-rule reranker remains disabled. The zero-shot reranker,
 learned ranker, structured dense input, and field-aware BM25 are not part of the
 pilot.
 
+## What the fusion does, measured
+
+**BM25-512 alone determines the final five.** The weighted RRF decides which
+candidates are considered, not which are delivered or in what order.
+
+This is a property of the design rather than an observation about one corpus. A
+dense-only candidate can outrank the lexical top five only if its own BM25 score
+is higher — and if it were, it would already be inside the BM25 top 100. The
+fusion changes the delivered set only when fewer than five eligible lexical
+candidates exist and dense-only candidates fill the remaining slots.
+
+Rehearsals on both evaluated corpora agree, measured against real site data in
+rolled-back read-only transactions on 30 July 2026:
+
+| corpus | articles | both retrievers | lexical-only | dense-only |
+| --- | --- | --- | --- | --- |
+| WordPress News (site 2469) | 1,097 | 86% | 14% | **0%** |
+| Airbnb (site 1) | 9,330 | 66% | 34% | **0%** |
+
+No delivered suggestion on either corpus came from dense retrieval alone. Do not
+describe the fusion as improving the final ordering; on this evidence it does
+not change the delivered top five at all. It is retained because it is the
+frozen, evaluated configuration and because it broadens the pool — which is what
+lets a lexical-only candidate reach an editor.
+
+The stored `fusion_rank` and `fusion_score` components exist so this claim stays
+checkable on live rows rather than resting on the rehearsal above.
+
 ## Rollout modes
 
 Both settings are JSON arrays of explicit site IDs and default to `[]`:
@@ -78,7 +106,66 @@ selected the pair.
 
 If index construction or one source ranking fails, the worker logs the error and
 creates that source's suggestions with the current cosine path. The job result
-reports the fallback count.
+reports the fallback count. A failure can only cost a source its hybrid ranking;
+it never expires, rewrites, or hides an existing suggestion.
+
+#### Eligibility
+
+Both halves of the candidate union are filtered by one shared SQL predicate
+(`_PILOT_ELIGIBILITY_SQL` in `app/ml/baseline.py`), so a lexically-retrieved
+candidate cannot reach an editor through a rule that dense retrieval would have
+applied. The rules are:
+
+- the target is active, on the same site, and embedded with the current model;
+- no active internal link already joins the pair;
+- no non-expired suggestion decision already covers the pair;
+- the content fingerprints differ;
+- `lower(btrim(title))` differs;
+- cosine similarity is at or below `SUGGESTION_DUPLICATE_SIMILARITY_THRESHOLD`
+  (0.99 by default).
+
+BM25 knows nothing about links, prior decisions, or vectors, so the lexical pool
+is pre-filtered in memory only to avoid spending its 100 slots on candidates
+already known to be ineligible; the SQL predicate above is the authority, and
+the worker walks the BM25 ranking in bounded pages until 100 eligible candidates
+survive or the scored corpus is exhausted. Ranks are re-derived over those
+survivors, so rejected candidates cannot consume the pool and hide the next
+eligible result. The near-duplicate ceiling is the rule that matters most here —
+it is invisible to text ranking, so without the shared predicate a lexical-only
+candidate would be the one way a duplicate page reaches the queue.
+
+This predicate applies to the pilot path only. Standard sites keep the exact
+baseline query they had before the pilot, so enabling nothing changes nothing.
+
+#### Stored score and components
+
+`suggestions.score` is cosine semantic similarity for every method. The
+dashboard percentage, its thresholds, and the global queue order all read that
+one column, so a pilot row and a baseline row at 0.82 mean the same thing.
+
+What actually selected and ordered a pilot row goes in `score_components`,
+untransformed:
+
+```json
+{
+  "version": "hybrid_bm25_v1",
+  "final_order": "bm25_512",
+  "score_is": "cosine_semantic_similarity",
+  "recipe": "structured_t3_tax2_c512",
+  "bm25_score": 12.47,
+  "fusion": {"name": "wrrf_d025_l100_k10", "dense_weight": 0.25,
+             "lexical_weight": 1.0, "rank_constant": 10},
+  "fusion_rank": 3, "fusion_score": 0.0912,
+  "dense_rank": 4, "lexical_rank": 2,
+  "semantic": 0.82
+}
+```
+
+`dense_rank` or `lexical_rank` is null when only the other retriever proposed
+the target. The raw BM25 score is reported as itself; it is deliberately not
+squashed into a 0–1 range, because any such number would be read as a confidence
+next to the similarity percentage and it is not one. Baseline rows store no
+components — their score already is their whole explanation.
 
 ### Explicit comparison
 
@@ -129,6 +216,26 @@ Before expansion:
 These sample gates are deliberately provisional. Record the measured baseline and
 agreed numerical thresholds before enabling the second site.
 
+## Queue capacity
+
+Generation never expires anything. The pilot fills only the slots a source has
+free, so enabling it cannot retire an editor's existing queue as a side effect.
+When every source is already at `MAX_SUGGESTIONS_PER_ARTICLE`, a pilot run
+creates nothing and says so.
+
+Clearing a queue is therefore a separate, deliberate, site-scoped action:
+
+```bash
+# report only — changes nothing
+python -m scripts.expire_pending_suggestions --site-id 12 --method baseline_cosine
+# apply
+python -m scripts.expire_pending_suggestions --site-id 12 --method baseline_cosine --yes
+```
+
+The script has no fleet-wide form — `--site-id` is required — and it only ever
+touches `pending` rows. `approved`, `applying`, `applied`, and `rejected` are
+editorial history and are never expired by it.
+
 ## Rollback
 
 1. Set the site's suggestion method back to **Standard**. If it is server-managed,
@@ -136,12 +243,29 @@ agreed numerical thresholds before enabling the second site.
 2. Restart the analysis worker only when the environment override changed.
 3. Do not trigger another pilot analysis.
 4. Inspect pending and approved `hybrid_bm25` suggestions separately.
-5. Expire pending pilot rows only through a reviewed, site-specific operation.
+5. Expire pending pilot rows only through the site-specific operation above.
    Do not silently cancel approved or publishing rows.
 
 Removing the flag stops new pilot ranking immediately after worker restart.
 Existing editorial decisions remain durable and require an explicit operational
 choice.
+
+### Schema rollback
+
+Both pilot migrations refuse to downgrade while the state they carry is still
+live, and they refuse before changing anything — `alembic/env.py` wraps the
+chain in one transaction, so a refusal leaves the schema exactly as it was:
+
+- `b8e5f1a3c027` refuses while any `hybrid_bm25` suggestion exists, in any
+  status, and reports the blocking rows by status. Dropping `score_components`
+  would leave those rows in the queue with no record of how they were chosen, in
+  front of an application whose method enum does not contain `hybrid_bm25`.
+- `6a7d9e2c4b10` refuses while any site is still on `experimental`, because
+  dropping the column would silently forget the rollout state.
+
+A blocked rollback is recoverable; an unreadable queue is not. Clear the pending
+pilot rows with the script above, decide deliberately about reviewed pilot rows,
+set enrolled sites back to Standard, then downgrade.
 
 ## Dashboard behavior
 
@@ -152,17 +276,34 @@ When the five-per-source quota has no open positions, generation is disabled wit
 queue-full explanation while **Compare methods** remains available.
 
 The queue requests all active suggestion methods so baseline and pilot rows are both
-visible during the mixed-version pilot. Cards label pilot rows as `hybrid BM25`. The
-displayed percentage is labelled semantic similarity in the preview; it is not
-presented as calibrated BM25 confidence.
+visible during the mixed-version pilot. No queue read, count, or bulk-review request
+sends a `method` filter, so a hybrid row is listed, counted, filtered, and reviewed
+exactly like a baseline one — the mixed queue is the normal case during a pilot, and
+a filter that quietly excluded one method would hide rows from the editor who has to
+decide about them. Cards label pilot rows as `hybrid BM25`. The displayed percentage
+is labelled semantic similarity in the preview; it is not presented as calibrated
+BM25 confidence.
 
 ## Known limitations
 
-- The in-memory BM25 index is rebuilt for each pilot or shadow analysis job.
+- The in-memory BM25 index is rebuilt for each pilot or shadow analysis job, and
+  its memory grows linearly with the corpus — roughly 0.5 GB of resident memory
+  for a 9,000-article site, alongside the embedding model in the same worker.
 - Offline relevance treats existing links as the known positives.
 - The stored score is semantic similarity, while BM25 determines pilot selection.
+  A queue sorted by score is therefore not sorted by what chose the pilot rows;
+  `score_components.bm25_score` is the only place that ordering is visible.
+- The pilot path applies the near-duplicate, identical-title, and identical-
+  fingerprint rules; the Standard path does not. That asymmetry is deliberate —
+  it keeps the rollout reversible and changes nothing fleet-wide — but it means
+  a shadow comparison is comparing two slightly different eligibility sets, not
+  only two rankings.
 - Hybrid rows already in the queue remain visible after the site flag is removed
   until an explicit lifecycle action handles them.
+- The pilot path normally issues one extra dense query per source for lexical
+  eligibility, and uses additional bounded queries only when rejected candidates
+  require backfilling the lexical top 100. Per-source cost was roughly 1.5–1.9×
+  the baseline path on the measured corpora.
 
 ## Local shadow dry run — 29 July 2026
 

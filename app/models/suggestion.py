@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum, Float, ForeignKey, Index, String, Text, func, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -65,7 +66,16 @@ class Suggestion(Base):
         ForeignKey("articles.id", ondelete="CASCADE"), index=True
     )
     method: Mapped[str] = mapped_column(SuggestionMethod)
+    # Cosine semantic similarity, for every method. The dashboard percentage, its
+    # thresholds, and the global queue order all read this one column, so it has
+    # to keep one meaning across methods — a pilot row and a baseline row at 0.82
+    # are equally similar. What a non-cosine ranker used to *choose* the pair goes
+    # in score_components instead of being rescaled into this column.
     score: Mapped[float] = mapped_column(Float)
+    # Truthful, method-specific explanation of the row: for hybrid_bm25, the BM25
+    # score that ordered it plus its fusion and per-retriever ranks. Null for rows
+    # written before the column existed.
+    score_components: Mapped[dict | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(
         SuggestionStatus, default="pending", server_default="pending"
     )

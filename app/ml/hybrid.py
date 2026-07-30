@@ -1,4 +1,20 @@
-"""Site-scoped dense + BM25 pilot ranking with frozen evaluation parameters."""
+"""Site-scoped dense + BM25 pilot ranking with frozen evaluation parameters.
+
+What this actually does, stated plainly, because the stored components claim it:
+
+* dense cosine retrieves a top-100 pool, structured BM25-512 retrieves another;
+* weighted RRF prioritizes the union of the two pools;
+* **BM25-512 alone decides the final five.**
+
+The fusion therefore broadens which candidates are considered; it does not
+improve the ordering of what is delivered. On both measured corpora, the union
+produced no delivered suggestion that dense retrieval contributed alone. See
+`docs/design/v1-limited-pilot.md` for the measurement.
+
+Both halves of the union are filtered by one shared SQL predicate
+(`app.ml.baseline`), so a lexically-retrieved candidate cannot reach an editor
+through a rule that dense retrieval would have applied.
+"""
 
 from collections import defaultdict
 from collections.abc import Sequence
@@ -7,8 +23,12 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.orm import Session, aliased
 
-from app.ml.baseline import semantic_scores_for_targets, top_candidates
-from app.ml.lexical import BM25Index, tokenize
+from app.ml.baseline import (
+    eligible_candidate_scores,
+    eligible_top_candidates,
+    top_candidates,
+)
+from app.ml.lexical import BM25Index, rank_scores, tokenize
 from app.models import (
     Article,
     ArticleTaxonomy,
@@ -28,6 +48,12 @@ LEXICAL_RRF_WEIGHT = 1.0
 RRF_RANK_CONSTANT = 10
 HYBRID_POOL_SIZE = DENSE_POOL_SIZE + LEXICAL_POOL_SIZE
 
+#: Names carried in the stored score components so a row can be traced back to
+#: the exact recipe that produced it.
+LEXICAL_RECIPE_NAME = "structured_t3_tax2_c512"
+FUSION_NAME = "wrrf_d025_l100_k10"
+COMPONENTS_VERSION = "hybrid_bm25_v1"
+
 
 @dataclass(frozen=True)
 class CorpusArticle:
@@ -40,8 +66,44 @@ class CorpusArticle:
 
 @dataclass(frozen=True)
 class RankedCandidate:
+    """One suggestion-to-be, with every number that explains its position.
+
+    `semantic_score` is what gets persisted as `Suggestion.score`, so the
+    dashboard percentage, its thresholds, and the global queue keep the single
+    meaning they have always had: cosine similarity. `bm25_score` is what
+    actually chose and ordered this row, and it is reported separately rather
+    than rescaled into something that looks like a confidence.
+    """
+
     target_id: int
     semantic_score: float
+    bm25_score: float = 0.0
+    fusion_rank: int | None = None
+    fusion_score: float = 0.0
+    dense_rank: int | None = None
+    lexical_rank: int | None = None
+
+    def score_components(self) -> dict:
+        return {
+            "version": COMPONENTS_VERSION,
+            # Named so a reader never has to infer which number ordered the row.
+            "final_order": "bm25_512",
+            "score_is": "cosine_semantic_similarity",
+            "recipe": LEXICAL_RECIPE_NAME,
+            "bm25_score": self.bm25_score,
+            "fusion": {
+                "name": FUSION_NAME,
+                "dense_weight": DENSE_RRF_WEIGHT,
+                "lexical_weight": LEXICAL_RRF_WEIGHT,
+                "rank_constant": RRF_RANK_CONSTANT,
+            },
+            "fusion_rank": self.fusion_rank,
+            "fusion_score": self.fusion_score,
+            # None means the other retriever never proposed this target.
+            "dense_rank": self.dense_rank,
+            "lexical_rank": self.lexical_rank,
+            "semantic": self.semantic_score,
+        }
 
 
 @dataclass(frozen=True)
@@ -51,6 +113,17 @@ class HybridRanking:
     dense_count: int
     lexical_count: int
     union_count: int
+
+
+def normalized_title(title: str) -> str:
+    """Match SQL's `lower(btrim(title))` exactly.
+
+    Deliberately *not* collapsing internal whitespace. Doing so would make this
+    in-memory pre-filter stricter than the database rule, and the two must agree
+    or the pre-filter silently drops candidates the authoritative predicate
+    would have allowed.
+    """
+    return title.lower().strip()
 
 
 def structured_terms(article: CorpusArticle) -> list[str]:
@@ -63,12 +136,12 @@ def structured_terms(article: CorpusArticle) -> list[str]:
     return title_terms * TITLE_WEIGHT + taxonomy_terms * TAXONOMY_WEIGHT + content_terms
 
 
-def weighted_reciprocal_rank_fusion(
+def weighted_rrf_scores(
     dense_ranking: Sequence[int],
     lexical_ranking: Sequence[int],
     *,
     limit: int = HYBRID_POOL_SIZE,
-) -> list[int]:
+) -> list[tuple[int, float]]:
     """Prioritize the candidate union with the frozen lexical-heavy RRF recipe."""
     if limit <= 0:
         raise ValueError("limit must be positive")
@@ -81,7 +154,7 @@ def weighted_reciprocal_rank_fusion(
         for rank, article_id in enumerate(ranking, start=1):
             scores[article_id] += weight / (RRF_RANK_CONSTANT + rank)
             best_rank[article_id] = min(best_rank.get(article_id, rank), rank)
-    return sorted(
+    ordered = sorted(
         scores,
         key=lambda article_id: (
             -scores[article_id],
@@ -89,6 +162,20 @@ def weighted_reciprocal_rank_fusion(
             article_id,
         ),
     )[:limit]
+    return [(article_id, scores[article_id]) for article_id in ordered]
+
+
+def weighted_reciprocal_rank_fusion(
+    dense_ranking: Sequence[int],
+    lexical_ranking: Sequence[int],
+    *,
+    limit: int = HYBRID_POOL_SIZE,
+) -> list[int]:
+    """The fused order alone, for callers that do not need the scores."""
+    return [
+        article_id
+        for article_id, _score in weighted_rrf_scores(dense_ranking, lexical_ranking, limit=limit)
+    ]
 
 
 class HybridRanker:
@@ -112,7 +199,7 @@ class HybridRanker:
         title_groups: dict[str, set[int]] = defaultdict(set)
         fingerprint_groups: dict[str, set[int]] = defaultdict(set)
         for article in articles.values():
-            title_groups[" ".join(article.title.lower().split())].add(article.id)
+            title_groups[normalized_title(article.title)].add(article.id)
             if article.content_fingerprint:
                 fingerprint_groups[article.content_fingerprint].add(article.id)
         self.title_groups = dict(title_groups)
@@ -182,7 +269,7 @@ class HybridRanker:
 
     def _duplicate_ids(self, source_id: int) -> set[int]:
         article = self.articles[source_id]
-        duplicates = set(self.title_groups.get(" ".join(article.title.lower().split()), set()))
+        duplicates = set(self.title_groups.get(normalized_title(article.title), set()))
         if article.content_fingerprint:
             duplicates.update(self.fingerprint_groups.get(article.content_fingerprint, set()))
         duplicates.discard(source_id)
@@ -195,63 +282,108 @@ class HybridRanker:
         source_id: int,
         model: str,
         limit: int,
+        duplicate_similarity_threshold: float,
+        include_baseline: bool = False,
     ) -> HybridRanking:
         if limit <= 0:
             raise ValueError("limit must be positive")
         if source_id not in self.articles:
             return HybridRanking((), (), 0, 0, 0)
 
-        baseline_rows = top_candidates(
+        # Dense half: the SQL predicate has already applied every pilot rule.
+        dense_rows = eligible_top_candidates(
             db,
             source_id,
             model,
             DENSE_POOL_SIZE,
+            duplicate_similarity_threshold,
         )
-        duplicate_ids = self._duplicate_ids(source_id)
-        dense_rows = [row for row in baseline_rows if row[0] not in duplicate_ids]
         dense_ids = [target_id for target_id, _score in dense_rows]
-        excluded_ids = self.blocked_targets.get(source_id, set()) | duplicate_ids | {source_id}
-        lexical_rows = self.index.rank(
-            self.terms_by_article[source_id],
-            limit=LEXICAL_POOL_SIZE,
-            excluded_ids=excluded_ids,
-        )
-        lexical_ids = [target_id for target_id, _score in lexical_rows]
-        lexical_scores = dict(lexical_rows)
+        semantic_scores = dict(dense_rows)
 
-        prioritized_ids = weighted_reciprocal_rank_fusion(
-            dense_ids,
-            lexical_ids,
+        # Lexical half: the in-memory exclusions are only a pre-filter, so the
+        # pool is not spent on candidates already known to be ineligible. The
+        # rules that BM25 cannot see are enforced by the re-check below.
+        excluded_ids = (
+            self.blocked_targets.get(source_id, set()) | self._duplicate_ids(source_id) | {source_id}
         )
-        fusion_rank = {target_id: rank for rank, target_id in enumerate(prioritized_ids)}
+        query_terms = self.terms_by_article[source_id]
+        bm25_scores = self.index.score_documents(query_terms, excluded_ids=excluded_ids)
+        ranked_lexical_ids = [
+            target_id for target_id, _score in rank_scores(bm25_scores)
+        ]
+
+        # Build the lexical top-100 *after* authoritative eligibility. Checking
+        # only the raw first 100 would let rejected candidates consume the pool:
+        # an eligible BM25 rank 101 could disappear even when it should be the
+        # highest-ranked eligible lexical result. Walk the ranking in bounded
+        # pages until the pool is full or the scored corpus is exhausted.
+        lexical_ids: list[int] = []
+        for page_start in range(0, len(ranked_lexical_ids), LEXICAL_POOL_SIZE):
+            if len(lexical_ids) >= LEXICAL_POOL_SIZE:
+                break
+            page_ids = ranked_lexical_ids[
+                page_start : page_start + LEXICAL_POOL_SIZE
+            ]
+            lexical_only_ids = [
+                target_id for target_id in page_ids if target_id not in semantic_scores
+            ]
+            semantic_scores.update(
+                eligible_candidate_scores(
+                    db,
+                    source_id,
+                    model,
+                    lexical_only_ids,
+                    duplicate_similarity_threshold,
+                )
+            )
+            lexical_ids.extend(
+                target_id for target_id in page_ids if target_id in semantic_scores
+            )
+        lexical_ids = lexical_ids[:LEXICAL_POOL_SIZE]
+
+        fused = weighted_rrf_scores(dense_ids, lexical_ids)
+        fusion_scores = dict(fused)
+        fusion_ranks = {target_id: rank for rank, (target_id, _score) in enumerate(fused, start=1)}
+        dense_ranks = {target_id: rank for rank, target_id in enumerate(dense_ids, start=1)}
+        lexical_ranks = {target_id: rank for rank, target_id in enumerate(lexical_ids, start=1)}
+
+        # BM25-512 alone decides the final order; the fused rank only breaks ties.
         final_ids = sorted(
-            prioritized_ids,
+            fusion_ranks,
             key=lambda target_id: (
-                -lexical_scores.get(target_id, 0.0),
-                fusion_rank[target_id],
+                -bm25_scores.get(target_id, 0.0),
+                fusion_ranks[target_id],
                 target_id,
             ),
         )[:limit]
-        semantic_scores = semantic_scores_for_targets(
-            db,
-            article_id=source_id,
-            model=model,
-            target_ids=final_ids,
-        )
         candidates = tuple(
             RankedCandidate(
                 target_id=target_id,
                 semantic_score=min(1.0, max(0.0, semantic_scores[target_id])),
+                bm25_score=bm25_scores.get(target_id, 0.0),
+                fusion_rank=fusion_ranks[target_id],
+                fusion_score=fusion_scores[target_id],
+                dense_rank=dense_ranks.get(target_id),
+                lexical_rank=lexical_ranks.get(target_id),
             )
             for target_id in final_ids
         )
-        baseline_candidates = tuple(
-            RankedCandidate(
-                target_id=target_id,
-                semantic_score=min(1.0, max(0.0, semantic_score)),
+
+        # The shadow comparison must be against what the baseline path would
+        # really have written, which is the untouched baseline query — not the
+        # pilot's stricter dense pool.
+        baseline_candidates: tuple[RankedCandidate, ...] = ()
+        if include_baseline:
+            baseline_candidates = tuple(
+                RankedCandidate(
+                    target_id=target_id,
+                    semantic_score=min(1.0, max(0.0, semantic_score)),
+                )
+                for target_id, semantic_score in top_candidates(
+                    db, source_id, model, DENSE_POOL_SIZE
+                )
             )
-            for target_id, semantic_score in baseline_rows
-        )
         return HybridRanking(
             candidates=candidates,
             baseline_candidates=baseline_candidates,

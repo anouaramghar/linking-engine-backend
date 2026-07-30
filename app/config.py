@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     v1_shadow_site_ids: frozenset[int] = frozenset()
     v1_pilot_site_ids: frozenset[int] = frozenset()
     v1_shadow_max_sources: int = Field(default=100, gt=0)
+    # A target this close to the source is the same page, not a link candidate.
+    # Applied by the pilot ranking path to both halves of its candidate union;
+    # the Standard cosine path is unchanged.
+    suggestion_duplicate_similarity_threshold: float = Field(default=0.99, ge=0.0, le=1.0)
 
     # Reject suspiciously incomplete crawls before they can replace a healthy snapshot.
     ingestion_min_previous_ratio: float = Field(default=0.5, ge=0.0, le=1.0)

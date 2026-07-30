@@ -519,10 +519,18 @@ def test_list_endpoints_reject_an_unbounded_limit(client, site):
 
 def test_bulk_review_enforces_batch_bounds(client, site):
     """A batch accepts the configured maximum but rejects larger or empty input."""
+    # Deliberately above any real id: this test is about the size of the batch,
+    # so it must not also approve a thousand rows that happen to exist. Starting
+    # at 1 is how this test once overwrote real review decisions.
+    UNREACHABLE_ID = 10**9
+
     def review(count: int) -> int:
         return client.post(
             "/api/v1/suggestions/bulk-review",
-            json={"suggestion_ids": list(range(1, count + 1)), "status": "approved"},
+            json={
+                "suggestion_ids": list(range(UNREACHABLE_ID, UNREACHABLE_ID + count)),
+                "status": "approved",
+            },
         ).status_code
 
     assert review(MAX_BULK_REVIEW) == 200

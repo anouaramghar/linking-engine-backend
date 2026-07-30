@@ -80,16 +80,19 @@ class BM25Index:
             for term, frequency in Counter(terms).items():
                 self.postings[term].append((document_id, frequency))
 
-    def rank(
+    def score_documents(
         self,
         query_terms: Sequence[str],
         *,
-        limit: int,
         excluded_ids: set[int] | None = None,
-    ) -> list[tuple[int, float]]:
-        """Return the highest BM25 scores for documents sharing query terms."""
-        if limit <= 0:
-            raise ValueError("limit must be positive")
+    ) -> dict[int, float]:
+        """Return the BM25 score of every document sharing a term with the query.
+
+        Exposed separately from `rank` because the pilot needs two things from one
+        accumulation pass: the lexical top-N, and the true score of a candidate
+        that dense retrieval contributed. Reporting 0.0 for the latter would put
+        an untrue number in the stored score components.
+        """
         excluded = excluded_ids or set()
         scores: dict[int, float] = defaultdict(float)
         average_length = self.average_document_length or 1.0
@@ -116,4 +119,27 @@ class BM25Index:
                     / (term_frequency + length_normalizer)
                 )
 
-        return sorted(scores.items(), key=lambda item: (-item[1], item[0]))[:limit]
+        return dict(scores)
+
+    def rank(
+        self,
+        query_terms: Sequence[str],
+        *,
+        limit: int,
+        excluded_ids: set[int] | None = None,
+    ) -> list[tuple[int, float]]:
+        """Return the highest BM25 scores for documents sharing query terms."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        scores = self.score_documents(query_terms, excluded_ids=excluded_ids)
+        return rank_scores(scores)[:limit]
+
+
+def rank_scores(scores: Mapping[int, float]) -> list[tuple[int, float]]:
+    """Order scored documents highest first, breaking ties on the document id.
+
+    The id tiebreak is what makes the ranking reproducible across runs: dict
+    iteration order would otherwise decide which of two equally scored documents
+    is suggested.
+    """
+    return sorted(scores.items(), key=lambda item: (-item[1], item[0]))

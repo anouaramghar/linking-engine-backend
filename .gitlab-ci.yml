@@ -26,8 +26,9 @@ test:
   variables:
     POSTGRES_USER: linkmesh
     POSTGRES_PASSWORD: linkmesh
-    POSTGRES_DB: linkmesh
-    DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh
+    POSTGRES_DB: linkmesh_test
+    DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh_test
+    TEST_DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh_test
     REDIS_URL: redis://redis:6379/0
   script:
     - |
