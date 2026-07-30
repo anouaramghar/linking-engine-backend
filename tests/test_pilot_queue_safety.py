@@ -184,7 +184,7 @@ def test_pilot_generation_never_expires_existing_pending_cosine_rows(db, pilot_s
 def test_the_pilot_fills_only_the_slots_a_source_has_free(db, pilot_site, monkeypatch):
     """Three of five slots are taken, so at most two new rows may appear."""
     site, source, targets = pilot_site
-    monkeypatch.setattr(settings, "max_suggestions_per_article", 5)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 5)
     for target in targets[:3]:
         _add_suggestion(db, site, source, target, status="pending")
 
@@ -200,7 +200,7 @@ def test_the_pilot_fills_only_the_slots_a_source_has_free(db, pilot_site, monkey
 
 def test_a_full_queue_produces_nothing_rather_than_making_room(db, pilot_site, monkeypatch):
     site, source, targets = pilot_site
-    monkeypatch.setattr(settings, "max_suggestions_per_article", 2)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 2)
     for target in targets[:2]:
         _add_suggestion(db, site, source, target, status="pending")
     before = _statuses(db, site)

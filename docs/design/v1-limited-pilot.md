@@ -12,7 +12,8 @@ The pilot uses the strongest frozen evaluation recipe:
 2. retrieve structured BM25 top 100;
 3. combine the candidate lists;
 4. prioritize the union with weighted reciprocal-rank fusion;
-5. select the final five in BM25 order.
+5. order the evaluated top five by BM25;
+6. expose only BM25 rank 1 during the visible pilot.
 
 Frozen parameters:
 
@@ -28,13 +29,14 @@ pilot.
 
 ## What the fusion does, measured
 
-**BM25-512 alone determines the final five.** The weighted RRF decides which
-candidates are considered, not which are delivered or in what order.
+**BM25-512 alone determines the evaluated top five.** The weighted RRF decides
+which candidates are considered, not their final order. The visible pilot then
+persists only rank 1; this safety cap does not change the frozen ranking recipe.
 
 This is a property of the design rather than an observation about one corpus. A
 dense-only candidate can outrank the lexical top five only if its own BM25 score
 is higher — and if it were, it would already be inside the BM25 top 100. The
-fusion changes the delivered set only when fewer than five eligible lexical
+fusion changes the evaluated set only when fewer than five eligible lexical
 candidates exist and dense-only candidates fill the remaining slots.
 
 Rehearsals on both evaluated corpora agree, measured against real site data in
@@ -45,9 +47,9 @@ rolled-back read-only transactions on 30 July 2026:
 | WordPress News (site 2469) | 1,097 | 86% | 14% | **0%** |
 | Airbnb (site 1) | 9,330 | 66% | 34% | **0%** |
 
-No delivered suggestion on either corpus came from dense retrieval alone. Do not
+No top-five suggestion on either corpus came from dense retrieval alone. Do not
 describe the fusion as improving the final ordering; on this evidence it does
-not change the delivered top five at all. It is retained because it is the
+not change the evaluated top five at all. It is retained because it is the
 frozen, evaluated configuration and because it broadens the pool — which is what
 lets a lexical-only candidate reach an editor.
 
@@ -62,6 +64,7 @@ Both settings are JSON arrays of explicit site IDs and default to `[]`:
 V1_SHADOW_SITE_IDS=[12]
 V1_PILOT_SITE_IDS=[]
 V1_SHADOW_MAX_SOURCES=100
+V1_PILOT_MAX_SUGGESTIONS_PER_ARTICLE=1
 ```
 
 A site cannot appear in both settings; startup validation rejects overlapping
@@ -218,10 +221,12 @@ agreed numerical thresholds before enabling the second site.
 
 ## Queue capacity
 
-Generation never expires anything. The pilot fills only the slots a source has
-free, so enabling it cannot retire an editor's existing queue as a side effect.
-When every source is already at `MAX_SUGGESTIONS_PER_ARTICLE`, a pilot run
-creates nothing and says so.
+Generation never expires anything. Standard generation keeps
+`MAX_SUGGESTIONS_PER_ARTICLE` (five by default), while the visible pilot uses
+`V1_PILOT_MAX_SUGGESTIONS_PER_ARTICLE` (one). Enabling the pilot cannot retire an
+editor's existing queue as a side effect: a source that already has one or more
+active suggestions receives nothing new until normal review or expiration frees
+capacity.
 
 Clearing a queue is therefore a separate, deliberate, site-scoped action:
 
@@ -272,8 +277,9 @@ set enrolled sites back to Standard, then downgrade.
 The Sites page has one **Generate suggestions** action. A visible badge identifies
 the saved **Standard** or **Experimental** method, and **Suggestion method…** changes
 future generation without replacing existing suggestions or editorial decisions.
-When the five-per-source quota has no open positions, generation is disabled with a
-queue-full explanation while **Compare methods** remains available.
+When the mode-specific per-source quota has no open positions, generation is
+disabled with a queue-full explanation while **Compare methods** remains
+available. Read-only comparison still evaluates five candidates.
 
 The queue requests all active suggestion methods so baseline and pilot rows are both
 visible during the mixed-version pilot. No queue read, count, or bulk-review request
@@ -324,3 +330,24 @@ filled every source quota, so the run also exercised the full-queue path.
 
 The site flag was not saved. The normal worker was restored after the temporary
 container exited.
+
+## Local rank-1 validation — 30 July 2026
+
+The one-per-source cap was validated on a fresh isolated clone of WordPress News
+site `2469`. Nothing was deployed or activated outside that clone.
+
+- active sources / suggestions created: 1,097 / 1,097;
+- minimum / maximum active suggestions per source: 1 / 1;
+- hybrid fallbacks: 0;
+- full-site generation time: 41.310s;
+- peak worker working set: 812.3 MB;
+- proxied suggestion API: 50 requests, 0 errors, 44.2ms p95.
+
+Recalculation from the six frozen site/seed reports found mean Hit@1 of 6.49% for
+cosine, 10.25% for BM25-512, and 10.39% for Hybrid. Hybrid therefore improved
+Hit@1 by 60.2% relative to cosine on this frozen evidence.
+
+A deterministic Codex-assisted review of 200 generated rank-1 pairs approved
+116 (58%). This is an engineering audit, not independent human editorial
+feedback, and does not satisfy the human expansion gate. The sampled queue rows
+were left pending.

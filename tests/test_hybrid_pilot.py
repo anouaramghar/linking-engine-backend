@@ -575,6 +575,7 @@ def test_committed_defaults_enroll_no_site():
 
     assert defaults.v1_shadow_site_ids == frozenset()
     assert defaults.v1_pilot_site_ids == frozenset()
+    assert defaults.v1_pilot_max_suggestions_per_article == 1
     assert defaults.suggestion_duplicate_similarity_threshold == 0.99
 
 
@@ -589,6 +590,21 @@ def test_a_standard_site_still_gets_the_baseline_path(db, site):
     assert rows
     assert {row.method for row in rows} == {"baseline_cosine"}
     assert "ranking_mode" not in result
+
+
+def test_a_standard_site_keeps_the_normal_per_source_cap(db, site, monkeypatch):
+    articles = _make_articles(db, site)
+    monkeypatch.setattr(settings, "max_suggestions_per_article", 2)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 1)
+
+    generate_suggestions(site.id)
+
+    rows = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    counts = {
+        article.id: sum(row.source_article_id == article.id for row in rows)
+        for article in articles
+    }
+    assert set(counts.values()) == {2}
 
 
 def test_pilot_site_persists_hybrid_method(db, site, monkeypatch):
@@ -623,13 +639,54 @@ def test_pilot_site_persists_hybrid_method(db, site, monkeypatch):
     assert result["mean_union_candidates"] == 3.0
 
 
-def test_explicit_comparison_never_persists_suggestions(db, site, monkeypatch):
-    source, target, other = _make_articles(db, site)
+def test_pilot_site_persists_only_rank_one_per_source(db, site, monkeypatch):
+    articles = _make_articles(db, site)
+    site.suggestion_mode = "experimental"
+    db.commit()
     calls = []
 
     class FakeRanker:
-        def rank(self, _db, *, source_id, **_kwargs):
-            calls.append(source_id)
+        def rank(self, _db, *, source_id, limit, **_kwargs):
+            calls.append((source_id, limit))
+            candidates = tuple(
+                RankedCandidate(target_id=article.id, semantic_score=0.8)
+                for article in articles
+                if article.id != source_id
+            )
+            return HybridRanking(
+                candidates=candidates[:limit],
+                baseline_candidates=candidates[:limit],
+                dense_count=2,
+                lexical_count=2,
+                union_count=2,
+            )
+
+    monkeypatch.setattr(
+        "app.services.suggestion_service.HybridRanker.load",
+        lambda *_args, **_kwargs: FakeRanker(),
+    )
+
+    result = generate_suggestions(site.id)
+
+    rows = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    counts = {
+        article.id: sum(row.source_article_id == article.id for row in rows)
+        for article in articles
+    }
+    assert set(counts.values()) == {1}
+    assert {limit for _source_id, limit in calls} == {1}
+    assert result["suggestion_cap_per_source"] == 1
+
+
+def test_explicit_comparison_never_persists_suggestions(db, site, monkeypatch):
+    source, target, other = _make_articles(db, site)
+    calls = []
+    monkeypatch.setattr(settings, "max_suggestions_per_article", 2)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 1)
+
+    class FakeRanker:
+        def rank(self, _db, *, source_id, limit, **_kwargs):
+            calls.append((source_id, limit))
             available = [
                 article.id for article in (source, target, other) if article.id != source_id
             ]
@@ -659,9 +716,11 @@ def test_explicit_comparison_never_persists_suggestions(db, site, monkeypatch):
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     assert suggestions == []
     assert len(calls) == 3
+    assert {limit for _source_id, limit in calls} == {2}
     assert result["ranking_mode"] == "shadow"
     assert result["comparison_only"] is True
     assert result["suggestions_created"] == 0
+    assert result["suggestion_cap_per_source"] == 2
 
 
 def test_shadow_site_persists_baseline_and_reports_overlap(db, site, monkeypatch):

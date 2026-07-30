@@ -206,6 +206,11 @@ def generate_suggestions(
             )
             if comparison_only and ranking_mode != "shadow":
                 raise ValueError("comparison-only analysis requires shadow ranking")
+            suggestion_cap = (
+                settings.v1_pilot_max_suggestions_per_article
+                if ranking_mode == "pilot"
+                else settings.max_suggestions_per_article
+            )
             hybrid_ranker = None
             hybrid_load_failed = False
             if ranking_mode != "baseline":
@@ -261,9 +266,7 @@ def generate_suggestions(
             shadow_overlap_total = 0.0
             shadow_exact_matches = 0
             for article_id in article_ids:
-                remaining = settings.max_suggestions_per_article - existing_counts.get(
-                    article_id, 0
-                )
+                remaining = suggestion_cap - existing_counts.get(article_id, 0)
                 has_capacity = remaining > 0
                 shadow_selected = ranking_mode == "shadow" and article_id in shadow_source_ids
                 if comparison_only and not shadow_selected:
@@ -296,7 +299,7 @@ def generate_suggestions(
                 else:
                     try:
                         ranking_limit = (
-                            settings.max_suggestions_per_article if shadow_selected else remaining
+                            suggestion_cap if shadow_selected else remaining
                         )
                         ranking = hybrid_ranker.rank(
                             db,
@@ -394,6 +397,7 @@ def generate_suggestions(
                     {
                         "ranking_mode": ranking_mode,
                         "comparison_only": comparison_only,
+                        "suggestion_cap_per_source": suggestion_cap,
                         "hybrid_ranker_loaded": not hybrid_load_failed,
                         "eligible_sources": eligible_sources,
                         "shadow_sources_selected": len(shadow_source_ids),
