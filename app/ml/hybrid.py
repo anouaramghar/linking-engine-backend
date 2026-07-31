@@ -1,4 +1,4 @@
-"""Site-scoped dense + BM25 pilot ranking with frozen evaluation parameters.
+"""Global dense + BM25 Hybrid ranking with frozen evaluation parameters.
 
 What this actually does, stated plainly, because the stored components claim it:
 
@@ -9,7 +9,7 @@ What this actually does, stated plainly, because the stored components claim it:
 The fusion therefore broadens which candidates are considered; it does not
 improve the ordering of what is delivered. On both measured corpora, the union
 produced no delivered suggestion that dense retrieval contributed alone. See
-`docs/design/v1-limited-pilot.md` for the measurement.
+`docs/design/global-hybrid-ranking.md` for the contract.
 
 Both halves of the union are filtered by one shared SQL predicate
 (`app.ml.baseline`), so a lexically-retrieved candidate cannot reach an editor
@@ -305,13 +305,13 @@ class HybridRanker:
         # pool is not spent on candidates already known to be ineligible. The
         # rules that BM25 cannot see are enforced by the re-check below.
         excluded_ids = (
-            self.blocked_targets.get(source_id, set()) | self._duplicate_ids(source_id) | {source_id}
+            self.blocked_targets.get(source_id, set())
+            | self._duplicate_ids(source_id)
+            | {source_id}
         )
         query_terms = self.terms_by_article[source_id]
         bm25_scores = self.index.score_documents(query_terms, excluded_ids=excluded_ids)
-        ranked_lexical_ids = [
-            target_id for target_id, _score in rank_scores(bm25_scores)
-        ]
+        ranked_lexical_ids = [target_id for target_id, _score in rank_scores(bm25_scores)]
 
         # Build the lexical top-100 *after* authoritative eligibility. Checking
         # only the raw first 100 would let rejected candidates consume the pool:
@@ -322,9 +322,7 @@ class HybridRanker:
         for page_start in range(0, len(ranked_lexical_ids), LEXICAL_POOL_SIZE):
             if len(lexical_ids) >= LEXICAL_POOL_SIZE:
                 break
-            page_ids = ranked_lexical_ids[
-                page_start : page_start + LEXICAL_POOL_SIZE
-            ]
+            page_ids = ranked_lexical_ids[page_start : page_start + LEXICAL_POOL_SIZE]
             lexical_only_ids = [
                 target_id for target_id in page_ids if target_id not in semantic_scores
             ]
@@ -337,9 +335,7 @@ class HybridRanker:
                     duplicate_similarity_threshold,
                 )
             )
-            lexical_ids.extend(
-                target_id for target_id in page_ids if target_id in semantic_scores
-            )
+            lexical_ids.extend(target_id for target_id in page_ids if target_id in semantic_scores)
         lexical_ids = lexical_ids[:LEXICAL_POOL_SIZE]
 
         fused = weighted_rrf_scores(dense_ids, lexical_ids)
@@ -372,7 +368,7 @@ class HybridRanker:
 
         # The shadow comparison must be against what the baseline path would
         # really have written, which is the untouched baseline query — not the
-        # pilot's stricter dense pool.
+        # Hybrid's stricter dense pool.
         baseline_candidates: tuple[RankedCandidate, ...] = ()
         if include_baseline:
             baseline_candidates = tuple(

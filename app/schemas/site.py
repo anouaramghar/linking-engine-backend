@@ -95,8 +95,9 @@ class SiteOut(BaseModel):
     base_url: str
     platform: str
     crawl_frequency: str
+    suggestion_method: Literal["hybrid_bm25"] = "hybrid_bm25"
     suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool = False
+    suggestion_mode_managed: bool = True
     suggestion_comparison_enabled: bool = False
     suggestion_slots_available: int = 0
     created_at: datetime

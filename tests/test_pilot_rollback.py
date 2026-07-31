@@ -23,6 +23,7 @@ from tests.conftest import TEST_DATABASE_URL, _database_name
 PILOT_REVISION = "b8e5f1a3c027"
 GLOBAL_REVISION = "c3d7a9f1e204"
 CORRECTIVE_REVISION = "d4e6f8a1b203"
+HYBRID_STANDARD_REVISION = "e7b4c9d2a601"
 SITE_MODE_REVISION = "6a7d9e2c4b10"
 #: The last revision that predates the pilot entirely.
 PRE_PILOT_REVISION = "f3a8b1c2d4e5"
@@ -221,24 +222,24 @@ def test_expiring_the_pending_rows_is_not_enough_while_decided_rows_remain(migra
         command.downgrade(config, SITE_MODE_REVISION)
 
 
-def test_corrective_migration_restores_standard_for_existing_and_new_sites(migrated):
-    """Databases already on the global revision have a safe forward path."""
+def test_hybrid_standard_migration_restores_experimental_for_existing_and_new_sites(migrated):
+    """Databases already on the site-scoped revision have a safe forward path."""
     config, url = migrated
-    command.downgrade(config, GLOBAL_REVISION)
-    _seed(url, site_mode="experimental")
+    command.downgrade(config, CORRECTIVE_REVISION)
+    _seed(url, site_mode="standard")
 
-    command.upgrade(config, CORRECTIVE_REVISION)
+    command.upgrade(config, HYBRID_STANDARD_REVISION)
 
     engine = create_engine(url)
     with engine.begin() as connection:
         connection.execute(
             text(
                 "INSERT INTO sites (name, base_url, platform) "
-                "VALUES ('new standard', 'https://new-standard.example.com', 'html')"
+                "VALUES ('new hybrid', 'https://new-hybrid.example.com', 'html')"
             )
         )
     engine.dispose()
-    assert _site_modes(url) == ["standard", "standard"]
+    assert _site_modes(url) == ["experimental", "experimental"]
 
 
 def test_the_full_rollback_succeeds_from_the_corrected_site_scoped_head(migrated):

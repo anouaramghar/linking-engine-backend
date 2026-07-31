@@ -30,6 +30,24 @@ def test_internal_hrefs_resolves_relative_links():
     ]
 
 
+def test_resolve_internal_url_follows_redirect_alias():
+    c = make_connector()
+    canonical = "https://example.com/canonical/"
+
+    def handler(request):
+        if request.url.path == "/blog/legacy/":
+            return httpx.Response(301, headers={"location": canonical}, request=request)
+        return httpx.Response(200, request=request)
+
+    c.client = httpx.Client(
+        base_url="https://example.com",
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+    )
+
+    assert c.resolve_internal_url("https://example.com/blog/legacy/") == canonical
+
+
 def test_to_article_handles_comment_only_rendered_content():
     c = make_connector()
     article = c._to_article(
@@ -108,7 +126,9 @@ def _mock_publish(connector, raw_content):
 def _suggestion(anchor_text=None):
     return SimpleNamespace(
         source_article=SimpleNamespace(id=1, external_id="10", url="https://example.com/src"),
-        target_article=SimpleNamespace(title="Tips & <Tricks>", url="https://example.com/t?a=1&b=2"),
+        target_article=SimpleNamespace(
+            title="Tips & <Tricks>", url="https://example.com/t?a=1&b=2"
+        ),
         anchor_text=anchor_text,
     )
 

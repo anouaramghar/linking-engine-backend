@@ -1,4 +1,4 @@
-"""Deterministic in-memory BM25 used by the limited-pilot ranking path."""
+"""Deterministic in-memory BM25 used by the global Hybrid ranking path."""
 
 import math
 import re

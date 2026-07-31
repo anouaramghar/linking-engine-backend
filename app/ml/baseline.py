@@ -2,10 +2,9 @@
 
 Two families of query live here.
 
-`top_candidates` is the long-standing baseline path and is left exactly as it
-was: every Standard site still gets the same rows it got before the pilot.
+`top_candidates` is retained for explicit Hybrid comparisons and ranking fallback.
 
-The pilot path uses `_PILOT_ELIGIBILITY_SQL` instead. Dense retrieval applies it
+The Hybrid path uses `_PILOT_ELIGIBILITY_SQL` instead. Dense retrieval applies it
 while choosing its own top k; `eligible_candidate_scores` applies the identical
 predicate to a candidate list produced elsewhere. That second use is the point.
 BM25 ranks documents — it has no way to know about existing links, prior
@@ -44,7 +43,7 @@ ORDER BY e2.vector <=> e1.vector
 LIMIT :k
 """)
 
-# The pilot's eligibility rules, in one place so both halves of the hybrid
+# Hybrid's eligibility rules, in one place so both halves of the ranking
 # candidate union are filtered by the same predicate. Every clause is a rule the
 # baseline path applies somewhere — the link, decision, active, site, and model
 # rules in SQL; the fingerprint and title rules in the ranker's in-memory corpus
@@ -103,7 +102,7 @@ WHERE e1.article_id = :article_id
 
 
 def top_candidates(db: Session, article_id: int, model: str, k: int) -> list[tuple[int, float]]:
-    """The unchanged baseline query, still serving every Standard site."""
+    """The baseline query used by explicit comparisons and fallback."""
     rows = db.execute(TOP_K_SQL, {"article_id": article_id, "model": model, "k": k}).all()
     return [(r.target_id, float(r.score)) for r in rows]
 
@@ -115,7 +114,7 @@ def eligible_top_candidates(
     k: int,
     duplicate_similarity_threshold: float,
 ) -> list[tuple[int, float]]:
-    """The pilot's dense pool: the k closest targets that pass every pilot rule."""
+    """The Hybrid dense pool: closest targets that pass every Hybrid rule."""
     rows = db.execute(
         PILOT_TOP_K_SQL,
         {

@@ -150,14 +150,12 @@ def _ranking_mode(
     ranking_mode_override: str | None = None,
 ) -> str:
     if ranking_mode_override is not None:
-        if ranking_mode_override not in {"baseline", "shadow", "pilot"}:
+        if ranking_mode_override not in {"baseline", "shadow", "hybrid"}:
             raise ValueError(f"unsupported ranking mode override: {ranking_mode_override}")
         return ranking_mode_override
-    if site_id in settings.v1_pilot_site_ids:
-        return "pilot"
-    if site_id in settings.v1_shadow_site_ids:
-        return "shadow"
-    return "pilot" if configured_mode == "experimental" else "baseline"
+    # Hybrid is the product default. `configured_mode` remains in the signature
+    # for rolling API compatibility; only explicit comparison overrides differ.
+    return "hybrid"
 
 
 def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[RankedCandidate]:
@@ -206,11 +204,7 @@ def generate_suggestions(
             )
             if comparison_only and ranking_mode != "shadow":
                 raise ValueError("comparison-only analysis requires shadow ranking")
-            suggestion_cap = (
-                settings.v1_pilot_max_suggestions_per_article
-                if ranking_mode == "pilot"
-                else settings.max_suggestions_per_article
-            )
+            suggestion_cap = settings.hybrid_max_suggestions_per_article
             hybrid_ranker = None
             hybrid_load_failed = False
             if ranking_mode != "baseline":
@@ -242,7 +236,7 @@ def generate_suggestions(
                 .order_by(Article.id)
             ).all()
             shadow_source_ids = (
-                _evenly_spaced_ids(article_ids, settings.v1_shadow_max_sources)
+                _evenly_spaced_ids(article_ids, settings.hybrid_max_sources_per_run)
                 if ranking_mode == "shadow"
                 else set()
             )
@@ -256,6 +250,15 @@ def generate_suggestions(
                     .group_by(Suggestion.source_article_id)
                 ).all()
             )
+            active_count = sum(existing_counts.values())
+            site_capacity = max(
+                0,
+                min(
+                    len(article_ids) * suggestion_cap,
+                    settings.hybrid_max_active_suggestions_per_site,
+                )
+                - active_count,
+            )
             created = 0
             eligible_sources = 0
             hybrid_sources = 0
@@ -265,19 +268,24 @@ def generate_suggestions(
             union_candidates_total = 0
             shadow_overlap_total = 0.0
             shadow_exact_matches = 0
-            pilot_sources_selected = 0
+            hybrid_sources_selected = 0
             for article_id in article_ids:
-                remaining = suggestion_cap - existing_counts.get(article_id, 0)
+                if ranking_mode == "hybrid" and site_capacity <= 0:
+                    break
+                remaining = min(
+                    suggestion_cap - existing_counts.get(article_id, 0),
+                    site_capacity,
+                )
                 has_capacity = remaining > 0
                 shadow_selected = ranking_mode == "shadow" and article_id in shadow_source_ids
                 if comparison_only and not shadow_selected:
                     continue
                 if not has_capacity and not shadow_selected:
                     continue
-                if ranking_mode == "pilot" and has_capacity:
-                    if pilot_sources_selected >= settings.v1_pilot_max_sources_per_run:
+                if ranking_mode == "hybrid" and has_capacity:
+                    if hybrid_sources_selected >= settings.hybrid_max_sources_per_run:
                         break
-                    pilot_sources_selected += 1
+                    hybrid_sources_selected += 1
                 if has_capacity:
                     eligible_sources += 1
                 method = "baseline_cosine"
@@ -321,7 +329,7 @@ def generate_suggestions(
                         lexical_candidates_total += ranking.lexical_count
                         union_candidates_total += ranking.union_count
                         hybrid_rows = list(ranking.candidates)
-                        if ranking_mode == "pilot":
+                        if ranking_mode == "hybrid":
                             candidate_rows = hybrid_rows
                             method = "hybrid_bm25"
                         else:
@@ -382,6 +390,7 @@ def generate_suggestions(
                         )
                     )
                     created += 1
+                site_capacity -= len(candidate_rows)
                 record_progress(
                     db,
                     job_run_id,
@@ -401,14 +410,10 @@ def generate_suggestions(
                         "ranking_mode": ranking_mode,
                         "comparison_only": comparison_only,
                         "suggestion_cap_per_source": suggestion_cap,
-                        "source_limit_per_run": (
-                            settings.v1_pilot_max_sources_per_run
-                            if ranking_mode == "pilot"
-                            else settings.v1_shadow_max_sources
-                        ),
+                        "source_limit_per_run": (settings.hybrid_max_sources_per_run),
                         "sources_selected": (
-                            pilot_sources_selected
-                            if ranking_mode == "pilot"
+                            hybrid_sources_selected
+                            if ranking_mode == "hybrid"
                             else len(shadow_source_ids)
                         ),
                         "hybrid_ranker_loaded": not hybrid_load_failed,

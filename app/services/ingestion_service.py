@@ -52,7 +52,9 @@ def _validate_snapshot_completeness(
     db: Session, site_id: int, run_id: int, article_count: int
 ) -> None:
     if article_count == 0:
-        raise ValueError(f"crawl returned zero articles for site {site_id}; snapshot not reconciled")
+        raise ValueError(
+            f"crawl returned zero articles for site {site_id}; snapshot not reconciled"
+        )
 
     previous_count = db.scalar(
         select(IngestionRun.articles_upserted)
@@ -79,9 +81,7 @@ def normalize_url(url: str) -> str:
     return f"{p.netloc.lower()}{p.path.rstrip('/')}"
 
 
-def _upsert_article(
-    db: Session, site_id: int, art: ArticleData, run_id: int | None = None
-) -> int:
+def _upsert_article(db: Session, site_id: int, art: ArticleData, run_id: int | None = None) -> int:
     db.execute(select(func.pg_advisory_xact_lock(_ARTICLE_UPSERT_LOCK_NAMESPACE, site_id)))
 
     identity_filters = [Article.url == art.url]
@@ -89,9 +89,7 @@ def _upsert_article(
         identity_filters.append(Article.external_id == art.external_id)
 
     matches = db.scalars(
-        select(Article)
-        .where(Article.site_id == site_id, or_(*identity_filters))
-        .with_for_update()
+        select(Article).where(Article.site_id == site_id, or_(*identity_filters)).with_for_update()
     ).all()
     by_url = next((article for article in matches if article.url == art.url), None)
     by_external_id = next(
@@ -286,9 +284,12 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         record_progress_durably(job_run_id, stage="resolving_links")
         links = 0
         seen: set[tuple[int, int]] = set()
+        resolve_internal_url = getattr(connector, "resolve_internal_url", None)
         for source_id, urls in outbound:
             for url in urls:
                 target_id = url_to_id.get(normalize_url(url))
+                if target_id is None and resolve_internal_url is not None:
+                    target_id = url_to_id.get(normalize_url(resolve_internal_url(url)))
                 if target_id and target_id != source_id and (source_id, target_id) not in seen:
                     _upsert_link(db, source_id, target_id, run.id)
                     seen.add((source_id, target_id))

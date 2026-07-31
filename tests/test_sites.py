@@ -1,8 +1,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from app.config import settings
-from app.models import Article, IngestionRun, InternalLink, JobRun, Suggestion
+from app.models import Article, IngestionRun, InternalLink, Suggestion
 
 
 def _payload():
@@ -24,8 +23,8 @@ def test_site_crud(client):
     assert site["article_count"] == 0
     assert site["internal_link_count"] == 0
     assert site["last_crawl_at"] is None
-    assert site["suggestion_mode"] == "standard"
-    assert site["suggestion_mode_managed"] is False
+    assert site["suggestion_mode"] == "experimental"
+    assert site["suggestion_mode_managed"] is True
     assert site["suggestion_comparison_enabled"] is False
     assert site["suggestion_slots_available"] == 0
     site_id = site["id"]
@@ -116,52 +115,17 @@ def test_site_response_includes_active_counts_and_latest_crawl(client, db, site)
         assert response["internal_link_count"] == 1
         assert response["last_ingestion_status"] == "succeeded"
         assert datetime.fromisoformat(response["last_crawl_at"]) == finished_at
-        assert response["suggestion_slots_available"] == 9
+        assert response["suggestion_slots_available"] == 5
 
 
-def test_suggestion_mode_is_saved_per_site(client, site):
-    response = client.put(
-        f"/api/v1/sites/{site.id}/suggestion-mode",
-        json={"suggestion_mode": "experimental"},
-    )
-
-    assert response.status_code == 200, response.text
-    assert response.json() == {
-        "suggestion_mode": "experimental",
-        "suggestion_mode_managed": False,
-        "suggestion_comparison_enabled": False,
-    }
-    assert client.get(f"/api/v1/sites/{site.id}").json()["suggestion_mode"] == "experimental"
-
-
-def test_server_managed_suggestion_mode_cannot_be_changed(client, site, monkeypatch):
-    monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset({site.id}))
-
-    response = client.put(
-        f"/api/v1/sites/{site.id}/suggestion-mode",
-        json={"suggestion_mode": "standard"},
-    )
-
-    assert response.status_code == 409
-    assert "managed by the server rollout configuration" in response.json()["detail"]
-
-
-def test_suggestion_mode_cannot_change_during_active_analysis(client, db, site, monkeypatch):
-    run = JobRun(site_id=site.id, kind="analysis", status="running")
-    db.add(run)
-    db.commit()
-    monkeypatch.setattr(
-        "app.api.routes.sites.reconcile_active_job_runs",
-        lambda _db, runs: runs,
-    )
-
+def test_suggestion_mode_is_global_and_cannot_be_changed(client, site):
     response = client.put(
         f"/api/v1/sites/{site.id}/suggestion-mode",
         json={"suggestion_mode": "experimental"},
     )
 
     assert response.status_code == 409
-    assert "active suggestion job" in response.json()["detail"]
+    assert "global suggestion method" in response.json()["detail"]
 
 
 def test_orphan_filter_ignores_expired_links(client, db, site):

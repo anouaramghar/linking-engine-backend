@@ -71,6 +71,7 @@ class WordPressConnector(ContentConnector):
             },
         )
         self._host = urlparse(site.base_url).netloc
+        self._canonical_url_cache: dict[str, str] = {}
 
     # -- reading ---------------------------------------------------------
 
@@ -93,7 +94,10 @@ class WordPressConnector(ContentConnector):
     def _taxonomy_map(self) -> dict[tuple[str, int], TaxonomyData]:
         """Map (kind, WP term id) to taxonomy; category and tag ids can overlap."""
         out: dict[tuple[str, int], TaxonomyData] = {}
-        for path, kind in [("/wp-json/wp/v2/categories", "category"), ("/wp-json/wp/v2/tags", "tag")]:
+        for path, kind in [
+            ("/wp-json/wp/v2/categories", "category"),
+            ("/wp-json/wp/v2/tags", "tag"),
+        ]:
             for term in self._paginate(path):
                 out[(kind, term["id"])] = TaxonomyData(
                     kind=kind,
@@ -106,9 +110,7 @@ class WordPressConnector(ContentConnector):
         """Hrefs pointing at this site's host, resolved absolute (handles /relative/ links)."""
         return self._internal_hrefs_from_tree(_parse_html(content_html), page_url)
 
-    def _internal_hrefs_from_tree(
-        self, tree: HtmlElement | None, page_url: str
-    ) -> list[str]:
+    def _internal_hrefs_from_tree(self, tree: HtmlElement | None, page_url: str) -> list[str]:
         if tree is None:
             return []
         hrefs = []
@@ -117,6 +119,23 @@ class WordPressConnector(ContentConnector):
             if urlparse(absolute).netloc == self._host:
                 hrefs.append(absolute)
         return hrefs
+
+    def resolve_internal_url(self, url: str) -> str:
+        """Resolve redirect aliases without changing external-origin policy."""
+        cached = self._canonical_url_cache.get(url)
+        if cached is not None:
+            return cached
+        try:
+            response = self.client.head(url)
+            if response.status_code in {405, 501}:
+                response = self.client.get(url)
+            canonical = str(response.url)
+        except httpx.HTTPError:
+            return url
+        if urlparse(canonical).netloc != self._host:
+            return url
+        self._canonical_url_cache[url] = canonical
+        return canonical
 
     def _to_article(
         self, post: dict, taxonomy_map: dict[tuple[str, int], TaxonomyData]
@@ -171,7 +190,9 @@ class WordPressConnector(ContentConnector):
         target = suggestion.target_article
         if not source.external_id:
             raise ValueError(f"article {source.id} has no WP post id")
-        resp = self.client.get(f"/wp-json/wp/v2/posts/{source.external_id}", params={"context": "edit"})
+        resp = self.client.get(
+            f"/wp-json/wp/v2/posts/{source.external_id}", params={"context": "edit"}
+        )
         resp.raise_for_status()
         content = resp.json()["content"]["raw"]
         if content.strip():

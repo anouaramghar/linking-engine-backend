@@ -48,16 +48,9 @@ def valid_dimension_probe(monkeypatch):
     )
 
 
-@pytest.fixture(autouse=True)
-def no_site_is_enrolled_by_default(monkeypatch):
-    monkeypatch.setattr(settings, "v1_shadow_site_ids", frozenset())
-    monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset())
-
-
 @pytest.fixture
 def pilot_site(db, site):
-    """A site on the experimental method with one source and seven targets."""
-    site.suggestion_mode = "experimental"
+    """A site with one source and seven targets."""
     articles = []
     for index in range(8):
         title = f"Canning topic {index}"
@@ -176,16 +169,18 @@ def test_pilot_generation_never_expires_existing_pending_cosine_rows(db, pilot_s
         db.refresh(row)
         assert row.status == "pending", "an existing pending row was expired by generation"
         assert row.method == "baseline_cosine"
-    assert db.scalar(
-        select(func.count()).select_from(Suggestion).where(Suggestion.status == "expired")
-    ) == 0
+    assert (
+        db.scalar(
+            select(func.count()).select_from(Suggestion).where(Suggestion.status == "expired")
+        )
+        == 0
+    )
 
 
-def test_the_pilot_fills_only_the_slots_a_source_has_free(db, pilot_site, monkeypatch):
-    """Three of five slots are taken, so at most two new rows may appear."""
+def test_hybrid_fills_only_the_slots_a_source_has_free(db, pilot_site):
+    """Two of three Hybrid slots are taken, so at most one new row appears."""
     site, source, targets = pilot_site
-    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 5)
-    for target in targets[:3]:
+    for target in targets[:2]:
         _add_suggestion(db, site, source, target, status="pending")
 
     generate_suggestions(site.id)
@@ -193,14 +188,14 @@ def test_the_pilot_fills_only_the_slots_a_source_has_free(db, pilot_site, monkey
     from_source = db.scalars(
         select(Suggestion).where(Suggestion.source_article_id == source.id)
     ).all()
-    assert len(from_source) == 5
+    assert len(from_source) == 3
     created = [row for row in from_source if row.method == "hybrid_bm25"]
-    assert len(created) == 2
+    assert len(created) == 1
 
 
 def test_a_full_queue_produces_nothing_rather_than_making_room(db, pilot_site, monkeypatch):
     site, source, targets = pilot_site
-    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 2)
+    monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 2)
     for target in targets[:2]:
         _add_suggestion(db, site, source, target, status="pending")
     before = _statuses(db, site)
@@ -264,9 +259,7 @@ def test_the_expiry_script_expires_only_pending_rows_of_the_named_site(db, pilot
 def test_the_expiry_script_can_target_one_method(db, pilot_site):
     site, source, targets = pilot_site
     cosine = _add_suggestion(db, site, source, targets[0], status="pending")
-    hybrid = _add_suggestion(
-        db, site, source, targets[1], status="pending", method="hybrid_bm25"
-    )
+    hybrid = _add_suggestion(db, site, source, targets[1], status="pending", method="hybrid_bm25")
 
     assert expire_main(["--site-id", str(site.id), "--method", "hybrid_bm25", "--yes"]) == 0
 
@@ -324,9 +317,7 @@ def test_an_index_failure_leaves_the_existing_queue_intact(db, pilot_site, monke
         assert row.status == status, f"the {status} row changed when the index failed"
 
 
-def test_a_load_sql_error_rolls_back_before_baseline_fallback(
-    db, pilot_site, monkeypatch
-):
+def test_a_load_sql_error_rolls_back_before_baseline_fallback(db, pilot_site, monkeypatch):
     """A caught PostgreSQL error must not poison the fallback transaction."""
     site, source, targets = pilot_site
     existing = {
@@ -356,9 +347,7 @@ def test_a_load_sql_error_rolls_back_before_baseline_fallback(
     } == {"baseline_cosine"}
 
 
-def test_a_per_source_ranking_failure_leaves_the_existing_queue_intact(
-    db, pilot_site, monkeypatch
-):
+def test_a_per_source_ranking_failure_leaves_the_existing_queue_intact(db, pilot_site, monkeypatch):
     site, source, targets = pilot_site
     existing = {
         "pending": _add_suggestion(db, site, source, targets[0], status="pending"),
@@ -388,9 +377,7 @@ def test_a_per_source_ranking_failure_leaves_the_existing_queue_intact(
     } == {"baseline_cosine"}
 
 
-def test_a_ranking_sql_error_rolls_back_before_baseline_fallback(
-    db, pilot_site, monkeypatch
-):
+def test_a_ranking_sql_error_rolls_back_before_baseline_fallback(db, pilot_site, monkeypatch):
     """Per-source SQL failures recover just like Python ranking failures."""
     site, source, targets = pilot_site
     existing = {
@@ -421,7 +408,7 @@ def test_a_ranking_sql_error_rolls_back_before_baseline_fallback(
 
 
 def test_a_ranking_failure_does_not_hide_rows_from_the_queue(db, pilot_site, client, monkeypatch):
-    """"Hidden" means invisible to the endpoints the dashboard actually reads."""
+    """ "Hidden" means invisible to the endpoints the dashboard actually reads."""
     site, source, targets = pilot_site
     visible = _add_suggestion(db, site, source, targets[0], status="pending")
 
