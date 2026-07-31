@@ -5,7 +5,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
 
-Platform = Enum("wordpress", "html", name="platform", native_enum=False, length=20)
+Platform = Enum("wordpress", "html", "pool", name="platform", native_enum=False, length=20)
 RunStatus = Enum("running", "succeeded", "failed", name="run_status", native_enum=False, length=20)
 SuggestionMode = Enum(
     "standard",

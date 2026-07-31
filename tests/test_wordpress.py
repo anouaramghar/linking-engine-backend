@@ -163,3 +163,42 @@ def test_apply_link_skips_only_on_exact_href():
     captured = _mock_publish(c, '<p><a href="https://example.com/t?a=1&b=25">other post</a></p>')
     c.apply_link(_suggestion())
     assert "Read also" in captured["content"]
+
+
+def _pool_suggestion():
+    """A customer post linking out to a read-only content-pool target."""
+    return SimpleNamespace(
+        source_article=SimpleNamespace(id=1, external_id="10", url="https://example.com/src"),
+        target_article=SimpleNamespace(
+            title="Photosynthesis", url="https://en.wikipedia.org/wiki/Photosynthesis"
+        ),
+        anchor_text=None,
+    )
+
+
+def test_apply_link_is_idempotent_for_external_pool_targets():
+    """A retry must not append a second block just because the target is off-site.
+
+    The publication worker rolls a claim back to 'approved' when the remote write
+    lands but the commit does not, so apply_link runs again on exactly the content
+    it just wrote. Matching only same-host hrefs made that check always miss for a
+    content-pool target and duplicate the "Read also" block on every attempt.
+    """
+    published = (
+        "<p>body</p>\n<p>Read also: "
+        '<a href="https://en.wikipedia.org/wiki/Photosynthesis">Photosynthesis</a></p>'
+    )
+    c = make_connector()
+    captured = _mock_publish(c, published)
+
+    c.apply_link(_pool_suggestion())
+
+    assert captured == {}
+
+    # A different external target still gets inserted.
+    c = make_connector()
+    captured = _mock_publish(c, published)
+    other = _pool_suggestion()
+    other.target_article.url = "https://en.wikipedia.org/wiki/Photosystem"
+    c.apply_link(other)
+    assert captured["content"].count("Read also") == 2

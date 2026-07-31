@@ -92,9 +92,7 @@ def _review_matching_counts(
         .execution_options(synchronize_session=False)
         .cte("reviewed_rows")
     )
-    bounded_reviewed_ids = (
-        select(reviewed_rows.c.id).limit(MAX_BULK_REVIEW).subquery()
-    )
+    bounded_reviewed_ids = select(reviewed_rows.c.id).limit(MAX_BULK_REVIEW).subquery()
     result = db.execute(
         select(
             select(func.count()).select_from(candidates).scalar_subquery().label("matched"),
@@ -105,9 +103,7 @@ def _review_matching_counts(
             .label("reviewed_ids"),
         )
     ).one()
-    reviewed_ids = (
-        sorted(result.reviewed_ids or []) if result.reviewed <= MAX_BULK_REVIEW else None
-    )
+    reviewed_ids = sorted(result.reviewed_ids or []) if result.reviewed <= MAX_BULK_REVIEW else None
     return result.matched, result.reviewed, reviewed_ids
 
 
@@ -215,9 +211,7 @@ def count_suggestions(
         site_id=site_id, method=method, min_percent=min_percent, max_percent=max_percent
     )
     rows = db.execute(
-        select(Suggestion.status, func.count())
-        .where(*conditions)
-        .group_by(Suggestion.status)
+        select(Suggestion.status, func.count()).where(*conditions).group_by(Suggestion.status)
     ).all()
     counts = {status: count for status, count in rows}
     return SuggestionCounts(
@@ -296,8 +290,11 @@ def list_suggestion_page(
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)
 def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    if db.get(Site, site_id) is None:
+    site = db.get(Site, site_id)
+    if site is None:
         raise HTTPException(404, f"site {site_id} not found")
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources cannot generate suggestions")
     try:
         run = enqueue_job(db, site_id, "analysis", analyze_site, job_timeout=7200)
     except DuplicateJobError as e:
@@ -307,8 +304,11 @@ def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted
 
 @router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)
 def trigger_analysis_comparison(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    if db.get(Site, site_id) is None:
+    site = db.get(Site, site_id)
+    if site is None:
         raise HTTPException(404, f"site {site_id} not found")
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources cannot generate suggestions")
     try:
         run = enqueue_job(db, site_id, "analysis", compare_site, job_timeout=7200)
     except DuplicateJobError as e:

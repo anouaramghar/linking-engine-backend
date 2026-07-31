@@ -110,6 +110,19 @@ class WordPressConnector(ContentConnector):
         """Hrefs pointing at this site's host, resolved absolute (handles /relative/ links)."""
         return self._internal_hrefs_from_tree(_parse_html(content_html), page_url)
 
+    def _all_hrefs(self, content_html: str, page_url: str) -> list[str]:
+        """Every href on the page, resolved absolute, whatever host it points at.
+
+        The publication idempotency check needs this rather than `_internal_hrefs`:
+        a content-pool target is external by definition, so filtering to this
+        site's host would drop the very link we are checking for and append a
+        duplicate "Read also" block on every retry.
+        """
+        tree = _parse_html(content_html)
+        if tree is None:
+            return []
+        return [urljoin(page_url, href) for href in tree.xpath("//a/@href")]
+
     def _internal_hrefs_from_tree(self, tree: HtmlElement | None, page_url: str) -> list[str]:
         if tree is None:
             return []
@@ -196,8 +209,10 @@ class WordPressConnector(ContentConnector):
         resp.raise_for_status()
         content = resp.json()["content"]["raw"]
         if content.strip():
-            # exact href match, not substring — "/post" must not match href="/post-2"
-            existing = set(self._internal_hrefs(content, source.url))
+            # exact href match, not substring — "/post" must not match href="/post-2".
+            # Every href, not just internal ones: the retry-safety this gives the
+            # publication worker has to hold for external content-pool targets too.
+            existing = set(self._all_hrefs(content, source.url))
             if target.url in existing:
                 return  # link already present — idempotent
         # ponytail: appended "read also" block; in-text placement + anchor generation is v4

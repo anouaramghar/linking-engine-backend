@@ -39,6 +39,7 @@ def _embed_missing(
     site_id: int,
     model: str,
     job_run_id: int | None = None,
+    encoded_offset: int = 0,
 ) -> int:
     """Encode active articles whose model-specific embedding is missing or stale."""
     encoded = 0
@@ -122,7 +123,7 @@ def _embed_missing(
             db,
             job_run_id,
             stage="encoding",
-            encoded=encoded,
+            encoded=encoded_offset + encoded,
         )
         db.commit()
 
@@ -194,9 +195,26 @@ def generate_suggestions(
             site = db.get(Site, site_id)
             if site is None:
                 raise ValueError(f"site {site_id} not found")
+            if site.platform == "pool":
+                raise ValueError("content-pool sources cannot generate suggestions")
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
+            pool_site_ids = db.scalars(
+                select(Site.id).where(Site.platform == "pool").order_by(Site.id)
+            ).all()
+            for pool_site_id in pool_site_ids:
+                # Different customer analyses may share the same pool. Reuse the
+                # analysis advisory lock so they cannot both insert one missing
+                # article/model embedding at the same time.
+                with _site_analysis_lock(pool_site_id):
+                    encoded += _embed_missing(
+                        db,
+                        pool_site_id,
+                        model,
+                        job_run_id,
+                        encoded_offset=encoded,
+                    )
             ranking_mode = _ranking_mode(
                 site_id,
                 site.suggestion_mode,

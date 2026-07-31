@@ -211,7 +211,6 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
     db.execute(
         update(Suggestion)
         .where(
-            Suggestion.site_id == site_id,
             Suggestion.status.in_(("pending", "approved")),
             or_(
                 Suggestion.source_article_id.in_(inactive_article_ids),

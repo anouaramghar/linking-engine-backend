@@ -111,6 +111,8 @@ def _site_out(
         settings.hybrid_max_active_suggestions_per_site,
     )
     item.suggestion_slots_available = max(0, site_capacity - active_suggestion_count)
+    if site.platform == "pool":
+        item.suggestion_slots_available = 0
     item.article_count = article_count
     item.internal_link_count = internal_link_count
     if run is not None:

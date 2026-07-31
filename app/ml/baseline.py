@@ -25,9 +25,11 @@ SELECT a2.id AS target_id,
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
 JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
-JOIN articles a2 ON a2.id = e2.article_id AND a2.site_id = a1.site_id
+JOIN articles a2 ON a2.id = e2.article_id
+JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
+  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
   AND a2.is_active IS TRUE
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
@@ -53,9 +55,11 @@ _PILOT_ELIGIBILITY_SQL = """
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
 JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
-JOIN articles a2 ON a2.id = e2.article_id AND a2.site_id = a1.site_id
+JOIN articles a2 ON a2.id = e2.article_id
+JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
+  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
   AND a2.is_active IS TRUE
   AND (                     -- identical inputs are duplicate pages, not link candidates
       e1.content_fingerprint IS NULL

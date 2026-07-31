@@ -12,7 +12,8 @@ MAX_BULK_SITES = 1000
 class SiteCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     base_url: str = Field(min_length=1, max_length=2048)
-    platform: Literal["wordpress", "html"]
+    platform: Literal["wordpress", "html", "pool"]
+    crawl_frequency: Literal["manual", "daily"] | None = None
     wp_username: str | None = Field(default=None, max_length=255)
     wp_app_password: str | None = Field(default=None, max_length=255)
 
@@ -20,6 +21,10 @@ class SiteCreate(BaseModel):
     def safe_base_url(self) -> "SiteCreate":
         if bool(self.wp_username) != bool(self.wp_app_password):
             raise ValueError("wp_username and wp_app_password must be provided together")
+        if self.platform != "wordpress" and (self.wp_username or self.wp_app_password):
+            raise ValueError("WordPress credentials are only valid for WordPress sites")
+        if self.platform != "pool" and self.crawl_frequency not in (None, "manual"):
+            raise ValueError("daily crawl frequency is reserved for content-pool sources")
         allow = settings.allow_unsafe_crawl_targets
         try:
             validate_url(
@@ -31,6 +36,8 @@ class SiteCreate(BaseModel):
         except UnsafeURLError as e:
             raise ValueError(str(e)) from e
         self.base_url = self.base_url.rstrip("/")
+        if self.crawl_frequency is None:
+            self.crawl_frequency = "daily" if self.platform == "pool" else "manual"
         return self
 
 

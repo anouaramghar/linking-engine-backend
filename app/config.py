@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     # Reject suspiciously incomplete crawls before they can replace a healthy snapshot.
     ingestion_min_previous_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
 
+    # External content pool (RSS/Atom and Wikipedia).
+    pool_max_articles_per_source: int = Field(default=50, ge=1, le=50)
+    pool_source_timeout: float = Field(default=20.0, gt=0.0, le=120.0)
+    pool_poll_interval_seconds: int = Field(default=86400, ge=60)
+    pool_poll_repeat_count: int = Field(default=3650, ge=1)
+
     # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/
     # metadata destinations and require HTTPS when WP credentials are used.
     # True relaxes both for crawling local test sites — development only.

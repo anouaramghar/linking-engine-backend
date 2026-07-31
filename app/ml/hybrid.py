@@ -20,7 +20,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, aliased
 
 from app.ml.baseline import (
@@ -34,6 +34,7 @@ from app.models import (
     ArticleTaxonomy,
     Embedding,
     InternalLink,
+    Site,
     Suggestion,
     Taxonomy,
 )
@@ -212,8 +213,9 @@ class HybridRanker:
             select(ArticleTaxonomy.article_id, Taxonomy.name)
             .join(Taxonomy, Taxonomy.id == ArticleTaxonomy.taxonomy_id)
             .join(Article, Article.id == ArticleTaxonomy.article_id)
+            .join(Site, Site.id == Article.site_id)
             .where(
-                Article.site_id == site_id,
+                or_(Article.site_id == site_id, Site.platform == "pool"),
                 Article.is_active.is_(True),
             )
             .order_by(ArticleTaxonomy.article_id, Taxonomy.name)
@@ -239,8 +241,9 @@ class HybridRanker:
                     Embedding,
                     (Embedding.article_id == Article.id) & (Embedding.model == model),
                 )
+                .join(Site, Site.id == Article.site_id)
                 .where(
-                    Article.site_id == site_id,
+                    or_(Article.site_id == site_id, Site.platform == "pool"),
                     Article.is_active.is_(True),
                 )
                 .order_by(Article.id)
