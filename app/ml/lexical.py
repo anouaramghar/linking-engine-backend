@@ -1,4 +1,4 @@
-"""Deterministic in-memory BM25 used by global Hybrid ranking."""
+"""Deterministic in-memory BM25 used by the limited-pilot ranking path."""
 
 import math
 import re
@@ -88,7 +88,7 @@ class BM25Index:
     ) -> dict[int, float]:
         """Return the BM25 score of every document sharing a term with the query.
 
-        Exposed separately from `rank` because Hybrid needs two things from one
+        Exposed separately from `rank` because the pilot needs two things from one
         accumulation pass: the lexical top-N, and the true score of a candidate
         that dense retrieval contributed. Reporting 0.0 for the latter would put
         an untrue number in the stored score components.

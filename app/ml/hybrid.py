@@ -1,4 +1,4 @@
-"""Global dense + BM25 ranking with frozen evaluation parameters.
+"""Site-scoped dense + BM25 pilot ranking with frozen evaluation parameters.
 
 What this actually does, stated plainly, because the stored components claim it:
 
@@ -9,7 +9,7 @@ What this actually does, stated plainly, because the stored components claim it:
 The fusion therefore broadens which candidates are considered; it does not
 improve the ordering of what is delivered. On both measured corpora, the union
 produced no delivered suggestion that dense retrieval contributed alone. See
-`docs/design/global-hybrid-ranking.md` for the measurement.
+`docs/design/v1-limited-pilot.md` for the measurement.
 
 Both halves of the union are filtered by one shared SQL predicate
 (`app.ml.baseline`), so a lexically-retrieved candidate cannot reach an editor
@@ -290,7 +290,7 @@ class HybridRanker:
         if source_id not in self.articles:
             return HybridRanking((), (), 0, 0, 0)
 
-        # Dense half: the SQL predicate has already applied every Hybrid rule.
+        # Dense half: the SQL predicate has already applied every pilot rule.
         dense_rows = eligible_top_candidates(
             db,
             source_id,
@@ -370,8 +370,9 @@ class HybridRanker:
             for target_id in final_ids
         )
 
-        # Offline comparisons use what the fallback path would really write,
-        # which is the untouched cosine query — not Hybrid's stricter dense pool.
+        # The shadow comparison must be against what the baseline path would
+        # really have written, which is the untouched baseline query — not the
+        # pilot's stricter dense pool.
         baseline_candidates: tuple[RankedCandidate, ...] = ()
         if include_baseline:
             baseline_candidates = tuple(

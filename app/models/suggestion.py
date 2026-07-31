@@ -68,7 +68,7 @@ class Suggestion(Base):
     method: Mapped[str] = mapped_column(SuggestionMethod)
     # Cosine semantic similarity, for every method. The dashboard percentage, its
     # thresholds, and the global queue order all read this one column, so it has
-    # to keep one meaning across methods — a Hybrid row and a fallback row at 0.82
+    # to keep one meaning across methods — a pilot row and a baseline row at 0.82
     # are equally similar. What a non-cosine ranker used to *choose* the pair goes
     # in score_components instead of being rescaled into this column.
     score: Mapped[float] = mapped_column(Float)

@@ -26,8 +26,8 @@ class Site(Base):
     crawl_frequency: Mapped[str] = mapped_column(String(50), default="manual", server_default="manual")
     suggestion_mode: Mapped[str] = mapped_column(
         SuggestionMode,
-        default="experimental",
-        server_default="experimental",
+        default="standard",
+        server_default="standard",
     )
     # WordPress Application Passwords (A2) — HTTP Basic Auth
     wp_username: Mapped[str | None] = mapped_column(String(255))

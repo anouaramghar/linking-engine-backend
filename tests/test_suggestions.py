@@ -1,4 +1,4 @@
-"""Cosine fallback + review lifecycle — hand-crafted embeddings, no torch needed."""
+"""Baseline cosine + review lifecycle — hand-crafted embeddings, no torch needed."""
 
 import hashlib
 from collections import Counter
@@ -31,19 +31,6 @@ def valid_dimension_probe(monkeypatch):
         "app.ml.embeddings.encode",
         lambda texts: [_vec(0) for _text in texts],
     )
-
-
-@pytest.fixture(autouse=True)
-def use_cosine_safety_fallback(monkeypatch):
-    """Keep lifecycle tests independent of the optional BM25 runtime."""
-    monkeypatch.setattr(
-        "app.services.suggestion_service.HybridRanker.load",
-        lambda *_args, **_kwargs: None,
-    )
-    # Several lifecycle fixtures intentionally use identical vectors. Production
-    # uses 0.99; this test-only value keeps those synthetic pairs eligible while
-    # still exercising the shared Hybrid/fallback predicate.
-    monkeypatch.setattr(settings, "suggestion_duplicate_similarity_threshold", 1.01)
 
 
 def _mix(a: int, b: int, wa: float, wb: float) -> list[float]:
@@ -111,10 +98,7 @@ def test_baseline_suggestions(db, site):
     assert best.score > 0.9
 
     # max 5 per article (A4)
-    assert all(
-        len(v) <= settings.hybrid_max_suggestions_per_article
-        for v in by_source.values()
-    )
+    assert all(len(v) <= settings.max_suggestions_per_article for v in by_source.values())
 
     # re-run: no duplicates
     generate_suggestions(site.id)
@@ -179,16 +163,16 @@ def test_reanalysis_respects_total_suggestion_cap(db, site):
 
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     counts = Counter(suggestion.source_article_id for suggestion in suggestions)
-    assert first["suggestions_created"] == 21
-    assert second["suggestions_created"] == 0
-    assert set(counts.values()) == {settings.hybrid_max_suggestions_per_article}
+    assert first == {"articles_encoded": 0, "suggestions_created": 35}
+    assert second == {"articles_encoded": 0, "suggestions_created": 0}
+    assert set(counts.values()) == {settings.max_suggestions_per_article}
 
 
 def test_rejected_and_applied_suggestions_free_active_quota(db, site):
     articles = _make_articles(
         db,
         site,
-        [_vec(0) for _ in range(settings.hybrid_max_suggestions_per_article + 3)],
+        [_vec(0) for _ in range(settings.max_suggestions_per_article + 3)],
     )
     source_id = articles[0].id
     generate_suggestions(site.id)
@@ -198,7 +182,7 @@ def test_rejected_and_applied_suggestions_free_active_quota(db, site):
         .where(Suggestion.source_article_id == source_id)
         .order_by(Suggestion.id)
     ).all()
-    assert len(original) == settings.hybrid_max_suggestions_per_article
+    assert len(original) == settings.max_suggestions_per_article
     rejected, applied = original[:2]
     rejected.status = "rejected"
     applied.status = "applied"
@@ -219,8 +203,8 @@ def test_rejected_and_applied_suggestions_free_active_quota(db, site):
         if suggestion.status in {"pending", "approved", "applying"}
     ]
     replacements = [suggestion for suggestion in suggestions if suggestion.id not in original_ids]
-    assert result["suggestions_created"] == 2
-    assert len(active) == settings.hybrid_max_suggestions_per_article
+    assert result == {"articles_encoded": 0, "suggestions_created": 2}
+    assert len(active) == settings.max_suggestions_per_article
     assert len(replacements) == 2
     assert decided_target_ids.isdisjoint(
         {suggestion.target_article_id for suggestion in replacements}
@@ -231,7 +215,7 @@ def test_expired_suggestion_frees_source_quota(db, site):
     articles = _make_articles(
         db,
         site,
-        [_vec(0) for _ in range(settings.hybrid_max_suggestions_per_article + 2)],
+        [_vec(0) for _ in range(settings.max_suggestions_per_article + 2)],
     )
     generate_suggestions(site.id)
     source = articles[0]
@@ -268,7 +252,7 @@ def test_expired_suggestion_frees_source_quota(db, site):
     replacements = [
         suggestion for suggestion in source_suggestions if suggestion.id not in original_ids
     ]
-    assert len(active) == settings.hybrid_max_suggestions_per_article
+    assert len(active) == settings.max_suggestions_per_article
     assert len(replacements) == 1
 
 
@@ -337,7 +321,7 @@ def test_rejected_source_target_pair_is_not_recreated(db, site):
             Suggestion.target_article_id == target.id,
         )
     ).all()
-    assert result["suggestions_created"] == 0
+    assert result == {"articles_encoded": 0, "suggestions_created": 0}
     assert len(matching) == 1
     assert matching[0].status == "rejected"
 
@@ -377,9 +361,9 @@ def test_concurrent_analysis_respects_total_suggestion_cap(db, site):
 
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     counts = Counter(suggestion.source_article_id for suggestion in suggestions)
-    assert sum(result["suggestions_created"] for result in results) == 21
-    assert len(suggestions) == 21
-    assert set(counts.values()) == {settings.hybrid_max_suggestions_per_article}
+    assert sum(result["suggestions_created"] for result in results) == 35
+    assert len(suggestions) == 35
+    assert set(counts.values()) == {settings.max_suggestions_per_article}
 
 
 def test_review_lifecycle(client, db, site):

@@ -1,4 +1,4 @@
-"""Global Hybrid ranking, eligibility, scoring, and fallback behavior."""
+"""Limited-pilot ranking, eligibility, shadowing, and fallback behavior."""
 
 import hashlib
 import math
@@ -57,6 +57,13 @@ def valid_dimension_probe(monkeypatch):
         "app.ml.embeddings.encode",
         lambda texts: [_vector(0) for _text in texts],
     )
+
+
+@pytest.fixture(autouse=True)
+def no_site_is_enrolled_by_default(monkeypatch):
+    """Every test starts from the committed defaults: both rollout lists empty."""
+    monkeypatch.setattr(settings, "v1_shadow_site_ids", frozenset())
+    monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset())
 
 
 def _make_articles(db, site) -> list[Article]:
@@ -352,9 +359,7 @@ def test_every_exclusion_rule_applies_to_lexically_retrieved_candidates(
     assert source.id not in delivered
 
 
-def test_a_lexical_only_near_duplicate_is_excluded_by_the_vector_rule(
-    db, site, eligibility_corpus
-):
+def test_a_lexical_only_near_duplicate_is_excluded_by_the_vector_rule(db, site, eligibility_corpus):
     """Isolates the rule that only the shared SQL predicate can enforce.
 
     The near-duplicate is the strongest lexical match in the corpus and is not
@@ -418,9 +423,7 @@ def test_lexical_pool_backfills_after_an_ineligible_first_page(monkeypatch):
     }
     monkeypatch.setattr(
         "app.ml.hybrid.eligible_top_candidates",
-        lambda *_args, **_kwargs: [
-            (article_id, 0.8) for article_id in range(102, 202)
-        ],
+        lambda *_args, **_kwargs: [(article_id, 0.8) for article_id in range(102, 202)],
     )
     checked_pages: list[list[int]] = []
 
@@ -486,10 +489,12 @@ def test_a_cross_site_article_is_never_a_candidate(db, site, eligibility_corpus)
 # --- stored score and components (correction 3) ------------------------------
 
 
-def test_hybrid_rows_store_cosine_as_the_score_and_bm25_in_the_components(
+def test_pilot_rows_store_cosine_as_the_score_and_bm25_in_the_components(
     db, site, eligibility_corpus
 ):
     source, targets = eligibility_corpus
+    site.suggestion_mode = "experimental"
+    db.commit()
 
     generate_suggestions(site.id)
 
@@ -527,12 +532,8 @@ def test_hybrid_rows_store_cosine_as_the_score_and_bm25_in_the_components(
     assert components["lexical_rank"] >= 1
 
 
-def test_cosine_fallback_rows_store_no_components(db, site, monkeypatch):
+def test_baseline_rows_store_no_components(db, site):
     _make_articles(db, site)
-    monkeypatch.setattr(
-        "app.services.suggestion_service.HybridRanker.load",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("index failed")),
-    )
 
     generate_suggestions(site.id)
 
@@ -542,13 +543,13 @@ def test_cosine_fallback_rows_store_no_components(db, site, monkeypatch):
     assert all(row.score_components is None for row in rows)
 
 
-def test_the_api_serves_the_components_for_a_hybrid_row(db, site, client, eligibility_corpus):
+def test_the_api_serves_the_components_for_a_pilot_row(db, site, client, eligibility_corpus):
     source, _targets = eligibility_corpus
+    site.suggestion_mode = "experimental"
+    db.commit()
     generate_suggestions(site.id)
 
-    response = client.get(
-        f"/api/v1/suggestions/{site.id}", params={"method": "hybrid_bm25"}
-    )
+    response = client.get(f"/api/v1/suggestions/{site.id}", params={"method": "hybrid_bm25"})
     assert response.status_code == 200
     payload = response.json()
 
@@ -560,24 +561,49 @@ def test_the_api_serves_the_components_for_a_hybrid_row(db, site, client, eligib
     assert served["score"] == pytest.approx(served["score_components"]["semantic"])
 
 
-# --- global generation contract ---------------------------------------------
+# --- rollout controls (correction 1) -----------------------------------------
 
 
-def test_committed_defaults_select_three_hybrid_suggestions():
+def test_committed_defaults_enroll_no_site():
     defaults = Settings(_env_file=None)
 
-    assert defaults.hybrid_max_suggestions_per_article == 3
+    assert defaults.v1_shadow_site_ids == frozenset()
+    assert defaults.v1_pilot_site_ids == frozenset()
+    assert defaults.v1_pilot_max_sources_per_run == 50
+    assert defaults.v1_pilot_max_suggestions_per_article == 3
     assert defaults.suggestion_duplicate_similarity_threshold == 0.99
 
 
-def test_global_hybrid_cap_cannot_exceed_the_product_limit():
-    with pytest.raises(ValidationError, match="less than or equal to 3"):
-        Settings(_env_file=None, hybrid_max_suggestions_per_article=4)
+def test_a_standard_site_still_gets_the_baseline_path(db, site):
+    """The default mode must not be quietly upgraded to hybrid."""
+    _make_articles(db, site)
+    assert site.suggestion_mode == "standard"
+
+    result = generate_suggestions(site.id)
+
+    rows = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    assert rows
+    assert {row.method for row in rows} == {"baseline_cosine"}
+    assert "ranking_mode" not in result
 
 
-def test_legacy_standard_site_value_does_not_select_cosine(db, site, monkeypatch):
+def test_a_standard_site_keeps_the_normal_per_source_cap(db, site, monkeypatch):
+    articles = _make_articles(db, site)
+    monkeypatch.setattr(settings, "max_suggestions_per_article", 2)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 3)
+
+    generate_suggestions(site.id)
+
+    rows = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    counts = {
+        article.id: sum(row.source_article_id == article.id for row in rows) for article in articles
+    }
+    assert set(counts.values()) == {2}
+
+
+def test_pilot_site_persists_hybrid_method(db, site, monkeypatch):
     source, target, _other = _make_articles(db, site)
-    site.suggestion_mode = "standard"
+    site.suggestion_mode = "experimental"
     db.commit()
 
     class FakeRanker:
@@ -602,12 +628,12 @@ def test_legacy_standard_site_value_does_not_select_cosine(db, site, monkeypatch
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     assert suggestions
     assert {suggestion.method for suggestion in suggestions} == {"hybrid_bm25"}
-    assert result["ranking_mode"] == "hybrid"
+    assert result["ranking_mode"] == "pilot"
     assert result["hybrid_fallback_sources"] == 0
     assert result["mean_union_candidates"] == 3.0
 
 
-def test_global_hybrid_persists_top_three_per_source(db, site, monkeypatch):
+def test_pilot_site_persists_top_three_per_source(db, site, monkeypatch):
     articles = _make_articles(db, site)
     articles.append(
         _add_article(
@@ -619,9 +645,10 @@ def test_global_hybrid_persists_top_three_per_source(db, site, monkeypatch):
             vector=_vector(3),
         )
     )
+    site.suggestion_mode = "experimental"
     db.commit()
     calls = []
-    monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 3)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 3)
 
     class FakeRanker:
         def rank(self, _db, *, source_id, limit, **_kwargs):
@@ -648,16 +675,181 @@ def test_global_hybrid_persists_top_three_per_source(db, site, monkeypatch):
 
     rows = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     counts = {
-        article.id: sum(row.source_article_id == article.id for row in rows)
-        for article in articles
+        article.id: sum(row.source_article_id == article.id for row in rows) for article in articles
     }
     assert set(counts.values()) == {3}
     assert {limit for _source_id, limit in calls} == {3}
     assert result["suggestion_cap_per_source"] == 3
 
 
-def test_hybrid_initialization_failure_falls_back_to_cosine(db, site, monkeypatch):
+def test_pilot_run_stops_at_the_configured_source_limit(db, site, monkeypatch):
+    articles = _make_articles(db, site)
+    articles.extend(
+        _add_article(
+            db,
+            site,
+            slug=f"bounded-{index}",
+            title=f"Bounded source {index}",
+            content="bounded pilot source",
+            vector=_vector(index + 3),
+        )
+        for index in range(3)
+    )
+    site.suggestion_mode = "experimental"
+    db.commit()
+    calls = []
+    monkeypatch.setattr(settings, "v1_pilot_max_sources_per_run", 2)
+
+    class FakeRanker:
+        def rank(self, _db, *, source_id, **_kwargs):
+            calls.append(source_id)
+            target_id = next(article.id for article in articles if article.id != source_id)
+            candidate = RankedCandidate(target_id=target_id, semantic_score=0.8)
+            return HybridRanking(
+                candidates=(candidate,),
+                baseline_candidates=(),
+                dense_count=1,
+                lexical_count=1,
+                union_count=1,
+            )
+
+    monkeypatch.setattr(
+        "app.services.suggestion_service.HybridRanker.load",
+        lambda *_args, **_kwargs: FakeRanker(),
+    )
+
+    result = generate_suggestions(site.id)
+
+    assert len(calls) == 2
+    assert result["suggestions_created"] == 2
+    assert result["source_limit_per_run"] == 2
+    assert result["sources_selected"] == 2
+    assert result["eligible_sources"] == 2
+
+
+def test_explicit_comparison_never_persists_suggestions(db, site, monkeypatch):
+    source, target, other = _make_articles(db, site)
+    calls = []
+    monkeypatch.setattr(settings, "max_suggestions_per_article", 2)
+    monkeypatch.setattr(settings, "v1_pilot_max_suggestions_per_article", 3)
+
+    class FakeRanker:
+        def rank(self, _db, *, source_id, limit, **_kwargs):
+            calls.append((source_id, limit))
+            available = [
+                article.id for article in (source, target, other) if article.id != source_id
+            ]
+            baseline = tuple(
+                RankedCandidate(target_id=target_id, semantic_score=0.8 - index * 0.1)
+                for index, target_id in enumerate(available)
+            )
+            return HybridRanking(
+                candidates=tuple(reversed(baseline)),
+                baseline_candidates=baseline,
+                dense_count=2,
+                lexical_count=2,
+                union_count=2,
+            )
+
+    monkeypatch.setattr(
+        "app.services.suggestion_service.HybridRanker.load",
+        lambda *_args, **_kwargs: FakeRanker(),
+    )
+
+    result = generate_suggestions(
+        site.id,
+        ranking_mode_override="shadow",
+        comparison_only=True,
+    )
+
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    assert suggestions == []
+    assert len(calls) == 3
+    assert {limit for _source_id, limit in calls} == {2}
+    assert result["ranking_mode"] == "shadow"
+    assert result["comparison_only"] is True
+    assert result["suggestions_created"] == 0
+    assert result["suggestion_cap_per_source"] == 2
+
+
+def test_shadow_site_persists_baseline_and_reports_overlap(db, site, monkeypatch):
+    source, target, other = _make_articles(db, site)
+    monkeypatch.setattr(settings, "v1_shadow_site_ids", frozenset({site.id}))
+
+    class FakeRanker:
+        def rank(self, _db, *, source_id, include_baseline=False, **_kwargs):
+            assert include_baseline, "shadow must compare against the real baseline rows"
+            available = [
+                article.id for article in (source, target, other) if article.id != source_id
+            ]
+            baseline = tuple(
+                RankedCandidate(target_id=target_id, semantic_score=0.8 - index * 0.1)
+                for index, target_id in enumerate(available)
+            )
+            return HybridRanking(
+                candidates=tuple(reversed(baseline)),
+                baseline_candidates=baseline,
+                dense_count=2,
+                lexical_count=2,
+                union_count=2,
+            )
+
+    monkeypatch.setattr(
+        "app.services.suggestion_service.HybridRanker.load",
+        lambda *_args, **_kwargs: FakeRanker(),
+    )
+
+    result = generate_suggestions(site.id)
+
+    suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+    assert suggestions
+    assert {suggestion.method for suggestion in suggestions} == {"baseline_cosine"}
+    assert all(suggestion.score_components is None for suggestion in suggestions)
+    assert result["ranking_mode"] == "shadow"
+    assert result["shadow_mean_overlap_at_5"] == 1.0
+    assert result["shadow_exact_order_rate"] == 0.0
+
+
+def test_shadow_sample_runs_when_existing_queue_fills_the_quota(db, site, monkeypatch):
     _make_articles(db, site)
+    monkeypatch.setattr(settings, "max_suggestions_per_article", 1)
+    baseline = generate_suggestions(site.id)
+    assert baseline["suggestions_created"] == 3
+
+    monkeypatch.setattr(settings, "v1_shadow_site_ids", frozenset({site.id}))
+    monkeypatch.setattr(settings, "v1_shadow_max_sources", 2)
+    calls = []
+
+    class FakeRanker:
+        def rank(self, _db, *, source_id, limit, **_kwargs):
+            calls.append((source_id, limit))
+            candidate = RankedCandidate(target_id=source_id, semantic_score=1.0)
+            return HybridRanking(
+                candidates=(candidate,),
+                baseline_candidates=(candidate,),
+                dense_count=2,
+                lexical_count=2,
+                union_count=2,
+            )
+
+    monkeypatch.setattr(
+        "app.services.suggestion_service.HybridRanker.load",
+        lambda *_args, **_kwargs: FakeRanker(),
+    )
+
+    result = generate_suggestions(site.id)
+
+    assert result["suggestions_created"] == 0
+    assert result["eligible_sources"] == 0
+    assert result["shadow_sources_selected"] == 2
+    assert result["hybrid_sources_evaluated"] == 2
+    assert len(calls) == 2
+    assert {limit for _source_id, limit in calls} == {1}
+
+
+def test_pilot_initialization_failure_falls_back_to_baseline(db, site, monkeypatch):
+    _make_articles(db, site)
+    monkeypatch.setattr(settings, "v1_pilot_site_ids", frozenset({site.id}))
     monkeypatch.setattr(
         "app.services.suggestion_service.HybridRanker.load",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("index failed")),
@@ -668,6 +860,15 @@ def test_hybrid_initialization_failure_falls_back_to_cosine(db, site, monkeypatc
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     assert suggestions
     assert {suggestion.method for suggestion in suggestions} == {"baseline_cosine"}
-    assert result["ranking_mode"] == "hybrid"
+    assert result["ranking_mode"] == "pilot"
     assert result["hybrid_ranker_loaded"] is False
     assert result["hybrid_fallback_sources"] == result["eligible_sources"]
+
+
+def test_shadow_and_pilot_site_sets_must_not_overlap():
+    with pytest.raises(ValidationError, match="overlap: 7"):
+        Settings(
+            _env_file=None,
+            v1_shadow_site_ids=frozenset({7}),
+            v1_pilot_site_ids=frozenset({7}),
+        )
