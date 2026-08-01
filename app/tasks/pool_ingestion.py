@@ -12,7 +12,8 @@ from app.db import SessionLocal
 from app.models import Site
 from app.services.alerts import send_alert
 from app.services.job_service import DuplicateJobError, enqueue_job
-from app.tasks.ingestion import ingest_site
+from app.services.pool_source_policy import PoolSourcePolicyError, require_approved_pool_source
+from app.tasks.ingestion import ingest_pool_site
 from app.tasks.queues import ingestion_queue, redis_conn
 
 logger = logging.getLogger(__name__)
@@ -37,13 +38,24 @@ def enqueue_daily_pool_ingestions() -> dict:
         with SessionLocal() as db:
             site_ids = db.scalars(
                 select(Site.id)
-                .where(Site.platform == "pool", Site.crawl_frequency == "daily")
+                .where(
+                    Site.platform == "pool",
+                    Site.crawl_frequency == "daily",
+                    Site.pool_source_approved.is_(True),
+                    Site.pool_source_quarantined.is_(False),
+                )
                 .order_by(Site.id)
             ).all()
             for site_id in site_ids:
                 try:
-                    enqueue_job(db, site_id, "ingestion", ingest_site, job_timeout=3600)
+                    site = db.get(Site, site_id)
+                    if site is None:
+                        continue
+                    require_approved_pool_source(site)
+                    enqueue_job(db, site_id, "ingestion", ingest_pool_site, job_timeout=3600)
                     queued += 1
+                except PoolSourcePolicyError:
+                    skipped += 1
                 except DuplicateJobError:
                     skipped += 1
                 except Exception as error:

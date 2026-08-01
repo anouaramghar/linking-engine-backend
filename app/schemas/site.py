@@ -30,7 +30,10 @@ class SiteCreate(BaseModel):
             validate_url(
                 self.base_url,
                 allow_private=allow,
-                require_https=bool(self.wp_username or self.wp_app_password) and not allow,
+                require_https=(
+                    bool(self.wp_username or self.wp_app_password) or self.platform == "pool"
+                )
+                and not allow,
                 resolve_dns=False,  # the pinned crawl transport resolves hostnames at connect time
             )
         except UnsafeURLError as e:
@@ -102,6 +105,15 @@ class SiteOut(BaseModel):
     base_url: str
     platform: str
     crawl_frequency: str
+    pool_source_approved: bool = False
+    pool_source_approved_at: datetime | None = None
+    pool_source_approved_by: str | None = None
+    pool_source_consecutive_failures: int = 0
+    pool_source_quarantined: bool = False
+    pool_source_quarantined_at: datetime | None = None
+    pool_source_quarantine_reason: str | None = None
+    pool_source_last_reactivated_at: datetime | None = None
+    pool_source_last_reactivated_by: str | None = None
     suggestion_method: Literal["hybrid_bm25"] = "hybrid_bm25"
     suggestion_mode: Literal["standard", "experimental"]
     suggestion_mode_managed: bool = True
@@ -112,6 +124,30 @@ class SiteOut(BaseModel):
     article_count: int = 0
     internal_link_count: int = 0
     last_crawl_at: datetime | None = None
+
+
+class PoolSourceApproval(BaseModel):
+    approved_by: str = Field(min_length=1, max_length=255)
+
+    @field_validator("approved_by")
+    @classmethod
+    def normalize_approver(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("approved_by must not be blank")
+        return normalized
+
+
+class PoolSourceReactivation(BaseModel):
+    reactivated_by: str = Field(min_length=1, max_length=255)
+
+    @field_validator("reactivated_by")
+    @classmethod
+    def normalize_reviewer(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("reactivated_by must not be blank")
+        return normalized
 
 
 class SiteSuggestionModeUpdate(BaseModel):

@@ -47,6 +47,17 @@ class Settings(BaseSettings):
     # External content pool (RSS/Atom and Wikipedia).
     pool_max_articles_per_source: int = Field(default=50, ge=1, le=50)
     pool_source_timeout: float = Field(default=20.0, gt=0.0, le=120.0)
+    pool_max_response_bytes: int = Field(default=5_000_000, ge=1_024, le=50_000_000)
+    pool_max_article_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
+    pool_max_title_chars: int = Field(default=500, ge=1, le=2_000)
+    pool_http_user_agent: str = Field(
+        default="LinkMesh/0.1 (contact: linkmesh@example.com)",
+        min_length=10,
+        max_length=500,
+    )
+    pool_request_delay_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
+    pool_allowed_domains: str = "wikipedia.org"
+    pool_quarantine_failure_threshold: int = Field(default=3, ge=1, le=20)
     pool_poll_interval_seconds: int = Field(default=86400, ge=60)
     pool_poll_repeat_count: int = Field(default=3650, ge=1)
 

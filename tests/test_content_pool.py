@@ -1,10 +1,12 @@
 """Content pools are read-only cross-site targets, never suggestion sources."""
 
 import hashlib
+import json
 import uuid
 from types import SimpleNamespace
 
 import feedparser
+import httpx
 import pytest
 from sqlalchemy import select
 
@@ -15,8 +17,17 @@ from app.connectors.wikipedia_connector import WikipediaConnector
 from app.models import Article, Embedding, IngestionRun, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.schemas.site import SiteCreate
+from app.connectors.url_guard import UnsafeURLError
 from app.services.ingestion_service import _reconcile_snapshot
+from app.services.pool_source_policy import (
+    PoolSourceFetchError,
+    PoolSourcePolicyError,
+    PoolSourceQuarantinedError,
+    is_pool_domain_allowed,
+    require_approved_pool_source,
+)
 from app.services.suggestion_service import generate_suggestions
+from app.tasks import ingestion as ingestion_task
 from app.tasks import pool_ingestion
 
 
@@ -30,12 +41,13 @@ def _fingerprint(title: str, content: str) -> str:
     return hashlib.sha256(f"{title}\n{content}".encode()).hexdigest()
 
 
-def _pool(db, *, frequency: str = "daily") -> Site:
+def _pool(db, *, frequency: str = "daily", approved: bool = True) -> Site:
     site = Site(
         name="News pool",
-        base_url=f"https://pool-{uuid.uuid4().hex[:8]}.example.com/feed.xml",
+        base_url=f"https://pool-{uuid.uuid4().hex[:8]}.wikipedia.org/feed.xml",
         platform="pool",
         crawl_frequency=frequency,
+        pool_source_approved=approved,
     )
     db.add(site)
     db.commit()
@@ -68,25 +80,47 @@ def test_pool_schema_defaults_to_daily_and_rejects_credentials():
             crawl_frequency="daily",
         )
 
+    with pytest.raises(ValueError, match="HTTPS required"):
+        SiteCreate(
+            name="Insecure pool",
+            base_url="http://en.wikipedia.org/wiki/Search_engine_optimization",
+            platform="pool",
+        )
+
+
+def test_pool_allowlist_accepts_subdomains_but_not_lookalikes(monkeypatch):
+    monkeypatch.setattr(settings, "pool_allowed_domains", "wikipedia.org,publisher.example")
+
+    assert is_pool_domain_allowed("https://en.wikipedia.org/wiki/Link_analysis")
+    assert is_pool_domain_allowed("https://news.publisher.example/feed.xml")
+    assert not is_pool_domain_allowed("https://evilwikipedia.org/feed.xml")
+
 
 def test_registry_selects_rss_or_wikipedia_connector():
-    rss = Site(name="RSS", base_url="https://example.com/feed.xml", platform="pool")
+    rss = Site(
+        name="RSS",
+        base_url="https://feeds.wikipedia.org/feed.xml",
+        platform="pool",
+        pool_source_approved=True,
+    )
     wiki = Site(
         name="Wiki",
         base_url="https://en.wikipedia.org/wiki/Link_analysis",
         platform="pool",
+        pool_source_approved=True,
     )
     assert isinstance(get_connector(rss), RSSConnector)
     assert isinstance(get_connector(wiki), WikipediaConnector)
 
 
 def test_rss_entry_is_normalized_without_fetching_the_article_page():
-    site = Site(name="RSS", base_url="https://example.com/feed.xml", platform="pool")
+    site = Site(name="RSS", base_url="https://feeds.wikipedia.org/feed.xml", platform="pool")
     connector = RSSConnector(site)
     parsed = feedparser.parse(
         b"""<?xml version='1.0'?><rss version='2.0'><channel><title>News</title>
         <item><guid>item-1</guid><title>Useful &amp; safe</title>
-        <link>https://example.com/useful</link><description><![CDATA[<p>Hello <b>world</b>.</p>]]></description>
+        <link>https://example.com/useful</link>
+        <description><![CDATA[<p>Hello <b>world</b>.</p>]]></description>
         </item></channel></rss>"""
     )
     article = connector._to_article(parsed.entries[0], "en")
@@ -96,6 +130,430 @@ def test_rss_entry_is_normalized_without_fetching_the_article_page():
     assert article.title == "Useful & safe"
     assert article.content_text == "Hello world ."
     assert article.external_id == "item-1"
+
+
+def test_rss_rejects_html_and_oversized_responses(monkeypatch):
+    site = Site(name="RSS", base_url="https://feeds.wikipedia.org/feed.xml", platform="pool")
+    html_transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "application/rss+xml"},
+            content=b"<html>not a feed</html>",
+        )
+    )
+    with pytest.raises(ValueError, match="HTML page"):
+        RSSConnector(site, transport=html_transport)._feed()
+
+    monkeypatch.setattr(settings, "pool_max_response_bytes", 8)
+    large_transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "application/rss+xml"},
+            stream=httpx.ByteStream(b"x" * 9),
+        )
+    )
+    with pytest.raises(ValueError, match="decoded-body limit"):
+        RSSConnector(site, transport=large_transport)._feed()
+
+
+def test_rss_rejects_malformed_and_binary_responses():
+    site = Site(name="RSS", base_url="https://feeds.wikipedia.org/feed.xml", platform="pool")
+    malformed = RSSConnector(
+        site,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=b"<rss><broken>")
+        ),
+    )
+    binary = RSSConnector(
+        site,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=b"\x00\x01not-a-feed")
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="invalid RSS/Atom feed"):
+            list(malformed.fetch_articles())
+        with pytest.raises(ValueError, match="non-XML or binary response"):
+            list(binary.fetch_articles())
+    finally:
+        malformed.client.close()
+        binary.client.close()
+
+
+def test_rss_rejects_non_feed_content_type():
+    connector = RSSConnector(
+        Site(name="RSS", base_url="https://feeds.wikipedia.org/feed.xml", platform="pool"),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                content=b"<html>temporary error</html>",
+            )
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="unsupported Content-Type 'text/html'"):
+            list(connector.fetch_articles())
+    finally:
+        connector.client.close()
+
+
+def test_pool_connector_bounds_stored_title_and_content(monkeypatch):
+    monkeypatch.setattr(settings, "pool_max_title_chars", 12)
+    monkeypatch.setattr(settings, "pool_max_article_chars", 20)
+    feed = b"""<rss version="2.0"><channel><title>Feed</title><item>
+    <guid>bounded</guid><title>A title that is much too long</title>
+    <link>https://example.com/bounded</link>
+    <description>A description that is much too long for storage.</description>
+    </item></channel></rss>"""
+    connector = RSSConnector(
+        Site(name="RSS", base_url="https://feeds.wikipedia.org/feed.xml", platform="pool"),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=feed)),
+    )
+    try:
+        article = next(connector.fetch_articles())
+    finally:
+        connector.client.close()
+
+    assert article.title == "A title that"
+    assert len(article.content_text) <= 20
+    assert len(article.content_html or "") <= 20
+
+
+def test_pool_connectors_reject_redirects_outside_allowlist():
+    requests: list[str] = []
+
+    def handler(request):
+        requests.append(str(request.url))
+        return httpx.Response(
+            302,
+            headers={"location": "https://outside.example/feed.xml"},
+        )
+
+    rss = RSSConnector(
+        Site(
+            name="RSS",
+            base_url="https://feeds.wikipedia.org/feed.xml",
+            platform="pool",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    wiki = WikipediaConnector(
+        Site(
+            name="Wiki",
+            base_url="https://en.wikipedia.org/wiki/Link_analysis",
+            platform="pool",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(PoolSourcePolicyError, match="outside.example"):
+            rss._feed()
+        with pytest.raises(PoolSourcePolicyError, match="outside.example"):
+            wiki._pages(titles="Link analysis")
+    finally:
+        rss.client.close()
+        wiki.client.close()
+
+    assert all("outside.example" not in url for url in requests)
+
+
+def test_wikipedia_connector_follows_continuation_and_validates_json(monkeypatch):
+    site = Site(
+        name="Wiki",
+        base_url="https://en.wikipedia.org/wiki/Link_analysis",
+        platform="pool",
+    )
+    pages = [
+        {
+            "pageid": 1,
+            "title": "First",
+            "fullurl": "https://en.wikipedia.org/wiki/First",
+            "extract": "first article",
+            "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+        },
+        {
+            "pageid": 2,
+            "title": "Second",
+            "fullurl": "https://en.wikipedia.org/wiki/Second",
+            "extract": "second article",
+            "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+        },
+    ]
+    calls = 0
+    sleeps: list[float] = []
+
+    def handler(_request):
+        nonlocal calls
+        calls += 1
+        payload = {"query": {"pages": [pages[calls - 1]]}}
+        if calls == 1:
+            payload["continue"] = {"continue": "-||", "gsroffset": 20}
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json; charset=utf-8"},
+            content=json.dumps(payload).encode(),
+        )
+
+    monkeypatch.setattr(settings, "pool_max_articles_per_source", 2)
+    monkeypatch.setattr(
+        "app.connectors.wikipedia_connector.time.sleep", lambda delay: sleeps.append(delay)
+    )
+    connector = WikipediaConnector(site, transport=httpx.MockTransport(handler))
+    articles = list(connector.fetch_articles())
+
+    assert [article.title for article in articles] == ["First", "Second"]
+    assert calls == 2
+    assert sleeps == [settings.pool_request_delay_seconds]
+
+
+def test_wikipedia_connector_bounds_empty_continuations(monkeypatch):
+    calls = 0
+
+    def handler(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(
+                {"query": {"pages": []}, "continue": {"gsroffset": calls}}
+            ).encode(),
+        )
+
+    monkeypatch.setattr(settings, "pool_max_articles_per_source", 2)
+    monkeypatch.setattr("app.connectors.wikipedia_connector.time.sleep", lambda _delay: None)
+    connector = WikipediaConnector(
+        Site(
+            name="Wiki",
+            base_url="https://en.wikipedia.org/wiki/Link_analysis",
+            platform="pool",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(ValueError, match="pagination exceeded request limit"):
+        list(connector.fetch_articles())
+
+    connector.client.close()
+    assert calls == 2
+
+
+def test_wikipedia_connector_rejects_oversized_and_non_json_responses(monkeypatch):
+    monkeypatch.setattr(settings, "pool_max_response_bytes", 1024)
+    site = Site(
+        name="Wiki",
+        base_url="https://en.wikipedia.org/wiki/Link_analysis",
+        platform="pool",
+    )
+    oversized = WikipediaConnector(
+        site,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                stream=httpx.ByteStream(b"x" * 1025),
+            )
+        ),
+    )
+    non_json = WikipediaConnector(
+        site,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                content=b"<html>temporary error</html>",
+            )
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="decoded-body limit"):
+            list(oversized.fetch_articles())
+        with pytest.raises(ValueError, match="unsupported Content-Type text/html"):
+            list(non_json.fetch_articles())
+    finally:
+        oversized.client.close()
+        non_json.client.close()
+
+
+def test_pool_connector_rejects_http_for_existing_rows(monkeypatch):
+    monkeypatch.setattr(settings, "allow_unsafe_crawl_targets", False)
+    with pytest.raises(UnsafeURLError, match="HTTPS required"):
+        RSSConnector(
+            Site(name="RSS", base_url="http://feeds.wikipedia.org/feed.xml", platform="pool"),
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+        )
+
+
+def test_pool_connector_allows_http_with_the_unsafe_switch(monkeypatch):
+    monkeypatch.setattr(settings, "allow_unsafe_crawl_targets", True)
+    monkeypatch.setattr(settings, "pool_allowed_domains", "127.0.0.1")
+    connector = RSSConnector(
+        Site(name="Local RSS", base_url="http://127.0.0.1:8090/feed.xml", platform="pool"),
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                content=b"<rss version='2.0'><channel /></rss>",
+            )
+        ),
+    )
+    try:
+        connector._feed()
+    finally:
+        connector.client.close()
+
+
+def test_pool_task_records_source_failures_only(monkeypatch):
+    recorded: list[tuple[int, Exception]] = []
+    monkeypatch.setattr(ingestion_task, "_is_terminal_attempt", lambda: True)
+    monkeypatch.setattr(
+        ingestion_task,
+        "_record_pool_ingestion_failure",
+        lambda site_id, error: recorded.append((site_id, error)),
+    )
+
+    def source_failure(*_args, **_kwargs):
+        raise PoolSourceFetchError("feed down")
+
+    monkeypatch.setattr(ingestion_task, "run_durably", source_failure)
+    with pytest.raises(PoolSourceFetchError):
+        ingestion_task.ingest_pool_site(7)
+    assert [site_id for site_id, _error in recorded] == [7]
+
+    recorded.clear()
+    monkeypatch.setattr(ingestion_task, "_is_terminal_attempt", lambda: False)
+    with pytest.raises(PoolSourceFetchError):
+        ingestion_task.ingest_pool_site(7)
+    assert recorded == []
+
+    def internal_failure(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(ingestion_task, "run_durably", internal_failure)
+    with pytest.raises(RuntimeError):
+        ingestion_task.ingest_pool_site(7)
+    assert recorded == []
+
+
+def test_pool_task_rejects_non_pool_sites_before_ingestion(monkeypatch):
+    class FakeDB:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, *_args):
+            return SimpleNamespace(id=7, platform="wordpress")
+
+    monkeypatch.setattr(ingestion_task, "SessionLocal", lambda: FakeDB())
+
+    with pytest.raises(PoolSourcePolicyError, match="not a content-pool source"):
+        ingestion_task._run_pool_ingestion(7)
+
+
+def test_pool_success_bookkeeping_runs_inside_durable_body(monkeypatch):
+    events: list[str] = []
+
+    class FakeDB:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get(self, *_args):
+            return SimpleNamespace(platform="pool")
+
+    monkeypatch.setattr(ingestion_task, "SessionLocal", lambda: FakeDB())
+    monkeypatch.setattr(ingestion_task, "require_approved_pool_source", lambda _site: None)
+    monkeypatch.setattr(
+        ingestion_task,
+        "_record_pool_ingestion_success",
+        lambda _site_id: events.append("pool-success"),
+    )
+
+    def fake_run_ingestion(_site_id, job_run_id=None):
+        events.append(f"ingestion:{job_run_id}")
+        return {"articles": 1}
+
+    monkeypatch.setattr(ingestion_task, "run_ingestion", fake_run_ingestion)
+
+    def fake_run_durably(job_run_id, fn, site_id):
+        events.append("durable-start")
+        result = fn(site_id, job_run_id=job_run_id)
+        events.append("durable-return")
+        return result
+
+    monkeypatch.setattr(ingestion_task, "run_durably", fake_run_durably)
+
+    assert ingestion_task.ingest_pool_site(7, 9) == {"articles": 1}
+    assert events == ["durable-start", "ingestion:9", "pool-success", "durable-return"]
+
+
+def test_pool_source_must_be_approved_before_ingestion_and_can_be_revoked(client, db):
+    response = client.post(
+        "/api/v1/sites",
+        json={
+            "name": "Approved pool",
+            "base_url": "https://en.wikipedia.org/wiki/Search_engine_optimization",
+            "platform": "pool",
+        },
+    )
+    assert response.status_code == 201, response.text
+    site_id = response.json()["id"]
+    try:
+        assert response.json()["pool_source_approved"] is False
+        assert client.post(f"/api/v1/sites/{site_id}/ingest").status_code == 409
+
+        approved = client.post(
+            f"/api/v1/sites/{site_id}/pool-source/approval",
+            json={"approved_by": "  editor  "},
+        )
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["pool_source_approved"] is True
+        assert approved.json()["pool_source_approved_by"] == "editor"
+
+        site = db.get(Site, site_id)
+        site.pool_source_consecutive_failures = 3
+        site.pool_source_quarantined = True
+        site.pool_source_quarantine_reason = "temporary outage"
+        db.commit()
+        reactivated = client.post(
+            f"/api/v1/sites/{site_id}/pool-source/reactivate",
+            json={"reactivated_by": "  operator  "},
+        )
+        assert reactivated.status_code == 200, reactivated.text
+        assert reactivated.json()["pool_source_quarantined"] is False
+        assert reactivated.json()["pool_source_consecutive_failures"] == 0
+        assert reactivated.json()["pool_source_last_reactivated_by"] == "operator"
+
+        revoked = client.delete(f"/api/v1/sites/{site_id}/pool-source/approval")
+        assert revoked.status_code == 200, revoked.text
+        assert revoked.json()["pool_source_approved"] is False
+        assert client.post(f"/api/v1/sites/{site_id}/ingest").status_code == 409
+    finally:
+        site = db.get(Site, site_id)
+        if site is not None:
+            db.delete(site)
+            db.commit()
+
+
+def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
+    pool = _pool(db)
+    monkeypatch.setattr(settings, "pool_quarantine_failure_threshold", 2)
+    try:
+        ingestion_task._record_pool_ingestion_failure(pool.id, RuntimeError("feed down"))
+        ingestion_task._record_pool_ingestion_failure(pool.id, RuntimeError("still down"))
+        db.refresh(pool)
+
+        assert pool.pool_source_consecutive_failures == 2
+        assert pool.pool_source_quarantined is True
+        assert pool.pool_source_quarantine_reason == "still down"
+        with pytest.raises(PoolSourceQuarantinedError):
+            require_approved_pool_source(pool)
+    finally:
+        db.delete(pool)
+        db.commit()
 
 
 def test_pool_routes_disallow_generation_and_publication(client, db):
@@ -126,6 +584,26 @@ def test_global_coordinator_discovers_new_daily_pool(monkeypatch, db):
             "failed": 0,
         }
         assert queued == [pool.id]
+    finally:
+        db.delete(pool)
+        db.commit()
+
+
+def test_global_coordinator_skips_unapproved_pool(monkeypatch, db):
+    pool = _pool(db, approved=False)
+    queued: list[int] = []
+    monkeypatch.setattr(
+        pool_ingestion,
+        "enqueue_job",
+        lambda _db, site_id, _kind, _fn, job_timeout: queued.append(site_id),
+    )
+    try:
+        assert pool_ingestion.enqueue_daily_pool_ingestions() == {
+            "queued": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+        assert queued == []
     finally:
         db.delete(pool)
         db.commit()

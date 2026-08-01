@@ -11,6 +11,7 @@ import httpx
 
 from app.config import settings
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
+from app.connectors.http_limits import get_limited_response
 from app.connectors.url_guard import (
     SSRFProtectedTransport,
     UnsafeURLError,
@@ -19,6 +20,16 @@ from app.connectors.url_guard import (
 )
 from app.models.site import Site
 from app.models.suggestion import Suggestion
+from app.services.pool_source_policy import pool_request_guard
+
+_RSS_ATOM_MEDIA_TYPES = {
+    "application/atom+xml",
+    "application/rdf+xml",
+    "application/rss+xml",
+    "application/x-rss+xml",
+    "application/xml",
+    "text/xml",
+}
 
 
 class _TextParser(HTMLParser):
@@ -62,6 +73,29 @@ def _external_id(value: str) -> str:
     return value if len(value) <= 255 else f"rss:{sha256(value.encode()).hexdigest()}"
 
 
+def _media_type(content_type: str | None) -> str | None:
+    if content_type is None:
+        return None
+    return content_type.split(";", 1)[0].strip().lower()
+
+
+def _decoded_prefix(content: bytes) -> str:
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return content[:1024].decode("utf-16", errors="ignore").lstrip().lower()
+    return content[:1024].decode("utf-8-sig", errors="ignore").lstrip().lower()
+
+
+def _validate_feed_payload(content: bytes, content_type: str | None) -> None:
+    media_type = _media_type(content_type)
+    if media_type is not None and media_type not in _RSS_ATOM_MEDIA_TYPES:
+        raise ValueError(f"RSS/Atom source returned unsupported Content-Type {media_type!r}")
+    prefix = _decoded_prefix(content)
+    if not prefix.startswith("<"):
+        raise ValueError("RSS/Atom source returned a non-XML or binary response")
+    if prefix.startswith(("<!doctype html", "<html")):
+        raise ValueError("RSS/Atom source returned an HTML page instead of a feed")
+
+
 class RSSConnector(ContentConnector):
     def __init__(
         self,
@@ -71,23 +105,42 @@ class RSSConnector(ContentConnector):
     ) -> None:
         super().__init__(site)
         allow_private = settings.allow_unsafe_crawl_targets
-        validate_url(site.base_url, allow_private=allow_private, resolve_dns=False)
+        validate_url(
+            site.base_url,
+            allow_private=allow_private,
+            require_https=not allow_private,
+            resolve_dns=False,
+        )
         self.client = httpx.Client(
             transport=transport or SSRFProtectedTransport(allow_private=allow_private),
             trust_env=False,
             timeout=settings.pool_source_timeout,
             follow_redirects=True,
             max_redirects=5,
-            headers={"User-Agent": "LinkMesh/0.1 (+content-pool)"},
-            event_hooks={"request": [request_guard(allow_private=allow_private)]},
+            headers={"User-Agent": settings.pool_http_user_agent},
+            event_hooks={
+                "request": [
+                    request_guard(
+                        allow_private=allow_private,
+                        require_https=not allow_private,
+                    ),
+                    pool_request_guard,
+                ]
+            },
         )
 
     def _feed(self):
-        response = self.client.get(self.site.base_url)
-        response.raise_for_status()
+        response = get_limited_response(
+            self.client,
+            self.site.base_url,
+            max_bytes=settings.pool_max_response_bytes,
+        )
+        _validate_feed_payload(response.content, response.content_type)
         parsed = feedparser.parse(response.content)
-        if parsed.bozo and not parsed.entries:
+        if parsed.bozo:
             raise ValueError(f"invalid RSS/Atom feed: {parsed.bozo_exception}")
+        if not str(parsed.version or "").lower().startswith(("rss", "atom")):
+            raise ValueError("invalid RSS/Atom feed: unsupported or missing feed version")
         return parsed
 
     def _to_article(self, entry: dict, feed_language: str | None) -> ArticleData | None:
@@ -98,13 +151,18 @@ class RSSConnector(ContentConnector):
             validate_url(
                 url,
                 allow_private=settings.allow_unsafe_crawl_targets,
+                require_https=not settings.allow_unsafe_crawl_targets,
                 resolve_dns=False,
             )
         except UnsafeURLError:
             return None
-        content_html = _entry_html(entry)
-        title = _text(entry.get("title")) or url
-        content_text = _text(content_html) or _text(entry.get("summary")) or title
+        if len(url) > 2048:
+            return None
+        content_html = _entry_html(entry)[: settings.pool_max_article_chars]
+        title = (_text(entry.get("title")) or url)[: settings.pool_max_title_chars]
+        content_text = (
+            _text(content_html) or _text(entry.get("summary")) or title
+        )[: settings.pool_max_article_chars]
         tags: list[TaxonomyData] = []
         seen_tags: set[str] = set()
         for tag in entry.get("tags") or []:

@@ -9,16 +9,27 @@ feed URL selects the feed connector; a `wikipedia.org/wiki/...` URL selects the
 MediaWiki connector. Pool sources default to daily crawling and remain manually
 crawlable through the normal site ingestion endpoint.
 
+New pool sources are unapproved. Add their parent domain to
+`POOL_ALLOWED_DOMAINS`, then approve them explicitly:
+
+```http
+POST /api/v1/sites/{site_id}/pool-source/approval
+{"approved_by": "editor"}
+```
+
+Approval is checked again before every manual or scheduled crawl. It can be
+revoked with `DELETE /api/v1/sites/{site_id}/pool-source/approval`.
+
 Register one global repeating coordinator after deployment:
 
 ```bash
 docker compose exec api python scripts/schedule_pool_ingestion.py
 ```
 
-The coordinator discovers all current daily pool sources every time it runs, so
-sources added later do not need their own schedule registration. It creates the
-same durable ingestion jobs used by normal crawls and skips a source that already
-has an active ingestion job.
+The coordinator discovers all approved, non-quarantined daily pool sources every
+time it runs, so sources added later do not need their own schedule registration.
+It creates the same durable ingestion jobs used by normal crawls and skips a
+source that already has an active ingestion job.
 
 The coordinator never fails on purpose. RQ schedules the next repeat only when a
 job succeeds, so a coordinator that ends in `failed` would take the entire daily
@@ -29,8 +40,16 @@ a coordinator that cannot enumerate its sources at all returns an `error` in its
 result and raises `pool_coordinator_failed`. Watch those two alert kinds rather
 than the job state — a chain that has stopped is otherwise invisible.
 
-Pool requests use the existing SSRF-protected transport and are bounded by
-`POOL_MAX_ARTICLES_PER_SOURCE` and `POOL_SOURCE_TIMEOUT`. During suggestion
+Pool requests use the existing SSRF-protected transport, require HTTPS, validate
+feed/API content types, and are bounded by response, title, and article limits.
+Wikipedia pagination is rate-limited. Terminal ingestion failures increment a
+per-source counter; after `POOL_QUARANTINE_FAILURE_THRESHOLD` failures the source
+is quarantined until it is approved and explicitly reactivated. During suggestion
 generation, missing pool embeddings are refreshed before pool articles enter the
 site's Hybrid candidate corpus. If a later pool crawl deactivates a target,
 pending or approved suggestions pointing to it expire during reconciliation.
+
+The source policy settings are `POOL_ALLOWED_DOMAINS`,
+`POOL_MAX_RESPONSE_BYTES`, `POOL_MAX_ARTICLE_CHARS`, `POOL_MAX_TITLE_CHARS`,
+`POOL_HTTP_USER_AGENT`, `POOL_REQUEST_DELAY_SECONDS`, and
+`POOL_QUARANTINE_FAILURE_THRESHOLD`.

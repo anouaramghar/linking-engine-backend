@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
 from sqlalchemy import exists, func, select
@@ -16,10 +18,13 @@ from app.schemas.site import (
     SiteBulkResult,
     SiteCreate,
     SiteOut,
+    PoolSourceApproval,
+    PoolSourceReactivation,
     SiteSuggestionModeState,
     SiteSuggestionModeUpdate,
 )
 from app.services.ingestion_service import latest_run
+from app.services.pool_source_policy import PoolSourcePolicyError, require_allowed_pool_domain
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -228,6 +233,63 @@ def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
         active_suggestion_count=active_suggestion_counts.get(site.id, 0),
         run=run,
     )
+
+
+@router.post("/{site_id}/pool-source/approval", response_model=SiteOut)
+def approve_pool_source(
+    site_id: int,
+    payload: PoolSourceApproval,
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    site = _get_site_or_404(db, site_id)
+    if site.platform != "pool":
+        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+    try:
+        require_allowed_pool_domain(site.base_url)
+    except PoolSourcePolicyError as error:
+        raise HTTPException(409, str(error)) from error
+    site.pool_source_approved = True
+    site.pool_source_approved_at = datetime.now(UTC)
+    site.pool_source_approved_by = payload.approved_by
+    db.commit()
+    return get_site(site_id, db)
+
+
+@router.delete("/{site_id}/pool-source/approval", response_model=SiteOut)
+def revoke_pool_source_approval(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
+    site = _get_site_or_404(db, site_id)
+    if site.platform != "pool":
+        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+    site.pool_source_approved = False
+    site.pool_source_approved_at = None
+    site.pool_source_approved_by = None
+    db.commit()
+    return get_site(site_id, db)
+
+
+@router.post("/{site_id}/pool-source/reactivate", response_model=SiteOut)
+def reactivate_pool_source(
+    site_id: int,
+    payload: PoolSourceReactivation,
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    site = _get_site_or_404(db, site_id)
+    if site.platform != "pool":
+        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+    if not site.pool_source_approved:
+        raise HTTPException(409, f"pool source site {site_id} must be approved first")
+    try:
+        require_allowed_pool_domain(site.base_url)
+    except PoolSourcePolicyError as error:
+        raise HTTPException(409, str(error)) from error
+    site.pool_source_consecutive_failures = 0
+    site.pool_source_quarantined = False
+    site.pool_source_quarantined_at = None
+    site.pool_source_quarantine_reason = None
+    site.pool_source_last_reactivated_at = datetime.now(UTC)
+    site.pool_source_last_reactivated_by = payload.reactivated_by
+    db.commit()
+    return get_site(site_id, db)
 
 
 @router.put("/{site_id}/suggestion-mode", response_model=SiteSuggestionModeState)

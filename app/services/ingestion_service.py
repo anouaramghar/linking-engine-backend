@@ -23,11 +23,12 @@ from app.models import (
     Taxonomy,
 )
 from app.services.job_service import record_progress_durably
+from app.services.pool_source_policy import PoolSourceFetchError
 
-# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 ingestion run,
-# 0x4C4A enqueue, 0x4C4D analysis, and 0x4C50 publication.
+# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 shared content
+# snapshot, 0x4C4A enqueue, and 0x4C50 publication.
 _ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C41  # "LA"
-_INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI"
+_INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI", shared with suggestion_service
 
 
 @contextmanager
@@ -259,7 +260,21 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         outbound: list[tuple[int, list[str]]] = []
         article_ids: set[int] = set()
         last_progress_count = 0
-        for art in connector.fetch_articles():
+        try:
+            articles_iterator = iter(connector.fetch_articles())
+        except Exception as error:
+            if site.platform == "pool":
+                raise PoolSourceFetchError(str(error)) from error
+            raise
+        while True:
+            try:
+                art = next(articles_iterator)
+            except StopIteration:
+                break
+            except Exception as error:
+                if site.platform == "pool":
+                    raise PoolSourceFetchError(str(error)) from error
+                raise
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id
@@ -277,7 +292,12 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
 
         articles = len(article_ids)
 
-        _validate_snapshot_completeness(db, site_id, run.id, articles)
+        try:
+            _validate_snapshot_completeness(db, site_id, run.id, articles)
+        except ValueError as error:
+            if site.platform == "pool":
+                raise PoolSourceFetchError(str(error)) from error
+            raise
 
         # Resolve links once all articles are known (forward references)
         record_progress_durably(job_run_id, stage="resolving_links")

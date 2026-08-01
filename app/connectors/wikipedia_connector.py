@@ -1,5 +1,7 @@
 """Read-only Wikipedia content-pool connector using the MediaWiki API."""
 
+import json
+import time
 from collections.abc import Iterator
 from datetime import datetime
 from urllib.parse import unquote, urlparse
@@ -8,6 +10,7 @@ import httpx
 
 from app.config import settings
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
+from app.connectors.http_limits import get_limited_response
 from app.connectors.url_guard import (
     SSRFProtectedTransport,
     UnsafeURLError,
@@ -16,6 +19,7 @@ from app.connectors.url_guard import (
 )
 from app.models.site import Site
 from app.models.suggestion import Suggestion
+from app.services.pool_source_policy import pool_request_guard
 
 
 def _timestamp(value: str | None) -> datetime | None:
@@ -31,7 +35,12 @@ class WikipediaConnector(ContentConnector):
     ) -> None:
         super().__init__(site)
         allow_private = settings.allow_unsafe_crawl_targets
-        validate_url(site.base_url, allow_private=allow_private, resolve_dns=False)
+        validate_url(
+            site.base_url,
+            allow_private=allow_private,
+            require_https=not allow_private,
+            resolve_dns=False,
+        )
         if not self.supports_url(site.base_url):
             raise ValueError("Wikipedia pool sources must use a wikipedia.org article URL")
         parsed = urlparse(site.base_url)
@@ -45,8 +54,16 @@ class WikipediaConnector(ContentConnector):
             timeout=settings.pool_source_timeout,
             follow_redirects=True,
             max_redirects=5,
-            headers={"User-Agent": "LinkMesh/0.1 (+content-pool)"},
-            event_hooks={"request": [request_guard(allow_private=allow_private)]},
+            headers={"User-Agent": settings.pool_http_user_agent},
+            event_hooks={
+                "request": [
+                    request_guard(
+                        allow_private=allow_private,
+                        require_https=not allow_private,
+                    ),
+                    pool_request_guard,
+                ]
+            },
         )
 
     @staticmethod
@@ -60,37 +77,73 @@ class WikipediaConnector(ContentConnector):
             and bool(parsed.path.removeprefix("/wiki/"))
         )
 
-    def _pages(self, **query) -> list[dict]:
-        response = self.client.get(
-            "/w/api.php",
-            params={
-                "action": "query",
-                "format": "json",
-                "formatversion": 2,
-                "redirects": 1,
-                "prop": "extracts|info|revisions",
-                "inprop": "url",
-                "explaintext": 1,
-                "rvprop": "timestamp",
-                "rvlimit": 1,
-                **query,
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-        if "error" in payload:
-            raise ValueError(f"Wikipedia API error: {payload['error'].get('info', 'unknown')}")
-        return payload.get("query", {}).get("pages", [])
+    def _pages(self, *, result_limit: int | None = None, **query) -> list[dict]:
+        pages: list[dict] = []
+        continuation: dict = {}
+        max_requests = 1
+        if result_limit:
+            page_size = max(1, int(query.get("gsrlimit") or result_limit))
+            max_requests = (result_limit + page_size - 1) // page_size + 1
+        for request_number in range(max_requests):
+            response = get_limited_response(
+                self.client,
+                "/w/api.php",
+                params={
+                    "action": "query",
+                    "format": "json",
+                    "formatversion": 2,
+                    "redirects": 1,
+                    "prop": "extracts|info|revisions",
+                    "inprop": "url",
+                    "explaintext": 1,
+                    "rvprop": "timestamp",
+                    "rvlimit": 1,
+                    **query,
+                    **continuation,
+                },
+                max_bytes=settings.pool_max_response_bytes,
+            )
+            media_type = (response.content_type or "").split(";", 1)[0].strip().lower()
+            if media_type != "application/json" and not media_type.endswith("+json"):
+                raise ValueError(
+                    "Wikipedia API returned unsupported Content-Type "
+                    f"{media_type or 'missing'}"
+                )
+            try:
+                payload = json.loads(response.content)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("Wikipedia API returned invalid JSON") from error
+            if not isinstance(payload, dict):
+                raise TypeError("Wikipedia API returned an invalid payload")
+            api_error = payload.get("error")
+            if api_error is not None:
+                info = (
+                    api_error.get("info", "unknown")
+                    if isinstance(api_error, dict)
+                    else api_error
+                )
+                raise ValueError(f"Wikipedia API error: {info}")
+            pages.extend(payload.get("query", {}).get("pages", []))
+            if result_limit is not None and len(pages) >= result_limit:
+                return pages[:result_limit]
+            continuation = payload.get("continue") or {}
+            if not continuation:
+                return pages
+            if request_number + 1 >= max_requests:
+                raise ValueError("Wikipedia API pagination exceeded request limit")
+            time.sleep(settings.pool_request_delay_seconds)
 
     def _to_article(self, page: dict) -> ArticleData | None:
         content = str(page.get("extract") or "").strip()
         url = str(page.get("fullurl") or "").strip()
-        if page.get("missing") or not url or not content:
+        if page.get("missing") or not url or not content or len(url) > 2048:
             return None
+        content = content[: settings.pool_max_article_chars]
         try:
             validate_url(
                 url,
                 allow_private=settings.allow_unsafe_crawl_targets,
+                require_https=not settings.allow_unsafe_crawl_targets,
                 same_host_as=self.site.base_url,
                 resolve_dns=False,
             )
@@ -99,7 +152,7 @@ class WikipediaConnector(ContentConnector):
         revisions = page.get("revisions") or []
         return ArticleData(
             url=url,
-            title=str(page.get("title") or url),
+            title=str(page.get("title") or url)[: settings.pool_max_title_chars],
             content_text=content,
             external_id=str(page.get("pageid") or url),
             language=self.language,
@@ -112,12 +165,15 @@ class WikipediaConnector(ContentConnector):
         )
 
     def fetch_articles(self) -> Iterator[ArticleData]:
-        for page in self._pages(
+        pages = self._pages(
+            result_limit=settings.pool_max_articles_per_source,
             generator="search",
             gsrsearch=self.seed_title,
-            gsrlimit=settings.pool_max_articles_per_source,
+            # MediaWiki caps regular-user search results at 20 per request.
+            gsrlimit=min(settings.pool_max_articles_per_source, 20),
             gsrnamespace=0,
-        ):
+        )
+        for page in pages:
             if article := self._to_article(page):
                 yield article
 
