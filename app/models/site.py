@@ -7,6 +7,13 @@ from app.db import Base
 
 Platform = Enum("wordpress", "html", name="platform", native_enum=False, length=20)
 RunStatus = Enum("running", "succeeded", "failed", name="run_status", native_enum=False, length=20)
+SuggestionMode = Enum(
+    "standard",
+    "experimental",
+    name="site_suggestion_mode",
+    native_enum=False,
+    length=20,
+)
 
 
 class Site(Base):
@@ -17,6 +24,11 @@ class Site(Base):
     base_url: Mapped[str] = mapped_column(String(2048), unique=True)
     platform: Mapped[str] = mapped_column(Platform)
     crawl_frequency: Mapped[str] = mapped_column(String(50), default="manual", server_default="manual")
+    suggestion_mode: Mapped[str] = mapped_column(
+        SuggestionMode,
+        default="experimental",
+        server_default="experimental",
+    )
     # WordPress Application Passwords (A2) — HTTP Basic Auth
     wp_username: Mapped[str | None] = mapped_column(String(255))
     wp_app_password: Mapped[str | None] = mapped_column(String(255))

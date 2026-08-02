@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from app.models import Article, IngestionRun, InternalLink
+from app.models import Article, IngestionRun, InternalLink, Suggestion
 
 
 def _payload():
@@ -23,6 +23,11 @@ def test_site_crud(client):
     assert site["article_count"] == 0
     assert site["internal_link_count"] == 0
     assert site["last_crawl_at"] is None
+    assert site["suggestion_method"] == "hybrid_bm25"
+    assert site["suggestion_mode"] == "experimental"
+    assert site["suggestion_mode_managed"] is True
+    assert site["suggestion_comparison_enabled"] is False
+    assert site["suggestion_slots_available"] == 0
     site_id = site["id"]
 
     # duplicate base_url rejected
@@ -79,6 +84,16 @@ def test_site_response_includes_active_counts_and_latest_crawl(client, db, site)
             ),
         ]
     )
+    db.add(
+        Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="baseline_cosine",
+            score=0.8,
+            status="pending",
+        )
+    )
     finished_at = datetime.now(timezone.utc) - timedelta(hours=2)
     db.add(
         IngestionRun(
@@ -101,6 +116,56 @@ def test_site_response_includes_active_counts_and_latest_crawl(client, db, site)
         assert response["internal_link_count"] == 1
         assert response["last_ingestion_status"] == "succeeded"
         assert datetime.fromisoformat(response["last_crawl_at"]) == finished_at
+        assert response["suggestion_method"] == "hybrid_bm25"
+        assert response["suggestion_slots_available"] == 5
+
+
+def test_suggestion_slots_are_capped_per_source_for_legacy_overfilled_queues(
+    client, db, site
+):
+    articles = [
+        Article(
+            site_id=site.id,
+            url=f"{site.base_url}/capacity-{index}",
+            title=f"Capacity {index}",
+            content_text="capacity",
+        )
+        for index in range(5)
+    ]
+    db.add_all(articles)
+    db.flush()
+    db.add_all(
+        [
+            Suggestion(
+                site_id=site.id,
+                source_article_id=articles[0].id,
+                target_article_id=target.id,
+                method="baseline_cosine",
+                score=0.8,
+                status="pending",
+            )
+            for target in articles[1:]
+        ]
+    )
+    db.commit()
+
+    response = client.get(f"/api/v1/sites/{site.id}").json()
+
+    # Five sources provide 15 global slots. The legacy source has four rows but
+    # can consume only its own three slots; the other 12 remain available.
+    assert response["article_count"] == 5
+    assert response["suggestion_slots_available"] == 12
+
+
+def test_global_hybrid_method_cannot_be_changed_per_site(client, site):
+    response = client.put(
+        f"/api/v1/sites/{site.id}/suggestion-mode",
+        json={"suggestion_mode": "standard"},
+    )
+
+    assert response.status_code == 409
+    assert "Hybrid/BM25 is the global suggestion method" in response.json()["detail"]
+    assert client.get(f"/api/v1/sites/{site.id}").json()["suggestion_mode"] == "experimental"
 
 
 def test_orphan_filter_ignores_expired_links(client, db, site):

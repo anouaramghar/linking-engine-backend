@@ -1,7 +1,7 @@
-"""Suggestion pipeline: encode missing embeddings, then cosine top-k -> pending suggestions
-(sequence 4.2)."""
+"""Global Hybrid/BM25 suggestion generation with a guarded cosine fallback."""
 
 import hashlib
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -9,15 +9,17 @@ from sqlalchemy import and_, func, select, update
 
 from app.config import settings
 from app.db import SessionLocal, engine
-from app.models import Article, Embedding, Suggestion
+from app.models import Article, Embedding, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
-from app.ml.baseline import top_candidates
+from app.ml.baseline import eligible_top_candidates
+from app.ml.hybrid import HybridRanker, RankedCandidate
 from app.services.job_service import record_progress
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
 _ANALYSIS_LOCK_NAMESPACE = 0x4C4D
 _DIMENSION_PROBE_INPUT = "LinkMesh dimension probe"
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -141,20 +143,69 @@ def _validate_embedding_dimension(model: str) -> None:
         )
 
 
-def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
-    """RQ task body."""
+def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[RankedCandidate]:
+    """The cosine safety fallback, in the shape the persistence loop expects.
+
+    Baseline rows carry no score components: `score` is cosine similarity and
+    that is the entire explanation, so an empty component blob would only add
+    noise to the queue payload.
+    """
+    return [
+        RankedCandidate(target_id=target_id, semantic_score=score)
+        for target_id, score in eligible_top_candidates(
+            db,
+            article_id,
+            model,
+            remaining,
+            settings.suggestion_duplicate_similarity_threshold,
+        )
+    ]
+
+
+def generate_suggestions(
+    site_id: int,
+    job_run_id: int | None = None,
+) -> dict:
+    """Generate the global Hybrid/BM25 queue, with per-source cosine fallback."""
     with _site_analysis_lock(site_id):
         db = SessionLocal()
         try:
+            site = db.get(Site, site_id)
+            if site is None:
+                raise ValueError(f"site {site_id} not found")
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
+            suggestion_cap = settings.hybrid_max_suggestions_per_article
+            hybrid_ranker = None
+            hybrid_load_failed = False
+            try:
+                hybrid_ranker = HybridRanker.load(
+                    db,
+                    site_id=site_id,
+                    model=model,
+                )
+            except Exception:
+                # A PostgreSQL statement error leaves the transaction aborted.
+                # End that failed read transaction before the fallback path issues
+                # its next query. Hybrid loading happens after `_embed_missing`
+                # commits, so there are no application writes to discard.
+                db.rollback()
+                hybrid_load_failed = True
+                logger.exception(
+                    "hybrid ranker initialization failed for site %s; using baseline cosine",
+                    site_id,
+                )
+            if hybrid_ranker is None:
+                hybrid_load_failed = True
 
             article_ids = db.scalars(
-                select(Article.id).where(
+                select(Article.id)
+                .where(
                     Article.site_id == site_id,
                     Article.is_active.is_(True),
                 )
+                .order_by(Article.id)
             ).all()
             existing_counts = dict(
                 db.execute(
@@ -167,20 +218,78 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                 ).all()
             )
             created = 0
+            eligible_sources = 0
+            hybrid_sources = 0
+            fallback_sources = 0
+            dense_candidates_total = 0
+            lexical_candidates_total = 0
+            union_candidates_total = 0
             for article_id in article_ids:
-                remaining = settings.max_suggestions_per_article - existing_counts.get(
-                    article_id, 0
-                )
-                if remaining <= 0:
+                remaining = suggestion_cap - existing_counts.get(article_id, 0)
+                has_capacity = remaining > 0
+                if not has_capacity:
                     continue
-                for target_id, score in top_candidates(db, article_id, model, remaining):
+                eligible_sources += 1
+                method = "baseline_cosine"
+                candidate_rows: list[RankedCandidate]
+                if hybrid_ranker is None:
+                    fallback_sources += 1
+                    candidate_rows = _baseline_rows(
+                        db,
+                        article_id,
+                        model,
+                        remaining,
+                    )
+                else:
+                    try:
+                        ranking = hybrid_ranker.rank(
+                            db,
+                            source_id=article_id,
+                            model=model,
+                            limit=remaining,
+                            duplicate_similarity_threshold=(
+                                settings.suggestion_duplicate_similarity_threshold
+                            ),
+                            include_baseline=False,
+                        )
+                        hybrid_sources += 1
+                        dense_candidates_total += ranking.dense_count
+                        lexical_candidates_total += ranking.lexical_count
+                        union_candidates_total += ranking.union_count
+                        candidate_rows = list(ranking.candidates)
+                        method = "hybrid_bm25"
+                    except Exception:
+                        # Ranking runs before this source adds suggestions or
+                        # progress. Rolling back is therefore safe, and required
+                        # when the caught failure came from PostgreSQL: without it
+                        # the baseline query fails with InFailedSqlTransaction.
+                        db.rollback()
+                        fallback_sources += 1
+                        logger.exception(
+                            "hybrid ranking failed for site %s source %s; using baseline cosine",
+                            site_id,
+                            article_id,
+                        )
+                        candidate_rows = _baseline_rows(
+                            db,
+                            article_id,
+                            model,
+                            remaining,
+                        )
+
+                for candidate in candidate_rows:
                     db.add(
                         Suggestion(
                             site_id=site_id,
                             source_article_id=article_id,
-                            target_article_id=target_id,
-                            method="baseline_cosine",
-                            score=score,
+                            target_article_id=candidate.target_id,
+                            method=method,
+                            # Cosine similarity for both methods, so one number keeps
+                            # one meaning across the mixed queue.
+                            score=candidate.semantic_score,
+                            score_components=(
+                                candidate.score_components() if method == "hybrid_bm25" else None
+                            ),
                             status="pending",
                         )
                     )
@@ -190,8 +299,35 @@ def generate_suggestions(site_id: int, job_run_id: int | None = None) -> dict:
                     job_run_id,
                     stage="suggesting",
                     created=created,
+                    ranking_mode="hybrid",
+                    hybrid_fallback_sources=fallback_sources,
                 )
                 db.commit()
-            return {"articles_encoded": encoded, "suggestions_created": created}
+            result = {
+                "articles_encoded": encoded,
+                "suggestions_created": created,
+                "ranking_mode": "hybrid",
+                "suggestion_cap_per_source": suggestion_cap,
+                "hybrid_ranker_loaded": not hybrid_load_failed,
+                "eligible_sources": eligible_sources,
+                "hybrid_sources_evaluated": hybrid_sources,
+                "hybrid_fallback_sources": fallback_sources,
+                "mean_dense_candidates": (
+                    round(dense_candidates_total / hybrid_sources, 2)
+                    if hybrid_sources
+                    else 0.0
+                ),
+                "mean_lexical_candidates": (
+                    round(lexical_candidates_total / hybrid_sources, 2)
+                    if hybrid_sources
+                    else 0.0
+                ),
+                "mean_union_candidates": (
+                    round(union_candidates_total / hybrid_sources, 2)
+                    if hybrid_sources
+                    else 0.0
+                ),
+            }
+            return result
         finally:
             db.close()

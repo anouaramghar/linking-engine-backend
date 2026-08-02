@@ -27,8 +27,12 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-base-en-v1.5"
     embedding_device: str = "cpu"
 
-    # Editorial rules (A4)
-    max_suggestions_per_article: int = 5
+    # Global suggestion contract: Hybrid retrieval, BM25-512 final ordering,
+    # and at most three active suggestions per source article.
+    hybrid_max_suggestions_per_article: int = Field(default=3, ge=1, le=3)
+    # A target this close to the source is the same page, not a link candidate.
+    # Applied to both halves of the Hybrid candidate union.
+    suggestion_duplicate_similarity_threshold: float = Field(default=0.99, ge=0.0, le=1.0)
 
     # Reject suspiciously incomplete crawls before they can replace a healthy snapshot.
     ingestion_min_previous_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -49,6 +53,5 @@ class Settings(BaseSettings):
         if self.environment != "development" and self.allow_unsafe_crawl_targets:
             raise ValueError("ALLOW_UNSAFE_CRAWL_TARGETS is development-only")
         return self
-
 
 settings = Settings()

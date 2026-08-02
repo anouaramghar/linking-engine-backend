@@ -21,7 +21,13 @@ class SuggestionOut(BaseModel):
     source_article: ArticleBrief
     target_article: ArticleBrief
     method: str
+    #: Cosine semantic similarity, whichever method selected the row.
     score: float
+    #: How this row was chosen, when the method records it. For `hybrid_bm25`:
+    #: the BM25 score that ordered it, its fusion and per-retriever ranks, and
+    #: the recipe names. Null for `baseline_cosine`, whose score already is its
+    #: whole explanation.
+    score_components: dict | None = None
     status: str
     anchor_text: str | None
     created_at: datetime

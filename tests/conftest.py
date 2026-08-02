@@ -1,12 +1,151 @@
+"""Shared fixtures, and the test-database isolation guard.
+
+This suite talks to a real PostgreSQL on purpose: the suggestion pipeline is
+mostly SQL — pgvector distance, the eligibility predicate, partial indexes — so
+a stubbed engine would exercise almost none of it.
+
+That makes pointing pytest at the wrong database a data-loss risk rather than an
+inconvenience. Suggestions keep no history rows, so a bulk-review test that
+writes `approved` across a developer's real queue cannot be undone: the previous
+statuses and `reviewed_at` values are simply gone. This has already happened
+once against the `linkmesh` development database.
+
+So the suite refuses to start unless it has been told, explicitly, which
+database is disposable. Import order is load-bearing: the resolution below
+rewrites ``DATABASE_URL`` in the environment *before* anything imports
+``app.config``, because ``app.db`` builds its engine from ``settings`` at import
+time and pydantic-settings lets a real environment variable win over ``.env``.
+"""
+
+import os
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
-from fastapi.testclient import TestClient
 
-from app.config import settings
-from app.db import SessionLocal
-from app.main import app
-from app.models import Site
+#: Databases the suite must never write to, whatever the configuration says.
+#: ``linkmesh`` is the development database; ``postgres`` is the cluster's
+#: maintenance database.
+PROTECTED_DATABASE_NAMES = frozenset({"linkmesh", "postgres", "template0", "template1"})
+
+#: Without ``TEST_DATABASE_URL``, a database is accepted only when its name says
+#: out loud that it is disposable.
+TEST_DATABASE_PREFIX = "test_"
+TEST_DATABASE_SUFFIX = "_test"
+
+_SETUP_HELP = """
+Create one and point the suite at it:
+
+    docker compose up -d db
+    docker compose exec db psql -U linkmesh -d postgres \\
+        -c 'CREATE DATABASE linkmesh_test OWNER linkmesh'
+
+    # bash / CI
+    export TEST_DATABASE_URL='postgresql+psycopg://linkmesh:linkmesh@127.0.0.1:15432/linkmesh_test'
+    # PowerShell
+    $env:TEST_DATABASE_URL = 'postgresql+psycopg://linkmesh:linkmesh@127.0.0.1:15432/linkmesh_test'
+
+    # migrate it once (alembic reads DATABASE_URL)
+    DATABASE_URL="$TEST_DATABASE_URL" alembic upgrade head
+
+See README.md, "Running the tests".
+"""
+
+
+def _database_name(url: str) -> str:
+    return urlsplit(url).path.lstrip("/")
+
+
+def _named_a_test_database(name: str) -> bool:
+    return name.startswith(TEST_DATABASE_PREFIX) or name.endswith(TEST_DATABASE_SUFFIX)
+
+
+def _resolve_test_database_url() -> str:
+    """Return the URL the suite may write to, or refuse to run.
+
+    ``TEST_DATABASE_URL`` is the intended path. A bare ``DATABASE_URL`` is
+    accepted only when the database name itself declares the database
+    disposable, so that configuring nothing fails loudly instead of quietly
+    inheriting the developer's ``.env``.
+    """
+    explicit = os.environ.get("TEST_DATABASE_URL", "").strip()
+    if explicit:
+        name = _database_name(explicit)
+        if not name:
+            raise pytest.UsageError(
+                f"TEST_DATABASE_URL names no database: {explicit!r}\n{_SETUP_HELP}"
+            )
+        if name in PROTECTED_DATABASE_NAMES:
+            raise pytest.UsageError(
+                f"TEST_DATABASE_URL points at the protected database {name!r}.\n"
+                "The suite writes and deletes rows; it must never run against "
+                f"development or maintenance data.\n{_SETUP_HELP}"
+            )
+        return explicit
+
+    configured = os.environ.get("DATABASE_URL", "").strip()
+    if configured and _named_a_test_database(_database_name(configured)):
+        return configured
+
+    where = (
+        f"DATABASE_URL={configured!r}"
+        if configured
+        else "neither TEST_DATABASE_URL nor DATABASE_URL is set, so app/config.py "
+        "would fall back to .env or its development default"
+    )
+    raise pytest.UsageError(
+        f"Refusing to run: no isolated test database is configured ({where}).\n"
+        "The suite creates, updates, and deletes rows, and suggestion reviews are "
+        "not recoverable once overwritten. Set TEST_DATABASE_URL, or name the "
+        f"database {TEST_DATABASE_PREFIX}* / *{TEST_DATABASE_SUFFIX}.\n{_SETUP_HELP}"
+    )
+
+
+def _redacted(url: str) -> str:
+    """The URL without its password, safe to print in a header or assertion."""
+    parts = urlsplit(url)
+    if parts.hostname is None:
+        return url
+    host = parts.hostname + (f":{parts.port}" if parts.port else "")
+    netloc = f"{parts.username}:***@{host}" if parts.username else host
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+TEST_DATABASE_URL = _resolve_test_database_url()
+os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+
+# Only now is importing the application safe: app.db reads settings.database_url at
+# import time, and the assignment above is what that read resolves to.
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app.config import settings  # noqa: E402
+from app.db import SessionLocal, engine  # noqa: E402
+from app.main import app  # noqa: E402
+from app.models import Site  # noqa: E402
+
+
+def pytest_report_header() -> str:
+    return f"test database: {_redacted(TEST_DATABASE_URL)}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def engine_is_bound_to_the_test_database():
+    """Second lock on the same door.
+
+    The rewrite above happens at import time; this checks the engine that was
+    actually built, so a stray ``create_engine`` or a re-imported settings object
+    cannot quietly reintroduce the development database mid-session.
+    """
+    bound = engine.url.database
+    assert bound not in PROTECTED_DATABASE_NAMES, (
+        f"the SQLAlchemy engine is bound to the protected database {bound!r} "
+        f"despite TEST_DATABASE_URL={_redacted(TEST_DATABASE_URL)}"
+    )
+    assert bound == _database_name(TEST_DATABASE_URL), (
+        f"the SQLAlchemy engine is bound to {bound!r}, not the configured test "
+        f"database {_database_name(TEST_DATABASE_URL)!r}"
+    )
+    yield
 
 
 @pytest.fixture(autouse=True)

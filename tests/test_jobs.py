@@ -54,6 +54,12 @@ def test_trigger_creates_durable_run(client, db, site, cleanup_rq):
     assert Job.fetch(body["job_id"], connection=redis_conn).origin == "ingestion"
 
 
+def test_comparison_trigger_is_not_a_product_endpoint(client, site):
+    response = client.post(f"/api/v1/suggestions/{site.id}/compare")
+
+    assert response.status_code == 404
+
+
 def test_job_run_is_committed_before_enqueue(db, site, monkeypatch):
     observed = {}
 

@@ -1,6 +1,23 @@
 # linking-engine-backend
 
+## Running the tests
 
+The suite runs against a real PostgreSQL and writes, updates, and deletes rows,
+so it refuses to start unless an isolated test database is named explicitly:
+
+```bash
+docker compose up -d db
+docker compose exec db psql -U linkmesh -d postgres \
+    -c 'CREATE DATABASE linkmesh_test OWNER linkmesh'
+
+export TEST_DATABASE_URL='postgresql+psycopg://linkmesh:linkmesh@127.0.0.1:15432/linkmesh_test'
+DATABASE_URL="$TEST_DATABASE_URL" alembic upgrade head
+pytest -q
+```
+
+Pointing the suite at `linkmesh` — or at nothing, which would inherit `.env` —
+is refused rather than allowed to overwrite development review decisions. Full
+details, including CI setup, are in [docs/testing.md](docs/testing.md).
 
 ## Getting started
 

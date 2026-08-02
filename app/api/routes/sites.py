@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
-from app.models import Article, IngestionRun, InternalLink, Site
+from app.config import settings
+from app.models import Article, IngestionRun, InternalLink, Site, Suggestion
 from app.schemas.site import (
     ArticleOut,
     SiteBulkCreated,
@@ -15,6 +16,8 @@ from app.schemas.site import (
     SiteBulkResult,
     SiteCreate,
     SiteOut,
+    SiteSuggestionModeState,
+    SiteSuggestionModeUpdate,
 )
 from app.services.ingestion_service import latest_run
 
@@ -41,9 +44,9 @@ def _first_error(exc: ValidationError) -> str:
 def _site_counts(
     db: Session,
     site_ids: list[int],
-) -> tuple[dict[int, int], dict[int, int]]:
+) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
     if not site_ids:
-        return {}, {}
+        return {}, {}, {}
 
     article_counts = dict(
         db.execute(
@@ -67,7 +70,52 @@ def _site_counts(
             .group_by(Article.site_id)
         ).all()
     )
-    return article_counts, internal_link_counts
+    active_counts_by_source = (
+        select(
+            Suggestion.site_id.label("site_id"),
+            Suggestion.source_article_id.label("source_article_id"),
+            func.count(Suggestion.id).label("active_count"),
+        )
+        .join(Article, Article.id == Suggestion.source_article_id)
+        .where(
+            Suggestion.site_id.in_(site_ids),
+            Article.is_active.is_(True),
+            Suggestion.status.in_(("pending", "approved", "applying")),
+        )
+        .group_by(Suggestion.site_id, Suggestion.source_article_id)
+        .subquery()
+    )
+    used_slots = {
+        site_id: int(slot_count)
+        for site_id, slot_count in db.execute(
+            select(
+                active_counts_by_source.c.site_id,
+                func.sum(
+                    func.least(
+                        active_counts_by_source.c.active_count,
+                        settings.hybrid_max_suggestions_per_article,
+                    )
+                ),
+            ).group_by(active_counts_by_source.c.site_id)
+        )
+    }
+    suggestion_slots = {
+        site_id: (
+            article_count * settings.hybrid_max_suggestions_per_article
+            - used_slots.get(site_id, 0)
+        )
+        for site_id, article_count in article_counts.items()
+    }
+    return article_counts, internal_link_counts, suggestion_slots
+
+
+def _suggestion_mode_state(_site: Site) -> SiteSuggestionModeState:
+    """Backward-compatible API state for the now-global Hybrid method."""
+    return SiteSuggestionModeState(
+        suggestion_mode="experimental",
+        suggestion_mode_managed=True,
+        suggestion_comparison_enabled=False,
+    )
 
 
 def _site_out(
@@ -75,9 +123,15 @@ def _site_out(
     *,
     article_count: int,
     internal_link_count: int,
+    suggestion_slots_available: int,
     run: IngestionRun | None,
 ) -> SiteOut:
     item = SiteOut.model_validate(site)
+    mode = _suggestion_mode_state(site)
+    item.suggestion_mode = mode.suggestion_mode
+    item.suggestion_mode_managed = mode.suggestion_mode_managed
+    item.suggestion_comparison_enabled = mode.suggestion_comparison_enabled
+    item.suggestion_slots_available = max(0, suggestion_slots_available)
     item.article_count = article_count
     item.internal_link_count = internal_link_count
     if run is not None:
@@ -163,7 +217,9 @@ def list_sites(
     db: Session = Depends(get_db),
 ) -> list[SiteOut]:
     sites = db.scalars(select(Site).order_by(Site.id).limit(limit).offset(offset)).all()
-    article_counts, internal_link_counts = _site_counts(db, [site.id for site in sites])
+    article_counts, internal_link_counts, suggestion_slots = _site_counts(
+        db, [site.id for site in sites]
+    )
     out = []
     for site in sites:
         run = latest_run(db, site.id)
@@ -172,6 +228,7 @@ def list_sites(
                 site,
                 article_count=article_counts.get(site.id, 0),
                 internal_link_count=internal_link_counts.get(site.id, 0),
+                suggestion_slots_available=suggestion_slots.get(site.id, 0),
                 run=run,
             )
         )
@@ -181,13 +238,31 @@ def list_sites(
 @router.get("/{site_id}", response_model=SiteOut)
 def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
     site = _get_site_or_404(db, site_id)
-    article_counts, internal_link_counts = _site_counts(db, [site.id])
+    article_counts, internal_link_counts, suggestion_slots = _site_counts(db, [site.id])
     run = latest_run(db, site.id)
     return _site_out(
         site,
         article_count=article_counts.get(site.id, 0),
         internal_link_count=internal_link_counts.get(site.id, 0),
+        suggestion_slots_available=suggestion_slots.get(site.id, 0),
         run=run,
+    )
+
+
+@router.put(
+    "/{site_id}/suggestion-mode",
+    response_model=SiteSuggestionModeState,
+    include_in_schema=False,
+)
+def update_suggestion_mode(
+    site_id: int,
+    payload: SiteSuggestionModeUpdate,
+    db: Session = Depends(get_db),
+) -> SiteSuggestionModeState:
+    _get_site_or_404(db, site_id)
+    raise HTTPException(
+        409,
+        "Hybrid/BM25 is the global suggestion method and cannot be changed per site",
     )
 
 
