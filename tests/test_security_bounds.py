@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from app.config import settings
+from app.config import Settings, settings
 from app.connectors.base import ArticleData, ContentConnector
 from app.connectors.html_crawler import HTMLConnector
 from app.connectors.http_limits import ResponseTooLargeError, get_limited_http_response
@@ -75,6 +75,10 @@ def test_wordpress_pagination_has_a_local_page_budget(monkeypatch):
     with pytest.raises(ValueError, match="page limit"):
         list(connector._paginate("posts"))
     assert requested_pages == [1, 2]
+
+
+def test_default_wordpress_page_budget_supports_large_sites_without_being_unbounded():
+    assert Settings.model_fields["crawl_max_wordpress_pages"].default == 1_000
 
 
 def test_wordpress_article_content_has_a_character_budget(monkeypatch):

@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     crawl_max_articles: int = Field(default=10_000, ge=1, le=100_000)
     crawl_max_sitemaps: int = Field(default=100, ge=1, le=10_000)
     crawl_max_sitemap_urls: int = Field(default=10_000, ge=1, le=100_000)
-    crawl_max_wordpress_pages: int = Field(default=100, ge=1, le=10_000)
+    crawl_max_wordpress_pages: int = Field(default=1_000, ge=1, le=10_000)
     crawl_max_response_bytes: int = Field(default=10_000_000, ge=1_024, le=100_000_000)
     crawl_max_article_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
     crawl_max_links_per_article: int = Field(default=1_000, ge=1, le=100_000)
