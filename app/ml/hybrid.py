@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, aliased
 
+from app.config import settings
 from app.ml.baseline import (
     eligible_candidate_scores,
     eligible_top_candidates,
@@ -129,6 +130,10 @@ def normalized_title(title: str) -> str:
 
 def structured_terms(article: CorpusArticle) -> list[str]:
     """Reproduce the frozen BM25-512 recipe selected by the offline evaluation."""
+    if len(article.content_text) > settings.crawl_max_article_chars:
+        raise ValueError(
+            f"article content exceeded {settings.crawl_max_article_chars} characters"
+        )
     title_terms = tokenize(article.title)
     taxonomy_terms = [
         term for taxonomy_name in article.taxonomy_names for term in tokenize(taxonomy_name)
@@ -208,29 +213,8 @@ class HybridRanker:
 
     @classmethod
     def load(cls, db: Session, *, site_id: int, model: str) -> "HybridRanker":
-        taxonomy_by_article: dict[int, list[str]] = defaultdict(list)
-        for article_id, taxonomy_name in db.execute(
-            select(ArticleTaxonomy.article_id, Taxonomy.name)
-            .join(Taxonomy, Taxonomy.id == ArticleTaxonomy.taxonomy_id)
-            .join(Article, Article.id == ArticleTaxonomy.article_id)
-            .join(Site, Site.id == Article.site_id)
-            .where(
-                or_(Article.site_id == site_id, Site.platform == "pool"),
-                Article.is_active.is_(True),
-            )
-            .order_by(ArticleTaxonomy.article_id, Taxonomy.name)
-        ):
-            taxonomy_by_article[article_id].append(taxonomy_name)
-
-        articles = {
-            row.id: CorpusArticle(
-                id=row.id,
-                title=row.title,
-                content_text=row.content_text,
-                content_fingerprint=row.content_fingerprint,
-                taxonomy_names=tuple(taxonomy_by_article[row.id]),
-            )
-            for row in db.execute(
+        article_rows = list(
+            db.execute(
                 select(
                     Article.id,
                     Article.title,
@@ -247,7 +231,39 @@ class HybridRanker:
                     Article.is_active.is_(True),
                 )
                 .order_by(Article.id)
+                .limit(settings.analysis_max_corpus_articles + 1)
             )
+        )
+        if len(article_rows) > settings.analysis_max_corpus_articles:
+            raise ValueError(
+                f"analysis corpus exceeded {settings.analysis_max_corpus_articles} articles"
+            )
+        article_ids = {row.id for row in article_rows}
+
+        taxonomy_by_article: dict[int, list[str]] = defaultdict(list)
+        for article_id, taxonomy_name in db.execute(
+            select(ArticleTaxonomy.article_id, Taxonomy.name)
+            .join(Taxonomy, Taxonomy.id == ArticleTaxonomy.taxonomy_id)
+            .join(Article, Article.id == ArticleTaxonomy.article_id)
+            .join(Site, Site.id == Article.site_id)
+            .where(
+                or_(Article.site_id == site_id, Site.platform == "pool"),
+                Article.is_active.is_(True),
+                Article.id.in_(article_ids),
+            )
+            .order_by(ArticleTaxonomy.article_id, Taxonomy.name)
+        ):
+            taxonomy_by_article[article_id].append(taxonomy_name)
+
+        articles = {
+            row.id: CorpusArticle(
+                id=row.id,
+                title=row.title,
+                content_text=row.content_text,
+                content_fingerprint=row.content_fingerprint,
+                taxonomy_names=tuple(taxonomy_by_article[row.id]),
+            )
+            for row in article_rows
         }
 
         blocked_targets: dict[int, set[int]] = defaultdict(set)

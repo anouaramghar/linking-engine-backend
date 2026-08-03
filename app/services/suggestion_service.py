@@ -42,6 +42,17 @@ def _embed_missing(
     encoded_offset: int = 0,
 ) -> int:
     """Encode active articles whose model-specific embedding is missing or stale."""
+    active_count = db.scalar(
+        select(func.count())
+        .select_from(Article)
+        .where(Article.site_id == site_id, Article.is_active.is_(True))
+    )
+    if active_count > settings.analysis_max_articles_per_site:
+        raise ValueError(
+            f"analysis article count exceeded {settings.analysis_max_articles_per_site} "
+            f"for site {site_id}"
+        )
+
     encoded = 0
     last_article_id = 0
     while True:
@@ -80,6 +91,10 @@ def _embed_missing(
             stored_recipe_version,
             stored_vector_size,
         ) in rows:
+            if len(text) > settings.crawl_max_article_chars:
+                raise ValueError(
+                    f"article content exceeded {settings.crawl_max_article_chars} characters"
+                )
             encode_input = f"{title}\n{text}"
             fingerprint = hashlib.sha256(encode_input.encode()).hexdigest()
             if (

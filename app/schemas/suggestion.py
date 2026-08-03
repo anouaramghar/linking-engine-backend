@@ -12,6 +12,8 @@ from app.schemas.site import ArticleBrief
 # all" exceeds PostgreSQL's 65535-parameter limit and 500s.
 MAX_BULK_REVIEW = MAX_ENGINE_PAGE_SIZE
 
+TargetOrigin = Literal["internal", "content_pool"]
+
 
 class SuggestionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -20,6 +22,10 @@ class SuggestionOut(BaseModel):
     site_id: int
     source_article: ArticleBrief
     target_article: ArticleBrief
+    #: Where the target lives relative to the site being reviewed.
+    target_origin: TargetOrigin
+    #: The site that owns the target article; useful when the target is external.
+    target_site_name: str
     method: str
     #: Cosine semantic similarity, whichever method selected the row.
     score: float

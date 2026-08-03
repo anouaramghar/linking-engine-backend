@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
-from app.models import Article, IngestionRun, InternalLink, Site, Suggestion
+from app.models import Article, IngestionRun, InternalLink, JobRun, Site, Suggestion
 from app.schemas.site import (
     ArticleOut,
     SiteBulkCreated,
@@ -90,6 +90,30 @@ def _site_counts(
     return article_counts, internal_link_counts, active_suggestion_counts
 
 
+def _latest_analyses(db: Session, site_ids: list[int]) -> dict[int, JobRun]:
+    """The last *finished* analysis run per site.
+
+    A crawl and an analysis are separate jobs, so the crawl run alone cannot say
+    whether a site has suggestions yet. In-flight analyses already reach the UI
+    through the active-jobs feed, so a resting row only needs the last outcome.
+    """
+    if not site_ids:
+        return {}
+
+    newest = (
+        select(func.max(JobRun.id))
+        .where(
+            JobRun.site_id.in_(site_ids),
+            JobRun.kind == "analysis",
+            JobRun.status.in_(("succeeded", "failed")),
+        )
+        .group_by(JobRun.site_id)
+        .scalar_subquery()
+    )
+    runs = db.scalars(select(JobRun).where(JobRun.id.in_(newest))).all()
+    return {run.site_id: run for run in runs}
+
+
 def _suggestion_mode_state(_site: Site) -> SiteSuggestionModeState:
     return SiteSuggestionModeState(
         suggestion_mode="experimental",
@@ -105,6 +129,7 @@ def _site_out(
     internal_link_count: int,
     active_suggestion_count: int,
     run: IngestionRun | None,
+    analysis: JobRun | None = None,
 ) -> SiteOut:
     item = SiteOut.model_validate(site)
     mode = _suggestion_mode_state(site)
@@ -123,6 +148,9 @@ def _site_out(
     if run is not None:
         item.last_ingestion_status = run.status
         item.last_crawl_at = run.finished_at or run.started_at
+    if analysis is not None:
+        item.last_analysis_status = analysis.status
+        item.last_analysis_at = analysis.finished_at or analysis.enqueued_at
     return item
 
 
@@ -206,6 +234,7 @@ def list_sites(
     article_counts, internal_link_counts, active_suggestion_counts = _site_counts(
         db, [site.id for site in sites]
     )
+    analyses = _latest_analyses(db, [site.id for site in sites])
     out = []
     for site in sites:
         run = latest_run(db, site.id)
@@ -216,6 +245,7 @@ def list_sites(
                 internal_link_count=internal_link_counts.get(site.id, 0),
                 active_suggestion_count=active_suggestion_counts.get(site.id, 0),
                 run=run,
+                analysis=analyses.get(site.id),
             )
         )
     return out
@@ -232,6 +262,7 @@ def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
         internal_link_count=internal_link_counts.get(site.id, 0),
         active_suggestion_count=active_suggestion_counts.get(site.id, 0),
         run=run,
+        analysis=_latest_analyses(db, [site.id]).get(site.id),
     )
 
 

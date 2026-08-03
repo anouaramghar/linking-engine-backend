@@ -118,6 +118,7 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 # import time, and the assignment above is what that read resolves to.
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.api.deps import require_api_key  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.db import SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
@@ -150,7 +151,12 @@ def engine_is_bound_to_the_test_database():
 
 @pytest.fixture(autouse=True)
 def disable_api_key(monkeypatch):
-    monkeypatch.setattr(settings, "api_key", "")
+    # Keep unrelated endpoint tests focused on their own behavior while auth
+    # tests remove this override and exercise the real dependency.
+    monkeypatch.setattr(settings, "api_key", "test-key")
+    app.dependency_overrides[require_api_key] = lambda: None
+    yield
+    app.dependency_overrides.pop(require_api_key, None)
 
 
 @pytest.fixture

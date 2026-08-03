@@ -748,6 +748,71 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
         db.commit()
 
 
+def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
+    pool = _pool(db)
+    source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/source",
+        title="Source article",
+        content_text="source",
+    )
+    internal_target = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/internal-target",
+        title="Internal target",
+        content_text="internal target",
+    )
+    pool_target = Article(
+        site_id=pool.id,
+        url="https://example.com/pool-target",
+        title="Pool target",
+        content_text="pool target",
+    )
+    db.add_all([source, internal_target, pool_target])
+    db.flush()
+    internal = Suggestion(
+        site_id=site.id,
+        source_article_id=source.id,
+        target_article_id=internal_target.id,
+        method="baseline_cosine",
+        score=0.9,
+    )
+    external = Suggestion(
+        site_id=site.id,
+        source_article_id=source.id,
+        target_article_id=pool_target.id,
+        method="hybrid_bm25",
+        score=0.8,
+    )
+    db.add_all([internal, external])
+    db.commit()
+    try:
+        response = client.get(f"/api/v1/suggestions/{site.id}")
+        assert response.status_code == 200
+        by_id = {item["id"]: item for item in response.json()}
+
+        assert by_id[internal.id]["target_origin"] == "internal"
+        assert by_id[internal.id]["target_site_name"] == site.name
+        assert by_id[external.id]["target_origin"] == "content_pool"
+        assert by_id[external.id]["target_site_name"] == pool.name
+
+        page = client.get(
+            "/api/v1/suggestions",
+            params={"site_id": site.id, "include_total": True},
+        )
+        assert page.status_code == 200
+        assert {item["target_origin"] for item in page.json()["items"]} == {
+            "internal",
+            "content_pool",
+        }
+    finally:
+        db.delete(internal)
+        db.delete(source)
+        db.delete(internal_target)
+        db.delete(pool)
+        db.commit()
+
+
 def test_pool_reconciliation_expires_customer_suggestions_to_missing_targets(db, site):
     pool = _pool(db)
     source = Article(

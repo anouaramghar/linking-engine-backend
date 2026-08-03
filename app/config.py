@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     api_port: int = 8000
     environment: str = "development"
 
-    # Static API key for all non-health endpoints; empty disables the check (local dev only)
+    # Static API key for all non-health endpoints; empty fails closed at the API boundary.
     api_key: str = ""
 
     # External search (v3)
@@ -43,6 +43,22 @@ class Settings(BaseSettings):
 
     # Reject suspiciously incomplete crawls before they can replace a healthy snapshot.
     ingestion_min_previous_ratio: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    # Customer-controlled crawl bounds. These apply to HTML and WordPress in
+    # addition to the tighter content-pool limits below.
+    crawl_max_duration_seconds: int = Field(default=1800, gt=0, le=7200)
+    crawl_max_articles: int = Field(default=10_000, ge=1, le=100_000)
+    crawl_max_sitemaps: int = Field(default=100, ge=1, le=10_000)
+    crawl_max_sitemap_urls: int = Field(default=10_000, ge=1, le=100_000)
+    crawl_max_wordpress_pages: int = Field(default=100, ge=1, le=10_000)
+    crawl_max_response_bytes: int = Field(default=10_000_000, ge=1_024, le=100_000_000)
+    crawl_max_article_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
+    crawl_max_links_per_article: int = Field(default=1_000, ge=1, le=100_000)
+    crawl_max_total_links: int = Field(default=100_000, ge=1, le=1_000_000)
+
+    # Analysis bounds are checked before embedding or corpus construction.
+    analysis_max_articles_per_site: int = Field(default=10_000, ge=1, le=100_000)
+    analysis_max_corpus_articles: int = Field(default=20_000, ge=1, le=200_000)
 
     # External content pool (RSS/Atom and Wikipedia).
     pool_max_articles_per_source: int = Field(default=50, ge=1, le=50)

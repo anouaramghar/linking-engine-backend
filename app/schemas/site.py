@@ -121,6 +121,10 @@ class SiteOut(BaseModel):
     suggestion_slots_available: int = 0
     created_at: datetime
     last_ingestion_status: str | None = None
+    # Last *finished* analysis, so a crawled site reads differently from an
+    # analysed one once both jobs have left the active feed.
+    last_analysis_status: str | None = None
+    last_analysis_at: datetime | None = None
     article_count: int = 0
     internal_link_count: int = 0
     last_crawl_at: datetime | None = None

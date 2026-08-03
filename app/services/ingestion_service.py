@@ -3,6 +3,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from time import monotonic
 from urllib.parse import urlparse
 
 from sqlalchemy import delete, func, or_, select, update
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.connectors.base import ArticleData, TaxonomyData
+from app.connectors.http_limits import check_crawl_deadline
 from app.connectors.registry import get_connector
 from app.db import SessionLocal, engine
 from app.models import (
@@ -256,9 +258,12 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         # Snapshot writes remain in one transaction so a failed crawl cannot alter
         # live content. This deliberately trades bounded, resumable batch commits
         # for atomicity; use staging and promotion before scaling to very large crawls.
+        crawl_started_at = monotonic()
         url_to_id: dict[str, int] = {}
         outbound: list[tuple[int, list[str]]] = []
         article_ids: set[int] = set()
+        articles_seen = 0
+        total_outbound_links = 0
         last_progress_count = 0
         try:
             articles_iterator = iter(connector.fetch_articles())
@@ -267,6 +272,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                 raise PoolSourceFetchError(str(error)) from error
             raise
         while True:
+            check_crawl_deadline(crawl_started_at)
             try:
                 art = next(articles_iterator)
             except StopIteration:
@@ -275,6 +281,22 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                 if site.platform == "pool":
                     raise PoolSourceFetchError(str(error)) from error
                 raise
+            articles_seen += 1
+            if articles_seen > settings.crawl_max_articles:
+                raise ValueError(f"crawl article count exceeded {settings.crawl_max_articles}")
+            if len(art.content_text) > settings.crawl_max_article_chars:
+                raise ValueError(
+                    f"article content exceeded {settings.crawl_max_article_chars} characters"
+                )
+            if len(art.outbound_internal_urls) > settings.crawl_max_links_per_article:
+                raise ValueError(
+                    f"article link count exceeded {settings.crawl_max_links_per_article}"
+                )
+            total_outbound_links += len(art.outbound_internal_urls)
+            if total_outbound_links > settings.crawl_max_total_links:
+                raise ValueError(
+                    f"crawl link count exceeded {settings.crawl_max_total_links}"
+                )
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id
@@ -305,7 +327,9 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         seen: set[tuple[int, int]] = set()
         resolve_internal_url = getattr(connector, "resolve_internal_url", None)
         for source_id, urls in outbound:
+            check_crawl_deadline(crawl_started_at)
             for url in urls:
+                check_crawl_deadline(crawl_started_at)
                 target_id = url_to_id.get(normalize_url(url))
                 if target_id is None and resolve_internal_url is not None:
                     target_id = url_to_id.get(normalize_url(resolve_internal_url(url)))

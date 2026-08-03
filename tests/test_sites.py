@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from app.models import Article, IngestionRun, InternalLink, Suggestion
+from app.models import Article, IngestionRun, InternalLink, JobRun, Suggestion
 
 
 def _payload():
@@ -116,6 +116,48 @@ def test_site_response_includes_active_counts_and_latest_crawl(client, db, site)
         assert response["last_ingestion_status"] == "succeeded"
         assert datetime.fromisoformat(response["last_crawl_at"]) == finished_at
         assert response["suggestion_slots_available"] == 5
+
+
+def test_analysis_state_is_reported_apart_from_the_crawl(client, db, site):
+    """A crawled site and an analysed one must not look identical to the UI."""
+    crawled_at = datetime.now(timezone.utc) - timedelta(hours=3)
+    db.add(
+        IngestionRun(
+            site_id=site.id,
+            status="succeeded",
+            articles_upserted=1,
+            started_at=crawled_at - timedelta(minutes=5),
+            finished_at=crawled_at,
+        )
+    )
+    db.commit()
+
+    listed = client.get(f"/api/v1/sites/{site.id}").json()
+    assert listed["last_ingestion_status"] == "succeeded"
+    assert listed["last_analysis_status"] is None
+
+    analysed_at = crawled_at + timedelta(hours=1)
+    db.add_all(
+        [
+            # An in-flight run must not overwrite the last finished outcome, and a
+            # failed older attempt must not outrank the successful newer one.
+            JobRun(site_id=site.id, kind="analysis", status="failed", finished_at=crawled_at),
+            JobRun(site_id=site.id, kind="analysis", status="succeeded", finished_at=analysed_at),
+            JobRun(site_id=site.id, kind="analysis", status="running"),
+            JobRun(site_id=site.id, kind="ingestion", status="succeeded", finished_at=analysed_at),
+        ]
+    )
+    db.commit()
+
+    detail = client.get(f"/api/v1/sites/{site.id}").json()
+    item = next(
+        candidate
+        for candidate in client.get("/api/v1/sites").json()
+        if candidate["id"] == site.id
+    )
+    for response in (detail, item):
+        assert response["last_analysis_status"] == "succeeded"
+        assert datetime.fromisoformat(response["last_analysis_at"]) == analysed_at
 
 
 def test_suggestion_mode_is_global_and_cannot_be_changed(client, site):

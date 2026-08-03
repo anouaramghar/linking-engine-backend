@@ -9,6 +9,7 @@ from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
+from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
     MAX_BULK_REVIEW,
     BulkReview,
@@ -27,6 +28,45 @@ router = APIRouter(tags=["suggestions"])
 
 
 UNREVIEWABLE = ("applying", "applied", "expired")
+
+
+def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[SuggestionOut]:
+    """Serialize suggestions with each target's ownership made explicit.
+
+    A normal customer suggestion targets an article from the same site. Pool
+    articles are deliberately allowed as targets, so the target article's
+    owning site is the source of truth for the dashboard label.
+    """
+
+    target_site_ids = {suggestion.target_article.site_id for suggestion in suggestions}
+    target_sites = {
+        site_id: (name, platform)
+        for site_id, name, platform in db.execute(
+            select(Site.id, Site.name, Site.platform).where(Site.id.in_(target_site_ids))
+        )
+    }
+    outputs = []
+    for suggestion in suggestions:
+        target_site_name, target_platform = target_sites[suggestion.target_article.site_id]
+        outputs.append(
+            SuggestionOut(
+                id=suggestion.id,
+                site_id=suggestion.site_id,
+                source_article=ArticleBrief.model_validate(suggestion.source_article),
+                target_article=ArticleBrief.model_validate(suggestion.target_article),
+                target_origin=(
+                    "content_pool" if target_platform == "pool" else "internal"
+                ),
+                target_site_name=target_site_name,
+                method=suggestion.method,
+                score=suggestion.score,
+                score_components=suggestion.score_components,
+                status=suggestion.status,
+                anchor_text=suggestion.anchor_text,
+                created_at=suggestion.created_at,
+            )
+        )
+    return outputs
 
 
 def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]:
@@ -274,6 +314,7 @@ def list_suggestion_page(
     ).all()
     has_more = len(items) > limit
     items = items[:limit]
+    serialized_items = _suggestion_outputs(db, items)
     next_cursor = None
     if has_more and items:
         next_cursor = SuggestionCursor(score=items[-1].score, id=items[-1].id)
@@ -281,7 +322,7 @@ def list_suggestion_page(
     if include_total:
         total = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
     return SuggestionPage(
-        items=items,
+        items=serialized_items,
         total=total,
         limit=limit,
         next_cursor=next_cursor,
@@ -324,7 +365,7 @@ def list_suggestions(
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-) -> list[Suggestion]:
+) -> list[SuggestionOut]:
     query = (
         select(Suggestion)
         .where(Suggestion.site_id == site_id)
@@ -337,13 +378,13 @@ def list_suggestions(
         query = query.where(Suggestion.status != "expired")
     if method:
         query = query.where(Suggestion.method == method)
-    return db.scalars(query.limit(limit).offset(offset)).all()
+    return _suggestion_outputs(db, db.scalars(query.limit(limit).offset(offset)).all())
 
 
 @router.put("/suggestions/{suggestion_id}", response_model=SuggestionOut)
 def review_suggestion(
     suggestion_id: int, payload: SuggestionReview, db: Session = Depends(get_db)
-) -> Suggestion:
+) -> SuggestionOut:
     suggestion = db.get(
         Suggestion,
         suggestion_id,
@@ -355,4 +396,4 @@ def review_suggestion(
         raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
     db.commit()
     db.refresh(suggestion)
-    return suggestion
+    return _suggestion_outputs(db, [suggestion])[0]
