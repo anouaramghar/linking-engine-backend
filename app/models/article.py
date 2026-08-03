@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -17,6 +17,12 @@ class Article(Base):
         # Idempotent ingestion: re-crawl updates, never duplicates
         UniqueConstraint("site_id", "url"),
         UniqueConstraint("site_id", "external_id"),
+        Index(
+            "ix_articles_title_trgm",
+            "title",
+            postgresql_using="gin",
+            postgresql_ops={"title": "gin_trgm_ops"},
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
