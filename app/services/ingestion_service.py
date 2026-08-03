@@ -3,6 +3,7 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from time import monotonic
 from urllib.parse import urlparse
 
 from sqlalchemy import delete, func, or_, select, update
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.connectors.base import ArticleData, TaxonomyData
+from app.connectors.http_limits import check_crawl_deadline
 from app.connectors.registry import get_connector
 from app.db import SessionLocal, engine
 from app.models import (
@@ -23,11 +25,12 @@ from app.models import (
     Taxonomy,
 )
 from app.services.job_service import record_progress_durably
+from app.services.pool_source_policy import PoolSourceFetchError
 
-# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 ingestion run,
-# 0x4C4A enqueue, 0x4C4D analysis, and 0x4C50 publication.
+# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 shared content
+# snapshot, 0x4C4A enqueue, and 0x4C50 publication.
 _ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C41  # "LA"
-_INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI"
+_INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI", shared with suggestion_service
 
 
 @contextmanager
@@ -52,7 +55,9 @@ def _validate_snapshot_completeness(
     db: Session, site_id: int, run_id: int, article_count: int
 ) -> None:
     if article_count == 0:
-        raise ValueError(f"crawl returned zero articles for site {site_id}; snapshot not reconciled")
+        raise ValueError(
+            f"crawl returned zero articles for site {site_id}; snapshot not reconciled"
+        )
 
     previous_count = db.scalar(
         select(IngestionRun.articles_upserted)
@@ -79,9 +84,7 @@ def normalize_url(url: str) -> str:
     return f"{p.netloc.lower()}{p.path.rstrip('/')}"
 
 
-def _upsert_article(
-    db: Session, site_id: int, art: ArticleData, run_id: int | None = None
-) -> int:
+def _upsert_article(db: Session, site_id: int, art: ArticleData, run_id: int | None = None) -> int:
     db.execute(select(func.pg_advisory_xact_lock(_ARTICLE_UPSERT_LOCK_NAMESPACE, site_id)))
 
     identity_filters = [Article.url == art.url]
@@ -89,9 +92,7 @@ def _upsert_article(
         identity_filters.append(Article.external_id == art.external_id)
 
     matches = db.scalars(
-        select(Article)
-        .where(Article.site_id == site_id, or_(*identity_filters))
-        .with_for_update()
+        select(Article).where(Article.site_id == site_id, or_(*identity_filters)).with_for_update()
     ).all()
     by_url = next((article for article in matches if article.url == art.url), None)
     by_external_id = next(
@@ -213,7 +214,6 @@ def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
     db.execute(
         update(Suggestion)
         .where(
-            Suggestion.site_id == site_id,
             Suggestion.status.in_(("pending", "approved")),
             or_(
                 Suggestion.source_article_id.in_(inactive_article_ids),
@@ -258,11 +258,45 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         # Snapshot writes remain in one transaction so a failed crawl cannot alter
         # live content. This deliberately trades bounded, resumable batch commits
         # for atomicity; use staging and promotion before scaling to very large crawls.
+        crawl_started_at = monotonic()
         url_to_id: dict[str, int] = {}
         outbound: list[tuple[int, list[str]]] = []
         article_ids: set[int] = set()
+        articles_seen = 0
+        total_outbound_links = 0
         last_progress_count = 0
-        for art in connector.fetch_articles():
+        try:
+            articles_iterator = iter(connector.fetch_articles())
+        except Exception as error:
+            if site.platform == "pool":
+                raise PoolSourceFetchError(str(error)) from error
+            raise
+        while True:
+            check_crawl_deadline(crawl_started_at)
+            try:
+                art = next(articles_iterator)
+            except StopIteration:
+                break
+            except Exception as error:
+                if site.platform == "pool":
+                    raise PoolSourceFetchError(str(error)) from error
+                raise
+            articles_seen += 1
+            if articles_seen > settings.crawl_max_articles:
+                raise ValueError(f"crawl article count exceeded {settings.crawl_max_articles}")
+            if len(art.content_text) > settings.crawl_max_article_chars:
+                raise ValueError(
+                    f"article content exceeded {settings.crawl_max_article_chars} characters"
+                )
+            if len(art.outbound_internal_urls) > settings.crawl_max_links_per_article:
+                raise ValueError(
+                    f"article link count exceeded {settings.crawl_max_links_per_article}"
+                )
+            total_outbound_links += len(art.outbound_internal_urls)
+            if total_outbound_links > settings.crawl_max_total_links:
+                raise ValueError(
+                    f"crawl link count exceeded {settings.crawl_max_total_links}"
+                )
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id
@@ -280,15 +314,25 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
 
         articles = len(article_ids)
 
-        _validate_snapshot_completeness(db, site_id, run.id, articles)
+        try:
+            _validate_snapshot_completeness(db, site_id, run.id, articles)
+        except ValueError as error:
+            if site.platform == "pool":
+                raise PoolSourceFetchError(str(error)) from error
+            raise
 
         # Resolve links once all articles are known (forward references)
         record_progress_durably(job_run_id, stage="resolving_links")
         links = 0
         seen: set[tuple[int, int]] = set()
+        resolve_internal_url = getattr(connector, "resolve_internal_url", None)
         for source_id, urls in outbound:
+            check_crawl_deadline(crawl_started_at)
             for url in urls:
+                check_crawl_deadline(crawl_started_at)
                 target_id = url_to_id.get(normalize_url(url))
+                if target_id is None and resolve_internal_url is not None:
+                    target_id = url_to_id.get(normalize_url(resolve_internal_url(url)))
                 if target_id and target_id != source_id and (source_id, target_id) not in seen:
                     _upsert_link(db, source_id, target_id, run.id)
                     seen.add((source_id, target_id))

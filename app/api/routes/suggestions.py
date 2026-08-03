@@ -2,15 +2,17 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, literal, select, tuple_, update
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import exists, func, literal, or_, select, tuple_, update
+from sqlalchemy.orm import Session, aliased, joinedload
 
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
-from app.models import Site, Suggestion
+from app.models import Article, Site, Suggestion
 from app.schemas.job import JobAccepted
+from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
     MAX_BULK_REVIEW,
+    MAX_SEARCH_TERM,
     BulkReview,
     BulkReviewFilter,
     BulkReviewFilterResult,
@@ -19,14 +21,54 @@ from app.schemas.suggestion import (
     SuggestionOut,
     SuggestionPage,
     SuggestionReview,
+    TargetOrigin,
 )
 from app.services.job_service import DuplicateJobError, enqueue_job
-from app.tasks.analysis import analyze_site
+from app.tasks.analysis import analyze_site, compare_site
 
 router = APIRouter(tags=["suggestions"])
 
 
 UNREVIEWABLE = ("applying", "applied", "expired")
+
+
+def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[SuggestionOut]:
+    """Serialize suggestions with each target's ownership made explicit.
+
+    A normal customer suggestion targets an article from the same site. Pool
+    articles are deliberately allowed as targets, so the target article's
+    owning site is the source of truth for the dashboard label.
+    """
+
+    target_site_ids = {suggestion.target_article.site_id for suggestion in suggestions}
+    target_sites = {
+        site_id: (name, platform)
+        for site_id, name, platform in db.execute(
+            select(Site.id, Site.name, Site.platform).where(Site.id.in_(target_site_ids))
+        )
+    }
+    outputs = []
+    for suggestion in suggestions:
+        target_site_name, target_platform = target_sites[suggestion.target_article.site_id]
+        outputs.append(
+            SuggestionOut(
+                id=suggestion.id,
+                site_id=suggestion.site_id,
+                source_article=ArticleBrief.model_validate(suggestion.source_article),
+                target_article=ArticleBrief.model_validate(suggestion.target_article),
+                target_origin=(
+                    "content_pool" if target_platform == "pool" else "internal"
+                ),
+                target_site_name=target_site_name,
+                method=suggestion.method,
+                score=suggestion.score,
+                score_components=suggestion.score_components,
+                status=suggestion.status,
+                anchor_text=suggestion.anchor_text,
+                created_at=suggestion.created_at,
+            )
+        )
+    return outputs
 
 
 def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]:
@@ -92,9 +134,7 @@ def _review_matching_counts(
         .execution_options(synchronize_session=False)
         .cte("reviewed_rows")
     )
-    bounded_reviewed_ids = (
-        select(reviewed_rows.c.id).limit(MAX_BULK_REVIEW).subquery()
-    )
+    bounded_reviewed_ids = select(reviewed_rows.c.id).limit(MAX_BULK_REVIEW).subquery()
     result = db.execute(
         select(
             select(func.count()).select_from(candidates).scalar_subquery().label("matched"),
@@ -105,10 +145,89 @@ def _review_matching_counts(
             .label("reviewed_ids"),
         )
     ).one()
-    reviewed_ids = (
-        sorted(result.reviewed_ids or []) if result.reviewed <= MAX_BULK_REVIEW else None
-    )
+    reviewed_ids = sorted(result.reviewed_ids or []) if result.reviewed <= MAX_BULK_REVIEW else None
     return result.matched, result.reviewed, reviewed_ids
+
+
+_LIKE_ESCAPE = "\\"
+
+
+def _like_pattern(term: str) -> str:
+    """Match `term` anywhere in a title, with its LIKE metacharacters defanged.
+
+    A search box is free text. An editor pasting a URL fragment or a title that
+    contains `_` must get those characters searched for, not interpreted as
+    wildcards — otherwise the narrower the query looks, the wider it matches.
+    """
+    escaped = (
+        term.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", f"{_LIKE_ESCAPE}%")
+        .replace("_", f"{_LIKE_ESCAPE}_")
+    )
+    return f"%{escaped}%"
+
+
+def _title_matches(term: str):
+    """Rows whose source or target article title contains `term`.
+
+    Correlated EXISTS rather than a join onto `articles`: the same condition list
+    is reused by the filtered bulk review, which applies it inside an UPDATE
+    where a join is not available. Keeping the two sides as separate subqueries
+    also lets PostgreSQL choose the trigram index for each independently.
+    """
+    pattern = _like_pattern(term)
+    return or_(
+        exists(
+            select(1).where(
+                Article.id == Suggestion.source_article_id,
+                Article.title.ilike(pattern, escape=_LIKE_ESCAPE),
+            )
+        ),
+        exists(
+            select(1).where(
+                Article.id == Suggestion.target_article_id,
+                Article.title.ilike(pattern, escape=_LIKE_ESCAPE),
+            )
+        ),
+    )
+
+
+def _target_is_pool():
+    """Whether this row's target article belongs to a content-pool site.
+
+    Ownership is read from the target's site, which is exactly how
+    `_suggestion_outputs` derives the `target_origin` the dashboard renders. One
+    source of truth, so the filter and the badge on the card cannot disagree.
+    """
+    return exists(
+        select(1)
+        .select_from(Article)
+        .join(Site, Site.id == Article.site_id)
+        .where(Article.id == Suggestion.target_article_id, Site.platform == "pool")
+    )
+
+
+def _has_stronger_reverse_pair():
+    """Whether the same pair is also suggested the other way round, and better.
+
+    Near-duplicate template pages propose A->B and B->A together, and a
+    score-ordered queue puts both at the top: on the dev corpus 256 rows are one
+    half of such a pair. Excluding *every* reciprocal row would discard the link
+    entirely, so this matches only the weaker direction — the stronger one
+    survives and the pair costs one review decision instead of two.
+
+    Ordered by (score, id) to match the queue's own ordering, which makes the
+    surviving direction the one the editor would have reached first anyway.
+    """
+    reverse = aliased(Suggestion)
+    return exists(
+        select(1).where(
+            reverse.source_article_id == Suggestion.target_article_id,
+            reverse.target_article_id == Suggestion.source_article_id,
+            reverse.status != "expired",
+            tuple_(reverse.score, reverse.id) > tuple_(Suggestion.score, Suggestion.id),
+        )
+    )
 
 
 def _percent_boundary(percent: int) -> float:
@@ -129,6 +248,9 @@ def _queue_conditions(
     method: str | None = None,
     min_percent: int | None = None,
     max_percent: int | None = None,
+    q: str | None = None,
+    target_origin: str | None = None,
+    exclude_reciprocal: bool = False,
 ) -> list:
     """Only the bounds the caller gave. Whether an absent status means "every
     status" or "everything but expired" differs per route, so it is decided there.
@@ -136,6 +258,11 @@ def _queue_conditions(
     The score bounds are asymmetric on purpose: the dashboard rule approves at or
     above a threshold and rejects below the same number, so a shared threshold
     must not put one row in both halves.
+
+    Every condition here is expressible inside an UPDATE ... WHERE, so the list,
+    the counts, and the filtered bulk review can all be built from one function.
+    That is what lets the dashboard promise that a bulk rule acts on exactly the
+    rows it is showing.
     """
     conditions = []
     if site_id is not None:
@@ -148,6 +275,15 @@ def _queue_conditions(
         conditions.append(Suggestion.score >= _percent_boundary(min_percent))
     if max_percent is not None:
         conditions.append(Suggestion.score < _percent_boundary(max_percent))
+    # A search of only whitespace is the same as no search; it must not collapse
+    # to '%%' and quietly match the whole queue.
+    if q is not None and q.strip():
+        conditions.append(_title_matches(q.strip()))
+    if target_origin is not None:
+        is_pool = _target_is_pool()
+        conditions.append(is_pool if target_origin == "content_pool" else ~is_pool)
+    if exclude_reciprocal:
+        conditions.append(~_has_stronger_reverse_pair())
     return conditions
 
 
@@ -192,6 +328,9 @@ def bulk_review_by_filter(
         method=payload.method,
         min_percent=payload.threshold_percent if payload.status == "approved" else None,
         max_percent=payload.threshold_percent if payload.status == "rejected" else None,
+        q=payload.q,
+        target_origin=payload.target_origin,
+        exclude_reciprocal=payload.exclude_reciprocal,
     )
     matched, reviewed, reviewed_ids = _review_matching_counts(db, conditions, payload.status)
     db.commit()
@@ -209,15 +348,22 @@ def count_suggestions(
     method: str | None = None,
     min_percent: int | None = Query(None, ge=0, le=100),
     max_percent: int | None = Query(None, ge=0, le=100),
+    q: str | None = Query(None, max_length=MAX_SEARCH_TERM),
+    target_origin: TargetOrigin | None = None,
+    exclude_reciprocal: bool = False,
     db: Session = Depends(get_db),
 ) -> SuggestionCounts:
     conditions = _queue_conditions(
-        site_id=site_id, method=method, min_percent=min_percent, max_percent=max_percent
+        site_id=site_id,
+        method=method,
+        min_percent=min_percent,
+        max_percent=max_percent,
+        q=q,
+        target_origin=target_origin,
+        exclude_reciprocal=exclude_reciprocal,
     )
     rows = db.execute(
-        select(Suggestion.status, func.count())
-        .where(*conditions)
-        .group_by(Suggestion.status)
+        select(Suggestion.status, func.count()).where(*conditions).group_by(Suggestion.status)
     ).all()
     counts = {status: count for status, count in rows}
     return SuggestionCounts(
@@ -233,6 +379,9 @@ def list_suggestion_page(
     method: str | None = None,
     min_percent: int | None = Query(None, ge=0, le=100),
     max_percent: int | None = Query(None, ge=0, le=100),
+    q: str | None = Query(None, max_length=MAX_SEARCH_TERM),
+    target_origin: TargetOrigin | None = None,
+    exclude_reciprocal: bool = False,
     after_score: float | None = Query(None, ge=0, le=1),
     after_id: int | None = Query(None, ge=1),
     include_total: bool = False,
@@ -247,6 +396,9 @@ def list_suggestion_page(
         method=method,
         min_percent=min_percent,
         max_percent=max_percent,
+        q=q,
+        target_origin=target_origin,
+        exclude_reciprocal=exclude_reciprocal,
     )
     if status is None:
         # Render the fixed predicate literally so PostgreSQL can prove that the
@@ -280,6 +432,7 @@ def list_suggestion_page(
     ).all()
     has_more = len(items) > limit
     items = items[:limit]
+    serialized_items = _suggestion_outputs(db, items)
     next_cursor = None
     if has_more and items:
         next_cursor = SuggestionCursor(score=items[-1].score, id=items[-1].id)
@@ -287,7 +440,7 @@ def list_suggestion_page(
     if include_total:
         total = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
     return SuggestionPage(
-        items=items,
+        items=serialized_items,
         total=total,
         limit=limit,
         next_cursor=next_cursor,
@@ -296,10 +449,27 @@ def list_suggestion_page(
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)
 def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    if db.get(Site, site_id) is None:
+    site = db.get(Site, site_id)
+    if site is None:
         raise HTTPException(404, f"site {site_id} not found")
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources cannot generate suggestions")
     try:
         run = enqueue_job(db, site_id, "analysis", analyze_site, job_timeout=7200)
+    except DuplicateJobError as e:
+        raise HTTPException(409, str(e)) from e
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
+
+
+@router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)
+def trigger_analysis_comparison(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
+    site = db.get(Site, site_id)
+    if site is None:
+        raise HTTPException(404, f"site {site_id} not found")
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    try:
+        run = enqueue_job(db, site_id, "analysis", compare_site, job_timeout=7200)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
@@ -313,7 +483,7 @@ def list_suggestions(
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-) -> list[Suggestion]:
+) -> list[SuggestionOut]:
     query = (
         select(Suggestion)
         .where(Suggestion.site_id == site_id)
@@ -326,13 +496,13 @@ def list_suggestions(
         query = query.where(Suggestion.status != "expired")
     if method:
         query = query.where(Suggestion.method == method)
-    return db.scalars(query.limit(limit).offset(offset)).all()
+    return _suggestion_outputs(db, db.scalars(query.limit(limit).offset(offset)).all())
 
 
 @router.put("/suggestions/{suggestion_id}", response_model=SuggestionOut)
 def review_suggestion(
     suggestion_id: int, payload: SuggestionReview, db: Session = Depends(get_db)
-) -> Suggestion:
+) -> SuggestionOut:
     suggestion = db.get(
         Suggestion,
         suggestion_id,
@@ -344,4 +514,4 @@ def review_suggestion(
         raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
     db.commit()
     db.refresh(suggestion)
-    return suggestion
+    return _suggestion_outputs(db, [suggestion])[0]

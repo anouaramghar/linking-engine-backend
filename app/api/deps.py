@@ -17,7 +17,10 @@ def get_db() -> Iterator[Session]:
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    if settings.api_key and (
-        x_api_key is None or not compare_digest(x_api_key, settings.api_key)
-    ):
+    if not settings.api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="API authentication is not configured",
+        )
+    if x_api_key is None or not compare_digest(x_api_key, settings.api_key):
         raise HTTPException(status_code=401, detail="invalid or missing X-API-Key header")

@@ -12,6 +12,13 @@ from app.schemas.site import ArticleBrief
 # all" exceeds PostgreSQL's 65535-parameter limit and 500s.
 MAX_BULK_REVIEW = MAX_ENGINE_PAGE_SIZE
 
+# Long enough for a full article title, short enough that the term stays a term.
+# A trigram index degrades toward a sequential scan as the pattern grows, so this
+# is a performance bound as much as a validation one.
+MAX_SEARCH_TERM = 200
+
+TargetOrigin = Literal["internal", "content_pool"]
+
 
 class SuggestionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -20,8 +27,18 @@ class SuggestionOut(BaseModel):
     site_id: int
     source_article: ArticleBrief
     target_article: ArticleBrief
+    #: Where the target lives relative to the site being reviewed.
+    target_origin: TargetOrigin
+    #: The site that owns the target article; useful when the target is external.
+    target_site_name: str
     method: str
+    #: Cosine semantic similarity, whichever method selected the row.
     score: float
+    #: How this row was chosen, when the method records it. For `hybrid_bm25`:
+    #: the BM25 score that ordered it, its fusion and per-retriever ranks, and
+    #: the recipe names. Null for `baseline_cosine`, whose score already is its
+    #: whole explanation.
+    score_components: dict | None = None
     status: str
     anchor_text: str | None
     created_at: datetime
@@ -98,6 +115,13 @@ class BulkReviewFilter(BaseModel):
     all_sites: bool = False
     method: str | None = None
     threshold_percent: int = Field(ge=0, le=100)
+    # The rule carries every filter the queue itself can apply, so "accept the
+    # 412 shown" can be true rather than approximately true. Each of these only
+    # ever narrows the match, so an older client that omits them keeps its
+    # existing fleet-wide behaviour.
+    q: str | None = Field(default=None, max_length=MAX_SEARCH_TERM)
+    target_origin: TargetOrigin | None = None
+    exclude_reciprocal: bool = False
 
     @model_validator(mode="after")
     def _fleet_scope_must_be_deliberate(self) -> "BulkReviewFilter":

@@ -12,7 +12,8 @@ MAX_BULK_SITES = 1000
 class SiteCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     base_url: str = Field(min_length=1, max_length=2048)
-    platform: Literal["wordpress", "html"]
+    platform: Literal["wordpress", "html", "pool"]
+    crawl_frequency: Literal["manual", "daily"] | None = None
     wp_username: str | None = Field(default=None, max_length=255)
     wp_app_password: str | None = Field(default=None, max_length=255)
 
@@ -20,17 +21,26 @@ class SiteCreate(BaseModel):
     def safe_base_url(self) -> "SiteCreate":
         if bool(self.wp_username) != bool(self.wp_app_password):
             raise ValueError("wp_username and wp_app_password must be provided together")
+        if self.platform != "wordpress" and (self.wp_username or self.wp_app_password):
+            raise ValueError("WordPress credentials are only valid for WordPress sites")
+        if self.platform != "pool" and self.crawl_frequency not in (None, "manual"):
+            raise ValueError("daily crawl frequency is reserved for content-pool sources")
         allow = settings.allow_unsafe_crawl_targets
         try:
             validate_url(
                 self.base_url,
                 allow_private=allow,
-                require_https=bool(self.wp_username or self.wp_app_password) and not allow,
+                require_https=(
+                    bool(self.wp_username or self.wp_app_password) or self.platform == "pool"
+                )
+                and not allow,
                 resolve_dns=False,  # the pinned crawl transport resolves hostnames at connect time
             )
         except UnsafeURLError as e:
             raise ValueError(str(e)) from e
         self.base_url = self.base_url.rstrip("/")
+        if self.crawl_frequency is None:
+            self.crawl_frequency = "daily" if self.platform == "pool" else "manual"
         return self
 
 
@@ -95,11 +105,63 @@ class SiteOut(BaseModel):
     base_url: str
     platform: str
     crawl_frequency: str
+    pool_source_approved: bool = False
+    pool_source_approved_at: datetime | None = None
+    pool_source_approved_by: str | None = None
+    pool_source_consecutive_failures: int = 0
+    pool_source_quarantined: bool = False
+    pool_source_quarantined_at: datetime | None = None
+    pool_source_quarantine_reason: str | None = None
+    pool_source_last_reactivated_at: datetime | None = None
+    pool_source_last_reactivated_by: str | None = None
+    suggestion_method: Literal["hybrid_bm25"] = "hybrid_bm25"
+    suggestion_mode: Literal["standard", "experimental"]
+    suggestion_mode_managed: bool = True
+    suggestion_comparison_enabled: bool = False
+    suggestion_slots_available: int = 0
     created_at: datetime
     last_ingestion_status: str | None = None
+    # Last *finished* analysis, so a crawled site reads differently from an
+    # analysed one once both jobs have left the active feed.
+    last_analysis_status: str | None = None
+    last_analysis_at: datetime | None = None
     article_count: int = 0
     internal_link_count: int = 0
     last_crawl_at: datetime | None = None
+
+
+class PoolSourceApproval(BaseModel):
+    approved_by: str = Field(min_length=1, max_length=255)
+
+    @field_validator("approved_by")
+    @classmethod
+    def normalize_approver(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("approved_by must not be blank")
+        return normalized
+
+
+class PoolSourceReactivation(BaseModel):
+    reactivated_by: str = Field(min_length=1, max_length=255)
+
+    @field_validator("reactivated_by")
+    @classmethod
+    def normalize_reviewer(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("reactivated_by must not be blank")
+        return normalized
+
+
+class SiteSuggestionModeUpdate(BaseModel):
+    suggestion_mode: Literal["standard", "experimental"]
+
+
+class SiteSuggestionModeState(BaseModel):
+    suggestion_mode: Literal["standard", "experimental"]
+    suggestion_mode_managed: bool
+    suggestion_comparison_enabled: bool
 
 
 class ArticleBrief(BaseModel):

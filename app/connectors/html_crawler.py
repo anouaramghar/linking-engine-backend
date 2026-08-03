@@ -7,6 +7,7 @@ crawler implementation when fleet-scale crawling (v5) needs concurrency/politene
 
 import logging
 from collections.abc import Iterator
+from time import monotonic
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -15,6 +16,7 @@ from lxml import etree, html as lxml_html
 
 from app.config import settings
 from app.connectors.base import ArticleData, ContentConnector, SiteMetadata
+from app.connectors.http_limits import check_crawl_deadline, get_limited_http_response
 from app.connectors.url_guard import (
     SSRFProtectedTransport,
     UnsafeURLError,
@@ -45,20 +47,46 @@ class HTMLConnector(ContentConnector):
             event_hooks={"request": [request_guard(allow_private=allow_private)]},
         )
         self._host = urlparse(site.base_url).netloc
+        self._crawl_started_at: float | None = None
+
+    def _check_crawl_budget(self) -> None:
+        if self._crawl_started_at is None:
+            self._crawl_started_at = monotonic()
+        check_crawl_deadline(self._crawl_started_at)
 
     def _sitemap_urls(self) -> list[str]:
         """sitemap_index.xml -> child sitemaps -> page URLs. Plain sitemaps also handled."""
         index_url = self.site.base_url.rstrip("/") + "/sitemap_index.xml"
         urls: list[str] = []
-        for sitemap_url in self._parse_sitemap(index_url, "//sm:sitemap/sm:loc") or [index_url]:
-            urls += self._parse_sitemap(sitemap_url, "//sm:url/sm:loc")
+        sitemap_urls = self._parse_sitemap(
+            index_url,
+            "//sm:sitemap/sm:loc",
+            max_items=settings.crawl_max_sitemaps,
+        ) or [index_url]
+        for sitemap_url in sitemap_urls:
+            urls += self._parse_sitemap(
+                sitemap_url,
+                "//sm:url/sm:loc",
+                max_items=settings.crawl_max_sitemap_urls,
+            )
+            if len(urls) > settings.crawl_max_sitemap_urls:
+                raise ValueError(
+                    f"sitemap URL count exceeded {settings.crawl_max_sitemap_urls}"
+                )
         return urls
 
-    def _parse_sitemap(self, url: str, xpath: str) -> list[str]:
-        resp = self.client.get(url)
+    def _parse_sitemap(self, url: str, xpath: str, *, max_items: int | None = None) -> list[str]:
+        self._check_crawl_budget()
+        resp = get_limited_http_response(
+            self.client,
+            url,
+            max_bytes=settings.crawl_max_response_bytes,
+        )
         resp.raise_for_status()
         tree = etree.fromstring(resp.content, parser=_XML_PARSER)
         locs = [loc.text.strip() for loc in tree.xpath(xpath, namespaces=SITEMAP_NS) if loc.text]
+        if max_items is not None and len(locs) > max_items:
+            raise ValueError(f"sitemap item count exceeded {max_items}")
         return [loc for loc in locs if self._same_origin(loc)]
 
     def _same_origin(self, url: str) -> bool:
@@ -72,24 +100,39 @@ class HTMLConnector(ContentConnector):
         return True
 
     def fetch_articles(self) -> Iterator[ArticleData]:
-        for url in self._sitemap_urls():
+        for article_number, url in enumerate(self._sitemap_urls(), start=1):
+            if article_number > settings.crawl_max_articles:
+                raise ValueError(f"crawl article count exceeded {settings.crawl_max_articles}")
             article = self.fetch_article_by_url(url)
             if article:
                 yield article
 
     def fetch_article_by_url(self, url: str) -> ArticleData | None:
-        resp = self.client.get(url)
+        self._check_crawl_budget()
+        resp = get_limited_http_response(
+            self.client,
+            url,
+            max_bytes=settings.crawl_max_response_bytes,
+        )
         if resp.status_code != 200:
             return None
         doc = trafilatura.bare_extraction(resp.text, url=url, with_metadata=True)
         if doc is None or not doc.text:
             return None  # not an article page (home, category listing...)
+        if len(doc.text) > settings.crawl_max_article_chars:
+            raise ValueError(
+                f"article content exceeded {settings.crawl_max_article_chars} characters"
+            )
         tree = lxml_html.fromstring(resp.text)
         internal = [
             urljoin(url, href)
             for href in tree.xpath("//a/@href")
             if urlparse(urljoin(url, href)).netloc == self._host
         ]
+        if len(internal) > settings.crawl_max_links_per_article:
+            raise ValueError(
+                f"article link count exceeded {settings.crawl_max_links_per_article}"
+            )
         return ArticleData(
             url=url,
             title=doc.title or url,
