@@ -1,5 +1,6 @@
 """Focused regression coverage for auth, remote-work, and analysis budgets."""
 
+import gzip
 from types import SimpleNamespace
 
 import httpx
@@ -8,7 +9,7 @@ import pytest
 from app.config import settings
 from app.connectors.base import ArticleData, ContentConnector
 from app.connectors.html_crawler import HTMLConnector
-from app.connectors.http_limits import ResponseTooLargeError
+from app.connectors.http_limits import ResponseTooLargeError, get_limited_http_response
 from app.connectors.wordpress import WordPressConnector
 from app.ml.hybrid import CorpusArticle, structured_terms
 from app.models import Article, IngestionRun
@@ -37,6 +38,26 @@ def test_html_sitemap_response_is_bounded(monkeypatch):
 
     with pytest.raises(ResponseTooLargeError, match="response declares|decoded-body limit"):
         connector._sitemap_urls()
+
+
+def test_bounded_http_response_does_not_decode_compressed_body_twice():
+    payload = b'{"name":"vibe"}'
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip", "content-type": "application/json"},
+            content=gzip.compress(payload),
+            request=request,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    response = get_limited_http_response(
+        client, "https://example.com/wp-json/wp/v2/sites", max_bytes=1024
+    )
+
+    assert response.content == payload
+    assert "content-encoding" not in response.headers
 
 
 def test_wordpress_pagination_has_a_local_page_budget(monkeypatch):

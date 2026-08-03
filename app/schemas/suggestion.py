@@ -12,6 +12,11 @@ from app.schemas.site import ArticleBrief
 # all" exceeds PostgreSQL's 65535-parameter limit and 500s.
 MAX_BULK_REVIEW = MAX_ENGINE_PAGE_SIZE
 
+# Long enough for a full article title, short enough that the term stays a term.
+# A trigram index degrades toward a sequential scan as the pattern grows, so this
+# is a performance bound as much as a validation one.
+MAX_SEARCH_TERM = 200
+
 TargetOrigin = Literal["internal", "content_pool"]
 
 
@@ -110,6 +115,13 @@ class BulkReviewFilter(BaseModel):
     all_sites: bool = False
     method: str | None = None
     threshold_percent: int = Field(ge=0, le=100)
+    # The rule carries every filter the queue itself can apply, so "accept the
+    # 412 shown" can be true rather than approximately true. Each of these only
+    # ever narrows the match, so an older client that omits them keeps its
+    # existing fleet-wide behaviour.
+    q: str | None = Field(default=None, max_length=MAX_SEARCH_TERM)
+    target_origin: TargetOrigin | None = None
+    exclude_reciprocal: bool = False
 
     @model_validator(mode="after")
     def _fleet_scope_must_be_deliberate(self) -> "BulkReviewFilter":

@@ -2,16 +2,17 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, literal, select, tuple_, update
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import exists, func, literal, or_, select, tuple_, update
+from sqlalchemy.orm import Session, aliased, joinedload
 
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
-from app.models import Site, Suggestion
+from app.models import Article, Site, Suggestion
 from app.schemas.job import JobAccepted
 from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
     MAX_BULK_REVIEW,
+    MAX_SEARCH_TERM,
     BulkReview,
     BulkReviewFilter,
     BulkReviewFilterResult,
@@ -20,6 +21,7 @@ from app.schemas.suggestion import (
     SuggestionOut,
     SuggestionPage,
     SuggestionReview,
+    TargetOrigin,
 )
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.analysis import analyze_site, compare_site
@@ -147,6 +149,87 @@ def _review_matching_counts(
     return result.matched, result.reviewed, reviewed_ids
 
 
+_LIKE_ESCAPE = "\\"
+
+
+def _like_pattern(term: str) -> str:
+    """Match `term` anywhere in a title, with its LIKE metacharacters defanged.
+
+    A search box is free text. An editor pasting a URL fragment or a title that
+    contains `_` must get those characters searched for, not interpreted as
+    wildcards — otherwise the narrower the query looks, the wider it matches.
+    """
+    escaped = (
+        term.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", f"{_LIKE_ESCAPE}%")
+        .replace("_", f"{_LIKE_ESCAPE}_")
+    )
+    return f"%{escaped}%"
+
+
+def _title_matches(term: str):
+    """Rows whose source or target article title contains `term`.
+
+    Correlated EXISTS rather than a join onto `articles`: the same condition list
+    is reused by the filtered bulk review, which applies it inside an UPDATE
+    where a join is not available. Keeping the two sides as separate subqueries
+    also lets PostgreSQL choose the trigram index for each independently.
+    """
+    pattern = _like_pattern(term)
+    return or_(
+        exists(
+            select(1).where(
+                Article.id == Suggestion.source_article_id,
+                Article.title.ilike(pattern, escape=_LIKE_ESCAPE),
+            )
+        ),
+        exists(
+            select(1).where(
+                Article.id == Suggestion.target_article_id,
+                Article.title.ilike(pattern, escape=_LIKE_ESCAPE),
+            )
+        ),
+    )
+
+
+def _target_is_pool():
+    """Whether this row's target article belongs to a content-pool site.
+
+    Ownership is read from the target's site, which is exactly how
+    `_suggestion_outputs` derives the `target_origin` the dashboard renders. One
+    source of truth, so the filter and the badge on the card cannot disagree.
+    """
+    return exists(
+        select(1)
+        .select_from(Article)
+        .join(Site, Site.id == Article.site_id)
+        .where(Article.id == Suggestion.target_article_id, Site.platform == "pool")
+    )
+
+
+def _has_stronger_reverse_pair():
+    """Whether the same pair is also suggested the other way round, and better.
+
+    Near-duplicate template pages propose A->B and B->A together, and a
+    score-ordered queue puts both at the top: on the dev corpus 256 rows are one
+    half of such a pair. Excluding *every* reciprocal row would discard the link
+    entirely, so this matches only the weaker direction — the stronger one
+    survives and the pair costs one review decision instead of two.
+
+    Ordered by (score, id) to match the queue's own ordering, which makes the
+    surviving direction the one the editor would have reached first anyway.
+    """
+    reverse = aliased(Suggestion)
+    return exists(
+        select(1).where(
+            reverse.source_article_id == Suggestion.target_article_id,
+            reverse.target_article_id == Suggestion.source_article_id,
+            reverse.status != "expired",
+            tuple_(reverse.score, reverse.id) > tuple_(Suggestion.score, Suggestion.id),
+        )
+    )
+
+
 def _percent_boundary(percent: int) -> float:
     """Raw-score boundary equivalent to JavaScript's Math.round(score * 100).
 
@@ -165,6 +248,9 @@ def _queue_conditions(
     method: str | None = None,
     min_percent: int | None = None,
     max_percent: int | None = None,
+    q: str | None = None,
+    target_origin: str | None = None,
+    exclude_reciprocal: bool = False,
 ) -> list:
     """Only the bounds the caller gave. Whether an absent status means "every
     status" or "everything but expired" differs per route, so it is decided there.
@@ -172,6 +258,11 @@ def _queue_conditions(
     The score bounds are asymmetric on purpose: the dashboard rule approves at or
     above a threshold and rejects below the same number, so a shared threshold
     must not put one row in both halves.
+
+    Every condition here is expressible inside an UPDATE ... WHERE, so the list,
+    the counts, and the filtered bulk review can all be built from one function.
+    That is what lets the dashboard promise that a bulk rule acts on exactly the
+    rows it is showing.
     """
     conditions = []
     if site_id is not None:
@@ -184,6 +275,15 @@ def _queue_conditions(
         conditions.append(Suggestion.score >= _percent_boundary(min_percent))
     if max_percent is not None:
         conditions.append(Suggestion.score < _percent_boundary(max_percent))
+    # A search of only whitespace is the same as no search; it must not collapse
+    # to '%%' and quietly match the whole queue.
+    if q is not None and q.strip():
+        conditions.append(_title_matches(q.strip()))
+    if target_origin is not None:
+        is_pool = _target_is_pool()
+        conditions.append(is_pool if target_origin == "content_pool" else ~is_pool)
+    if exclude_reciprocal:
+        conditions.append(~_has_stronger_reverse_pair())
     return conditions
 
 
@@ -228,6 +328,9 @@ def bulk_review_by_filter(
         method=payload.method,
         min_percent=payload.threshold_percent if payload.status == "approved" else None,
         max_percent=payload.threshold_percent if payload.status == "rejected" else None,
+        q=payload.q,
+        target_origin=payload.target_origin,
+        exclude_reciprocal=payload.exclude_reciprocal,
     )
     matched, reviewed, reviewed_ids = _review_matching_counts(db, conditions, payload.status)
     db.commit()
@@ -245,10 +348,19 @@ def count_suggestions(
     method: str | None = None,
     min_percent: int | None = Query(None, ge=0, le=100),
     max_percent: int | None = Query(None, ge=0, le=100),
+    q: str | None = Query(None, max_length=MAX_SEARCH_TERM),
+    target_origin: TargetOrigin | None = None,
+    exclude_reciprocal: bool = False,
     db: Session = Depends(get_db),
 ) -> SuggestionCounts:
     conditions = _queue_conditions(
-        site_id=site_id, method=method, min_percent=min_percent, max_percent=max_percent
+        site_id=site_id,
+        method=method,
+        min_percent=min_percent,
+        max_percent=max_percent,
+        q=q,
+        target_origin=target_origin,
+        exclude_reciprocal=exclude_reciprocal,
     )
     rows = db.execute(
         select(Suggestion.status, func.count()).where(*conditions).group_by(Suggestion.status)
@@ -267,6 +379,9 @@ def list_suggestion_page(
     method: str | None = None,
     min_percent: int | None = Query(None, ge=0, le=100),
     max_percent: int | None = Query(None, ge=0, le=100),
+    q: str | None = Query(None, max_length=MAX_SEARCH_TERM),
+    target_origin: TargetOrigin | None = None,
+    exclude_reciprocal: bool = False,
     after_score: float | None = Query(None, ge=0, le=1),
     after_id: int | None = Query(None, ge=1),
     include_total: bool = False,
@@ -281,6 +396,9 @@ def list_suggestion_page(
         method=method,
         min_percent=min_percent,
         max_percent=max_percent,
+        q=q,
+        target_origin=target_origin,
+        exclude_reciprocal=exclude_reciprocal,
     )
     if status is None:
         # Render the fixed predicate literally so PostgreSQL can prove that the

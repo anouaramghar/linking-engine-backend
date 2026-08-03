@@ -78,9 +78,12 @@ def get_limited_http_response(
     """Return a bounded response while preserving status and headers for callers."""
     with client.stream("GET", url, params=params, **kwargs) as response:
         content = _read_limited_body(response, max_bytes, raise_for_status=False)
+        headers = dict(response.headers)
+        for header in ("content-encoding", "content-length", "transfer-encoding"):
+            headers.pop(header, None)
         return httpx.Response(
             response.status_code,
-            headers=response.headers,
+            headers=headers,
             content=content,
             request=response.request,
         )
