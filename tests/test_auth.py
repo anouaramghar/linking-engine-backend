@@ -2,6 +2,7 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from app.api.deps import require_api_key
 from app.config import Settings, settings
@@ -36,5 +37,36 @@ def test_missing_api_key_fails_closed(monkeypatch):
 
 
 def test_api_key_required_outside_development():
-    with pytest.raises(ValueError, match="API_KEY must be set"):
+    with pytest.raises(ValueError, match="API_KEY or OPERATOR_API_KEYS must be set"):
         Settings(environment="production", api_key="", _env_file=None)
+
+
+def test_operator_key_can_access_protected_routes(client, monkeypatch):
+    monkeypatch.setattr(settings, "operator_api_keys", {"alice": SecretStr("alice-key")})
+
+    assert client.get("/api/v1/sites").status_code == 401
+    assert (
+        client.get("/api/v1/sites", headers={"X-API-Key": "alice-key"}).status_code == 200
+    )
+
+
+def test_credential_encryption_key_required_outside_development():
+    with pytest.raises(ValueError, match="CREDENTIAL_ENCRYPTION_KEY must be set"):
+        Settings(
+            environment="production",
+            api_key="sekret",
+            credential_encryption_key=None,
+            _env_file=None,
+        )
+
+
+def test_production_accepts_both_required_keys():
+    configured = Settings(
+        environment="production",
+        api_key="sekret",
+        credential_encryption_key=SecretStr(
+            "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
+        ),
+        _env_file=None,
+    )
+    assert configured.credential_encryption_key is not None

@@ -19,6 +19,51 @@ Pointing the suite at `linkmesh` â€” or at nothing, which would inherit `.env` â
 is refused rather than allowed to overwrite development review decisions. Full
 details, including CI setup, are in [docs/testing.md](docs/testing.md).
 
+## Rotating the credential encryption key
+
+`CREDENTIAL_ENCRYPTION_KEY` is the primary Fernet key: every new or updated
+WordPress application password is encrypted with it. To rotate it without
+making existing credentials unreadable:
+
+1. Move the current primary key into `CREDENTIAL_DECRYPTION_KEYS`.
+2. Generate a new key and set it as `CREDENTIAL_ENCRYPTION_KEY`.
+3. Deploy the application and run `alembic upgrade head`. The rotation migration
+   decrypts each stored credential with the primary or a previous key, then
+   re-encrypts it with the new primary key.
+4. Verify WordPress ingestion and publication, then remove the previous keys.
+
+Multiple previous keys may be supplied as a comma-separated list. Never commit
+any real key to Git, and do not remove a previous key before the migration has
+completed successfully.
+
+## Operator identity for approval actions
+
+Content-pool approval and reactivation records derive their operator identity
+from an operator-specific API key, never from a caller-supplied request field.
+Configure operators as a JSON object:
+
+```dotenv
+OPERATOR_API_KEYS={"alice":"replace-with-alice-key","bob":"replace-with-bob-key"}
+```
+
+Send the matching value in the `X-API-Key` header. Operator keys may call all
+protected routes. The generic `API_KEY` remains valid for service operations,
+but cannot approve or reactivate a content-pool source because it identifies no
+human operator. With authentication disabled in development, audit actions are
+recorded as `local-development`.
+
+Every successful content-pool approval, revocation, automatic quarantine, and
+reactivation also creates an immutable traceability event. Read a source's
+newest events first with:
+
+```http
+GET /api/v1/sites/{site_id}/pool-source/audit-events?limit=50&offset=0
+```
+
+Each event snapshots the source name and URL, the action, the authenticated
+operator (`system` for automatic quarantine), the timestamp, and an optional
+reason. Events intentionally survive source deletion.
+
 ## Getting started
 
 To make it easy for you to get started with GitLab, here's a list of recommended next steps.

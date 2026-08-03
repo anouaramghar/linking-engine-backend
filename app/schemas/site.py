@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.config import settings
 from app.connectors.url_guard import UnsafeURLError, validate_url
+from app.security.credentials import CredentialEncryptionError, validate_credential_encryption_key
 
 MAX_BULK_SITES = 1000
 
@@ -23,6 +24,13 @@ class SiteCreate(BaseModel):
             raise ValueError("wp_username and wp_app_password must be provided together")
         if self.platform != "wordpress" and (self.wp_username or self.wp_app_password):
             raise ValueError("WordPress credentials are only valid for WordPress sites")
+        if self.wp_app_password:
+            try:
+                # Fail before the request reaches the database. The actual value is
+                # encrypted by the model's database type on write.
+                validate_credential_encryption_key()
+            except CredentialEncryptionError as error:
+                raise ValueError(str(error)) from error
         if self.platform != "pool" and self.crawl_frequency not in (None, "manual"):
             raise ValueError("daily crawl frequency is reserved for content-pool sources")
         allow = settings.allow_unsafe_crawl_targets
@@ -128,30 +136,6 @@ class SiteOut(BaseModel):
     article_count: int = 0
     internal_link_count: int = 0
     last_crawl_at: datetime | None = None
-
-
-class PoolSourceApproval(BaseModel):
-    approved_by: str = Field(min_length=1, max_length=255)
-
-    @field_validator("approved_by")
-    @classmethod
-    def normalize_approver(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("approved_by must not be blank")
-        return normalized
-
-
-class PoolSourceReactivation(BaseModel):
-    reactivated_by: str = Field(min_length=1, max_length=255)
-
-    @field_validator("reactivated_by")
-    @classmethod
-    def normalize_reviewer(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("reactivated_by must not be blank")
-        return normalized
 
 
 class SiteSuggestionModeUpdate(BaseModel):

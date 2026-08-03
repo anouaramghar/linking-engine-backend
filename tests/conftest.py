@@ -22,6 +22,7 @@ import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+from pydantic import SecretStr
 
 #: Databases the suite must never write to, whatever the configuration says.
 #: ``linkmesh`` is the development database; ``postgres`` is the cluster's
@@ -154,6 +155,13 @@ def disable_api_key(monkeypatch):
     # Keep unrelated endpoint tests focused on their own behavior while auth
     # tests remove this override and exercise the real dependency.
     monkeypatch.setattr(settings, "api_key", "test-key")
+    monkeypatch.setattr(settings, "operator_api_keys", {})
+    monkeypatch.setattr(
+        settings,
+        "credential_encryption_key",
+        SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
+    )
+    monkeypatch.setattr(settings, "credential_decryption_keys", None)
     app.dependency_overrides[require_api_key] = lambda: None
     yield
     app.dependency_overrides.pop(require_api_key, None)
