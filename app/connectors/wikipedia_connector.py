@@ -85,22 +85,28 @@ class WikipediaConnector(ContentConnector):
             page_size = max(1, int(query.get("gsrlimit") or result_limit))
             max_requests = (result_limit + page_size - 1) // page_size + 1
         for request_number in range(max_requests):
+            params = {
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "redirects": 1,
+                "prop": "extracts|info|revisions",
+                "inprop": "url",
+                "explaintext": 1,
+                "rvprop": "timestamp",
+                **query,
+                **continuation,
+            }
+            # MediaWiki rejects rvlimit when a generator supplies several
+            # pages. A direct title lookup is a single-page query and may pin
+            # the revision count explicitly; generator queries already return
+            # the latest revision by default.
+            if "generator" not in query:
+                params["rvlimit"] = 1
             response = get_limited_response(
                 self.client,
                 "/w/api.php",
-                params={
-                    "action": "query",
-                    "format": "json",
-                    "formatversion": 2,
-                    "redirects": 1,
-                    "prop": "extracts|info|revisions",
-                    "inprop": "url",
-                    "explaintext": 1,
-                    "rvprop": "timestamp",
-                    "rvlimit": 1,
-                    **query,
-                    **continuation,
-                },
+                params=params,
                 max_bytes=settings.pool_max_response_bytes,
             )
             media_type = (response.content_type or "").split(";", 1)[0].strip().lower()

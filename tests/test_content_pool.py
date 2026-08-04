@@ -296,9 +296,10 @@ def test_wikipedia_connector_follows_continuation_and_validates_json(monkeypatch
     calls = 0
     sleeps: list[float] = []
 
-    def handler(_request):
+    def handler(request):
         nonlocal calls
         calls += 1
+        assert "rvlimit" not in request.url.params
         payload = {"query": {"pages": [pages[calls - 1]]}}
         if calls == 1:
             payload["continue"] = {"continue": "-||", "gsroffset": 20}
