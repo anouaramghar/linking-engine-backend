@@ -19,7 +19,16 @@ from collections.abc import Sequence
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
-TOP_K_SQL = text("""
+_LOW_VALUE_TARGET_SQL = """
+  AND lower(btrim(a2.title)) NOT IN (
+      'login', 'log in', 'sign in', 'sign up', 'register', 'registration',
+      'dashboard', 'my account', 'cart', 'shopping cart', 'checkout',
+      'privacy policy', 'terms of service', 'terms of use', 'cookie policy',
+      'support portal')
+  AND lower(a2.url) !~ '(^|/)(login|log-in|sign-in|sign-up|signup|register|registration|dashboard|my-account|cart|shopping-cart|checkout|privacy-policy|terms-of-service|terms-of-use|cookie-policy|support-portal)(/|[?#]|$)'
+"""
+
+TOP_K_SQL = text(f"""
 SELECT a2.id AS target_id,
        1 - (e2.vector <=> e1.vector) AS score
 FROM embeddings e1
@@ -31,6 +40,7 @@ WHERE a1.id = :article_id
   AND e1.model = :model
   AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
   AND a2.is_active IS TRUE
+  {_LOW_VALUE_TARGET_SQL}
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
       WHERE il.source_article_id = a1.id
@@ -51,7 +61,7 @@ LIMIT :k
 # rules in SQL; the fingerprint and title rules in the ranker's in-memory corpus
 # — plus the near-duplicate vector ceiling, which only a vector comparison can
 # express and which a lexical candidate would otherwise slip past entirely.
-_PILOT_ELIGIBILITY_SQL = """
+_PILOT_ELIGIBILITY_SQL = f"""
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
 JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
@@ -61,6 +71,7 @@ WHERE a1.id = :article_id
   AND e1.model = :model
   AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
   AND a2.is_active IS TRUE
+  {_LOW_VALUE_TARGET_SQL}
   AND (                     -- identical inputs are duplicate pages, not link candidates
       e1.content_fingerprint IS NULL
       OR e2.content_fingerprint IS NULL

@@ -194,6 +194,30 @@ def eligibility_corpus(db, site):
             content=f"{LEXICAL_BODY} bath",
             vector=_similar_vector(0.40, axis=10),
         ),
+        "low_value_title": _add_article(
+            db,
+            site,
+            slug="customer-entry",
+            title="My Account",
+            content=f"{LEXICAL_BODY} account",
+            vector=_similar_vector(0.39, axis=12),
+        ),
+        "low_value_url": _add_article(
+            db,
+            site,
+            slug="support-portal",
+            title="Customer help center",
+            content=f"{LEXICAL_BODY} support",
+            vector=_similar_vector(0.38, axis=13),
+        ),
+        "useful_login_article": _add_article(
+            db,
+            site,
+            slug="guide-to-login-security",
+            title="How to secure login pages",
+            content=f"{LEXICAL_BODY} authentication guide",
+            vector=_similar_vector(0.37, axis=14),
+        ),
         "eligible": _add_article(
             db,
             site,
@@ -338,7 +362,7 @@ def test_every_exclusion_rule_applies_to_lexically_retrieved_candidates(
     ranking = _rank(db, site, source)
 
     delivered = {candidate.target_id for candidate in ranking.candidates}
-    assert delivered == {targets["eligible"].id}
+    assert delivered == {targets["eligible"].id, targets["useful_login_article"].id}
     for name in (
         "vector_duplicate",
         "same_title",
@@ -346,6 +370,8 @@ def test_every_exclusion_rule_applies_to_lexically_retrieved_candidates(
         "inactive",
         "linked",
         "decided",
+        "low_value_title",
+        "low_value_url",
     ):
         assert targets[name].id not in delivered, f"{name} should have been excluded"
     assert source.id not in delivered
