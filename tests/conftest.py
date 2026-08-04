@@ -152,11 +152,31 @@ def engine_is_bound_to_the_test_database():
 @pytest.fixture(autouse=True)
 def disable_api_key(monkeypatch):
     # Keep unrelated endpoint tests focused on their own behavior while auth
-    # tests remove this override and exercise the real dependency.
+    # tests remove this override and exercise the real dependency. Most ranking
+    # tests use deliberately orthogonal toy vectors to isolate quotas and state
+    # transitions; the dedicated score-floor test opts back into the production
+    # threshold explicitly.
     monkeypatch.setattr(settings, "api_key", "test-key")
+    monkeypatch.setattr(settings, "suggestion_min_score", 0.0)
     app.dependency_overrides[require_api_key] = lambda: None
     yield
     app.dependency_overrides.pop(require_api_key, None)
+
+
+@pytest.fixture(autouse=True)
+def offline_publication_defaults(monkeypatch):
+    """Two things a publication run does to the outside world that tests must not.
+
+    The inter-article pause exists to be polite to a customer's host; against a
+    mock transport it only adds real seconds. Preflight placement generation
+    calls OpenRouter, which is a live third-party request and real money — with
+    a key present in `.env` the suite silently started making them, which is
+    both a cost and a source of four-minute test runs.
+
+    Tests that exercise either one override the setting themselves.
+    """
+    monkeypatch.setattr(settings, "publish_request_delay_seconds", 0.0)
+    monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
 
 
 @pytest.fixture

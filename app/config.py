@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     # Global Hybrid contract: BM25-512 final ordering and at most three active
     # suggestions per source article.
     hybrid_max_suggestions_per_article: int = Field(default=3, ge=1, le=3)
+    # The cap above bounds open review work, not the article. A reviewed row
+    # frees its slot, so once a source's suggestions are applied the next run
+    # proposes three fresh targets for it — and the run after that three more,
+    # for ever, because the already-suggested filter only blocks a repeated
+    # pair. This is the standing bound on how many links LinkMesh may ever add
+    # to one article: counted over the rows still on their way to becoming a
+    # link plus the ones that already did. A rejection still frees its slot —
+    # an editor saying no never put a link on the page.
+    hybrid_max_lifetime_links_per_article: int = Field(default=5, ge=1, le=100)
     # Keep each editorial batch reviewable. Later runs continue with sources
     # that still have open suggestion slots.
     hybrid_max_sources_per_run: int = Field(default=50, gt=0)
@@ -56,6 +65,41 @@ class Settings(BaseSettings):
     # Applied by the Hybrid ranking path to both halves of its candidate union;
     # the Standard cosine path is unchanged.
     suggestion_duplicate_similarity_threshold: float = Field(default=0.99, ge=0.0, le=1.0)
+    # Below this cosine similarity the pair is too weak to ask an editor to
+    # review. The local Hybrid corpus currently bottoms out at 0.571, so 0.50
+    # removes the weak tail without changing its existing queue.
+    suggestion_min_score: float = Field(default=0.50, ge=0.0, le=1.0)
+
+    # How many links publication may place *inside* an article's prose. The
+    # per-run suggestion cap above bounds open review work, not the article: an
+    # applied suggestion stops counting, so successive runs would keep adding
+    # in-text links to the same post. This is the standing limit on the post
+    # itself. Suggestions past it still publish, as the appended block — so the
+    # setting moves links out of the prose rather than dropping them. 0 turns
+    # in-text placement off site-wide and restores the appended-block behaviour.
+    publish_max_in_text_links_per_article: int = Field(default=3, ge=0, le=20)
+    # Two in-text links a few words apart read as spam even when each is
+    # defensible alone. Raw characters, because that is what the splice works
+    # in and the bound only has to be roughly right. 0 turns the guard off.
+    publish_min_in_text_gap_chars: int = Field(default=300, ge=0, le=10_000)
+    # Pause between source articles in a publication run. A run is the densest
+    # write traffic LinkMesh ever sends a customer site, and shared hosting
+    # answers that with a WAF block rather than a Retry-After we could honour.
+    publish_request_delay_seconds: float = Field(default=0.5, ge=0.0, le=60.0)
+    # Placements missing at publication time are generated in a preflight pass,
+    # because the review queue is worked in bulk and a bulk-approved row never
+    # had its drawer opened. Each is a model call of a few seconds, so the pass
+    # is capped: past this many the rest publish as the appended block, exactly
+    # as they do today. 0 disables preflight and restores lazy-only generation.
+    publish_max_placement_calls_per_run: int = Field(default=200, ge=0, le=5_000)
+    # How many preflight placement calls run at once. The pass is latency-bound
+    # on an external API, not CPU-bound; the ceiling is the provider's rate
+    # limit, not ours.
+    publish_placement_concurrency: int = Field(default=4, ge=1, le=16)
+    # Consecutive failures after which a suggestion stops being retried. Without
+    # it a permanently broken row — a post locked by a plugin, a revoked
+    # password — fails on every publication run for ever.
+    publish_max_suggestion_attempts: int = Field(default=3, ge=1, le=20)
 
     # Reject suspiciously incomplete crawls before they can replace a healthy snapshot.
     ingestion_min_previous_ratio: float = Field(default=0.5, ge=0.0, le=1.0)

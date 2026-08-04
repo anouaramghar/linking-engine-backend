@@ -228,6 +228,32 @@ def test_the_model_only_sees_the_configured_slice(monkeypatch, enable_openrouter
     assert not placement.found  # the passage is past the cut
 
 
+def test_an_anchor_a_sibling_already_took_is_rejected(
+    monkeypatch, enable_openrouter, suggestion
+):
+    """Two suggestions on one source cannot both link the same words.
+
+    Publication gives the phrase to the first and the loser publishes as the
+    appended block — having paid for a placement it can never use. The prompt
+    says so, and this is the rule behind the hint, because a model that ignores
+    an instruction must not be able to spend the slot anyway.
+    """
+    _stub_completion(monkeypatch, {"passage": REAL_PASSAGE, "anchor": "fewer acids"})
+
+    assert not placement_service.generate(suggestion, taken_anchors=["Fewer Acids"]).found
+    assert placement_service.generate(suggestion, taken_anchors=["long steep"]).found
+
+
+def test_the_prompt_lists_the_anchors_already_taken(monkeypatch, enable_openrouter, suggestion):
+    calls: list[str] = []
+    _stub_completion(monkeypatch, {"passage": REAL_PASSAGE, "anchor": "long steep"}, calls)
+
+    placement_service.generate(suggestion, taken_anchors=["fewer acids"])
+
+    assert "ALREADY TAKEN" in calls[0]
+    assert "- fewer acids" in calls[0]
+
+
 # --- the endpoint ----------------------------------------------------------
 
 

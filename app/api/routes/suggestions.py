@@ -72,10 +72,32 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
                 score_components=suggestion.score_components,
                 status=suggestion.status,
                 anchor_text=suggestion.anchor_text,
+                publish_outcome=suggestion.publish_outcome,
+                publish_attempts=suggestion.publish_attempts,
+                publish_error=suggestion.publish_error,
                 created_at=suggestion.created_at,
             )
         )
     return outputs
+
+
+def _review_values(status: str) -> dict:
+    """What a review writes, whichever path issued it.
+
+    Undoing a decision returns the suggestion to the unreviewed state, so the
+    review timestamp is cleared rather than advanced.
+
+    The publication failure history is cleared too. A quarantined row is only
+    ever revived by an editor deciding on it again, and leaving the count at the
+    limit re-quarantines it on its very next attempt — which makes re-approval
+    look like it worked and change nothing.
+    """
+    return {
+        "status": status,
+        "reviewed_at": None if status == "pending" else datetime.now(timezone.utc),
+        "publish_attempts": 0,
+        "publish_error": None,
+    }
 
 
 def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]:
@@ -91,14 +113,11 @@ def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]
     would otherwise re-fetch the touched rows to update its identity map, and
     nothing here reads them back through it.
     """
-    # Undoing a decision returns the suggestion to the unreviewed state, so the
-    # review timestamp is cleared rather than advanced.
-    reviewed_at = None if status == "pending" else datetime.now(timezone.utc)
     return set(
         db.scalars(
             update(Suggestion)
             .where(*conditions, Suggestion.status.notin_(UNREVIEWABLE))
-            .values(status=status, reviewed_at=reviewed_at)
+            .values(**_review_values(status))
             .returning(Suggestion.id)
             .execution_options(synchronize_session=False)
         )
@@ -123,7 +142,6 @@ def _review_matching_counts(
     if not conditions:
         raise ValueError("filtered review requires at least one match condition")
 
-    reviewed_at = None if status == "pending" else datetime.now(timezone.utc)
     candidates = (
         select(Suggestion.id)
         .where(*conditions)
@@ -136,7 +154,7 @@ def _review_matching_counts(
             Suggestion.id == candidates.c.id,
             *conditions,
         )
-        .values(status=status, reviewed_at=reviewed_at)
+        .values(**_review_values(status))
         .returning(Suggestion.id)
         .execution_options(synchronize_session=False)
         .cte("reviewed_rows")

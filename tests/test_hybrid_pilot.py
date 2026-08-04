@@ -157,7 +157,7 @@ def eligibility_corpus(db, site):
             slug="same-title",
             title="  TOMATO CANNING BASICS  ",
             content=f"{LEXICAL_BODY} reprint",
-            vector=_similar_vector(0.60, axis=6),
+            vector=_similar_vector(0.80, axis=6),
         ),
         # Byte-identical content fingerprint.
         "same_fingerprint": _add_article(
@@ -166,7 +166,7 @@ def eligibility_corpus(db, site):
             slug="same-fingerprint",
             title="Canning tomatoes duplicate",
             content=f"{LEXICAL_BODY} copy",
-            vector=_similar_vector(0.55, axis=7),
+            vector=_similar_vector(0.75, axis=7),
             fingerprint=_fingerprint("Tomato canning basics", LEXICAL_BODY),
         ),
         "inactive": _add_article(
@@ -175,7 +175,7 @@ def eligibility_corpus(db, site):
             slug="inactive",
             title="Retired canning guide",
             content=f"{LEXICAL_BODY} retired",
-            vector=_similar_vector(0.50, axis=8),
+            vector=_similar_vector(0.70, axis=8),
             is_active=False,
         ),
         "linked": _add_article(
@@ -184,7 +184,7 @@ def eligibility_corpus(db, site):
             slug="linked",
             title="Canning jars explained",
             content=f"{LEXICAL_BODY} jars",
-            vector=_similar_vector(0.45, axis=9),
+            vector=_similar_vector(0.65, axis=9),
         ),
         "decided": _add_article(
             db,
@@ -192,7 +192,7 @@ def eligibility_corpus(db, site):
             slug="decided",
             title="Water bath canning",
             content=f"{LEXICAL_BODY} bath",
-            vector=_similar_vector(0.40, axis=10),
+            vector=_similar_vector(0.60, axis=10),
         ),
         "eligible": _add_article(
             db,
@@ -200,7 +200,7 @@ def eligibility_corpus(db, site):
             slug="eligible",
             title="Altitude adjustments for canning",
             content=f"{LEXICAL_BODY} altitude chart",
-            vector=_similar_vector(0.35, axis=11),
+            vector=_similar_vector(0.55, axis=11),
         ),
     }
     db.flush()
@@ -503,7 +503,7 @@ def test_pilot_rows_store_cosine_as_the_score_and_bm25_in_the_components(
     components = row.score_components
     assert row.score == pytest.approx(components["semantic"])
     assert 0.0 <= row.score <= 1.0
-    assert row.score == pytest.approx(0.35, abs=1e-6)
+    assert row.score == pytest.approx(0.55, abs=1e-6)
 
     # BM25 is reported separately, raw, and is not rescaled into anything that
     # reads as a confidence.
@@ -561,8 +561,10 @@ def test_committed_defaults_enable_global_hybrid():
 
     assert defaults.hybrid_max_sources_per_run == 50
     assert defaults.hybrid_max_suggestions_per_article == 3
+    assert defaults.hybrid_max_lifetime_links_per_article == 5
     assert defaults.hybrid_max_active_suggestions_per_site == 1500
     assert defaults.suggestion_duplicate_similarity_threshold == 0.99
+    assert defaults.suggestion_min_score == 0.50
 
 
 def test_default_site_uses_the_hybrid_path(db, site):
@@ -576,7 +578,7 @@ def test_default_site_uses_the_hybrid_path(db, site):
     assert result["ranking_mode"] == "hybrid"
 
 
-def test_hybrid_uses_the_configured_per_source_cap(db, site, monkeypatch):
+def test_hybrid_respects_the_configured_per_source_cap(db, site, monkeypatch):
     articles = _make_articles(db, site)
     monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 2)
 
@@ -586,7 +588,9 @@ def test_hybrid_uses_the_configured_per_source_cap(db, site, monkeypatch):
     counts = {
         article.id: sum(row.source_article_id == article.id for row in rows) for article in articles
     }
-    assert set(counts.values()) == {2}
+    assert rows
+    assert max(counts.values()) == 2
+    assert all(count <= 2 for count in counts.values())
     assert {row.method for row in rows} == {"hybrid_bm25"}
 
 

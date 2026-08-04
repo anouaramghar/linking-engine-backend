@@ -245,6 +245,9 @@ def test_counts_report_every_status_and_a_total_matching_the_list(
     _suggest(db, site, pair, 0.30, status="approved")
     _suggest(db, site, pair, 0.40, status="applied")
     _suggest(db, site, pair, 0.50, status="expired")
+    # Quarantined rows are returned by the default list, so a chip that cannot
+    # report them makes the chips disagree with `total` by exactly this row.
+    _suggest(db, site, pair, 0.55, status="failed")
     _suggest(db, other_site, other_pair, 0.60)
     db.commit()
 
@@ -257,7 +260,8 @@ def test_counts_report_every_status_and_a_total_matching_the_list(
         "applying": 0,
         "applied": 1,
         "expired": 1,
-        "total": 4,
+        "failed": 1,
+        "total": 5,
     }
     # The advertised contract: `total` is what the list returns with no status.
     assert (

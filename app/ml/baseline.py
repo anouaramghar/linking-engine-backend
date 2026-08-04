@@ -19,6 +19,8 @@ from collections.abc import Sequence
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
+from app.config import settings
+
 TOP_K_SQL = text("""
 SELECT a2.id AS target_id,
        1 - (e2.vector <=> e1.vector) AS score
@@ -31,6 +33,7 @@ WHERE a1.id = :article_id
   AND e1.model = :model
   AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
   AND a2.is_active IS TRUE
+  AND (1 - (e2.vector <=> e1.vector)) >= :minimum_score
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
       WHERE il.source_article_id = a1.id
@@ -41,6 +44,11 @@ WHERE a1.id = :article_id
       WHERE s.source_article_id = a1.id
         AND s.target_article_id = a2.id
         AND s.status != 'expired')
+  AND NOT EXISTS (          -- the reverse direction is already proposed or a link
+      SELECT 1 FROM suggestions s
+      WHERE s.source_article_id = a2.id
+        AND s.target_article_id = a1.id
+        AND s.status IN ('pending', 'approved', 'applying', 'applied'))
 ORDER BY e2.vector <=> e1.vector
 LIMIT :k
 """)
@@ -51,6 +59,10 @@ LIMIT :k
 # rules in SQL; the fingerprint and title rules in the ranker's in-memory corpus
 # — plus the near-duplicate vector ceiling, which only a vector comparison can
 # express and which a lexical candidate would otherwise slip past entirely.
+#
+# The reverse-direction rule keeps A->B and B->A from both being proposed. The
+# first direction generated wins an otherwise symmetric choice; later sources
+# continue to their next eligible target instead of creating the mirror row.
 _PILOT_ELIGIBILITY_SQL = """
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
@@ -67,6 +79,7 @@ WHERE a1.id = :article_id
       OR e2.content_fingerprint <> e1.content_fingerprint)
   AND lower(btrim(a2.title)) <> lower(btrim(a1.title))
   AND (e2.vector <=> e1.vector) > :duplicate_distance
+  AND (1 - (e2.vector <=> e1.vector)) >= :minimum_score
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
       WHERE il.source_article_id = a1.id
@@ -77,6 +90,11 @@ WHERE a1.id = :article_id
       WHERE s.source_article_id = a1.id
         AND s.target_article_id = a2.id
         AND s.status != 'expired')
+  AND NOT EXISTS (          -- the reverse direction is already proposed or a link
+      SELECT 1 FROM suggestions s
+      WHERE s.source_article_id = a2.id
+        AND s.target_article_id = a1.id
+        AND s.status IN ('pending', 'approved', 'applying', 'applied'))
 """
 
 PILOT_TOP_K_SQL = text(f"""
@@ -107,7 +125,15 @@ WHERE e1.article_id = :article_id
 
 def top_candidates(db: Session, article_id: int, model: str, k: int) -> list[tuple[int, float]]:
     """The baseline query used by explicit comparisons and fallback."""
-    rows = db.execute(TOP_K_SQL, {"article_id": article_id, "model": model, "k": k}).all()
+    rows = db.execute(
+        TOP_K_SQL,
+        {
+            "article_id": article_id,
+            "model": model,
+            "k": k,
+            "minimum_score": settings.suggestion_min_score,
+        },
+    ).all()
     return [(r.target_id, float(r.score)) for r in rows]
 
 
@@ -126,6 +152,7 @@ def eligible_top_candidates(
             "model": model,
             "k": k,
             "duplicate_distance": 1.0 - duplicate_similarity_threshold,
+            "minimum_score": settings.suggestion_min_score,
         },
     ).all()
     return [(r.target_id, float(r.score)) for r in rows]
@@ -153,6 +180,7 @@ def eligible_candidate_scores(
             "model": model,
             "target_ids": list(target_ids),
             "duplicate_distance": 1.0 - duplicate_similarity_threshold,
+            "minimum_score": settings.suggestion_min_score,
         },
     ).all()
     return {row.target_id: float(row.score) for row in rows}

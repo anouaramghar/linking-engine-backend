@@ -18,6 +18,11 @@ from app.services.job_service import record_progress
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
+# Open review work. 'applied' is deliberately absent: a published link stops
+# occupying the queue. It still counts against the article — see _LIFETIME_STATUSES.
+_ACTIVE_STATUSES = ("pending", "approved", "applying")
+# Every row that is, or is on its way to becoming, a link on the source article.
+_LIFETIME_STATUSES = (*_ACTIVE_STATUSES, "applied")
 _ANALYSIS_LOCK_NAMESPACE = 0x4C4D
 _DIMENSION_PROBE_INPUT = "LinkMesh dimension probe"
 logger = logging.getLogger(__name__)
@@ -238,6 +243,7 @@ def generate_suggestions(
             if comparison_only and ranking_mode != "shadow":
                 raise ValueError("comparison-only analysis requires shadow ranking")
             suggestion_cap = settings.hybrid_max_suggestions_per_article
+            lifetime_cap = settings.hybrid_max_lifetime_links_per_article
             hybrid_ranker = None
             hybrid_load_failed = False
             if ranking_mode != "baseline":
@@ -273,16 +279,24 @@ def generate_suggestions(
                 if ranking_mode == "shadow"
                 else set()
             )
-            existing_counts = dict(
-                db.execute(
-                    select(Suggestion.source_article_id, func.count())
-                    .where(
-                        Suggestion.site_id == site_id,
-                        Suggestion.status.in_(("pending", "approved", "applying")),
-                    )
-                    .group_by(Suggestion.source_article_id)
-                ).all()
-            )
+            # One pass, two bounds per source: what is still in review, and what
+            # this article has ever been given. They differ only by 'applied' —
+            # a link that is on the page now and does not stop being one because
+            # it left the queue.
+            source_counts = db.execute(
+                select(
+                    Suggestion.source_article_id,
+                    func.count().filter(Suggestion.status.in_(_ACTIVE_STATUSES)),
+                    func.count(),
+                )
+                .where(
+                    Suggestion.site_id == site_id,
+                    Suggestion.status.in_(_LIFETIME_STATUSES),
+                )
+                .group_by(Suggestion.source_article_id)
+            ).all()
+            existing_counts = {source_id: active for source_id, active, _ in source_counts}
+            lifetime_counts = {source_id: lifetime for source_id, _, lifetime in source_counts}
             active_count = sum(existing_counts.values())
             site_capacity = max(
                 0,
@@ -307,6 +321,7 @@ def generate_suggestions(
                     break
                 remaining = min(
                     suggestion_cap - existing_counts.get(article_id, 0),
+                    lifetime_cap - lifetime_counts.get(article_id, 0),
                     site_capacity,
                 )
                 has_capacity = remaining > 0

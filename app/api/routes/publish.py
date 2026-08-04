@@ -1,13 +1,24 @@
-from fastapi import APIRouter, Depends, HTTPException
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db
+from app.connectors.registry import get_connector
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
-from app.schemas.publication import PendingPublicationSite
+from app.schemas.publication import (
+    PendingPublicationSite,
+    PlannedArticle,
+    PlannedLink,
+    PublicationDryRun,
+    PublicationPreviewError,
+)
 from app.services.job_service import DuplicateJobError, enqueue_job
-from app.tasks.publication import publish_approved
+from app.tasks.publication import generate_missing_placements, grouped_batch, publish_approved
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/publish", tags=["publish"])
 
@@ -46,6 +57,116 @@ def trigger_publication(site_id: int, db: Session = Depends(get_db)) -> JobAccep
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
+
+
+@router.get("/{site_id}/dry-run", response_model=PublicationDryRun)
+def dry_run_publication(
+    site_id: int,
+    # Each source article is a live request to the customer's site, so a
+    # synchronous preview is bounded rather than covering the whole queue.
+    max_articles: int = Query(default=25, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> PublicationDryRun:
+    """What publication would write, decided against the live posts, without writing.
+
+    There was no way to see this before it happened. The same reads, the same
+    ordering and the same in-text-or-block decisions as a real run — but no
+    WordPress POST and no claim. Missing placements are prepared first and
+    stored internally, so the subsequent publish reuses the choices shown here.
+    """
+    site = db.get(Site, site_id)
+    if site is None:
+        raise HTTPException(404, f"site {site_id} not found")
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources are read-only")
+
+    # A preview writes nothing, so the superseded rows are left for the run
+    # itself to expire.
+    groups, _superseded = grouped_batch(db, site_id)
+    approved = (
+        db.scalar(
+            select(func.count())
+            .select_from(Suggestion)
+            .where(Suggestion.site_id == site_id, Suggestion.status == "approved")
+        )
+        or 0
+    )
+    preview_groups = groups[:max_articles]
+    generate_missing_placements(preview_groups, None)
+    connector = get_connector(site)
+    planned: list[PlannedLink] = []
+    articles: list[PlannedArticle] = []
+    errors: list[PublicationPreviewError] = []
+    placements_missing = 0
+    for _source_article_id, suggestion_ids in preview_groups:
+        rows = db.scalars(
+            select(Suggestion)
+            .where(Suggestion.id.in_(suggestion_ids))
+            .options(
+                joinedload(Suggestion.source_article),
+                joinedload(Suggestion.target_article),
+            )
+        ).all()
+        by_id = {row.id: row for row in rows}
+        ordered = [by_id[sid] for sid in suggestion_ids if sid in by_id]
+        if not ordered:
+            errors.append(
+                PublicationPreviewError(
+                    source_article_id=_source_article_id,
+                    source_url="",
+                    message="approved suggestions changed while the preview was loading",
+                )
+            )
+            continue
+        placements_missing += sum(1 for row in ordered if row.placement_generated_at is None)
+        try:
+            preview = connector.preview_links(ordered)
+        except Exception as error:
+            # One unreachable post must not lose the preview of the others.
+            logger.warning("dry run failed for source article %s: %s", _source_article_id, error)
+            source = ordered[0].source_article if ordered else None
+            errors.append(
+                PublicationPreviewError(
+                    source_article_id=_source_article_id,
+                    source_url=source.url if source is not None else "",
+                    message=str(error)[:500],
+                )
+            )
+            continue
+        links = [
+            PlannedLink(
+                suggestion_id=suggestion.id,
+                source_article_id=suggestion.source_article_id,
+                source_url=suggestion.source_article.url,
+                target_url=suggestion.target_article.url,
+                outcome=outcome,
+                anchor_text=suggestion.anchor_text if outcome == "inserted" else None,
+            )
+            for suggestion, outcome in zip(ordered, preview.outcomes, strict=True)
+        ]
+        planned.extend(links)
+        articles.append(
+            PlannedArticle(
+                source_article_id=_source_article_id,
+                source_url=ordered[0].source_article.url,
+                original_html=preview.original_content,
+                updated_html=preview.updated_content,
+                links=links,
+            )
+        )
+    return PublicationDryRun(
+        site_id=site_id,
+        approved=approved,
+        previewed=len(planned),
+        placements_missing=placements_missing,
+        inserted=sum(1 for link in planned if link.outcome == "inserted"),
+        block=sum(1 for link in planned if link.outcome == "block"),
+        already_present=sum(1 for link in planned if link.outcome == "already_present"),
+        planned=planned,
+        articles=articles,
+        errors=errors,
+        truncated=len(groups) > max_articles,
+    )
 
 
 @router.get("/{site_id}/status")

@@ -41,6 +41,9 @@ class SuggestionOut(BaseModel):
     score_components: dict | None = None
     status: str
     anchor_text: str | None
+    publish_outcome: str | None = None
+    publish_attempts: int = 0
+    publish_error: str | None = None
     created_at: datetime
 
 
@@ -115,6 +118,10 @@ class SuggestionCounts(BaseModel):
     applying: int = 0
     applied: int = 0
     expired: int = 0
+    # Quarantined after repeated publication failures. Counted in `total` because
+    # the list endpoint returns these rows, and a chip the editor cannot see is
+    # how a stuck suggestion stays stuck.
+    failed: int = 0
     total: int = 0
 
 

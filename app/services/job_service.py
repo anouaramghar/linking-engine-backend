@@ -56,6 +56,10 @@ class DuplicateJobError(Exception):
         super().__init__(f"{run.kind} job already {run.status} for site {run.site_id}")
 
 
+class NonRetryableTaskError(RuntimeError):
+    """A terminal task failure that RQ must not schedule again."""
+
+
 @contextmanager
 def _site_enqueue_lock(site_id: int) -> Iterator[None]:
     # The work session commits the durable row before enqueueing. A dedicated
@@ -273,7 +277,16 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
             error = str(e)[:2000]
             current_job = get_current_job()
             retries_left = getattr(current_job, "retries_left", None)
-            final_attempt = current_job is None or retries_left is None or retries_left <= 0
+            non_retryable = isinstance(e, NonRetryableTaskError)
+            if non_retryable and current_job is not None:
+                # RQ checks this same in-memory Job after the function raises.
+                current_job.retries_left = 0
+            final_attempt = (
+                non_retryable
+                or current_job is None
+                or retries_left is None
+                or retries_left <= 0
+            )
             if run is not None:
                 now = datetime.now(timezone.utc)
                 if run.kind == "publication":

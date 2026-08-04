@@ -16,6 +16,11 @@ succeeds or becomes terminal.
 
 _STAGE = "publishing"
 
+#: Connector outcomes carried in progress next to `applied`, and resumed for the
+#: same reason: the row that produced one was committed, so restarting the count
+#: on a retry would report "applied 10, inserted 1" for the same ten links.
+PUBLICATION_OUTCOMES = ("inserted", "block", "already_present")
+
 
 def _count(progress: dict, key: str, default: int = 0) -> int:
     value = progress.get(key, default)
@@ -48,6 +53,12 @@ def begin_publication_attempt(previous: dict | None, batch_size: int) -> dict:
         "attempt_failures": attempt_failures,
         "failure_state": None,
     }
+
+
+def resume_outcome_counts(previous: dict | None) -> dict[str, int]:
+    """The outcome tallies an earlier attempt already committed."""
+    previous = previous if isinstance(previous, dict) and previous.get("stage") == _STAGE else {}
+    return {name: _count(previous, name) for name in PUBLICATION_OUTCOMES}
 
 
 def record_publication_applied(progress: dict) -> dict:

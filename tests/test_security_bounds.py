@@ -118,7 +118,7 @@ class _TooManyArticlesConnector(ContentConnector):
     def supports_incremental_sync(self):
         return False
 
-    def apply_link(self, suggestion):
+    def apply_links(self, suggestions, *, dry_run=False):
         raise NotImplementedError
 
 

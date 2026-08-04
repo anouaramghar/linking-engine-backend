@@ -9,7 +9,13 @@ from urllib.parse import unquote, urlparse
 import httpx
 
 from app.config import settings
-from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
+from app.connectors.base import (
+    ArticleData,
+    ContentConnector,
+    LinkOutcome,
+    SiteMetadata,
+    TaxonomyData,
+)
 from app.connectors.http_limits import get_limited_response
 from app.connectors.url_guard import (
     SSRFProtectedTransport,
@@ -161,7 +167,7 @@ class WikipediaConnector(ContentConnector):
                 TaxonomyData(kind="tag", name="Wikipedia"),
                 TaxonomyData(kind="tag", name=self.seed_title[:255]),
             ],
-            outbound_internal_urls=[],
+            outbound_internal_links=[],
         )
 
     def fetch_articles(self) -> Iterator[ArticleData]:
@@ -198,5 +204,7 @@ class WikipediaConnector(ContentConnector):
     def supports_incremental_sync(self) -> bool:
         return True
 
-    def apply_link(self, suggestion: Suggestion) -> None:
+    def apply_links(
+        self, suggestions: list[Suggestion], *, dry_run: bool = False
+    ) -> list[LinkOutcome]:
         raise NotImplementedError("content-pool sources are read-only")

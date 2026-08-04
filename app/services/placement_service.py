@@ -12,6 +12,7 @@ located in the post is an anchor that cannot be linked.
 
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -49,6 +50,8 @@ TARGET article.
 the link lands, not the whole paragraph.
 4. If no passage in the SOURCE article is a genuinely good fit for this link, say \
 so instead of forcing one.
+5. If the request lists anchor phrases that are already taken, do not reuse one. \
+Each link in an article needs its own words.
 
 Answer with a JSON object and nothing else:
 {"passage": "<exact text from the source article>", "anchor": "<exact substring \
@@ -142,26 +145,42 @@ def build_user_prompt(
     target_title: str,
     target_url: str,
     target_text: str,
+    taken_anchors: Sequence[str] = (),
 ) -> str:
     target_preview = _normalize(target_text)[:TARGET_PREVIEW_CHARS]
+    taken = (
+        "ALREADY TAKEN anchor phrases in this SOURCE article (pick different words):\n"
+        + "\n".join(f"- {anchor}" for anchor in taken_anchors)
+        + "\n\n"
+        if taken_anchors
+        else ""
+    )
     return (
         f"TARGET article (the page to link to)\n"
         f"Title: {target_title}\n"
         f"URL: {target_url}\n"
         f"About: {target_preview}\n\n"
+        f"{taken}"
         f"SOURCE article (the page to place the link in)\n"
         f"Title: {source_title}\n"
         f"Text:\n{source_text}"
     )
 
 
-def generate(suggestion: Suggestion) -> Placement:
+def generate(suggestion: Suggestion, taken_anchors: Sequence[str] = ()) -> Placement:
     """Ask the model where this link belongs. Performs no database work.
 
     Split from the persistence below so the network call happens outside any
     open transaction: it takes seconds, and an idle transaction held across it
     would pin a connection and block the publication worker's row locks for the
     same length of time.
+
+    `taken_anchors` are phrases other suggestions on this same source article
+    have already claimed. Generated one row at a time, the model has no way to
+    know that, so two suggestions routinely pick the same phrase — publication
+    then gives it to the first and the loser falls back to the appended block,
+    having paid for a placement it cannot use. The list is both a hint in the
+    prompt and a hard rejection below, because a hint alone is not a rule.
 
     Raises `OpenRouterError` when the model cannot be reached — that is a
     temporary failure, and recording it as "no placement" would make it
@@ -177,12 +196,16 @@ def generate(suggestion: Suggestion) -> Placement:
             target_title=target.title,
             target_url=target.url,
             target_text=target.content_text,
+            taken_anchors=taken_anchors,
         ),
     )
     # Verified against the same slice the model was shown, so a passage can never
     # be accepted from a part of the article it could not have read.
     source_text = _normalize(source.content_text[: settings.placement_max_source_chars])
     context, anchor = _verify(answer.get("passage"), answer.get("anchor"), source_text)
+    if anchor is not None and any(anchor.casefold() == taken.casefold() for taken in taken_anchors):
+        logger.info("placement rejected: anchor %r is already taken on this article", anchor)
+        context, anchor = None, None
     return Placement(
         anchor_text=anchor,
         placement_context=context,

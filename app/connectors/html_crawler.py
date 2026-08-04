@@ -15,7 +15,13 @@ import trafilatura
 from lxml import etree, html as lxml_html
 
 from app.config import settings
-from app.connectors.base import ArticleData, ContentConnector, SiteMetadata
+from app.connectors.base import (
+    ArticleData,
+    ContentConnector,
+    LinkOutcome,
+    OutboundLink,
+    SiteMetadata,
+)
 from app.connectors.http_limits import check_crawl_deadline, get_limited_http_response
 from app.connectors.url_guard import (
     SSRFProtectedTransport,
@@ -25,6 +31,8 @@ from app.connectors.url_guard import (
 )
 from app.models.suggestion import Suggestion
 
+#: Anchors are phrases; a link wrapping a whole section is stored truncated.
+_MAX_ANCHOR_TEXT_CHARS = 300
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 # Sitemap XML is untrusted input — no entity resolution, no network fetches
 _XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
@@ -125,9 +133,13 @@ class HTMLConnector(ContentConnector):
             )
         tree = lxml_html.fromstring(resp.text)
         internal = [
-            urljoin(url, href)
-            for href in tree.xpath("//a/@href")
-            if urlparse(urljoin(url, href)).netloc == self._host
+            OutboundLink(
+                url=absolute,
+                anchor_text=" ".join(anchor.text_content().split())[:_MAX_ANCHOR_TEXT_CHARS]
+                or None,
+            )
+            for anchor in tree.xpath("//a[@href]")
+            if urlparse(absolute := urljoin(url, anchor.get("href"))).netloc == self._host
         ]
         if len(internal) > settings.crawl_max_links_per_article:
             raise ValueError(
@@ -141,7 +153,7 @@ class HTMLConnector(ContentConnector):
             language=None,
             published_at=None,  # trafilatura dates are unreliable; left for v2 heuristics
             taxonomies=[],  # no structured source on static HTML (A14)
-            outbound_internal_urls=internal,
+            outbound_internal_links=internal,
         )
 
     def get_site_metadata(self) -> SiteMetadata:
@@ -155,7 +167,9 @@ class HTMLConnector(ContentConnector):
     def supports_incremental_sync(self) -> bool:
         return False
 
-    def apply_link(self, suggestion: Suggestion) -> None:
+    def apply_links(
+        self, suggestions: list[Suggestion], *, dry_run: bool = False
+    ) -> list[LinkOutcome]:
         # A3 resolved: design ready (FTP hypothesis documented), no implementation —
         # HTML sites are secondary, WordPress is the v1 priority.
         raise NotImplementedError("writing to static HTML sites is not supported in v1 (A3)")

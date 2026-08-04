@@ -7,7 +7,13 @@ import pytest
 from sqlalchemy import event, func, select
 
 import app.services.ingestion_service as ingestion_service
-from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
+from app.connectors.base import (
+    ArticleData,
+    ContentConnector,
+    OutboundLink,
+    SiteMetadata,
+    TaxonomyData,
+)
 from app.db import SessionLocal, engine
 from app.models import (
     Article,
@@ -30,14 +36,18 @@ class StubConnector(ContentConnector):
             content_text="text a",
             external_id="1",
             taxonomies=[TaxonomyData(kind="category", name="SEO")],
-            outbound_internal_urls=[f"{base}/b", f"{base}/b#frag", f"{base}/missing"],
+            outbound_internal_links=[
+                OutboundLink(url=f"{base}/b", anchor_text="to B"),
+                OutboundLink(url=f"{base}/b#frag"),
+                OutboundLink(url=f"{base}/missing"),
+            ],
         )
         yield ArticleData(
             url=f"{base}/b/",
             title="Article B",
             content_text="text b",
             external_id="2",
-            outbound_internal_urls=[f"{base}/a"],
+            outbound_internal_links=[OutboundLink(url=f"{base}/a", anchor_text="back to A")],
         )
 
     def fetch_article_by_url(self, url):
@@ -49,7 +59,7 @@ class StubConnector(ContentConnector):
     def supports_incremental_sync(self):
         return False
 
-    def apply_link(self, suggestion):
+    def apply_links(self, suggestions, *, dry_run=False):
         pass
 
 
@@ -146,6 +156,31 @@ def test_ingestion_idempotent(db, site, monkeypatch):
     runs = db.scalars(select(IngestionRun).where(IngestionRun.site_id == site.id)).all()
     assert len(runs) == 2
     assert all(r.status == "succeeded" and r.finished_at is not None for r in runs)
+
+
+def test_ingestion_stores_the_anchor_text_of_each_link(db, site, monkeypatch):
+    """The words an editor chose are the anchor-distribution report's only input.
+
+    The connector had always read them and the column had always existed; the
+    resolution step simply never passed one to the other, so every row was NULL
+    and there was nothing to report on.
+    """
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    ingestion_service.run_ingestion(site.id)
+
+    urls = dict(
+        db.execute(select(Article.id, Article.url).where(Article.site_id == site.id)).all()
+    )
+    anchors = {
+        (urls[link.source_article_id], urls[link.target_article_id]): link.anchor_text
+        for link in db.scalars(
+            select(InternalLink).where(InternalLink.source_article_id.in_(urls))
+        )
+    }
+    assert anchors == {
+        (f"{site.base_url}/a", f"{site.base_url}/b/"): "to B",
+        (f"{site.base_url}/b/", f"{site.base_url}/a"): "back to A",
+    }
 
 
 def test_durable_ingestion_records_final_progress(db, site, monkeypatch):
