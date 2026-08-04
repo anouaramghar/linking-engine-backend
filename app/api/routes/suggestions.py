@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
@@ -7,6 +8,8 @@ from sqlalchemy.orm import Session, aliased, joinedload
 
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
+from app.ml.llm import openrouter
+from app.ml.llm.openrouter import OpenRouterError, OpenRouterNotConfigured
 from app.models import Article, Site, Suggestion
 from app.schemas.job import JobAccepted
 from app.schemas.site import ArticleBrief
@@ -16,6 +19,7 @@ from app.schemas.suggestion import (
     BulkReview,
     BulkReviewFilter,
     BulkReviewFilterResult,
+    PlacementOut,
     SuggestionCounts,
     SuggestionCursor,
     SuggestionOut,
@@ -23,8 +27,11 @@ from app.schemas.suggestion import (
     SuggestionReview,
     TargetOrigin,
 )
+from app.services import placement_service
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.analysis import analyze_site, compare_site
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["suggestions"])
 
@@ -497,6 +504,63 @@ def list_suggestions(
     if method:
         query = query.where(Suggestion.method == method)
     return _suggestion_outputs(db, db.scalars(query.limit(limit).offset(offset)).all())
+
+
+@router.get("/suggestions/{suggestion_id}/placement", response_model=PlacementOut)
+def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) -> PlacementOut:
+    """Where in the source article this link belongs, generating it on first ask.
+
+    Lazy rather than part of analysis: a run produces far more suggestions than
+    an editor opens, and this costs a model call per row. The result is written
+    back, so the price is paid once per suggestion no matter how often the
+    drawer is reopened — including when the answer was "nothing fits".
+
+    Two editors opening the same row at once will both generate. The second
+    write simply replaces the first with an equivalent answer, which is cheaper
+    than a lock held across an external request.
+    """
+    suggestion = db.get(
+        Suggestion,
+        suggestion_id,
+        options=[joinedload(Suggestion.source_article), joinedload(Suggestion.target_article)],
+    )
+    if suggestion is None:
+        raise HTTPException(404, f"suggestion {suggestion_id} not found")
+
+    placement = placement_service.stored(suggestion)
+    if placement is None:
+        if not openrouter.is_configured():
+            raise HTTPException(
+                503,
+                "placement generation is not configured; set OPENROUTER_API_KEY",
+            )
+        # Hand the connection back before the model call. Everything needed is
+        # already loaded, and an open read transaction held across a
+        # multi-second external request sits in front of the publication
+        # worker's writes to this same table. Detaching first so the rollback
+        # does not expire the instance out from under `generate`.
+        db.expunge_all()
+        db.rollback()
+        try:
+            placement = placement_service.generate(suggestion)
+        except OpenRouterNotConfigured as e:  # key removed between the check and here
+            raise HTTPException(503, str(e)) from e
+        except OpenRouterError as e:
+            # Upstream, and temporary. Nothing is written, so the next open
+            # retries rather than inheriting a failure as a permanent verdict.
+            logger.warning("placement generation failed for suggestion %s: %s", suggestion_id, e)
+            raise HTTPException(502, "the placement model is unavailable; try again") from e
+        placement_service.store(db, suggestion_id, placement)
+        db.commit()
+
+    return PlacementOut(
+        suggestion_id=suggestion_id,
+        found=placement.found,
+        placement_context=placement.placement_context,
+        anchor_text=placement.anchor_text,
+        llm_model=placement.llm_model,
+        generated_at=placement.generated_at,
+    )
 
 
 @router.put("/suggestions/{suggestion_id}", response_model=SuggestionOut)

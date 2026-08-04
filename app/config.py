@@ -20,6 +20,22 @@ class Settings(BaseSettings):
     # External search (v3)
     tavily_api_key: str = ""
 
+    # Placement context (v4): an OpenRouter-hosted model reads the source article
+    # and picks the passage the link belongs in. Empty key disables the feature —
+    # the placement endpoint reports it as unavailable rather than the review
+    # queue losing anything it had before.
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    placement_model: str = "google/gemma-4-31b-it"
+    placement_timeout_seconds: float = Field(default=60.0, gt=0.0, le=300.0)
+    # How much of the source article the model is shown. The model's context
+    # window is far larger than this, so the bound is about latency and spend on
+    # a per-preview call, not about what it can read.
+    placement_max_source_chars: int = Field(default=12_000, ge=500, le=100_000)
+    # One passage plus one anchor phrase is a small answer; this only has to be
+    # large enough that a valid response is never truncated mid-JSON.
+    placement_max_output_tokens: int = Field(default=800, ge=64, le=4_000)
+
     # Best-effort operations alerting; empty logs alerts locally.
     alert_webhook_url: str = ""
 

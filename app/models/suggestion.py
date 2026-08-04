@@ -79,8 +79,19 @@ class Suggestion(Base):
     status: Mapped[str] = mapped_column(
         SuggestionStatus, default="pending", server_default="pending"
     )
+    # -- placement context (v4) -------------------------------------------
+    # The phrase the link would be written on, copied verbatim out of the source
+    # article rather than composed, so it can later be found again in the post.
     anchor_text: Mapped[str | None] = mapped_column(Text)  # v4
     llm_model: Mapped[str | None] = mapped_column(String(100))  # v4 traceability
+    # The passage `anchor_text` sits in, also verbatim — what the dashboard shows
+    # an editor so the decision is about a real position in the article.
+    placement_context: Mapped[str | None] = mapped_column(Text)
+    # Set once the model has been asked, whatever it answered. It is what
+    # separates "not generated yet" from "generated, and no passage fit" — the
+    # two look identical in the columns above and must not cost the same row a
+    # second call on every preview.
+    placement_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
