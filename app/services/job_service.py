@@ -141,7 +141,14 @@ def reconcile_active_job_runs(db: Session, runs: list[JobRun]) -> list[JobRun]:
     return active
 
 
-def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
+def _enqueue_job_locked(
+    db: Session,
+    site_id: int,
+    kind: str,
+    fn,
+    job_timeout: int,
+    task_kwargs: dict | None = None,
+) -> JobRun:
     """Create the durable run row, then enqueue. Raises DuplicateJobError while an
     active run of this kind exists for the site."""
     active = db.scalars(
@@ -168,6 +175,7 @@ def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: i
         fn,
         site_id,
         job_run_id=run.id,
+        **(task_kwargs or {}),
         job_timeout=job_timeout,
         retry=Retry(max=2, interval=[30, 120]),  # limited automatic retries
         on_stopped=Callback(handle_job_stopped),
@@ -178,9 +186,23 @@ def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: i
     return run
 
 
-def enqueue_job(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
+def enqueue_job(
+    db: Session,
+    site_id: int,
+    kind: str,
+    fn,
+    job_timeout: int,
+    task_kwargs: dict | None = None,
+) -> JobRun:
     with _site_enqueue_lock(site_id):
-        return _enqueue_job_locked(db, site_id, kind, fn, job_timeout)
+        return _enqueue_job_locked(
+            db,
+            site_id,
+            kind,
+            fn,
+            job_timeout,
+            task_kwargs=task_kwargs,
+        )
 
 
 def record_progress(

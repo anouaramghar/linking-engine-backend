@@ -1,5 +1,12 @@
 # linking-engine-backend
 
+## Batch pipeline
+
+The backend can run ingestion followed by suggestion generation for several
+sites while tracking each site independently. See
+[docs/batch-pipeline.md](docs/batch-pipeline.md) for the API, statuses, and retry
+procedure.
+
 ## Running the tests
 
 The suite runs against a real PostgreSQL and writes, updates, and deletes rows,
