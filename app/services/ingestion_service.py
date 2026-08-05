@@ -15,6 +15,7 @@ from app.connectors.base import ArticleData, TaxonomyData
 from app.connectors.http_limits import check_crawl_deadline
 from app.connectors.registry import get_connector
 from app.db import SessionLocal, engine
+from app.ml.external.cleaning import normalize_external_url
 from app.models import (
     Article,
     ArticleTaxonomy,
@@ -270,6 +271,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         # for atomicity; use staging and promotion before scaling to very large crawls.
         crawl_started_at = monotonic()
         url_to_id: dict[str, int] = {}
+        external_urls_seen: set[str] = set()
         outbound: list[tuple[int, list[str]]] = []
         article_ids: set[int] = set()
         articles_seen = 0
@@ -298,6 +300,18 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                 raise ValueError(
                     f"article content exceeded {settings.crawl_max_article_chars} characters"
                 )
+            if site.platform == "pool":
+                try:
+                    normalized_external_url = normalize_external_url(art.url)
+                except ValueError as error:
+                    raise PoolSourceFetchError(str(error)) from error
+                # Feeds often repeat the same article with a tracking URL or a
+                # different query order. Keep the first (normally newest) entry
+                # and never let those aliases create distinct Article rows.
+                if normalized_external_url in external_urls_seen:
+                    continue
+                external_urls_seen.add(normalized_external_url)
+                art = art.model_copy(update={"url": normalized_external_url})
             if len(art.outbound_internal_links) > settings.crawl_max_links_per_article:
                 raise ValueError(
                     f"article link count exceeded {settings.crawl_max_links_per_article}"

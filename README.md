@@ -7,6 +7,24 @@ sites while tracking each site independently. See
 [docs/batch-pipeline.md](docs/batch-pipeline.md) for the API, statuses, and retry
 procedure.
 
+## Evaluation dashboard history
+
+The evaluation API computes editorial, placement, publishing, method, and site
+metrics from live suggestion data. Date filters select a generated-suggestion
+cohort, so every outcome on the page describes the same population.
+
+Orphan-page history is prospective because an earlier crawl state cannot be
+reconstructed after links change. After applying migrations, register the
+idempotent daily snapshot job once:
+
+```bash
+python scripts/schedule_evaluation_snapshots.py
+```
+
+The worker must listen to the `default` queue with the RQ scheduler enabled, as
+the provided Docker Compose worker does. Re-registering the script is safe: the
+job id is unique, and each site/date snapshot is updated rather than duplicated.
+
 ## Running the tests
 
 The suite runs against a real PostgreSQL and writes, updates, and deletes rows,

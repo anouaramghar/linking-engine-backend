@@ -1,4 +1,5 @@
 from datetime import datetime
+from uuid import uuid4
 
 from sqlalchemy import (
     DateTime,
@@ -74,6 +75,15 @@ class Suggestion(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    # Stable correlation key for logs, API responses and lifecycle events.
+    # Unlike the database id it can safely be copied between environments.
+    trace_id: Mapped[str] = mapped_column(
+        String(36),
+        unique=True,
+        index=True,
+        default=lambda: str(uuid4()),
+        server_default=text("gen_random_uuid()::text"),
+    )
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
     source_article_id: Mapped[int] = mapped_column(
         ForeignKey("articles.id", ondelete="CASCADE"), index=True
@@ -126,3 +136,33 @@ class Suggestion(Base):
 
     source_article: Mapped[Article] = relationship(foreign_keys=[source_article_id])
     target_article: Mapped[Article] = relationship(foreign_keys=[target_article_id])
+    events: Mapped[list["SuggestionEvent"]] = relationship(
+        back_populates="suggestion",
+        cascade="all, delete-orphan",
+        order_by="SuggestionEvent.created_at",
+    )
+
+
+class SuggestionEvent(Base):
+    """Immutable explanation of one suggestion lifecycle transition."""
+
+    __tablename__ = "suggestion_events"
+    __table_args__ = (
+        Index(
+            "ix_suggestion_events_suggestion_created",
+            "suggestion_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    suggestion_id: Mapped[int] = mapped_column(
+        ForeignKey("suggestions.id", ondelete="CASCADE"), index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(30))
+    actor: Mapped[str] = mapped_column(String(255))
+    details: Mapped[dict] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    suggestion: Mapped[Suggestion] = relationship(back_populates="events")

@@ -24,6 +24,10 @@ from app.models import (
     Suggestion,
 )
 from app.models.article import EMBEDDING_DIM
+from app.ml.external.cleaning import (
+    deduplicate_external_urls,
+    normalize_external_url,
+)
 from app.schemas.site import SiteCreate
 from app.connectors.url_guard import UnsafeURLError
 from app.services.ingestion_service import _reconcile_snapshot
@@ -99,6 +103,49 @@ def test_pool_schema_defaults_to_daily_and_rejects_credentials():
             base_url="http://en.wikipedia.org/wiki/Search_engine_optimization",
             platform="pool",
         )
+
+
+def test_external_urls_have_one_stable_storage_identity():
+    assert normalize_external_url(
+        " HTTPS://B\u00dcCHER.Example:443/report/?utm_source=test&id=7&b=2#section "
+    ) == "https://xn--bcher-kva.example/report/?b=2&id=7"
+    assert normalize_external_url("http://[2001:DB8::1]:80") == "http://[2001:db8::1]/"
+
+    assert deduplicate_external_urls(
+        [
+            "https://Example.com/report?id=7&utm_medium=email",
+            "https://example.com:443/report?utm_source=search&id=7#result",
+            "https://example.com/report?id=8",
+        ]
+    ) == [
+        "https://example.com/report?id=7",
+        "https://example.com/report?id=8",
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "ftp://example.com/report",
+        "https://user:secret@example.com/report",
+        "https://example.com/a path",
+        "https://example.com:99999/report",
+    ],
+)
+def test_external_url_normalization_rejects_unsafe_or_ambiguous_values(value):
+    with pytest.raises(ValueError, match="external URL"):
+        normalize_external_url(value)
+
+
+def test_pool_registration_normalizes_the_source_url_before_deduplication():
+    payload = SiteCreate(
+        name="Tracked feed",
+        base_url="HTTPS://EN.WIKIPEDIA.ORG:443/feed.xml?utm_source=setup&id=7#feed",
+        platform="pool",
+    )
+
+    assert payload.base_url == "https://en.wikipedia.org/feed.xml?id=7"
 
 
 def test_pool_allowlist_accepts_subdomains_but_not_lookalikes(monkeypatch):

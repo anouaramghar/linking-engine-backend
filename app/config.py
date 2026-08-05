@@ -167,6 +167,12 @@ class Settings(BaseSettings):
     pool_poll_interval_seconds: int = Field(default=86400, ge=60)
     pool_poll_repeat_count: int = Field(default=3650, ge=1)
 
+    # One durable observation per managed site and day. Historical orphan-page
+    # counts cannot be reconstructed after a crawl, so the evaluation dashboard
+    # records them prospectively instead of inventing a pre-deployment trend.
+    evaluation_snapshot_interval_seconds: int = Field(default=86400, ge=60)
+    evaluation_snapshot_repeat_count: int = Field(default=3650, ge=1)
+
     # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/
     # metadata destinations and require HTTPS when WP credentials are used.
     # True relaxes both for crawling local test sites — development only.

@@ -20,10 +20,22 @@ MAX_SEARCH_TERM = 200
 TargetOrigin = Literal["internal", "content_pool"]
 
 
+class SuggestionEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    suggestion_id: int
+    event_type: str
+    actor: str
+    details: dict
+    created_at: datetime
+
+
 class SuggestionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    trace_id: str
     site_id: int
     source_article: ArticleBrief
     target_article: ArticleBrief

@@ -5,10 +5,10 @@ mostly SQL — pgvector distance, the eligibility predicate, partial indexes —
 a stubbed engine would exercise almost none of it.
 
 That makes pointing pytest at the wrong database a data-loss risk rather than an
-inconvenience. Suggestions keep no history rows, so a bulk-review test that
-writes `approved` across a developer's real queue cannot be undone: the previous
-statuses and `reviewed_at` values are simply gone. This has already happened
-once against the `linkmesh` development database.
+inconvenience. Suggestion audit events explain changes but do not make a bulk
+review reversible: a test that writes `approved` across a developer's real queue
+still overwrites live workflow state. This has already happened once against the
+`linkmesh` development database.
 
 So the suite refuses to start unless it has been told, explicitly, which
 database is disposable. Import order is load-bearing: the resolution below

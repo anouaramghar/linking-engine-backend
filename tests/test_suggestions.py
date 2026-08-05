@@ -606,8 +606,9 @@ def test_bulk_review_round_trips_do_not_scale_with_the_batch(client, db, site):
         event.remove(engine, "before_cursor_execute", record)
 
     assert resp.status_code == 200
-    # One SELECT for which ids exist, one UPDATE ... RETURNING for the reviews.
-    assert len(selects) == 1, f"{len(selects)} SELECTs for {len(ids)} suggestions"
+    # One SELECT for which ids exist, one constant-cost actor label for the
+    # lifecycle trigger, and one UPDATE ... RETURNING for the reviews.
+    assert len(selects) == 2, f"{len(selects)} SELECTs for {len(ids)} suggestions"
     assert len(updates) == 1, f"{len(updates)} UPDATEs for {len(ids)} suggestions"
 
 

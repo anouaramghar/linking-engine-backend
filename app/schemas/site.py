@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from app.config import settings
 from app.connectors.url_guard import UnsafeURLError, validate_url
+from app.ml.external.cleaning import normalize_external_url
 from app.security.credentials import CredentialEncryptionError, validate_credential_encryption_key
 
 MAX_BULK_SITES = 1000
@@ -33,6 +34,12 @@ class SiteCreate(BaseModel):
                 raise ValueError(str(error)) from error
         if self.platform != "pool" and self.crawl_frequency not in (None, "manual"):
             raise ValueError("daily crawl frequency is reserved for content-pool sources")
+        if self.platform == "pool":
+            # A pool source is external input and may arrive from a copied URL
+            # containing a fragment, tracking parameters, or a default port.
+            # Store one canonical representation so the unique base_url
+            # constraint catches repeated registrations of the same source.
+            self.base_url = normalize_external_url(self.base_url)
         allow = settings.allow_unsafe_crawl_targets
         try:
             validate_url(

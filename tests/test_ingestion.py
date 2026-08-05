@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, BrokenBarrierError
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import delete, event, func, select
 
 import app.services.ingestion_service as ingestion_service
 from app.connectors.base import (
@@ -21,6 +21,7 @@ from app.models import (
     IngestionRun,
     InternalLink,
     JobRun,
+    Site,
     Suggestion,
     Taxonomy,
 )
@@ -110,6 +111,22 @@ class DuplicateArticleStubConnector(StubConnector):
         )
         for _ in range(4):
             yield article
+
+
+class ExternalAliasStubConnector(StubConnector):
+    def fetch_articles(self):
+        yield ArticleData(
+            url="https://EXAMPLE.com:443/report?id=7&utm_source=feed#first",
+            title="Canonical article",
+            content_text="first copy wins",
+            external_id="canonical",
+        )
+        yield ArticleData(
+            url="https://example.com/report?utm_medium=email&id=7",
+            title="Tracked alias",
+            content_text="duplicate copy",
+            external_id="alias",
+        )
 
 
 class FailingStubConnector(ReducedStubConnector):
@@ -317,6 +334,45 @@ def test_duplicate_records_do_not_bypass_snapshot_completeness(db, site, monkeyp
     articles = db.scalars(select(Article).where(Article.site_id == site.id)).all()
     assert len(articles) == 4
     assert all(article.is_active is True for article in articles)
+
+
+def test_pool_ingestion_normalizes_and_deduplicates_external_article_urls(
+    db, monkeypatch
+):
+    pool = Site(
+        name="External pool",
+        base_url="https://en.wikipedia.org/wiki/Link_analysis",
+        platform="pool",
+        crawl_frequency="daily",
+        pool_source_approved=True,
+    )
+    db.add(pool)
+    db.commit()
+    monkeypatch.setattr(
+        ingestion_service,
+        "get_connector",
+        lambda source: ExternalAliasStubConnector(source),
+    )
+
+    try:
+        result = ingestion_service.run_ingestion(pool.id)
+        db.expire_all()
+        articles = db.scalars(select(Article).where(Article.site_id == pool.id)).all()
+        stored = [
+            (article.url, article.external_id, article.content_text) for article in articles
+        ]
+    finally:
+        # Pool articles participate in every site's candidate corpus. This test
+        # creates its own source rather than using the per-test `site` fixture,
+        # so it must also remove it even when an assertion or ingestion fails.
+        db.rollback()
+        db.execute(delete(Site).where(Site.id == pool.id))
+        db.commit()
+
+    assert result == {"articles": 1, "links": 0}
+    assert stored == [
+        ("https://example.com/report?id=7", "canonical", "first copy wins")
+    ]
 
 
 def test_overlapping_ingestion_fails_fast_and_records_failed_run(db, site, monkeypatch):

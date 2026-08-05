@@ -54,3 +54,28 @@ def require_operator_identity(x_api_key: str | None = Header(default=None)) -> s
         status_code=401,
         detail="an operator-specific X-API-Key is required for this action",
     )
+
+
+def get_audit_actor(x_api_key: str | None = Header(default=None)) -> str:
+    """Trusted actor label for ordinary state-changing API operations.
+
+    Operator keys retain their human identity. The service key remains valid for
+    dashboard reviews, but is recorded plainly as automation rather than being
+    mistaken for a named editor.
+    """
+    operator_id = _operator_for_key(x_api_key)
+    if operator_id is not None:
+        return operator_id[:255]
+    if (
+        settings.api_key
+        and x_api_key is not None
+        and compare_digest(x_api_key, settings.api_key)
+    ):
+        return "service-api"
+    if (
+        settings.environment == "development"
+        and not settings.api_key
+        and not settings.operator_api_keys
+    ):
+        return "local-development"
+    raise HTTPException(status_code=401, detail="invalid or missing X-API-Key header")

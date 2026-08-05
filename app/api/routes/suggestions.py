@@ -3,14 +3,14 @@ from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import exists, func, literal, or_, select, tuple_, update
+from sqlalchemy import exists, func, literal, or_, select, text, tuple_, update
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from app.api.deps import get_db
+from app.api.deps import get_audit_actor, get_db
 from app.api.pagination import MAX_PAGE_SIZE
 from app.ml.llm import openrouter
 from app.ml.llm.openrouter import OpenRouterError, OpenRouterNotConfigured
-from app.models import Article, Site, Suggestion
+from app.models import Article, Site, Suggestion, SuggestionEvent
 from app.schemas.job import JobAccepted
 from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
@@ -22,6 +22,7 @@ from app.schemas.suggestion import (
     PlacementOut,
     SuggestionCounts,
     SuggestionCursor,
+    SuggestionEventOut,
     SuggestionOut,
     SuggestionPage,
     SuggestionReview,
@@ -65,6 +66,7 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
         outputs.append(
             SuggestionOut(
                 id=suggestion.id,
+                trace_id=suggestion.trace_id,
                 site_id=suggestion.site_id,
                 source_article=ArticleBrief.model_validate(suggestion.source_article),
                 target_article=ArticleBrief.model_validate(suggestion.target_article),
@@ -131,6 +133,14 @@ def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]
 
 def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[int]:
     return _review_matching(db, [Suggestion.id.in_(suggestion_ids)], status)
+
+
+def _set_audit_actor(db: Session, actor: str) -> None:
+    """Label trigger-written lifecycle events for this transaction only."""
+    db.execute(
+        text("SELECT set_config('linkmesh.audit_actor', :actor, true)"),
+        {"actor": actor[:255]},
+    )
 
 
 def _review_matching_counts(
@@ -319,7 +329,11 @@ def _queue_conditions(
 
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
 @router.post("/suggestions/bulk-review")
-def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
+def bulk_review(
+    payload: BulkReview,
+    db: Session = Depends(get_db),
+    actor: str = Depends(get_audit_actor),
+) -> dict:
     # Partial success, not all-or-nothing: a batch is a set of independent
     # decisions, and one row the publication worker has already claimed must not
     # discard the rest. Undo hits this routinely — the worker can pick up an
@@ -331,8 +345,16 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
     existing = set(
         db.scalars(select(Suggestion.id).where(Suggestion.id.in_(payload.suggestion_ids)))
     )
+    _set_audit_actor(db, actor)
     reviewed = _review_ids(db, payload.suggestion_ids, payload.status)
     db.commit()
+    logger.info(
+        "suggestion review actor=%s mode=explicit status=%s reviewed=%s skipped=%s",
+        actor,
+        payload.status,
+        len(reviewed),
+        len(existing - reviewed),
+    )
     return {
         "reviewed": sorted(reviewed),
         "skipped": sorted(existing - reviewed),
@@ -343,7 +365,9 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
 # also declared before /suggestions/{site_id}, for the same reason as bulk-review
 @router.post("/suggestions/bulk-review-by-filter", response_model=BulkReviewFilterResult)
 def bulk_review_by_filter(
-    payload: BulkReviewFilter, db: Session = Depends(get_db)
+    payload: BulkReviewFilter,
+    db: Session = Depends(get_db),
+    actor: str = Depends(get_audit_actor),
 ) -> BulkReviewFilterResult:
     """Apply a bulk rule to every row it matches, however many that is.
 
@@ -362,8 +386,16 @@ def bulk_review_by_filter(
         target_origin=payload.target_origin,
         exclude_reciprocal=payload.exclude_reciprocal,
     )
+    _set_audit_actor(db, actor)
     matched, reviewed, reviewed_ids = _review_matching_counts(db, conditions, payload.status)
     db.commit()
+    logger.info(
+        "suggestion review actor=%s mode=filter status=%s reviewed=%s skipped=%s",
+        actor,
+        payload.status,
+        reviewed,
+        matched - reviewed,
+    )
     return BulkReviewFilterResult(
         reviewed=reviewed,
         skipped=matched - reviewed,
@@ -603,9 +635,33 @@ def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) 
     )
 
 
+@router.get(
+    "/suggestions/{suggestion_id}/events",
+    response_model=list[SuggestionEventOut],
+)
+def list_suggestion_events(
+    suggestion_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> list[SuggestionEvent]:
+    if db.get(Suggestion, suggestion_id) is None:
+        raise HTTPException(404, f"suggestion {suggestion_id} not found")
+    return list(
+        db.scalars(
+            select(SuggestionEvent)
+            .where(SuggestionEvent.suggestion_id == suggestion_id)
+            .order_by(SuggestionEvent.created_at.desc(), SuggestionEvent.id.desc())
+            .limit(limit)
+        )
+    )
+
+
 @router.put("/suggestions/{suggestion_id}", response_model=SuggestionOut)
 def review_suggestion(
-    suggestion_id: int, payload: SuggestionReview, db: Session = Depends(get_db)
+    suggestion_id: int,
+    payload: SuggestionReview,
+    db: Session = Depends(get_db),
+    actor: str = Depends(get_audit_actor),
 ) -> SuggestionOut:
     suggestion = db.get(
         Suggestion,
@@ -614,8 +670,15 @@ def review_suggestion(
     )
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
+    _set_audit_actor(db, actor)
     if not _review_ids(db, [suggestion_id], payload.status):
         raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
     db.commit()
+    logger.info(
+        "suggestion review trace_id=%s actor=%s mode=single status=%s",
+        suggestion.trace_id,
+        actor,
+        payload.status,
+    )
     db.refresh(suggestion)
     return _suggestion_outputs(db, [suggestion])[0]
