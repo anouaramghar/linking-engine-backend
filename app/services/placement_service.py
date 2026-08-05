@@ -94,15 +94,21 @@ def _locate(needle: str, haystack: str) -> str | None:
 
     Case-sensitively first, so an exact quote is returned untouched. The
     case-insensitive retry exists because models routinely re-case a leading
-    word after a line break; the slice from the *article* is returned, never the
-    model's version of it, so the result is still the article's own text.
+    word after a line break; the matched text from the *article* is returned,
+    never the model's version of it, so the result is still the article's own.
+
+    That retry matches by span rather than by index arithmetic. Case folding can
+    change a string's length — "ß" folds to "ss" — so finding the position in a
+    folded haystack and then slicing the original by `len(needle)` returns a
+    window shifted by the difference: a passage silently gaining or losing its
+    last characters, and an anchor that no longer sits where it says it does.
     """
     if not needle:
         return None
     if needle in haystack:
         return needle
-    position = haystack.casefold().find(needle.casefold())
-    return haystack[position : position + len(needle)] if position != -1 else None
+    match = re.search(re.escape(needle), haystack, re.IGNORECASE)
+    return match.group(0) if match else None
 
 
 def _verify(passage: object, anchor: object, source_text: str) -> tuple[str | None, str | None]:

@@ -38,6 +38,11 @@ router = APIRouter(tags=["suggestions"])
 
 UNREVIEWABLE = ("applying", "applied", "expired")
 
+#: Statuses whose anchor phrase is spoken for. The row is on its way to becoming
+#: a link on the source article, or already is one. A rejected, expired or
+#: quarantined row will never publish, so the words it picked are free again.
+CLAIMS_AN_ANCHOR = ("pending", "approved", "applying", "applied")
+
 
 def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[SuggestionOut]:
     """Serialize suggestions with each target's ownership made explicit.
@@ -536,6 +541,13 @@ def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) 
     Two editors opening the same row at once will both generate. The second
     write simply replaces the first with an equivalent answer, which is cheaper
     than a lock held across an external request.
+
+    The phrases sibling suggestions on this source article have already claimed
+    are passed along, exactly as the publication preflight passes them. Without
+    that, two rows on one article routinely pick the same words: publication
+    gives the phrase to whichever writes first and sends the other to the
+    appended block, so the second editor is shown a placement that will not be
+    the one they get.
     """
     suggestion = db.get(
         Suggestion,
@@ -552,6 +564,16 @@ def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) 
                 503,
                 "placement generation is not configured; set OPENROUTER_API_KEY",
             )
+        taken_anchors = list(
+            db.scalars(
+                select(Suggestion.anchor_text).where(
+                    Suggestion.source_article_id == suggestion.source_article_id,
+                    Suggestion.id != suggestion_id,
+                    Suggestion.anchor_text.is_not(None),
+                    Suggestion.status.in_(CLAIMS_AN_ANCHOR),
+                )
+            )
+        )
         # Hand the connection back before the model call. Everything needed is
         # already loaded, and an open read transaction held across a
         # multi-second external request sits in front of the publication
@@ -560,7 +582,7 @@ def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) 
         db.expunge_all()
         db.rollback()
         try:
-            placement = placement_service.generate(suggestion)
+            placement = placement_service.generate(suggestion, taken_anchors)
         except OpenRouterNotConfigured as e:  # key removed between the check and here
             raise HTTPException(503, str(e)) from e
         except OpenRouterError as e:

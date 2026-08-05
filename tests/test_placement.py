@@ -244,6 +244,35 @@ def test_an_anchor_a_sibling_already_took_is_rejected(
     assert placement_service.generate(suggestion, taken_anchors=["long steep"]).found
 
 
+def test_a_recased_quote_comes_back_as_the_article_wrote_it(
+    monkeypatch, enable_openrouter, suggestion
+):
+    """Models routinely re-case a word, so the match is case-insensitive — but
+    what is stored is the article's own text, never the model's version of it."""
+    _stub_completion(monkeypatch, {"passage": REAL_PASSAGE.upper(), "anchor": "FEWER ACIDS"})
+    placement = placement_service.generate(suggestion)
+
+    assert placement.placement_context == REAL_PASSAGE
+    assert placement.anchor_text == "fewer acids"
+
+
+def test_a_quote_that_folds_to_a_different_length_is_rejected_not_shifted(
+    monkeypatch, enable_openrouter, suggestion, db
+):
+    """Regression: "ß" case-folds to "ss", so a folded copy is longer than the
+    original. Locating the position in that copy and slicing the original by the
+    quote's length returned a window shifted by one per such character — a
+    passage silently losing its last words, and an anchor no longer where it
+    claimed to be. Matching by span makes this a clean miss instead."""
+    suggestion.source_article.content_text = "Die Straße war lang genug für alle."
+    db.commit()
+    _stub_completion(
+        monkeypatch, {"passage": "DIE STRASSE WAR LANG GENUG FÜR ALLE.", "anchor": "STRASSE"}
+    )
+
+    assert not placement_service.generate(suggestion).found
+
+
 def test_the_prompt_lists_the_anchors_already_taken(monkeypatch, enable_openrouter, suggestion):
     calls: list[str] = []
     _stub_completion(monkeypatch, {"passage": REAL_PASSAGE, "anchor": "long steep"}, calls)
@@ -327,6 +356,56 @@ def test_placement_is_unavailable_without_a_key(monkeypatch, client, suggestion)
 
 def test_placement_404s_for_an_unknown_suggestion(enable_openrouter, client):
     assert client.get("/api/v1/suggestions/99999999/placement").status_code == 404
+
+
+def test_the_drawer_passes_the_anchors_siblings_already_took(
+    monkeypatch, enable_openrouter, client, db, suggestion
+):
+    """The preflight pass tells each call which phrases its siblings claimed;
+    opening the drawer has to do the same. Without it two rows on one article
+    pick the same words, publication gives them to whichever writes first, and
+    the second editor is shown a placement they will not get."""
+    sibling = Suggestion(
+        site_id=suggestion.site_id,
+        source_article_id=suggestion.source_article_id,
+        target_article_id=suggestion.target_article_id,
+        method="baseline_cosine",
+        score=0.7,
+        anchor_text="fewer acids",
+        status="approved",
+    )
+    db.add(sibling)
+    db.commit()
+
+    calls: list[str] = []
+    _stub_completion(monkeypatch, {"passage": REAL_PASSAGE, "anchor": "fewer acids"}, calls)
+
+    response = client.get(f"/api/v1/suggestions/{suggestion.id}/placement")
+
+    assert "- fewer acids" in calls[0], "the taken phrase never reached the prompt"
+    assert response.json()["found"] is False, "a taken phrase must not be handed out twice"
+
+
+def test_a_rejected_sibling_does_not_hold_its_anchor(
+    monkeypatch, enable_openrouter, client, db, suggestion
+):
+    """A row an editor said no to will never publish, so the words it picked are
+    free again. Counting them as taken would starve the rows that can still run."""
+    db.add(
+        Suggestion(
+            site_id=suggestion.site_id,
+            source_article_id=suggestion.source_article_id,
+            target_article_id=suggestion.target_article_id,
+            method="baseline_cosine",
+            score=0.7,
+            anchor_text="fewer acids",
+            status="rejected",
+        )
+    )
+    db.commit()
+    _stub_completion(monkeypatch, {"passage": REAL_PASSAGE, "anchor": "fewer acids"})
+
+    assert client.get(f"/api/v1/suggestions/{suggestion.id}/placement").json()["found"] is True
 
 
 def test_the_queue_does_not_carry_placement(monkeypatch, enable_openrouter, client, suggestion):

@@ -39,11 +39,18 @@ class PublicationPreviewError(BaseModel):
 class PublicationDryRun(BaseModel):
     """What a publication run would write, decided against the live posts.
 
-    Read-only in every sense: the posts are fetched exactly as a real run
-    fetches them and the same decisions are made, but nothing is saved and no
-    placement is generated. `placements_missing` is the caveat that makes the
-    rest honest — those rows show as "block" here and may still become in-text
-    links once the run's preflight pass has generated their placements.
+    Read-only where it matters: the posts are fetched exactly as a real run
+    fetches them and the same decisions are made, but no article is written and
+    no suggestion is claimed.
+
+    Placements are the one exception. Missing ones are generated and stored
+    before the preview is computed — otherwise every bulk-approved row would
+    show as "block" here and then publish in-text, which is a preview that
+    predicts the wrong thing. The generation is the same bounded, once-per-row
+    pass publication runs, so the publish that follows reuses these choices
+    rather than paying again. `placements_missing` counts what that pass could
+    not cover: rows past its budget, or whose model call failed. Those show as
+    "block" here and may still become in-text links at publication.
     """
 
     site_id: int

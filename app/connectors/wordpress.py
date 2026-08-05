@@ -837,7 +837,6 @@ class WordPressConnector(ContentConnector):
             lambda: self.client.post(url, json={"content": content}, **self._request_kwargs(url)),
             f"saving post {source.external_id}",
         )
-        raise AssertionError("unreachable")  # pragma: no cover - loop always returns
 
     def _warn_if_marker_stripped(self, source, sent: str, response: httpx.Response) -> None:
         """The in-text cap is only real if the marker survives the save.
