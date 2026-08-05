@@ -75,6 +75,11 @@ def source_with_pool_targets(db):
     Internal pairs now deliberately have only one proposed direction, so a
     content pool isolates per-source quota behavior without a reverse proposal
     from each target consuming the replacement candidates.
+
+    The pool is approved because these tests are about quota accounting, not
+    about the approval gate: an unapproved pool contributes no candidates at
+    all, which would empty the queue these tests measure rather than exercise
+    it. `test_content_pool.py` owns the gate itself.
     """
     pool_ids = []
 
@@ -84,6 +89,7 @@ def source_with_pool_targets(db):
             name="Test pool",
             base_url=f"https://pool-{uuid.uuid4().hex[:8]}.example",
             platform="pool",
+            pool_source_approved=True,
         )
         db.add(pool)
         db.commit()

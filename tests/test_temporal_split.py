@@ -82,7 +82,10 @@ def test_editor_split_is_time_based_deduplicated_and_marks_new_nodes(db):
     )
     db.commit()
 
-    split = build_temporal_evaluation_split(db, cutoff_at=CUTOFF)
+    # Scoped to this test's own site: the builder reads every site by default,
+    # so an unscoped call here measures whatever else the suite left in the
+    # shared test database rather than the four suggestions above.
+    split = build_temporal_evaluation_split(db, cutoff_at=CUTOFF, site_ids=(site.id,))
 
     assert len(split.train) == 1
     assert split.train[0].target_article_id == old_target.id
