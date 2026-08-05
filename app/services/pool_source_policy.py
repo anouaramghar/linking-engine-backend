@@ -1,5 +1,6 @@
 """Approval and domain policy for external content-pool sources."""
 
+from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -81,14 +82,28 @@ def require_approved_pool_source(site: Site) -> None:
     require_allowed_pool_domain(site.base_url)
 
 
-def expire_pool_target_suggestions(db: Session, site_id: int) -> int:
-    """Remove a disabled pool source from every active editorial queue."""
+def expire_pool_target_suggestions(
+    db: Session, site_id: int, *, reason: Literal["revoked", "quarantined"]
+) -> int:
+    """Remove a disabled pool source from the editorial queues it still occupies.
+
+    Revocation clears approved suggestions as well as pending ones. An operator
+    has decided this source may not be linked to, and an approval that outlived
+    that decision would publish exactly the link they just disallowed.
+
+    Quarantine clears only pending ones. It is automatic and reversible — a
+    threshold of consecutive fetch failures, undone by the reactivate endpoint —
+    and an approved suggestion is finished editorial work. A feed that timed out
+    three times says nothing about the target article, so discarding a decision
+    an editor already made would cost more than it protects.
+    """
+    statuses = ("pending", "approved") if reason == "revoked" else ("pending",)
     target_ids = select(Article.id).where(Article.site_id == site_id)
     result = db.execute(
         update(Suggestion)
         .where(
             Suggestion.target_article_id.in_(target_ids),
-            Suggestion.status.in_(("pending", "approved")),
+            Suggestion.status.in_(statuses),
         )
         .values(status="expired")
     )

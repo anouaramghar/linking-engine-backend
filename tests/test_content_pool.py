@@ -710,7 +710,15 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
         score=0.8,
         status="pending",
     )
-    db.add(suggestion)
+    already_approved = Suggestion(
+        site_id=customer.id,
+        source_article_id=source.id,
+        target_article_id=target.id,
+        method="baseline_cosine",
+        score=0.7,
+        status="approved",
+    )
+    db.add_all([suggestion, already_approved])
     db.commit()
     monkeypatch.setattr(settings, "pool_quarantine_failure_threshold", 2)
     try:
@@ -723,6 +731,11 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
         assert pool.pool_source_quarantine_reason == "still down"
         db.refresh(suggestion)
         assert suggestion.status == "expired"
+        # Quarantine is automatic and reversible, so it withdraws the untouched
+        # queue but not a decision an editor already made. Revocation, which is
+        # a person deciding this source is not linkable, clears both.
+        db.refresh(already_approved)
+        assert already_approved.status == "approved"
         event = db.scalar(
             select(PoolSourceAuditEvent).where(PoolSourceAuditEvent.site_id == pool.id)
         )

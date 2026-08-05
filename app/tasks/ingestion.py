@@ -65,7 +65,7 @@ def _record_pool_ingestion_failure(site_id: int, error: Exception) -> None:
             site.pool_source_quarantined = True
             site.pool_source_quarantined_at = datetime.now(UTC)
             site.pool_source_quarantine_reason = str(error)[:2000]
-            expire_pool_target_suggestions(db, site.id)
+            expire_pool_target_suggestions(db, site.id, reason="quarantined")
             if newly_quarantined:
                 record_pool_source_audit_event(
                     db,

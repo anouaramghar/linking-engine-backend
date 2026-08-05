@@ -330,7 +330,7 @@ def revoke_pool_source_approval(
     site.pool_source_approved = False
     site.pool_source_approved_at = None
     site.pool_source_approved_by = None
-    expire_pool_target_suggestions(db, site.id)
+    expire_pool_target_suggestions(db, site.id, reason="revoked")
     record_pool_source_audit_event(db, site, "revoked", operator_id)
     db.commit()
     return get_site(site_id, db)
