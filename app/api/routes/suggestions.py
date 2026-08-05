@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import exists, func, literal, or_, select, tuple_, update
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from app.api.deps import get_db
+from app.api.deps import get_db, require_api_key, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
 from app.ml.llm import openrouter
 from app.ml.llm.openrouter import OpenRouterError, OpenRouterNotConfigured
@@ -28,6 +28,12 @@ from app.schemas.suggestion import (
     TargetOrigin,
 )
 from app.services import placement_service
+from app.services.authorization import (
+    Principal,
+    authorize_site,
+    check_site_access,
+    require_admin_principal,
+)
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.analysis import analyze_site, compare_site
 
@@ -68,9 +74,7 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
                 site_id=suggestion.site_id,
                 source_article=ArticleBrief.model_validate(suggestion.source_article),
                 target_article=ArticleBrief.model_validate(suggestion.target_article),
-                target_origin=(
-                    "content_pool" if target_platform == "pool" else "internal"
-                ),
+                target_origin=("content_pool" if target_platform == "pool" else "internal"),
                 target_site_name=target_site_name,
                 method=suggestion.method,
                 score=suggestion.score,
@@ -274,6 +278,7 @@ def _percent_boundary(percent: int) -> float:
 def _queue_conditions(
     *,
     site_id: int | None = None,
+    tenant_id: int | None = None,
     status: str | None = None,
     method: str | None = None,
     min_percent: int | None = None,
@@ -297,6 +302,15 @@ def _queue_conditions(
     conditions = []
     if site_id is not None:
         conditions.append(Suggestion.site_id == site_id)
+    if tenant_id is not None:
+        conditions.append(
+            exists(
+                select(1).where(
+                    Site.id == Suggestion.site_id,
+                    Site.tenant_id == tenant_id,
+                )
+            )
+        )
     if status is not None:
         conditions.append(Suggestion.status == status)
     if method is not None:
@@ -317,9 +331,21 @@ def _queue_conditions(
     return conditions
 
 
+def _tenant_scope(principal: Principal) -> int | None:
+    if principal.is_admin:
+        return None
+    if principal.tenant_id is None:
+        raise HTTPException(403, "tenant credentials required")
+    return principal.tenant_id
+
+
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
 @router.post("/suggestions/bulk-review")
-def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
+def bulk_review(
+    payload: BulkReview,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> dict:
     # Partial success, not all-or-nothing: a batch is a set of independent
     # decisions, and one row the publication worker has already claimed must not
     # discard the rest. Undo hits this routinely — the worker can pick up an
@@ -328,10 +354,23 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
     #
     # Read the ids that exist first, so "skipped" means the worker got there
     # first rather than lumping in ids that were never rows at all.
-    existing = set(
-        db.scalars(select(Suggestion.id).where(Suggestion.id.in_(payload.suggestion_ids)))
+    # Authorize every referenced site before mutating any row. The owning
+    # tenant rides along in the same statement so a batch of any size stays
+    # exactly one SELECT plus the review UPDATE.
+    rows = list(
+        db.execute(
+            select(Suggestion.id, Site.tenant_id)
+            .join(Site, Site.id == Suggestion.site_id)
+            .where(Suggestion.id.in_(payload.suggestion_ids))
+        ).all()
     )
-    reviewed = _review_ids(db, payload.suggestion_ids, payload.status)
+    existing = {suggestion_id for suggestion_id, _tenant_id in rows}
+    for _suggestion_id, tenant_id in rows:
+        check_site_access(principal, tenant_id)
+    # Review the ids this join actually authorized, not the raw request. A
+    # suggestion whose site row is missing cannot be ownership-checked, so it
+    # must not be swept along by an `IN` over the caller's list.
+    reviewed = _review_ids(db, sorted(existing), payload.status)
     db.commit()
     return {
         "reviewed": sorted(reviewed),
@@ -343,7 +382,9 @@ def bulk_review(payload: BulkReview, db: Session = Depends(get_db)) -> dict:
 # also declared before /suggestions/{site_id}, for the same reason as bulk-review
 @router.post("/suggestions/bulk-review-by-filter", response_model=BulkReviewFilterResult)
 def bulk_review_by_filter(
-    payload: BulkReviewFilter, db: Session = Depends(get_db)
+    payload: BulkReviewFilter,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
 ) -> BulkReviewFilterResult:
     """Apply a bulk rule to every row it matches, however many that is.
 
@@ -352,8 +393,13 @@ def bulk_review_by_filter(
     but can no longer name its targets, and a fleet-wide rule matches far more
     rows than PostgreSQL will accept as bound parameters.
     """
+    if payload.all_sites:
+        require_admin_principal(principal)
+    elif payload.site_id is not None:
+        authorize_site(db, principal, payload.site_id)
     conditions = _queue_conditions(
         site_id=payload.site_id,
+        tenant_id=_tenant_scope(principal),
         status=payload.match_status,
         method=payload.method,
         min_percent=payload.threshold_percent if payload.status == "approved" else None,
@@ -381,10 +427,14 @@ def count_suggestions(
     q: str | None = Query(None, max_length=MAX_SEARCH_TERM),
     target_origin: TargetOrigin | None = None,
     exclude_reciprocal: bool = False,
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> SuggestionCounts:
+    if site_id is not None:
+        authorize_site(db, principal, site_id)
     conditions = _queue_conditions(
         site_id=site_id,
+        tenant_id=_tenant_scope(principal),
         method=method,
         min_percent=min_percent,
         max_percent=max_percent,
@@ -417,11 +467,15 @@ def list_suggestion_page(
     include_total: bool = False,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int | None = Query(None, ge=0, deprecated=True),
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> SuggestionPage:
     """The queue across every site, or one of them, a cursor page at a time."""
+    if site_id is not None:
+        authorize_site(db, principal, site_id)
     conditions = _queue_conditions(
         site_id=site_id,
+        tenant_id=_tenant_scope(principal),
         status=status,
         method=method,
         min_percent=min_percent,
@@ -478,28 +532,28 @@ def list_suggestion_page(
 
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)
-def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    site = db.get(Site, site_id)
-    if site is None:
-        raise HTTPException(404, f"site {site_id} not found")
+def trigger_analysis(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
     try:
-        run = enqueue_job(db, site_id, "analysis", analyze_site, job_timeout=7200)
+        run = enqueue_job(db, site.id, "analysis", analyze_site, job_timeout=7200)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
 @router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)
-def trigger_analysis_comparison(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    site = db.get(Site, site_id)
-    if site is None:
-        raise HTTPException(404, f"site {site_id} not found")
+def trigger_analysis_comparison(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
     try:
-        run = enqueue_job(db, site_id, "analysis", compare_site, job_timeout=7200)
+        run = enqueue_job(db, site.id, "analysis", compare_site, job_timeout=7200)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
@@ -507,7 +561,7 @@ def trigger_analysis_comparison(site_id: int, db: Session = Depends(get_db)) -> 
 
 @router.get("/suggestions/{site_id}", response_model=list[SuggestionOut])
 def list_suggestions(
-    site_id: int,
+    site: Site = Depends(require_site_access),
     status: str | None = None,
     method: str | None = None,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
@@ -516,7 +570,7 @@ def list_suggestions(
 ) -> list[SuggestionOut]:
     query = (
         select(Suggestion)
-        .where(Suggestion.site_id == site_id)
+        .where(Suggestion.site_id == site.id)
         .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
         .order_by(Suggestion.score.desc())
     )
@@ -530,7 +584,11 @@ def list_suggestions(
 
 
 @router.get("/suggestions/{suggestion_id}/placement", response_model=PlacementOut)
-def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) -> PlacementOut:
+def get_suggestion_placement(
+    suggestion_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> PlacementOut:
     """Where in the source article this link belongs, generating it on first ask.
 
     Lazy rather than part of analysis: a run produces far more suggestions than
@@ -556,6 +614,7 @@ def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) 
     )
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
+    authorize_site(db, principal, suggestion.site_id)
 
     placement = placement_service.stored(suggestion)
     if placement is None:
@@ -605,7 +664,10 @@ def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) 
 
 @router.put("/suggestions/{suggestion_id}", response_model=SuggestionOut)
 def review_suggestion(
-    suggestion_id: int, payload: SuggestionReview, db: Session = Depends(get_db)
+    suggestion_id: int,
+    payload: SuggestionReview,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
 ) -> SuggestionOut:
     suggestion = db.get(
         Suggestion,
@@ -614,6 +676,7 @@ def review_suggestion(
     )
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
+    authorize_site(db, principal, suggestion.site_id)
     if not _review_ids(db, [suggestion_id], payload.status):
         raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
     db.commit()

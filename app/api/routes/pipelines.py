@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db
+from app.api.deps import get_db, require_api_key
 from app.models import PipelineBatch, PipelineSiteRun, Site
 from app.schemas.pipeline import PipelineBatchCreate, PipelineBatchOut, PipelineSiteRunOut
+from app.services.authorization import Principal, authorize_site
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.services.pipeline_service import (
     pipeline_batch_counts,
@@ -66,6 +67,7 @@ def _enqueue_pipeline_stage(
 @router.post("/batches", status_code=202, response_model=PipelineBatchOut)
 def create_pipeline_batch(
     payload: PipelineBatchCreate,
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> PipelineBatchOut:
     sites = list(db.scalars(select(Site).where(Site.id.in_(payload.site_ids))))
@@ -73,6 +75,8 @@ def create_pipeline_batch(
     missing = sorted(set(payload.site_ids) - found)
     if missing:
         raise HTTPException(404, f"site(s) not found: {', '.join(map(str, missing))}")
+    for site in sites:
+        authorize_site(db, principal, site.id)
     pool_sites = sorted(site.id for site in sites if site.platform == "pool")
     if pool_sites:
         raise HTTPException(
@@ -115,10 +119,22 @@ def create_pipeline_batch(
 
 
 @router.get("/batches/{batch_id}", response_model=PipelineBatchOut)
-def get_pipeline_batch(batch_id: int, db: Session = Depends(get_db)) -> PipelineBatchOut:
+def get_pipeline_batch(
+    batch_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> PipelineBatchOut:
     batch = db.get(PipelineBatch, batch_id)
     if batch is None:
         raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    items = list(db.scalars(select(PipelineSiteRun).where(PipelineSiteRun.batch_id == batch.id)))
+    if not items and not principal.is_admin:
+        # Deleting a site cascades its runs away, which can empty a batch that
+        # still exists. Hiding it from tenants is right — there is nothing left
+        # to prove ownership with — but an admin should still see the record.
+        raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    for item in items:
+        authorize_site(db, principal, item.site_id)
     return _batch_out(db, batch)
 
 
@@ -130,8 +146,10 @@ def get_pipeline_batch(batch_id: int, db: Session = Depends(get_db)) -> Pipeline
 def retry_pipeline_site(
     batch_id: int,
     site_id: int,
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> PipelineBatchOut:
+    authorize_site(db, principal, site_id)
     batch = db.get(PipelineBatch, batch_id)
     if batch is None:
         raise HTTPException(404, f"pipeline batch {batch_id} not found")

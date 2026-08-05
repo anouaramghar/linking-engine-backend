@@ -15,10 +15,15 @@ class Settings(BaseSettings):
     environment: str = "development"
 
     # Static API key for all non-health endpoints; empty fails closed at the API boundary.
+    # When set, this key is a legacy admin principal (all tenants) with a deprecation warning.
     api_key: str = ""
     # Human operator identities mapped to their individual API keys. These keys
-    # may call every protected route and provide trusted approval audit identity.
+    # may call every protected route as admin and provide trusted approval audit identity.
     operator_api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+    # HMAC pepper for database API key hashes. A database leak alone must not let
+    # an attacker verify candidate secrets offline. Set a long random value in
+    # every non-dev environment before minting tenant keys.
+    api_key_pepper: str = ""
 
     # Fernet key used to encrypt WordPress application passwords at rest.
     credential_encryption_key: SecretStr | None = None

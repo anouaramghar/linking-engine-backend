@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, joinedload
 
-from app.api.deps import get_db
+from app.api.deps import get_db, require_api_key, require_site_access
 from app.connectors.registry import get_connector
 from app.models import Site, Suggestion
 from app.schemas.job import JobAccepted
@@ -15,6 +15,7 @@ from app.schemas.publication import (
     PublicationDryRun,
     PublicationPreviewError,
 )
+from app.services.authorization import Principal, tenant_site_filter
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.publication import generate_missing_placements, grouped_batch, publish_approved
 
@@ -25,9 +26,10 @@ router = APIRouter(prefix="/publish", tags=["publish"])
 
 @router.get("/pending", response_model=list[PendingPublicationSite])
 def pending_publication_sites(
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> list[PendingPublicationSite]:
-    rows = db.execute(
+    query = (
         select(
             Suggestion.site_id,
             func.count().label("awaiting_publication"),
@@ -35,7 +37,11 @@ def pending_publication_sites(
         .where(Suggestion.status == "approved")
         .group_by(Suggestion.site_id)
         .order_by(Suggestion.site_id)
-    ).all()
+    )
+    owned = tenant_site_filter(principal)
+    if owned is not None:
+        query = query.join(Site, Site.id == Suggestion.site_id).where(owned)
+    rows = db.execute(query).all()
     return [
         PendingPublicationSite(
             site_id=site_id,
@@ -46,14 +52,14 @@ def pending_publication_sites(
 
 
 @router.post("/{site_id}", status_code=202, response_model=JobAccepted)
-def trigger_publication(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    site = db.get(Site, site_id)
-    if site is None:
-        raise HTTPException(404, f"site {site_id} not found")
+def trigger_publication(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources are read-only")
     try:
-        run = enqueue_job(db, site_id, "publication", publish_approved, job_timeout=3600)
+        run = enqueue_job(db, site.id, "publication", publish_approved, job_timeout=3600)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
@@ -61,7 +67,7 @@ def trigger_publication(site_id: int, db: Session = Depends(get_db)) -> JobAccep
 
 @router.get("/{site_id}/dry-run", response_model=PublicationDryRun)
 def dry_run_publication(
-    site_id: int,
+    site: Site = Depends(require_site_access),
     # Each source article is a live request to the customer's site, so a
     # synchronous preview is bounded rather than covering the whole queue.
     max_articles: int = Query(default=25, ge=1, le=100),
@@ -74,20 +80,17 @@ def dry_run_publication(
     WordPress POST and no claim. Missing placements are prepared first and
     stored internally, so the subsequent publish reuses the choices shown here.
     """
-    site = db.get(Site, site_id)
-    if site is None:
-        raise HTTPException(404, f"site {site_id} not found")
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources are read-only")
 
     # A preview writes nothing, so the superseded rows are left for the run
     # itself to expire.
-    groups, _superseded = grouped_batch(db, site_id)
+    groups, _superseded = grouped_batch(db, site.id)
     approved = (
         db.scalar(
             select(func.count())
             .select_from(Suggestion)
-            .where(Suggestion.site_id == site_id, Suggestion.status == "approved")
+            .where(Suggestion.site_id == site.id, Suggestion.status == "approved")
         )
         or 0
     )
@@ -155,7 +158,7 @@ def dry_run_publication(
             )
         )
     return PublicationDryRun(
-        site_id=site_id,
+        site_id=site.id,
         approved=approved,
         previewed=len(planned),
         placements_missing=placements_missing,
@@ -170,10 +173,13 @@ def dry_run_publication(
 
 
 @router.get("/{site_id}/status")
-def publication_status(site_id: int, db: Session = Depends(get_db)) -> dict:
+def publication_status(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> dict:
     rows = db.execute(
         select(Suggestion.status, func.count())
-        .where(Suggestion.site_id == site_id, Suggestion.status.in_(["approved", "applied"]))
+        .where(Suggestion.site_id == site.id, Suggestion.status.in_(["approved", "applied"]))
         .group_by(Suggestion.status)
     ).all()
     counts = dict(rows)
