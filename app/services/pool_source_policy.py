@@ -69,6 +69,44 @@ def pool_request_guard(request: httpx.Request) -> None:
     require_allowed_pool_domain(str(request.url))
 
 
+def _same_property(left: str, right: str) -> bool:
+    # ponytail: host equality plus parent/child, no public-suffix list. A client
+    # at blog.example.com and a pool source at example.com are one property and
+    # must collide; `co.uk` would over-block, which is the safe direction for
+    # this rule. Add tldextract only if a real allowlist entry gets refused.
+    return left == right or left.endswith(f".{right}") or right.endswith(f".{left}")
+
+
+def require_no_pbn_conflict(db: Session, base_url: str, *, as_pool: bool) -> None:
+    """A domain we manage for a client may never also be a link target (PBN rule).
+
+    Google punishes a network of sites we control linking to each other, so the
+    check runs in both directions: approving a pool source rejects a domain any
+    client site holds, and creating a client site rejects a domain an approved
+    pool source holds. One direction alone would leave the bad state reachable
+    by doing the two steps in the other order.
+    """
+    domain = pool_source_domain(base_url)
+    query = (
+        select(Site.base_url).where(Site.platform != "pool")
+        if as_pool
+        else select(Site.base_url).where(
+            Site.platform == "pool", Site.pool_source_approved.is_(True)
+        )
+    )
+    for other_url in db.scalars(query):
+        try:
+            other_domain = pool_source_domain(other_url)
+        except PoolSourcePolicyError:
+            continue  # a malformed stored URL is not evidence of a conflict
+        if _same_property(domain, other_domain):
+            held_by = "a client site" if as_pool else "an approved content-pool source"
+            raise PoolSourcePolicyError(
+                f"domain {domain!r} is already {held_by} ({other_domain!r}); "
+                "linking it from other clients would form a private blog network"
+            )
+
+
 def require_approved_pool_source(site: Site) -> None:
     if site.platform != "pool":
         raise PoolSourcePolicyError(f"site {site.id} is not a content-pool source")

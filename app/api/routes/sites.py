@@ -48,6 +48,7 @@ from app.services.pool_source_policy import (
     PoolSourcePolicyError,
     expire_pool_target_suggestions,
     require_allowed_pool_domain,
+    require_no_pbn_conflict,
 )
 from app.services.pool_source_audit import record_pool_source_audit_event
 
@@ -190,6 +191,11 @@ def create_site(
         )
     ):
         raise HTTPException(409, DUPLICATE_REASON)
+    if payload.platform != "pool":
+        try:
+            require_no_pbn_conflict(db, payload.base_url, as_pool=False)
+        except PoolSourcePolicyError as error:
+            raise HTTPException(409, str(error)) from error
     site = Site(**payload.model_dump(), tenant_id=owner_tenant_id)
     db.add(site)
     db.commit()
@@ -253,6 +259,15 @@ def bulk_create_sites(
                 SiteBulkFailure(row=index, base_url=item.base_url, reason=DUPLICATE_REASON)
             )
             continue
+
+        if item.platform != "pool":
+            try:
+                require_no_pbn_conflict(db, item.base_url, as_pool=False)
+            except PoolSourcePolicyError as error:
+                rejected.append(
+                    SiteBulkFailure(row=index, base_url=item.base_url, reason=str(error))
+                )
+                continue
 
         site = Site(**item.model_dump(), tenant_id=owner_tenant_id)
         try:
@@ -364,6 +379,7 @@ def approve_pool_source(
         raise HTTPException(409, f"site {site.id} is not a content-pool source")
     try:
         require_allowed_pool_domain(site.base_url)
+        require_no_pbn_conflict(db, site.base_url, as_pool=True)
     except PoolSourcePolicyError as error:
         raise HTTPException(409, str(error)) from error
     site.pool_source_approved = True

@@ -566,6 +566,74 @@ def test_pool_source_must_be_approved_before_ingestion_and_can_be_revoked(client
         _delete_audit_events(db, site_id)
 
 
+def test_a_managed_domain_can_never_become_a_pool_target(client, db, monkeypatch):
+    """PBN rule: a domain we run for a client must not be a link target for other
+    clients, whichever order the two sites are created in."""
+    monkeypatch.setattr(settings, "pool_allowed_domains", "wikipedia.org,client.example")
+    created: list[int] = []
+    try:
+        managed = client.post(
+            "/api/v1/sites",
+            json={
+                "name": "Client blog",
+                "base_url": "https://blog.client.example",
+                "platform": "wordpress",
+            },
+        )
+        assert managed.status_code == 201, managed.text
+        created.append(managed.json()["id"])
+
+        pool = client.post(
+            "/api/v1/sites",
+            json={
+                "name": "Same property, as a pool source",
+                "base_url": "https://client.example/feed.xml",
+                "platform": "pool",
+            },
+        )
+        assert pool.status_code == 201, pool.text
+        pool_id = pool.json()["id"]
+        created.append(pool_id)
+
+        refused = client.post(f"/api/v1/sites/{pool_id}/pool-source/approval")
+        assert refused.status_code == 409, refused.text
+        assert "private blog network" in refused.text
+        db.expire_all()
+        assert db.get(Site, pool_id).pool_source_approved is False
+
+        # Reverse order: the pool source is approved before the client site exists.
+        wiki = client.post(
+            "/api/v1/sites",
+            json={
+                "name": "Wikipedia",
+                "base_url": "https://en.wikipedia.org/wiki/Backlink",
+                "platform": "pool",
+            },
+        )
+        assert wiki.status_code == 201, wiki.text
+        created.append(wiki.json()["id"])
+        approval = client.post(f"/api/v1/sites/{wiki.json()['id']}/pool-source/approval")
+        assert approval.status_code == 200, approval.text
+
+        collision = client.post(
+            "/api/v1/sites",
+            json={
+                "name": "Client on the pool domain",
+                "base_url": "https://wikipedia.org",
+                "platform": "wordpress",
+            },
+        )
+        assert collision.status_code == 409, collision.text
+        assert "private blog network" in collision.text
+    finally:
+        for site_id in created:
+            site = db.get(Site, site_id)
+            if site is not None:
+                db.delete(site)
+                db.commit()
+            _delete_audit_events(db, site_id)
+
+
 def test_pool_approval_identity_comes_from_operator_key(client, db, monkeypatch):
     monkeypatch.setattr(settings, "operator_api_keys", {"alice": SecretStr("alice-key")})
     response = client.post(
