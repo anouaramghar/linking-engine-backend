@@ -14,6 +14,7 @@ exactly the same rules as the dense candidates it competes with, rather than a
 subset someone remembered to reimplement.
 """
 
+import re
 from collections.abc import Sequence
 
 from sqlalchemy import bindparam, text
@@ -21,14 +22,37 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 
+# Navigational and transactional targets, from settings rather than literals so
+# a non-English site can supply its own without a code change or a migration.
+# Both halves are bound parameters: the terms are operator-supplied, and the URL
+# rule is a regex, so neither may be pasted into the statement text. An empty
+# list disables its half — `<> ALL('{}')` is already true for every row, and the
+# empty-pattern test short-circuits before the match.
 _LOW_VALUE_TARGET_SQL = """
-  AND lower(btrim(a2.title)) NOT IN (
-      'login', 'log in', 'sign in', 'sign up', 'register', 'registration',
-      'dashboard', 'my account', 'cart', 'shopping cart', 'checkout',
-      'privacy policy', 'terms of service', 'terms of use', 'cookie policy',
-      'support portal')
-  AND lower(a2.url) !~ '(^|/)(login|log-in|sign-in|sign-up|signup|register|registration|dashboard|my-account|cart|shopping-cart|checkout|privacy-policy|terms-of-service|terms-of-use|cookie-policy|support-portal)(/|[?#]|$)'
+  AND lower(btrim(a2.title)) <> ALL(CAST(:low_value_titles AS text[]))
+  AND (:low_value_url_pattern = '' OR lower(a2.url) !~ :low_value_url_pattern)
 """
+
+
+def low_value_target_params() -> dict[str, object]:
+    """The bound values behind `_LOW_VALUE_TARGET_SQL`.
+
+    The slugs become one alternation rather than one regex per slug: this runs
+    on the whole embedding join, before the top-k limit, so the row cost of the
+    rule matters. Each slug is escaped — a term like `c++` is a literal here,
+    not a quantifier that would fail the match or the parse.
+    """
+    slugs = "|".join(
+        re.escape(slug.strip().lower())
+        for slug in settings.low_value_target_url_slugs
+        if slug.strip()
+    )
+    titles = [title.strip().lower() for title in settings.low_value_target_titles]
+    return {
+        "low_value_titles": titles,
+        "low_value_url_pattern": rf"(^|/)({slugs})(/|[?#]|$)" if slugs else "",
+    }
+
 
 TOP_K_SQL = text(f"""
 SELECT a2.id AS target_id,
@@ -153,6 +177,7 @@ def top_candidates(db: Session, article_id: int, model: str, k: int) -> list[tup
             "model": model,
             "k": k,
             "minimum_score": settings.suggestion_min_score,
+            **low_value_target_params(),
         },
     ).all()
     return [(r.target_id, float(r.score)) for r in rows]
@@ -174,6 +199,7 @@ def eligible_top_candidates(
             "k": k,
             "duplicate_distance": 1.0 - duplicate_similarity_threshold,
             "minimum_score": settings.suggestion_min_score,
+            **low_value_target_params(),
         },
     ).all()
     return [(r.target_id, float(r.score)) for r in rows]
@@ -202,6 +228,7 @@ def eligible_candidate_scores(
             "target_ids": list(target_ids),
             "duplicate_distance": 1.0 - duplicate_similarity_threshold,
             "minimum_score": settings.suggestion_min_score,
+            **low_value_target_params(),
         },
     ).all()
     return {row.target_id: float(row.score) for row in rows}

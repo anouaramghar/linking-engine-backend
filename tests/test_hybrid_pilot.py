@@ -377,6 +377,47 @@ def test_every_exclusion_rule_applies_to_lexically_retrieved_candidates(
     assert source.id not in delivered
 
 
+def test_low_value_targets_are_configured_rather_than_fixed(
+    db, site, eligibility_corpus, monkeypatch
+):
+    """The deny-list is a setting, so a site in another language can replace it.
+
+    Emptying both lists must deliver the two pages the shipped English terms
+    exclude, and nothing else may change: every other exclusion rule is
+    independent of this one.
+    """
+    source, targets = eligibility_corpus
+    monkeypatch.setattr(settings, "low_value_target_titles", [])
+    monkeypatch.setattr(settings, "low_value_target_url_slugs", [])
+
+    delivered = {candidate.target_id for candidate in _rank(db, site, source).candidates}
+
+    assert targets["low_value_title"].id in delivered
+    assert targets["low_value_url"].id in delivered
+    for name in ("vector_duplicate", "same_title", "same_fingerprint", "inactive", "linked"):
+        assert targets[name].id not in delivered, f"{name} should still be excluded"
+
+
+def test_low_value_slugs_match_whole_segments_and_survive_regex_characters(
+    db, site, eligibility_corpus, monkeypatch
+):
+    """A configured slug is a literal path segment, not a pattern.
+
+    `guide-to-login-security` contains "login" and must survive, which is the
+    segment boundary doing work. The `c++` term is the escaping: unescaped it is
+    an invalid quantifier and Postgres rejects the whole statement.
+    """
+    source, targets = eligibility_corpus
+    monkeypatch.setattr(settings, "low_value_target_titles", [])
+    monkeypatch.setattr(settings, "low_value_target_url_slugs", ["c++", "support-portal"])
+
+    delivered = {candidate.target_id for candidate in _rank(db, site, source).candidates}
+
+    assert targets["useful_login_article"].id in delivered
+    assert targets["low_value_url"].id not in delivered
+    assert targets["low_value_title"].id in delivered
+
+
 def test_a_lexical_only_near_duplicate_is_excluded_by_the_vector_rule(db, site, eligibility_corpus):
     """Isolates the rule that only the shared SQL predicate can enforce.
 

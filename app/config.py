@@ -77,6 +77,28 @@ class Settings(BaseSettings):
     # review. The local Hybrid corpus currently bottoms out at 0.571, so 0.50
     # removes the weak tail without changing its existing queue.
     suggestion_min_score: float = Field(default=0.50, ge=0.0, le=1.0)
+    # Navigational and transactional pages carry no editorial value as link
+    # targets. The defaults are English because the pilot sites are; a site in
+    # another language needs its own terms, which is why these are settings
+    # rather than literals in the ranking SQL. Titles are matched whole and
+    # case-insensitively after trimming; slugs are matched as a whole path
+    # segment. Emptying either list disables that half of the rule.
+    low_value_target_titles: list[str] = Field(
+        default=[
+            "login", "log in", "sign in", "sign up", "register", "registration",
+            "dashboard", "my account", "cart", "shopping cart", "checkout",
+            "privacy policy", "terms of service", "terms of use", "cookie policy",
+            "support portal",
+        ]
+    )
+    low_value_target_url_slugs: list[str] = Field(
+        default=[
+            "login", "log-in", "sign-in", "sign-up", "signup", "register",
+            "registration", "dashboard", "my-account", "cart", "shopping-cart",
+            "checkout", "privacy-policy", "terms-of-service", "terms-of-use",
+            "cookie-policy", "support-portal",
+        ]
+    )
 
     # How many links publication may place *inside* an article's prose. The
     # per-run suggestion cap above bounds open review work, not the article: an
