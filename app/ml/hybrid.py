@@ -20,7 +20,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from app.config import settings
@@ -227,7 +227,14 @@ class HybridRanker:
                 )
                 .join(Site, Site.id == Article.site_id)
                 .where(
-                    or_(Article.site_id == site_id, Site.platform == "pool"),
+                    or_(
+                        Article.site_id == site_id,
+                        and_(
+                            Site.platform == "pool",
+                            Site.pool_source_approved.is_(True),
+                            Site.pool_source_quarantined.is_(False),
+                        ),
+                    ),
                     Article.is_active.is_(True),
                 )
                 .order_by(Article.id)

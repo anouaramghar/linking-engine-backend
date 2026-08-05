@@ -6,10 +6,19 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db
+from app.api.deps import get_db, require_operator_identity
 from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
-from app.models import Article, IngestionRun, InternalLink, JobRun, Site, Suggestion
+from app.models import (
+    Article,
+    IngestionRun,
+    InternalLink,
+    JobRun,
+    PoolSourceAuditEvent,
+    Site,
+    Suggestion,
+)
+from app.schemas.pool_audit import PoolSourceAuditEventOut
 from app.schemas.site import (
     ArticleOut,
     SiteBulkCreated,
@@ -18,13 +27,16 @@ from app.schemas.site import (
     SiteBulkResult,
     SiteCreate,
     SiteOut,
-    PoolSourceApproval,
-    PoolSourceReactivation,
     SiteSuggestionModeState,
     SiteSuggestionModeUpdate,
 )
 from app.services.ingestion_service import latest_run
-from app.services.pool_source_policy import PoolSourcePolicyError, require_allowed_pool_domain
+from app.services.pool_source_policy import (
+    PoolSourcePolicyError,
+    expire_pool_target_suggestions,
+    require_allowed_pool_domain,
+)
+from app.services.pool_source_audit import record_pool_source_audit_event
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -251,6 +263,25 @@ def list_sites(
     return out
 
 
+@router.get(
+    "/{site_id}/pool-source/audit-events",
+    response_model=list[PoolSourceAuditEventOut],
+)
+def list_pool_source_audit_events(
+    site_id: int,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[PoolSourceAuditEvent]:
+    return db.scalars(
+        select(PoolSourceAuditEvent)
+        .where(PoolSourceAuditEvent.site_id == site_id)
+        .order_by(PoolSourceAuditEvent.created_at.desc(), PoolSourceAuditEvent.id.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+
 @router.get("/{site_id}", response_model=SiteOut)
 def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
     site = _get_site_or_404(db, site_id)
@@ -269,8 +300,8 @@ def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
 @router.post("/{site_id}/pool-source/approval", response_model=SiteOut)
 def approve_pool_source(
     site_id: int,
-    payload: PoolSourceApproval,
     db: Session = Depends(get_db),
+    operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
     site = _get_site_or_404(db, site_id)
     if site.platform != "pool":
@@ -281,19 +312,26 @@ def approve_pool_source(
         raise HTTPException(409, str(error)) from error
     site.pool_source_approved = True
     site.pool_source_approved_at = datetime.now(UTC)
-    site.pool_source_approved_by = payload.approved_by
+    site.pool_source_approved_by = operator_id
+    record_pool_source_audit_event(db, site, "approved", operator_id)
     db.commit()
     return get_site(site_id, db)
 
 
 @router.delete("/{site_id}/pool-source/approval", response_model=SiteOut)
-def revoke_pool_source_approval(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
+def revoke_pool_source_approval(
+    site_id: int,
+    db: Session = Depends(get_db),
+    operator_id: str = Depends(require_operator_identity),
+) -> SiteOut:
     site = _get_site_or_404(db, site_id)
     if site.platform != "pool":
         raise HTTPException(409, f"site {site_id} is not a content-pool source")
     site.pool_source_approved = False
     site.pool_source_approved_at = None
     site.pool_source_approved_by = None
+    expire_pool_target_suggestions(db, site.id)
+    record_pool_source_audit_event(db, site, "revoked", operator_id)
     db.commit()
     return get_site(site_id, db)
 
@@ -301,8 +339,8 @@ def revoke_pool_source_approval(site_id: int, db: Session = Depends(get_db)) -> 
 @router.post("/{site_id}/pool-source/reactivate", response_model=SiteOut)
 def reactivate_pool_source(
     site_id: int,
-    payload: PoolSourceReactivation,
     db: Session = Depends(get_db),
+    operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
     site = _get_site_or_404(db, site_id)
     if site.platform != "pool":
@@ -318,7 +356,8 @@ def reactivate_pool_source(
     site.pool_source_quarantined_at = None
     site.pool_source_quarantine_reason = None
     site.pool_source_last_reactivated_at = datetime.now(UTC)
-    site.pool_source_last_reactivated_by = payload.reactivated_by
+    site.pool_source_last_reactivated_by = operator_id
+    record_pool_source_audit_event(db, site, "reactivated", operator_id)
     db.commit()
     return get_site(site_id, db)
 

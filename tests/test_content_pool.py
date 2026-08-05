@@ -8,13 +8,21 @@ from types import SimpleNamespace
 import feedparser
 import httpx
 import pytest
-from sqlalchemy import select
+from pydantic import SecretStr
+from sqlalchemy import delete, select
 
 from app.config import settings
 from app.connectors.registry import get_connector
 from app.connectors.rss_connector import RSSConnector
 from app.connectors.wikipedia_connector import WikipediaConnector
-from app.models import Article, Embedding, IngestionRun, Site, Suggestion
+from app.models import (
+    Article,
+    Embedding,
+    IngestionRun,
+    PoolSourceAuditEvent,
+    Site,
+    Suggestion,
+)
 from app.models.article import EMBEDDING_DIM
 from app.schemas.site import SiteCreate
 from app.connectors.url_guard import UnsafeURLError
@@ -53,6 +61,11 @@ def _pool(db, *, frequency: str = "daily", approved: bool = True) -> Site:
     db.commit()
     db.refresh(site)
     return site
+
+
+def _delete_audit_events(db, site_id: int) -> None:
+    db.execute(delete(PoolSourceAuditEvent).where(PoolSourceAuditEvent.site_id == site_id))
+    db.commit()
 
 
 def test_pool_schema_defaults_to_daily_and_rejects_credentials():
@@ -283,9 +296,10 @@ def test_wikipedia_connector_follows_continuation_and_validates_json(monkeypatch
     calls = 0
     sleeps: list[float] = []
 
-    def handler(_request):
+    def handler(request):
         nonlocal calls
         calls += 1
+        assert "rvlimit" not in request.url.params
         payload = {"query": {"pages": [pages[calls - 1]]}}
         if calls == 1:
             payload["continue"] = {"continue": "-||", "gsroffset": 20}
@@ -507,11 +521,11 @@ def test_pool_source_must_be_approved_before_ingestion_and_can_be_revoked(client
 
         approved = client.post(
             f"/api/v1/sites/{site_id}/pool-source/approval",
-            json={"approved_by": "  editor  "},
+            json={"approved_by": "spoofed-editor"},
         )
         assert approved.status_code == 200, approved.text
         assert approved.json()["pool_source_approved"] is True
-        assert approved.json()["pool_source_approved_by"] == "editor"
+        assert approved.json()["pool_source_approved_by"] == "local-development"
 
         site = db.get(Site, site_id)
         site.pool_source_consecutive_failures = 3
@@ -520,17 +534,144 @@ def test_pool_source_must_be_approved_before_ingestion_and_can_be_revoked(client
         db.commit()
         reactivated = client.post(
             f"/api/v1/sites/{site_id}/pool-source/reactivate",
-            json={"reactivated_by": "  operator  "},
+            json={"reactivated_by": "spoofed-operator"},
         )
         assert reactivated.status_code == 200, reactivated.text
         assert reactivated.json()["pool_source_quarantined"] is False
         assert reactivated.json()["pool_source_consecutive_failures"] == 0
-        assert reactivated.json()["pool_source_last_reactivated_by"] == "operator"
+        assert reactivated.json()["pool_source_last_reactivated_by"] == "local-development"
 
         revoked = client.delete(f"/api/v1/sites/{site_id}/pool-source/approval")
         assert revoked.status_code == 200, revoked.text
         assert revoked.json()["pool_source_approved"] is False
         assert client.post(f"/api/v1/sites/{site_id}/ingest").status_code == 409
+
+        history = client.get(f"/api/v1/sites/{site_id}/pool-source/audit-events")
+        assert history.status_code == 200
+        assert [event["action"] for event in history.json()] == [
+            "revoked",
+            "reactivated",
+            "approved",
+        ]
+        assert [event["operator_id"] for event in history.json()] == [
+            "local-development",
+            "local-development",
+            "local-development",
+        ]
+    finally:
+        site = db.get(Site, site_id)
+        if site is not None:
+            db.delete(site)
+            db.commit()
+        _delete_audit_events(db, site_id)
+
+
+def test_pool_approval_identity_comes_from_operator_key(client, db, monkeypatch):
+    monkeypatch.setattr(settings, "operator_api_keys", {"alice": SecretStr("alice-key")})
+    response = client.post(
+        "/api/v1/sites",
+        headers={"X-API-Key": "alice-key"},
+        json={
+            "name": "Operator-approved pool",
+            "base_url": "https://en.wikipedia.org/wiki/Information_retrieval",
+            "platform": "pool",
+        },
+    )
+    assert response.status_code == 201, response.text
+    site_id = response.json()["id"]
+    try:
+        missing = client.post(f"/api/v1/sites/{site_id}/pool-source/approval")
+        assert missing.status_code == 401
+
+        approved = client.post(
+            f"/api/v1/sites/{site_id}/pool-source/approval",
+            headers={"X-API-Key": "alice-key"},
+            json={"approved_by": "mallory"},
+        )
+        assert approved.status_code == 200, approved.text
+        assert approved.json()["pool_source_approved_by"] == "alice"
+    finally:
+        site = db.get(Site, site_id)
+        if site is not None:
+            db.delete(site)
+            db.commit()
+        _delete_audit_events(db, site_id)
+
+
+def test_revoking_pool_source_expires_active_customer_suggestions(client, db):
+    pool = _pool(db)
+    customer = Site(
+        name="Customer",
+        base_url=f"https://customer-{uuid.uuid4().hex[:8]}.example.com",
+        platform="html",
+    )
+    db.add(customer)
+    db.flush()
+    source = Article(
+        site_id=customer.id,
+        url=f"{customer.base_url}/source",
+        title="Source",
+        content_text="source",
+    )
+    target = Article(
+        site_id=pool.id,
+        url=f"https://example.com/{uuid.uuid4().hex}",
+        title="Pool target",
+        content_text="target",
+    )
+    db.add_all([source, target])
+    db.flush()
+    suggestions = [
+        Suggestion(
+            site_id=customer.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="hybrid_bm25",
+            score=0.8,
+            status=status,
+        )
+        for status in ("pending", "approved", "rejected")
+    ]
+    db.add_all(suggestions)
+    db.commit()
+    try:
+        response = client.delete(f"/api/v1/sites/{pool.id}/pool-source/approval")
+        assert response.status_code == 200, response.text
+        for suggestion in suggestions:
+            db.refresh(suggestion)
+        assert [suggestion.status for suggestion in suggestions] == [
+            "expired",
+            "expired",
+            "rejected",
+        ]
+    finally:
+        site_id = pool.id
+        db.delete(pool)
+        db.delete(customer)
+        db.commit()
+        _delete_audit_events(db, site_id)
+
+
+def test_generic_service_key_cannot_supply_operator_identity(client, db, monkeypatch):
+    monkeypatch.setattr(settings, "api_key", "service-key")
+    response = client.post(
+        "/api/v1/sites",
+        headers={"X-API-Key": "service-key"},
+        json={
+            "name": "Service-key pool",
+            "base_url": "https://en.wikipedia.org/wiki/Search_engine",
+            "platform": "pool",
+        },
+    )
+    assert response.status_code == 201, response.text
+    site_id = response.json()["id"]
+    try:
+        approval = client.post(
+            f"/api/v1/sites/{site_id}/pool-source/approval",
+            headers={"X-API-Key": "service-key"},
+        )
+        assert approval.status_code == 401
+        assert "operator-specific" in approval.text
     finally:
         site = db.get(Site, site_id)
         if site is not None:
@@ -540,6 +681,37 @@ def test_pool_source_must_be_approved_before_ingestion_and_can_be_revoked(client
 
 def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
     pool = _pool(db)
+    customer = Site(
+        name="Customer",
+        base_url=f"https://customer-{uuid.uuid4().hex[:8]}.example.com",
+        platform="html",
+    )
+    db.add(customer)
+    db.flush()
+    source = Article(
+        site_id=customer.id,
+        url=f"{customer.base_url}/source",
+        title="Source",
+        content_text="source",
+    )
+    target = Article(
+        site_id=pool.id,
+        url=f"https://example.com/{uuid.uuid4().hex}",
+        title="Pool target",
+        content_text="target",
+    )
+    db.add_all([source, target])
+    db.flush()
+    suggestion = Suggestion(
+        site_id=customer.id,
+        source_article_id=source.id,
+        target_article_id=target.id,
+        method="hybrid_bm25",
+        score=0.8,
+        status="pending",
+    )
+    db.add(suggestion)
+    db.commit()
     monkeypatch.setattr(settings, "pool_quarantine_failure_threshold", 2)
     try:
         ingestion_task._record_pool_ingestion_failure(pool.id, RuntimeError("feed down"))
@@ -549,11 +721,52 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
         assert pool.pool_source_consecutive_failures == 2
         assert pool.pool_source_quarantined is True
         assert pool.pool_source_quarantine_reason == "still down"
+        db.refresh(suggestion)
+        assert suggestion.status == "expired"
+        event = db.scalar(
+            select(PoolSourceAuditEvent).where(PoolSourceAuditEvent.site_id == pool.id)
+        )
+        assert event is not None
+        assert event.action == "quarantined"
+        assert event.operator_id == "system"
+        assert event.reason == "still down"
         with pytest.raises(PoolSourceQuarantinedError):
             require_approved_pool_source(pool)
     finally:
+        site_id = pool.id
         db.delete(pool)
+        db.delete(customer)
         db.commit()
+        _delete_audit_events(db, site_id)
+
+
+def test_pool_traceability_survives_site_deletion(client, db):
+    response = client.post(
+        "/api/v1/sites",
+        json={
+            "name": "Deleted pool",
+            "base_url": "https://en.wikipedia.org/wiki/Web_search_engine",
+            "platform": "pool",
+        },
+    )
+    assert response.status_code == 201, response.text
+    site_id = response.json()["id"]
+    try:
+        approved = client.post(f"/api/v1/sites/{site_id}/pool-source/approval")
+        assert approved.status_code == 200, approved.text
+        assert client.delete(f"/api/v1/sites/{site_id}").status_code == 204
+
+        history = client.get(f"/api/v1/sites/{site_id}/pool-source/audit-events")
+        assert history.status_code == 200
+        assert history.json()[0]["action"] == "approved"
+        assert history.json()[0]["site_name"] == "Deleted pool"
+        assert history.json()[0]["site_base_url"].endswith("/Web_search_engine")
+    finally:
+        site = db.get(Site, site_id)
+        if site is not None:
+            db.delete(site)
+            db.commit()
+        _delete_audit_events(db, site_id)
 
 
 def test_pool_routes_disallow_generation_and_publication(client, db):
@@ -809,6 +1022,53 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
         db.delete(internal)
         db.delete(source)
         db.delete(internal_target)
+        db.delete(pool)
+        db.commit()
+
+
+@pytest.mark.parametrize(
+    ("approved", "quarantined"),
+    [(False, False), (True, True)],
+)
+def test_hybrid_excludes_disabled_pool_sources(
+    db, site, monkeypatch, approved, quarantined
+):
+    monkeypatch.setattr(
+        "app.ml.embeddings.encode",
+        lambda texts: [_vector(1.0) for _text in texts],
+    )
+    pool = _pool(db, approved=approved)
+    pool.pool_source_quarantined = quarantined
+    source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/{uuid.uuid4().hex}",
+        title="Tomato guide",
+        content_text="tomato canning safety",
+    )
+    target = Article(
+        site_id=pool.id,
+        url=f"https://example.com/{uuid.uuid4().hex}",
+        title="Tomato safety",
+        content_text="tomato canning safety details",
+    )
+    db.add_all([source, target])
+    db.flush()
+    for article, vector in ((source, _vector(1.0)), (target, _vector(0.8, 0.6))):
+        db.add(
+            Embedding(
+                article_id=article.id,
+                model=settings.embedding_model,
+                vector=vector,
+                content_fingerprint=_fingerprint(article.title, article.content_text),
+                input_recipe_version=1,
+                vector_size=EMBEDDING_DIM,
+            )
+        )
+    db.commit()
+    try:
+        result = generate_suggestions(site.id)
+        assert result["suggestions_created"] == 0
+    finally:
         db.delete(pool)
         db.commit()
 

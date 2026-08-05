@@ -3,9 +3,13 @@
 from urllib.parse import urlsplit
 
 import httpx
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.models.article import Article
 from app.models.site import Site
+from app.models.suggestion import Suggestion
 
 
 class PoolSourcePolicyError(ValueError):
@@ -75,3 +79,17 @@ def require_approved_pool_source(site: Site) -> None:
             f"{site.pool_source_quarantine_reason or 'repeated ingestion failures'}"
         )
     require_allowed_pool_domain(site.base_url)
+
+
+def expire_pool_target_suggestions(db: Session, site_id: int) -> int:
+    """Remove a disabled pool source from every active editorial queue."""
+    target_ids = select(Article.id).where(Article.site_id == site_id)
+    result = db.execute(
+        update(Suggestion)
+        .where(
+            Suggestion.target_article_id.in_(target_ids),
+            Suggestion.status.in_(("pending", "approved")),
+        )
+        .values(status="expired")
+    )
+    return result.rowcount or 0

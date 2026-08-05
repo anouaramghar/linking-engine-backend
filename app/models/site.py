@@ -4,6 +4,7 @@ from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Tex
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+from app.db_types import EncryptedCredential
 
 Platform = Enum("wordpress", "html", "pool", name="platform", native_enum=False, length=20)
 RunStatus = Enum("running", "succeeded", "failed", name="run_status", native_enum=False, length=20)
@@ -33,7 +34,7 @@ class Site(Base):
     )
     # WordPress Application Passwords (A2) — HTTP Basic Auth
     wp_username: Mapped[str | None] = mapped_column(String(255))
-    wp_app_password: Mapped[str | None] = mapped_column(String(255))
+    wp_app_password: Mapped[str | None] = mapped_column(EncryptedCredential())
     pool_source_approved: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

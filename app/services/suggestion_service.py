@@ -221,7 +221,13 @@ def generate_suggestions(
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
             pool_site_ids = db.scalars(
-                select(Site.id).where(Site.platform == "pool").order_by(Site.id)
+                select(Site.id)
+                .where(
+                    Site.platform == "pool",
+                    Site.pool_source_approved.is_(True),
+                    Site.pool_source_quarantined.is_(False),
+                )
+                .order_by(Site.id)
             ).all()
             for pool_site_id in pool_site_ids:
                 # Different customer analyses may share the same pool. Reuse the

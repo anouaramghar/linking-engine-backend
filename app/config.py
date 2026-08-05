@@ -1,6 +1,6 @@
 from typing import Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +16,14 @@ class Settings(BaseSettings):
 
     # Static API key for all non-health endpoints; empty fails closed at the API boundary.
     api_key: str = ""
+    # Human operator identities mapped to their individual API keys. These keys
+    # may call every protected route and provide trusted approval audit identity.
+    operator_api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+
+    # Fernet key used to encrypt WordPress application passwords at rest.
+    credential_encryption_key: SecretStr | None = None
+    # Comma-separated previous Fernet keys accepted only for decryption during rotation.
+    credential_decryption_keys: SecretStr | None = None
 
     # External search (v3)
     tavily_api_key: str = ""
@@ -144,8 +152,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def require_api_key_outside_development(self) -> Self:
-        if self.environment != "development" and not self.api_key:
-            raise ValueError("API_KEY must be set outside development")
+        if self.environment != "development" and not (self.api_key or self.operator_api_keys):
+            raise ValueError("API_KEY or OPERATOR_API_KEYS must be set outside development")
+        return self
+
+    @model_validator(mode="after")
+    def require_credential_key_outside_development(self) -> Self:
+        key = self.credential_encryption_key
+        if self.environment != "development" and (key is None or not key.get_secret_value()):
+            raise ValueError("CREDENTIAL_ENCRYPTION_KEY must be set outside development")
         return self
 
     @model_validator(mode="after")

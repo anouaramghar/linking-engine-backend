@@ -21,7 +21,16 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 
-TOP_K_SQL = text("""
+_LOW_VALUE_TARGET_SQL = """
+  AND lower(btrim(a2.title)) NOT IN (
+      'login', 'log in', 'sign in', 'sign up', 'register', 'registration',
+      'dashboard', 'my account', 'cart', 'shopping cart', 'checkout',
+      'privacy policy', 'terms of service', 'terms of use', 'cookie policy',
+      'support portal')
+  AND lower(a2.url) !~ '(^|/)(login|log-in|sign-in|sign-up|signup|register|registration|dashboard|my-account|cart|shopping-cart|checkout|privacy-policy|terms-of-service|terms-of-use|cookie-policy|support-portal)(/|[?#]|$)'
+"""
+
+TOP_K_SQL = text(f"""
 SELECT a2.id AS target_id,
        1 - (e2.vector <=> e1.vector) AS score
 FROM embeddings e1
@@ -31,9 +40,15 @@ JOIN articles a2 ON a2.id = e2.article_id
 JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
-  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
+  AND (
+      a2.site_id = a1.site_id
+      OR (
+          candidate_site.platform = 'pool'
+          AND candidate_site.pool_source_approved IS TRUE
+          AND candidate_site.pool_source_quarantined IS FALSE))
   AND a2.is_active IS TRUE
   AND (1 - (e2.vector <=> e1.vector)) >= :minimum_score
+  {_LOW_VALUE_TARGET_SQL}
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
       WHERE il.source_article_id = a1.id
@@ -63,7 +78,7 @@ LIMIT :k
 # The reverse-direction rule keeps A->B and B->A from both being proposed. The
 # first direction generated wins an otherwise symmetric choice; later sources
 # continue to their next eligible target instead of creating the mirror row.
-_PILOT_ELIGIBILITY_SQL = """
+_PILOT_ELIGIBILITY_SQL = f"""
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
 JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
@@ -71,8 +86,14 @@ JOIN articles a2 ON a2.id = e2.article_id
 JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
-  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
+  AND (
+      a2.site_id = a1.site_id
+      OR (
+          candidate_site.platform = 'pool'
+          AND candidate_site.pool_source_approved IS TRUE
+          AND candidate_site.pool_source_quarantined IS FALSE))
   AND a2.is_active IS TRUE
+  {_LOW_VALUE_TARGET_SQL}
   AND (                     -- identical inputs are duplicate pages, not link candidates
       e1.content_fingerprint IS NULL
       OR e2.content_fingerprint IS NULL

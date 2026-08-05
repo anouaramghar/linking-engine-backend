@@ -22,6 +22,7 @@ import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+from pydantic import SecretStr
 
 #: Databases the suite must never write to, whatever the configuration says.
 #: ``linkmesh`` is the development database; ``postgres`` is the cluster's
@@ -156,7 +157,14 @@ def disable_api_key(monkeypatch):
     # tests use deliberately orthogonal toy vectors to isolate quotas and state
     # transitions; the dedicated score-floor test opts back into the production
     # threshold explicitly.
-    monkeypatch.setattr(settings, "api_key", "test-key")
+    monkeypatch.setattr(settings, "api_key", "")
+    monkeypatch.setattr(settings, "operator_api_keys", {})
+    monkeypatch.setattr(
+        settings,
+        "credential_encryption_key",
+        SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
+    )
+    monkeypatch.setattr(settings, "credential_decryption_keys", None)
     monkeypatch.setattr(settings, "suggestion_min_score", 0.0)
     app.dependency_overrides[require_api_key] = lambda: None
     yield
