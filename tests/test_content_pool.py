@@ -767,7 +767,13 @@ def test_pool_traceability_survives_site_deletion(client, db):
     try:
         approved = client.post(f"/api/v1/sites/{site_id}/pool-source/approval")
         assert approved.status_code == 200, approved.text
-        assert client.delete(f"/api/v1/sites/{site_id}").status_code == 204
+        assert (
+            client.delete(
+                f"/api/v1/sites/{site_id}",
+                params={"confirm_name": "Deleted pool"},
+            ).status_code
+            == 204
+        )
 
         history = client.get(f"/api/v1/sites/{site_id}/pool-source/audit-events")
         assert history.status_code == 200

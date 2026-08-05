@@ -376,8 +376,22 @@ def update_suggestion_mode(
 
 
 @router.delete("/{site_id}", status_code=204)
-def delete_site(site_id: int, db: Session = Depends(get_db)) -> None:
-    db.delete(_get_site_or_404(db, site_id))  # ON DELETE CASCADE takes everything else
+def delete_site(
+    site_id: int,
+    confirm_name: str = Query(
+        ...,
+        min_length=1,
+        description="Must exactly match the site name; stops accidental and CSRF-driven deletes.",
+    ),
+    db: Session = Depends(get_db),
+) -> None:
+    site = _get_site_or_404(db, site_id)
+    if confirm_name != site.name:
+        raise HTTPException(
+            409,
+            "confirm_name must exactly match the site name",
+        )
+    db.delete(site)  # ON DELETE CASCADE takes everything else
     db.commit()
 
 

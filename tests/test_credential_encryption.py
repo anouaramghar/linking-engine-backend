@@ -129,4 +129,7 @@ def test_site_api_never_returns_password(client):
 
     assert response.status_code == 201
     assert "wp_app_password" not in response.json()
-    client.delete(f"/api/v1/sites/{response.json()['id']}")
+    client.delete(
+        f"/api/v1/sites/{response.json()['id']}",
+        params={"confirm_name": "api-encrypted-site"},
+    )
