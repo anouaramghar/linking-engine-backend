@@ -1,11 +1,10 @@
-"""Cosine retrieval primitives over pgvector (exact below ~100k vectors).
+"""Baseline v1: cosine top-k over pgvector, exact search (A13 — no index below ~100k vectors).
 
 Two families of query live here.
 
-`top_candidates` is the long-standing cosine query retained for frozen offline
-comparisons against the pre-global behavior.
+`top_candidates` is retained for explicit Hybrid comparisons and ranking fallback.
 
-The global Hybrid path uses `_HYBRID_ELIGIBILITY_SQL` instead. Dense retrieval applies it
+The Hybrid path uses `_PILOT_ELIGIBILITY_SQL` instead. Dense retrieval applies it
 while choosing its own top k; `eligible_candidate_scores` applies the identical
 predicate to a candidate list produced elsewhere. That second use is the point.
 BM25 ranks documents — it has no way to know about existing links, prior
@@ -26,9 +25,11 @@ SELECT a2.id AS target_id,
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
 JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
-JOIN articles a2 ON a2.id = e2.article_id AND a2.site_id = a1.site_id
+JOIN articles a2 ON a2.id = e2.article_id
+JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
+  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
   AND a2.is_active IS TRUE
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
@@ -44,19 +45,21 @@ ORDER BY e2.vector <=> e1.vector
 LIMIT :k
 """)
 
-# The Hybrid eligibility rules, in one place so both halves of the
+# Hybrid's eligibility rules, in one place so both halves of the ranking
 # candidate union are filtered by the same predicate. Every clause is a rule the
 # baseline path applies somewhere — the link, decision, active, site, and model
 # rules in SQL; the fingerprint and title rules in the ranker's in-memory corpus
 # — plus the near-duplicate vector ceiling, which only a vector comparison can
 # express and which a lexical candidate would otherwise slip past entirely.
-_HYBRID_ELIGIBILITY_SQL = """
+_PILOT_ELIGIBILITY_SQL = """
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
 JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
-JOIN articles a2 ON a2.id = e2.article_id AND a2.site_id = a1.site_id
+JOIN articles a2 ON a2.id = e2.article_id
+JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
+  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
   AND a2.is_active IS TRUE
   AND (                     -- identical inputs are duplicate pages, not link candidates
       e1.content_fingerprint IS NULL
@@ -76,10 +79,10 @@ WHERE a1.id = :article_id
         AND s.status != 'expired')
 """
 
-HYBRID_TOP_K_SQL = text(f"""
+PILOT_TOP_K_SQL = text(f"""
 SELECT a2.id AS target_id,
        1 - (e2.vector <=> e1.vector) AS score
-{_HYBRID_ELIGIBILITY_SQL}
+{_PILOT_ELIGIBILITY_SQL}
 ORDER BY e2.vector <=> e1.vector, a2.id
 LIMIT :k
 """)
@@ -87,7 +90,7 @@ LIMIT :k
 ELIGIBLE_SCORES_SQL = text(f"""
 SELECT a2.id AS target_id,
        1 - (e2.vector <=> e1.vector) AS score
-{_HYBRID_ELIGIBILITY_SQL}
+{_PILOT_ELIGIBILITY_SQL}
   AND a2.id IN :target_ids
 """).bindparams(bindparam("target_ids", expanding=True))
 
@@ -103,7 +106,7 @@ WHERE e1.article_id = :article_id
 
 
 def top_candidates(db: Session, article_id: int, model: str, k: int) -> list[tuple[int, float]]:
-    """The legacy cosine query retained for frozen offline comparisons."""
+    """The baseline query used by explicit comparisons and fallback."""
     rows = db.execute(TOP_K_SQL, {"article_id": article_id, "model": model, "k": k}).all()
     return [(r.target_id, float(r.score)) for r in rows]
 
@@ -115,9 +118,9 @@ def eligible_top_candidates(
     k: int,
     duplicate_similarity_threshold: float,
 ) -> list[tuple[int, float]]:
-    """The Hybrid dense pool: the k closest targets that pass every rule."""
+    """The Hybrid dense pool: closest targets that pass every Hybrid rule."""
     rows = db.execute(
-        HYBRID_TOP_K_SQL,
+        PILOT_TOP_K_SQL,
         {
             "article_id": article_id,
             "model": model,

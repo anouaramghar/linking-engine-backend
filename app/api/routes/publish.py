@@ -36,8 +36,11 @@ def pending_publication_sites(
 
 @router.post("/{site_id}", status_code=202, response_model=JobAccepted)
 def trigger_publication(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    if db.get(Site, site_id) is None:
+    site = db.get(Site, site_id)
+    if site is None:
         raise HTTPException(404, f"site {site_id} not found")
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources are read-only")
     try:
         run = enqueue_job(db, site_id, "publication", publish_approved, job_timeout=3600)
     except DuplicateJobError as e:

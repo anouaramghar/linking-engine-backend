@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
 from sqlalchemy import exists, func, select
@@ -7,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
-from app.models import Article, IngestionRun, InternalLink, Site, Suggestion
+from app.models import Article, IngestionRun, InternalLink, JobRun, Site, Suggestion
 from app.schemas.site import (
     ArticleOut,
     SiteBulkCreated,
@@ -16,10 +18,13 @@ from app.schemas.site import (
     SiteBulkResult,
     SiteCreate,
     SiteOut,
+    PoolSourceApproval,
+    PoolSourceReactivation,
     SiteSuggestionModeState,
     SiteSuggestionModeUpdate,
 )
 from app.services.ingestion_service import latest_run
+from app.services.pool_source_policy import PoolSourcePolicyError, require_allowed_pool_domain
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -70,47 +75,46 @@ def _site_counts(
             .group_by(Article.site_id)
         ).all()
     )
-    active_counts_by_source = (
-        select(
-            Suggestion.site_id.label("site_id"),
-            Suggestion.source_article_id.label("source_article_id"),
-            func.count(Suggestion.id).label("active_count"),
-        )
-        .join(Article, Article.id == Suggestion.source_article_id)
-        .where(
-            Suggestion.site_id.in_(site_ids),
-            Article.is_active.is_(True),
-            Suggestion.status.in_(("pending", "approved", "applying")),
-        )
-        .group_by(Suggestion.site_id, Suggestion.source_article_id)
-        .subquery()
+    active_suggestion_counts = dict(
+        db.execute(
+            select(Suggestion.site_id, func.count(Suggestion.id))
+            .join(Article, Article.id == Suggestion.source_article_id)
+            .where(
+                Suggestion.site_id.in_(site_ids),
+                Article.is_active.is_(True),
+                Suggestion.status.in_(("pending", "approved", "applying")),
+            )
+            .group_by(Suggestion.site_id)
+        ).all()
     )
-    used_slots = {
-        site_id: int(slot_count)
-        for site_id, slot_count in db.execute(
-            select(
-                active_counts_by_source.c.site_id,
-                func.sum(
-                    func.least(
-                        active_counts_by_source.c.active_count,
-                        settings.hybrid_max_suggestions_per_article,
-                    )
-                ),
-            ).group_by(active_counts_by_source.c.site_id)
+    return article_counts, internal_link_counts, active_suggestion_counts
+
+
+def _latest_analyses(db: Session, site_ids: list[int]) -> dict[int, JobRun]:
+    """The last *finished* analysis run per site.
+
+    A crawl and an analysis are separate jobs, so the crawl run alone cannot say
+    whether a site has suggestions yet. In-flight analyses already reach the UI
+    through the active-jobs feed, so a resting row only needs the last outcome.
+    """
+    if not site_ids:
+        return {}
+
+    newest = (
+        select(func.max(JobRun.id))
+        .where(
+            JobRun.site_id.in_(site_ids),
+            JobRun.kind == "analysis",
+            JobRun.status.in_(("succeeded", "failed")),
         )
-    }
-    suggestion_slots = {
-        site_id: (
-            article_count * settings.hybrid_max_suggestions_per_article
-            - used_slots.get(site_id, 0)
-        )
-        for site_id, article_count in article_counts.items()
-    }
-    return article_counts, internal_link_counts, suggestion_slots
+        .group_by(JobRun.site_id)
+        .scalar_subquery()
+    )
+    runs = db.scalars(select(JobRun).where(JobRun.id.in_(newest))).all()
+    return {run.site_id: run for run in runs}
 
 
 def _suggestion_mode_state(_site: Site) -> SiteSuggestionModeState:
-    """Backward-compatible API state for the now-global Hybrid method."""
     return SiteSuggestionModeState(
         suggestion_mode="experimental",
         suggestion_mode_managed=True,
@@ -123,20 +127,30 @@ def _site_out(
     *,
     article_count: int,
     internal_link_count: int,
-    suggestion_slots_available: int,
+    active_suggestion_count: int,
     run: IngestionRun | None,
+    analysis: JobRun | None = None,
 ) -> SiteOut:
     item = SiteOut.model_validate(site)
     mode = _suggestion_mode_state(site)
     item.suggestion_mode = mode.suggestion_mode
     item.suggestion_mode_managed = mode.suggestion_mode_managed
     item.suggestion_comparison_enabled = mode.suggestion_comparison_enabled
-    item.suggestion_slots_available = max(0, suggestion_slots_available)
+    site_capacity = min(
+        article_count * settings.hybrid_max_suggestions_per_article,
+        settings.hybrid_max_active_suggestions_per_site,
+    )
+    item.suggestion_slots_available = max(0, site_capacity - active_suggestion_count)
+    if site.platform == "pool":
+        item.suggestion_slots_available = 0
     item.article_count = article_count
     item.internal_link_count = internal_link_count
     if run is not None:
         item.last_ingestion_status = run.status
         item.last_crawl_at = run.finished_at or run.started_at
+    if analysis is not None:
+        item.last_analysis_status = analysis.status
+        item.last_analysis_at = analysis.finished_at or analysis.enqueued_at
     return item
 
 
@@ -217,9 +231,10 @@ def list_sites(
     db: Session = Depends(get_db),
 ) -> list[SiteOut]:
     sites = db.scalars(select(Site).order_by(Site.id).limit(limit).offset(offset)).all()
-    article_counts, internal_link_counts, suggestion_slots = _site_counts(
+    article_counts, internal_link_counts, active_suggestion_counts = _site_counts(
         db, [site.id for site in sites]
     )
+    analyses = _latest_analyses(db, [site.id for site in sites])
     out = []
     for site in sites:
         run = latest_run(db, site.id)
@@ -228,8 +243,9 @@ def list_sites(
                 site,
                 article_count=article_counts.get(site.id, 0),
                 internal_link_count=internal_link_counts.get(site.id, 0),
-                suggestion_slots_available=suggestion_slots.get(site.id, 0),
+                active_suggestion_count=active_suggestion_counts.get(site.id, 0),
                 run=run,
+                analysis=analyses.get(site.id),
             )
         )
     return out
@@ -238,22 +254,76 @@ def list_sites(
 @router.get("/{site_id}", response_model=SiteOut)
 def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
     site = _get_site_or_404(db, site_id)
-    article_counts, internal_link_counts, suggestion_slots = _site_counts(db, [site.id])
+    article_counts, internal_link_counts, active_suggestion_counts = _site_counts(db, [site.id])
     run = latest_run(db, site.id)
     return _site_out(
         site,
         article_count=article_counts.get(site.id, 0),
         internal_link_count=internal_link_counts.get(site.id, 0),
-        suggestion_slots_available=suggestion_slots.get(site.id, 0),
+        active_suggestion_count=active_suggestion_counts.get(site.id, 0),
         run=run,
+        analysis=_latest_analyses(db, [site.id]).get(site.id),
     )
 
 
-@router.put(
-    "/{site_id}/suggestion-mode",
-    response_model=SiteSuggestionModeState,
-    include_in_schema=False,
-)
+@router.post("/{site_id}/pool-source/approval", response_model=SiteOut)
+def approve_pool_source(
+    site_id: int,
+    payload: PoolSourceApproval,
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    site = _get_site_or_404(db, site_id)
+    if site.platform != "pool":
+        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+    try:
+        require_allowed_pool_domain(site.base_url)
+    except PoolSourcePolicyError as error:
+        raise HTTPException(409, str(error)) from error
+    site.pool_source_approved = True
+    site.pool_source_approved_at = datetime.now(UTC)
+    site.pool_source_approved_by = payload.approved_by
+    db.commit()
+    return get_site(site_id, db)
+
+
+@router.delete("/{site_id}/pool-source/approval", response_model=SiteOut)
+def revoke_pool_source_approval(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
+    site = _get_site_or_404(db, site_id)
+    if site.platform != "pool":
+        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+    site.pool_source_approved = False
+    site.pool_source_approved_at = None
+    site.pool_source_approved_by = None
+    db.commit()
+    return get_site(site_id, db)
+
+
+@router.post("/{site_id}/pool-source/reactivate", response_model=SiteOut)
+def reactivate_pool_source(
+    site_id: int,
+    payload: PoolSourceReactivation,
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    site = _get_site_or_404(db, site_id)
+    if site.platform != "pool":
+        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+    if not site.pool_source_approved:
+        raise HTTPException(409, f"pool source site {site_id} must be approved first")
+    try:
+        require_allowed_pool_domain(site.base_url)
+    except PoolSourcePolicyError as error:
+        raise HTTPException(409, str(error)) from error
+    site.pool_source_consecutive_failures = 0
+    site.pool_source_quarantined = False
+    site.pool_source_quarantined_at = None
+    site.pool_source_quarantine_reason = None
+    site.pool_source_last_reactivated_at = datetime.now(UTC)
+    site.pool_source_last_reactivated_by = payload.reactivated_by
+    db.commit()
+    return get_site(site_id, db)
+
+
+@router.put("/{site_id}/suggestion-mode", response_model=SiteSuggestionModeState)
 def update_suggestion_mode(
     site_id: int,
     payload: SiteSuggestionModeUpdate,

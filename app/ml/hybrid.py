@@ -1,4 +1,4 @@
-"""Global dense + BM25 ranking with frozen evaluation parameters.
+"""Global dense + BM25 Hybrid ranking with frozen evaluation parameters.
 
 What this actually does, stated plainly, because the stored components claim it:
 
@@ -9,7 +9,7 @@ What this actually does, stated plainly, because the stored components claim it:
 The fusion therefore broadens which candidates are considered; it does not
 improve the ordering of what is delivered. On both measured corpora, the union
 produced no delivered suggestion that dense retrieval contributed alone. See
-`docs/design/global-hybrid-ranking.md` for the measurement.
+`docs/design/global-hybrid-ranking.md` for the contract.
 
 Both halves of the union are filtered by one shared SQL predicate
 (`app.ml.baseline`), so a lexically-retrieved candidate cannot reach an editor
@@ -20,9 +20,10 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, aliased
 
+from app.config import settings
 from app.ml.baseline import (
     eligible_candidate_scores,
     eligible_top_candidates,
@@ -34,6 +35,7 @@ from app.models import (
     ArticleTaxonomy,
     Embedding,
     InternalLink,
+    Site,
     Suggestion,
     Taxonomy,
 )
@@ -128,6 +130,10 @@ def normalized_title(title: str) -> str:
 
 def structured_terms(article: CorpusArticle) -> list[str]:
     """Reproduce the frozen BM25-512 recipe selected by the offline evaluation."""
+    if len(article.content_text) > settings.crawl_max_article_chars:
+        raise ValueError(
+            f"article content exceeded {settings.crawl_max_article_chars} characters"
+        )
     title_terms = tokenize(article.title)
     taxonomy_terms = [
         term for taxonomy_name in article.taxonomy_names for term in tokenize(taxonomy_name)
@@ -207,14 +213,43 @@ class HybridRanker:
 
     @classmethod
     def load(cls, db: Session, *, site_id: int, model: str) -> "HybridRanker":
+        article_rows = list(
+            db.execute(
+                select(
+                    Article.id,
+                    Article.title,
+                    Article.content_text,
+                    Embedding.content_fingerprint,
+                )
+                .join(
+                    Embedding,
+                    (Embedding.article_id == Article.id) & (Embedding.model == model),
+                )
+                .join(Site, Site.id == Article.site_id)
+                .where(
+                    or_(Article.site_id == site_id, Site.platform == "pool"),
+                    Article.is_active.is_(True),
+                )
+                .order_by(Article.id)
+                .limit(settings.analysis_max_corpus_articles + 1)
+            )
+        )
+        if len(article_rows) > settings.analysis_max_corpus_articles:
+            raise ValueError(
+                f"analysis corpus exceeded {settings.analysis_max_corpus_articles} articles"
+            )
+        article_ids = {row.id for row in article_rows}
+
         taxonomy_by_article: dict[int, list[str]] = defaultdict(list)
         for article_id, taxonomy_name in db.execute(
             select(ArticleTaxonomy.article_id, Taxonomy.name)
             .join(Taxonomy, Taxonomy.id == ArticleTaxonomy.taxonomy_id)
             .join(Article, Article.id == ArticleTaxonomy.article_id)
+            .join(Site, Site.id == Article.site_id)
             .where(
-                Article.site_id == site_id,
+                or_(Article.site_id == site_id, Site.platform == "pool"),
                 Article.is_active.is_(True),
+                Article.id.in_(article_ids),
             )
             .order_by(ArticleTaxonomy.article_id, Taxonomy.name)
         ):
@@ -228,23 +263,7 @@ class HybridRanker:
                 content_fingerprint=row.content_fingerprint,
                 taxonomy_names=tuple(taxonomy_by_article[row.id]),
             )
-            for row in db.execute(
-                select(
-                    Article.id,
-                    Article.title,
-                    Article.content_text,
-                    Embedding.content_fingerprint,
-                )
-                .join(
-                    Embedding,
-                    (Embedding.article_id == Article.id) & (Embedding.model == model),
-                )
-                .where(
-                    Article.site_id == site_id,
-                    Article.is_active.is_(True),
-                )
-                .order_by(Article.id)
-            )
+            for row in article_rows
         }
 
         blocked_targets: dict[int, set[int]] = defaultdict(set)
@@ -290,7 +309,7 @@ class HybridRanker:
         if source_id not in self.articles:
             return HybridRanking((), (), 0, 0, 0)
 
-        # Dense half: the SQL predicate has already applied every Hybrid rule.
+        # Dense half: the SQL predicate has already applied every pilot rule.
         dense_rows = eligible_top_candidates(
             db,
             source_id,
@@ -305,13 +324,13 @@ class HybridRanker:
         # pool is not spent on candidates already known to be ineligible. The
         # rules that BM25 cannot see are enforced by the re-check below.
         excluded_ids = (
-            self.blocked_targets.get(source_id, set()) | self._duplicate_ids(source_id) | {source_id}
+            self.blocked_targets.get(source_id, set())
+            | self._duplicate_ids(source_id)
+            | {source_id}
         )
         query_terms = self.terms_by_article[source_id]
         bm25_scores = self.index.score_documents(query_terms, excluded_ids=excluded_ids)
-        ranked_lexical_ids = [
-            target_id for target_id, _score in rank_scores(bm25_scores)
-        ]
+        ranked_lexical_ids = [target_id for target_id, _score in rank_scores(bm25_scores)]
 
         # Build the lexical top-100 *after* authoritative eligibility. Checking
         # only the raw first 100 would let rejected candidates consume the pool:
@@ -322,9 +341,7 @@ class HybridRanker:
         for page_start in range(0, len(ranked_lexical_ids), LEXICAL_POOL_SIZE):
             if len(lexical_ids) >= LEXICAL_POOL_SIZE:
                 break
-            page_ids = ranked_lexical_ids[
-                page_start : page_start + LEXICAL_POOL_SIZE
-            ]
+            page_ids = ranked_lexical_ids[page_start : page_start + LEXICAL_POOL_SIZE]
             lexical_only_ids = [
                 target_id for target_id in page_ids if target_id not in semantic_scores
             ]
@@ -337,9 +354,7 @@ class HybridRanker:
                     duplicate_similarity_threshold,
                 )
             )
-            lexical_ids.extend(
-                target_id for target_id in page_ids if target_id in semantic_scores
-            )
+            lexical_ids.extend(target_id for target_id in page_ids if target_id in semantic_scores)
         lexical_ids = lexical_ids[:LEXICAL_POOL_SIZE]
 
         fused = weighted_rrf_scores(dense_ids, lexical_ids)
@@ -370,8 +385,9 @@ class HybridRanker:
             for target_id in final_ids
         )
 
-        # Offline comparisons use what the fallback path would really write,
-        # which is the untouched cosine query — not Hybrid's stricter dense pool.
+        # The shadow comparison must be against what the baseline path would
+        # really have written, which is the untouched baseline query — not the
+        # Hybrid's stricter dense pool.
         baseline_candidates: tuple[RankedCandidate, ...] = ()
         if include_baseline:
             baseline_candidates = tuple(

@@ -9,17 +9,27 @@ from app.schemas.job import JobAccepted
 from app.schemas.site import IngestionRunOut
 from app.services.ingestion_service import latest_run
 from app.services.job_service import DuplicateJobError, enqueue_job
+from app.services.pool_source_policy import PoolSourcePolicyError, require_approved_pool_source
 from app.tasks.ingestion import ingest_site
+from app.tasks.ingestion import ingest_pool_site
 
 router = APIRouter(prefix="/sites", tags=["ingestion"])
 
 
 @router.post("/{site_id}/ingest", status_code=202, response_model=JobAccepted)
 def trigger_ingestion(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    if db.get(Site, site_id) is None:
+    site = db.get(Site, site_id)
+    if site is None:
         raise HTTPException(404, f"site {site_id} not found")
+    task = ingest_site
+    if site.platform == "pool":
+        try:
+            require_approved_pool_source(site)
+        except PoolSourcePolicyError as error:
+            raise HTTPException(409, str(error)) from error
+        task = ingest_pool_site
     try:
-        run = enqueue_job(db, site_id, "ingestion", ingest_site, job_timeout=3600)
+        run = enqueue_job(db, site_id, "ingestion", task, job_timeout=3600)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)

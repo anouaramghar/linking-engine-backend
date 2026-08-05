@@ -1,4 +1,4 @@
-"""Cosine fallback + review lifecycle — hand-crafted embeddings, no torch needed."""
+"""Baseline cosine + review lifecycle — hand-crafted embeddings, no torch needed."""
 
 import hashlib
 from collections import Counter
@@ -31,19 +31,6 @@ def valid_dimension_probe(monkeypatch):
         "app.ml.embeddings.encode",
         lambda texts: [_vec(0) for _text in texts],
     )
-
-
-@pytest.fixture(autouse=True)
-def use_cosine_safety_fallback(monkeypatch):
-    """Keep lifecycle tests independent of the optional BM25 runtime."""
-    monkeypatch.setattr(
-        "app.services.suggestion_service.HybridRanker.load",
-        lambda *_args, **_kwargs: None,
-    )
-    # Several lifecycle fixtures intentionally use identical vectors. Production
-    # uses 0.99; this test-only value keeps those synthetic pairs eligible while
-    # still exercising the shared Hybrid/fallback predicate.
-    monkeypatch.setattr(settings, "suggestion_duplicate_similarity_threshold", 1.01)
 
 
 def _mix(a: int, b: int, wa: float, wb: float) -> list[float]:
@@ -82,14 +69,21 @@ def _make_articles(db, site, vectors):
 
 def test_baseline_suggestions(db, site):
     # a0 and a1 nearly identical, a2 close to both, a3 orthogonal (off-topic)
-    a = _make_articles(db, site, [
-        _vec(0), _mix(0, 1, 0.98, 0.2), _mix(0, 1, 0.7, 0.7), _vec(2),
-    ])
+    a = _make_articles(
+        db,
+        site,
+        [
+            _vec(0),
+            _mix(0, 1, 0.98, 0.2),
+            _mix(0, 1, 0.7, 0.7),
+            _vec(2),
+        ],
+    )
     # a0 -> a1 already linked: must NOT be suggested again
     db.add(InternalLink(source_article_id=a[0].id, target_article_id=a[1].id))
     db.commit()
 
-    result = generate_suggestions(site.id)
+    result = generate_suggestions(site.id, ranking_mode_override="shadow")
     assert result["articles_encoded"] == 0  # all pre-embedded, no model download
 
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
@@ -111,13 +105,10 @@ def test_baseline_suggestions(db, site):
     assert best.score > 0.9
 
     # max 5 per article (A4)
-    assert all(
-        len(v) <= settings.hybrid_max_suggestions_per_article
-        for v in by_source.values()
-    )
+    assert all(len(v) <= settings.hybrid_max_suggestions_per_article for v in by_source.values())
 
     # re-run: no duplicates
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
     total = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     assert len(total) == len(suggestions)
 
@@ -174,8 +165,8 @@ def test_analysis_uses_only_current_articles_and_links(db, site):
 def test_reanalysis_respects_total_suggestion_cap(db, site):
     _make_articles(db, site, [_vec(0) for _ in range(7)])
 
-    first = generate_suggestions(site.id)
-    second = generate_suggestions(site.id)
+    first = generate_suggestions(site.id, ranking_mode_override="shadow")
+    second = generate_suggestions(site.id, ranking_mode_override="shadow")
 
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     counts = Counter(suggestion.source_article_id for suggestion in suggestions)
@@ -191,12 +182,10 @@ def test_rejected_and_applied_suggestions_free_active_quota(db, site):
         [_vec(0) for _ in range(settings.hybrid_max_suggestions_per_article + 3)],
     )
     source_id = articles[0].id
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
 
     original = db.scalars(
-        select(Suggestion)
-        .where(Suggestion.source_article_id == source_id)
-        .order_by(Suggestion.id)
+        select(Suggestion).where(Suggestion.source_article_id == source_id).order_by(Suggestion.id)
     ).all()
     assert len(original) == settings.hybrid_max_suggestions_per_article
     rejected, applied = original[:2]
@@ -206,12 +195,10 @@ def test_rejected_and_applied_suggestions_free_active_quota(db, site):
     original_ids = {suggestion.id for suggestion in original}
     db.commit()
 
-    result = generate_suggestions(site.id)
+    result = generate_suggestions(site.id, ranking_mode_override="shadow")
 
     suggestions = db.scalars(
-        select(Suggestion)
-        .where(Suggestion.source_article_id == source_id)
-        .order_by(Suggestion.id)
+        select(Suggestion).where(Suggestion.source_article_id == source_id).order_by(Suggestion.id)
     ).all()
     active = [
         suggestion
@@ -233,12 +220,10 @@ def test_expired_suggestion_frees_source_quota(db, site):
         site,
         [_vec(0) for _ in range(settings.hybrid_max_suggestions_per_article + 2)],
     )
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
     source = articles[0]
     original = db.scalars(
-        select(Suggestion)
-        .where(Suggestion.source_article_id == source.id)
-        .order_by(Suggestion.id)
+        select(Suggestion).where(Suggestion.source_article_id == source.id).order_by(Suggestion.id)
     ).all()
     expired = original[0]
     inactive_target = db.get(Article, expired.target_article_id)
@@ -255,7 +240,7 @@ def test_expired_suggestion_frees_source_quota(db, site):
     db.commit()
 
     assert db.get(Suggestion, expired.id).status == "expired"
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
 
     source_suggestions = db.scalars(
         select(Suggestion).where(Suggestion.source_article_id == source.id)
@@ -274,7 +259,7 @@ def test_expired_suggestion_frees_source_quota(db, site):
 
 def test_expired_pair_is_suggested_again_after_article_reactivation(db, site):
     source, target = _make_articles(db, site, [_vec(0), _vec(0)])
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
     original = db.scalar(
         select(Suggestion).where(
             Suggestion.source_article_id == source.id,
@@ -302,7 +287,7 @@ def test_expired_pair_is_suggested_again_after_article_reactivation(db, site):
     db.commit()
     assert target.is_active is True
 
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
 
     matching = db.scalars(
         select(Suggestion)
@@ -319,7 +304,7 @@ def test_expired_pair_is_suggested_again_after_article_reactivation(db, site):
 
 def test_rejected_source_target_pair_is_not_recreated(db, site):
     source, target = _make_articles(db, site, [_vec(0), _vec(0)])
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
     suggestion = db.scalar(
         select(Suggestion).where(
             Suggestion.source_article_id == source.id,
@@ -329,7 +314,7 @@ def test_rejected_source_target_pair_is_not_recreated(db, site):
     suggestion.status = "rejected"
     db.commit()
 
-    result = generate_suggestions(site.id)
+    result = generate_suggestions(site.id, ranking_mode_override="shadow")
 
     matching = db.scalars(
         select(Suggestion).where(
@@ -366,9 +351,10 @@ def test_concurrent_analysis_respects_total_suggestion_cap(db, site):
 
     event.listen(engine, "after_cursor_execute", synchronize_first_candidate_queries)
     try:
+
         def analyze(site_id):
             worker_entries.wait(timeout=2)
-            return generate_suggestions(site_id)
+            return generate_suggestions(site_id, ranking_mode_override="shadow")
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(analyze, [site.id, site.id]))
@@ -384,7 +370,7 @@ def test_concurrent_analysis_respects_total_suggestion_cap(db, site):
 
 def test_review_lifecycle(client, db, site):
     _make_articles(db, site, [_vec(0), _mix(0, 1, 0.9, 0.3)])
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     first, second = suggestions[0], suggestions[1]
 
@@ -417,7 +403,7 @@ def test_review_lifecycle(client, db, site):
 def test_review_can_be_undone(client, db, site):
     """An editor can return a reviewed suggestion to the pending queue."""
     _make_articles(db, site, [_vec(0), _mix(0, 1, 0.9, 0.3)])
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     first, second = suggestions[0], suggestions[1]
 
@@ -444,9 +430,7 @@ def test_review_can_be_undone(client, db, site):
     assert all(s.reviewed_at is None for s in restored)
 
     # a published suggestion still cannot be walked back
-    db.execute(
-        update(Suggestion).where(Suggestion.id == first.id).values(status="applied")
-    )
+    db.execute(update(Suggestion).where(Suggestion.id == first.id).values(status="applied"))
     db.commit()
     resp = client.put(f"/api/v1/suggestions/{first.id}", json={"status": "pending"})
     assert resp.status_code == 409
@@ -460,7 +444,7 @@ def test_bulk_review_applies_the_rows_it_can_and_reports_the_rest(client, db, si
     instead of failing whole.
     """
     _make_articles(db, site, [_vec(0), _mix(0, 1, 0.9, 0.3)])
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
     suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
     first, second = suggestions[0], suggestions[1]
 
@@ -497,7 +481,7 @@ def test_bulk_review_round_trips_do_not_scale_with_the_batch(client, db, site):
     one is 1000 round trips inside a single synchronous request.
     """
     _make_articles(db, site, [_vec(0), _mix(0, 1, 0.9, 0.3), _mix(0, 1, 0.8, 0.4)])
-    generate_suggestions(site.id)
+    generate_suggestions(site.id, ranking_mode_override="shadow")
     ids = [s.id for s in db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()]
     assert len(ids) > 2, "need a batch large enough for per-row work to show up"
 
@@ -528,7 +512,10 @@ def test_bulk_review_round_trips_do_not_scale_with_the_batch(client, db, site):
 
 def test_list_endpoints_reject_an_unbounded_limit(client, site):
     """A single request must not be able to ask for the whole table."""
-    assert client.get(f"/api/v1/suggestions/{site.id}", params={"limit": 10_000_000}).status_code == 422
+    assert (
+        client.get(f"/api/v1/suggestions/{site.id}", params={"limit": 10_000_000}).status_code
+        == 422
+    )
     assert client.get("/api/v1/sites", params={"limit": 10_000_000}).status_code == 422
     assert client.get(f"/api/v1/suggestions/{site.id}", params={"offset": -1}).status_code == 422
 
