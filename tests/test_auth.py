@@ -41,8 +41,9 @@ def test_api_key_required_outside_development():
         Settings(environment="production", api_key="", _env_file=None)
 
 
-def test_operator_key_can_access_protected_routes(client, monkeypatch):
+def test_operator_key_can_access_protected_routes(monkeypatch):
     monkeypatch.setattr(settings, "operator_api_keys", {"alice": SecretStr("alice-key")})
+    client = _real_auth_client()
 
     assert client.get("/api/v1/sites").status_code == 401
     assert (

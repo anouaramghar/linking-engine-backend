@@ -154,7 +154,7 @@ def engine_is_bound_to_the_test_database():
 def disable_api_key(monkeypatch):
     # Keep unrelated endpoint tests focused on their own behavior while auth
     # tests remove this override and exercise the real dependency.
-    monkeypatch.setattr(settings, "api_key", "test-key")
+    monkeypatch.setattr(settings, "api_key", "")
     monkeypatch.setattr(settings, "operator_api_keys", {})
     monkeypatch.setattr(
         settings,

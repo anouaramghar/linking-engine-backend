@@ -598,6 +598,60 @@ def test_pool_approval_identity_comes_from_operator_key(client, db, monkeypatch)
         _delete_audit_events(db, site_id)
 
 
+def test_revoking_pool_source_expires_active_customer_suggestions(client, db):
+    pool = _pool(db)
+    customer = Site(
+        name="Customer",
+        base_url=f"https://customer-{uuid.uuid4().hex[:8]}.example.com",
+        platform="html",
+    )
+    db.add(customer)
+    db.flush()
+    source = Article(
+        site_id=customer.id,
+        url=f"{customer.base_url}/source",
+        title="Source",
+        content_text="source",
+    )
+    target = Article(
+        site_id=pool.id,
+        url=f"https://example.com/{uuid.uuid4().hex}",
+        title="Pool target",
+        content_text="target",
+    )
+    db.add_all([source, target])
+    db.flush()
+    suggestions = [
+        Suggestion(
+            site_id=customer.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="hybrid_bm25",
+            score=0.8,
+            status=status,
+        )
+        for status in ("pending", "approved", "rejected")
+    ]
+    db.add_all(suggestions)
+    db.commit()
+    try:
+        response = client.delete(f"/api/v1/sites/{pool.id}/pool-source/approval")
+        assert response.status_code == 200, response.text
+        for suggestion in suggestions:
+            db.refresh(suggestion)
+        assert [suggestion.status for suggestion in suggestions] == [
+            "expired",
+            "expired",
+            "rejected",
+        ]
+    finally:
+        site_id = pool.id
+        db.delete(pool)
+        db.delete(customer)
+        db.commit()
+        _delete_audit_events(db, site_id)
+
+
 def test_generic_service_key_cannot_supply_operator_identity(client, db, monkeypatch):
     monkeypatch.setattr(settings, "api_key", "service-key")
     response = client.post(
@@ -627,6 +681,37 @@ def test_generic_service_key_cannot_supply_operator_identity(client, db, monkeyp
 
 def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
     pool = _pool(db)
+    customer = Site(
+        name="Customer",
+        base_url=f"https://customer-{uuid.uuid4().hex[:8]}.example.com",
+        platform="html",
+    )
+    db.add(customer)
+    db.flush()
+    source = Article(
+        site_id=customer.id,
+        url=f"{customer.base_url}/source",
+        title="Source",
+        content_text="source",
+    )
+    target = Article(
+        site_id=pool.id,
+        url=f"https://example.com/{uuid.uuid4().hex}",
+        title="Pool target",
+        content_text="target",
+    )
+    db.add_all([source, target])
+    db.flush()
+    suggestion = Suggestion(
+        site_id=customer.id,
+        source_article_id=source.id,
+        target_article_id=target.id,
+        method="hybrid_bm25",
+        score=0.8,
+        status="pending",
+    )
+    db.add(suggestion)
+    db.commit()
     monkeypatch.setattr(settings, "pool_quarantine_failure_threshold", 2)
     try:
         ingestion_task._record_pool_ingestion_failure(pool.id, RuntimeError("feed down"))
@@ -636,6 +721,8 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
         assert pool.pool_source_consecutive_failures == 2
         assert pool.pool_source_quarantined is True
         assert pool.pool_source_quarantine_reason == "still down"
+        db.refresh(suggestion)
+        assert suggestion.status == "expired"
         event = db.scalar(
             select(PoolSourceAuditEvent).where(PoolSourceAuditEvent.site_id == pool.id)
         )
@@ -648,6 +735,7 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
     finally:
         site_id = pool.id
         db.delete(pool)
+        db.delete(customer)
         db.commit()
         _delete_audit_events(db, site_id)
 
@@ -934,6 +1022,53 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
         db.delete(internal)
         db.delete(source)
         db.delete(internal_target)
+        db.delete(pool)
+        db.commit()
+
+
+@pytest.mark.parametrize(
+    ("approved", "quarantined"),
+    [(False, False), (True, True)],
+)
+def test_hybrid_excludes_disabled_pool_sources(
+    db, site, monkeypatch, approved, quarantined
+):
+    monkeypatch.setattr(
+        "app.ml.embeddings.encode",
+        lambda texts: [_vector(1.0) for _text in texts],
+    )
+    pool = _pool(db, approved=approved)
+    pool.pool_source_quarantined = quarantined
+    source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/{uuid.uuid4().hex}",
+        title="Tomato guide",
+        content_text="tomato canning safety",
+    )
+    target = Article(
+        site_id=pool.id,
+        url=f"https://example.com/{uuid.uuid4().hex}",
+        title="Tomato safety",
+        content_text="tomato canning safety details",
+    )
+    db.add_all([source, target])
+    db.flush()
+    for article, vector in ((source, _vector(1.0)), (target, _vector(0.8, 0.6))):
+        db.add(
+            Embedding(
+                article_id=article.id,
+                model=settings.embedding_model,
+                vector=vector,
+                content_fingerprint=_fingerprint(article.title, article.content_text),
+                input_recipe_version=1,
+                vector_size=EMBEDDING_DIM,
+            )
+        )
+    db.commit()
+    try:
+        result = generate_suggestions(site.id)
+        assert result["suggestions_created"] == 0
+    finally:
         db.delete(pool)
         db.commit()
 

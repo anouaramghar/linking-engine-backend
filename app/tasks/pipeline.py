@@ -30,6 +30,18 @@ def _mark_stage_failure(pipeline_site_run_id: int, stage: str, error: Exception)
         db.commit()
 
 
+def _require_pipeline_site(pipeline_site_run_id: int, site_id: int) -> None:
+    with SessionLocal() as db:
+        item = db.get(PipelineSiteRun, pipeline_site_run_id)
+        if item is None:
+            raise ValueError(f"pipeline site run {pipeline_site_run_id} not found")
+        if item.site_id != site_id:
+            raise ValueError(
+                f"pipeline site run {pipeline_site_run_id} belongs to site "
+                f"{item.site_id}, not site {site_id}"
+            )
+
+
 def ingest_pipeline_site(
     site_id: int,
     job_run_id: int | None = None,
@@ -37,6 +49,7 @@ def ingest_pipeline_site(
 ) -> dict:
     if batch_site_run_id is None:
         raise ValueError("batch_site_run_id is required")
+    _require_pipeline_site(batch_site_run_id, site_id)
     with SessionLocal() as db:
         update_pipeline_site(
             db,
@@ -95,6 +108,7 @@ def analyze_pipeline_site(
 ) -> dict:
     if batch_site_run_id is None:
         raise ValueError("batch_site_run_id is required")
+    _require_pipeline_site(batch_site_run_id, site_id)
     with SessionLocal() as db:
         update_pipeline_site(
             db,

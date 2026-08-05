@@ -1,7 +1,7 @@
 """encrypt WordPress application passwords at rest
 
 Revision ID: 9c2a7e4f1b60
-Revises: d7a4c2e9f018
+Revises: c5f3a91b7d24
 Create Date: 2026-08-03 12:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from app.security.credentials import encrypt_credential, is_encrypted_credential
 
 
 revision = "9c2a7e4f1b60"
-down_revision = "d7a4c2e9f018"
+down_revision = "c5f3a91b7d24"
 branch_labels = None
 depends_on = None
 

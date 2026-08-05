@@ -161,6 +161,26 @@ def test_ingestion_failure_marks_site_and_batch_failed(db, monkeypatch):
     _cleanup(db, batch.id, [site.id])
 
 
+def test_pipeline_worker_rejects_a_site_run_from_another_site(db):
+    first = _site(db, "ownership-first")
+    second = _site(db, "ownership-second")
+    batch = PipelineBatch()
+    db.add(batch)
+    db.flush()
+    item = PipelineSiteRun(batch_id=batch.id, site_id=first.id)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+
+    with pytest.raises(ValueError, match=f"belongs to site {first.id}, not site {second.id}"):
+        pipeline_tasks.ingest_pipeline_site(second.id, batch_site_run_id=item.id)
+
+    db.refresh(item)
+    assert item.status == "queued"
+    assert item.stage == "ingestion"
+    _cleanup(db, batch.id, [first.id, second.id])
+
+
 def test_retry_restarts_only_the_failed_stage(client, db, monkeypatch):
     site = _site(db, "retry")
     batch = PipelineBatch(status="failed")

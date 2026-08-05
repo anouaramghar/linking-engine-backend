@@ -38,7 +38,12 @@ JOIN articles a2 ON a2.id = e2.article_id
 JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
-  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
+  AND (
+      a2.site_id = a1.site_id
+      OR (
+          candidate_site.platform = 'pool'
+          AND candidate_site.pool_source_approved IS TRUE
+          AND candidate_site.pool_source_quarantined IS FALSE))
   AND a2.is_active IS TRUE
   {_LOW_VALUE_TARGET_SQL}
   AND NOT EXISTS (          -- already linked (editorial filter)
@@ -69,7 +74,12 @@ JOIN articles a2 ON a2.id = e2.article_id
 JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
-  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
+  AND (
+      a2.site_id = a1.site_id
+      OR (
+          candidate_site.platform = 'pool'
+          AND candidate_site.pool_source_approved IS TRUE
+          AND candidate_site.pool_source_quarantined IS FALSE))
   AND a2.is_active IS TRUE
   {_LOW_VALUE_TARGET_SQL}
   AND (                     -- identical inputs are duplicate pages, not link candidates
