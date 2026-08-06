@@ -81,6 +81,11 @@ def get_limited_http_response(
         headers = dict(response.headers)
         for header in ("content-encoding", "content-length", "transfer-encoding"):
             headers.pop(header, None)
+        # httpx re-encodes header values as ASCII when constructing a Response,
+        # and a CDN can send non-ASCII bytes (wordpress.org's `x-olaf: ☄`).
+        # Losing such a header costs nothing here; failing the whole crawl costs
+        # a site and a job retry.
+        headers = {k: v for k, v in headers.items() if v.isascii()}
         return httpx.Response(
             response.status_code,
             headers=headers,
