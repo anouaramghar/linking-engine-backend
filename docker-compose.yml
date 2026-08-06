@@ -83,6 +83,19 @@ services:
     volumes:
       - hf_cache:/home/linkmesh/.cache/huggingface
 
+  telegram-bot:
+    <<: *app-service
+    # Long-polls Telegram for dashboard logins. Exactly one replica: two
+    # concurrent getUpdates calls on one token make Telegram reject both with a
+    # 409, so scaling this is a way to break login rather than speed it up.
+    command: ["python", "-m", "app.telegram_bot"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:
   redisdata:
