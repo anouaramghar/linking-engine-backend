@@ -2,12 +2,14 @@ from collections.abc import Iterator
 from secrets import compare_digest
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Cookie, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Site
+from app.services import dashboard_auth
+from app.services.dashboard_auth import SESSION_COOKIE
 from app.services.authorization import (
     Principal,
     authenticate_api_key,
@@ -69,15 +71,27 @@ def require_site_read(
 def require_operator_identity(
     principal: Annotated[Principal, Depends(require_api_key)],
     x_api_key: Annotated[str | None, Header()] = None,
+    session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    db: Session = Depends(get_db),
 ) -> str:
     """Human identity for pool audit actions.
 
-    An operator-mapped env key (matching the raw header) is the primary path.
-    Database admin keys and an operator-key principal are accepted as fallbacks
-    so key-based deployments can still approve pool sources; the legacy service
-    key and tenant keys cannot. With no authentication configured at all, the
-    development box signs as ``local-development``.
+    A logged-in dashboard session is the primary path: it names a person rather
+    than a shared credential, which is the entire point of an audit trail. It is
+    also what lets the dashboard perform these actions at all — the proxy
+    attaches the legacy service key, which is rejected below, so before login
+    existed every pool approval from the UI failed with a 401.
+
+    An operator-mapped env key (matching the raw header) is next, then database
+    admin keys and an operator-key principal, so key-based deployments and
+    scripts still work; the legacy service key and tenant keys cannot. With no
+    authentication configured at all, the development box signs as
+    ``local-development``.
     """
+    user = dashboard_auth.verify_session(db, session_token)
+    if user is not None:
+        return f"telegram:{user.telegram_id}"
+
     operator_id = _operator_for_key(x_api_key)
     if operator_id is not None:
         return operator_id

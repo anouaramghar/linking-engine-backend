@@ -169,6 +169,25 @@ def test_revoking_someone_ends_their_open_session(client, db):
     assert other.get("/api/v1/auth/session").status_code == 401
 
 
+def test_session_supplies_the_operator_identity_the_shared_key_cannot(
+    client, db, site, monkeypatch
+):
+    """The live 401 this feature exists to fix.
+
+    The proxy attaches the shared service key, which `require_operator_identity`
+    rejects, so every pool approval from the dashboard failed. A session now
+    answers for a person instead. 409 here means auth passed and the route
+    reached its own "not a pool source" guard.
+    """
+    monkeypatch.setattr(settings, "api_key", "sekret")  # defeat the dev fallback
+
+    anonymous = TestClient(app)
+    assert anonymous.post(f"/api/v1/sites/{site.id}/pool-source/reactivate").status_code == 401
+
+    _login_as(client, db, telegram_id=4242)
+    assert client.post(f"/api/v1/sites/{site.id}/pool-source/reactivate").status_code == 409
+
+
 def test_opening_the_login_router_does_not_open_the_rest(monkeypatch):
     """The regression that would matter most: login routes are unauthenticated,
     and everything else must stay behind the key."""

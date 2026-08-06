@@ -26,6 +26,10 @@ from app.models import DashboardSession, DashboardUser, LoginNonce
 
 logger = logging.getLogger(__name__)
 
+#: Lives here rather than in the route module so `app.api.deps` can read the
+#: cookie without importing a router that imports it back.
+SESSION_COOKIE = "linkmesh_session"
+
 _NONCE_BYTES = 24
 _SESSION_TOKEN_BYTES = 32
 

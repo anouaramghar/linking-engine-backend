@@ -24,10 +24,9 @@ from app.schemas.dashboard import (
     SessionOut,
 )
 from app.services import dashboard_auth
+from app.services.dashboard_auth import SESSION_COOKIE
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-SESSION_COOKIE = "linkmesh_session"
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
