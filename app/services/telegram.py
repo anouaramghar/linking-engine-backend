@@ -19,8 +19,12 @@ logger = logging.getLogger(__name__)
 API_BASE = "https://api.telegram.org"
 
 #: Telegram holds the request open until an update arrives. Longer polls mean
-#: fewer round trips; the ceiling is the read timeout below.
+#: fewer round trips; the HTTP read timeout has to clear it, see `_HTTP_MARGIN`.
 POLL_TIMEOUT_SECONDS = 25
+
+#: How much longer the HTTP read may take than the poll it carries. Without the
+#: margin every long poll aborts on the client side exactly as it succeeds.
+_HTTP_MARGIN = 10
 
 
 class TelegramError(RuntimeError):
@@ -28,15 +32,29 @@ class TelegramError(RuntimeError):
 
 
 class TelegramClient:
-    def __init__(self, token: str, *, base_url: str = API_BASE) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        base_url: str = API_BASE,
+        http: httpx.Client | None = None,
+    ) -> None:
         self._token = token
         self._base_url = base_url
+        # One client, so consecutive long polls reuse the connection. Tests
+        # inject one carrying a mock transport.
+        self._http = http or httpx.Client()
 
     def _url(self, method: str) -> str:
         return f"{self._base_url}/bot{self._token}/{method}"
 
-    def _call(self, method: str, *, timeout: float, **payload) -> object:
-        response = httpx.post(self._url(method), json=payload, timeout=timeout)
+    def _call(self, method: str, payload: dict, *, http_timeout: float) -> object:
+        """Payload is passed as a dict, not **kwargs.
+
+        Telegram's own ``timeout`` field is part of the payload for getUpdates,
+        and as a keyword it collided with this function's HTTP timeout.
+        """
+        response = self._http.post(self._url(method), json=payload, timeout=http_timeout)
         response.raise_for_status()
         body = response.json()
         if not body.get("ok"):
@@ -54,12 +72,15 @@ class TelegramClient:
         payload: dict[str, object] = {"timeout": timeout, "allowed_updates": ["message"]}
         if offset is not None:
             payload["offset"] = offset
-        # Read timeout must outlast the long poll itself or every poll aborts.
-        result = self._call("getUpdates", timeout=timeout + 10, **payload)
+        result = self._call("getUpdates", payload, http_timeout=timeout + _HTTP_MARGIN)
         return list(result) if isinstance(result, list) else []
 
-    def send_message(self, chat_id: int, text: str, *, timeout: float = 10.0) -> None:
-        self._call("sendMessage", timeout=timeout, chat_id=chat_id, text=text)
+    def send_message(self, chat_id: int, text: str, *, http_timeout: float = 10.0) -> None:
+        self._call("sendMessage", {"chat_id": chat_id, "text": text}, http_timeout=http_timeout)
+
+    def get_me(self) -> dict:
+        result = self._call("getMe", {}, http_timeout=10.0)
+        return result if isinstance(result, dict) else {}
 
 
 def client_from_settings() -> TelegramClient | None:

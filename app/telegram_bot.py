@@ -160,8 +160,17 @@ def run(
     logger.info("telegram_bot_stopped")
 
 
-def main() -> int:
+def configure_logging() -> None:
+    """Separate from ``main`` so it is testable without starting a poll loop."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # httpx logs every request line at INFO, and the bot token sits in the URL
+    # path — that puts the credential in plaintext in the container logs. The
+    # request line tells us nothing the bot does not already log itself.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def main() -> int:
+    configure_logging()
     client = client_from_settings()
     if client is None:
         logger.error(
