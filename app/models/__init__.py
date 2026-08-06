@@ -1,6 +1,7 @@
 from app.db import Base
 from app.models.alert import Alert
 from app.models.article import Article, ArticleTaxonomy, Embedding, Taxonomy
+from app.models.dashboard import DashboardSession, DashboardUser, LoginNonce
 from app.models.job import JobRun
 from app.models.link import InternalLink
 from app.models.pool_audit import PoolSourceAuditEvent
@@ -15,10 +16,13 @@ __all__ = [
     "ApiKey",
     "Article",
     "ArticleTaxonomy",
+    "DashboardSession",
+    "DashboardUser",
     "Embedding",
     "IngestionRun",
     "InternalLink",
     "JobRun",
+    "LoginNonce",
     "PoolSourceAuditEvent",
     "PipelineBatch",
     "PipelineSiteRun",

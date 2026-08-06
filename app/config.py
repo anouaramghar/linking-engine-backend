@@ -25,6 +25,25 @@ class Settings(BaseSettings):
     # every non-dev environment before minting tenant keys.
     api_key_pepper: str = ""
 
+    # Dashboard login via Telegram; see docs/design/dashboard-authentication.md.
+    # The Login Widget is deliberately not used: it needs a publicly routable
+    # registered domain, and this deployment sits behind an IP restriction. The
+    # bot deep-link flow needs only outbound access to api.telegram.org.
+    # An empty token disables dashboard login; the proxy then has no gate to
+    # consult, so it must not be deployed with auth_request enabled.
+    telegram_bot_token: SecretStr | None = None
+    # Used to build the t.me deep link the browser shows. No leading '@'.
+    telegram_bot_username: str = ""
+    # Pre-approved Telegram user ID allowed to approve everyone else. Without it
+    # the first login has nobody to admit it and the dashboard is unreachable.
+    dashboard_bootstrap_admin_id: int | None = None
+    # Sliding: a request within the window extends it. 12 hours covers a working
+    # day without forcing a re-login over lunch.
+    dashboard_session_ttl_minutes: int = Field(default=720, gt=0, le=43_200)
+    # Long enough to switch to Telegram and press Start, short enough that an
+    # abandoned nonce is not a standing invitation.
+    dashboard_login_nonce_ttl_seconds: int = Field(default=300, gt=0, le=3_600)
+
     # Fernet key used to encrypt WordPress application passwords at rest.
     credential_encryption_key: SecretStr | None = None
     # Comma-separated previous Fernet keys accepted only for decryption during rotation.
