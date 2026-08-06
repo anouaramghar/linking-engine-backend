@@ -191,8 +191,16 @@ finish() {
 # ──────────────────────────────────────────────────────────────────────────
 
 # Run from the backend repo root, so .env and docker-compose.yml resolve
-# whatever directory the wizard was invoked from.
-cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+# whatever directory the wizard was invoked from. Backslashes are normalized
+# first: launched from PowerShell the path arrives Windows-style, and `dirname`
+# would find no separator and silently answer ".", putting .env in the wrong
+# place.
+_repo_root() {
+  local src="${BASH_SOURCE[0]}"
+  src="${src//\\//}"
+  (cd "$(dirname "$src")/.." && pwd)
+}
+cd "$(_repo_root)" || exit 1
 
 TOTAL_STAGES=4
 TOTAL_MINUTES=7
