@@ -41,7 +41,33 @@ class SuggestionOut(BaseModel):
     score_components: dict | None = None
     status: str
     anchor_text: str | None
+    publish_outcome: str | None = None
+    publish_attempts: int = 0
+    publish_error: str | None = None
     created_at: datetime
+
+
+class PlacementOut(BaseModel):
+    """Where in the source article the link would go.
+
+    Generated on demand rather than during analysis, so this is not part of
+    `SuggestionOut` — a queue page must not pay for a model call per row.
+
+    `found` is the field to branch on. A null `placement_context` with
+    `found=false` is a real answer: the model read the article and no passage
+    fit. The client renders that, not a spinner.
+    """
+
+    suggestion_id: int
+    found: bool
+    #: A passage copied verbatim from the source article, or null.
+    placement_context: str | None
+    #: A contiguous substring of `placement_context`, so a client can highlight
+    #: it by searching the context rather than by trusting an offset.
+    anchor_text: str | None
+    #: Which model produced this, for traceability once several have run.
+    llm_model: str | None
+    generated_at: datetime
 
 
 # 'pending' lets an editor undo a decision; 'applied' is set exclusively by the
@@ -92,6 +118,10 @@ class SuggestionCounts(BaseModel):
     applying: int = 0
     applied: int = 0
     expired: int = 0
+    # Quarantined after repeated publication failures. Counted in `total` because
+    # the list endpoint returns these rows, and a chip the editor cannot see is
+    # how a stuck suggestion stays stuck.
+    failed: int = 0
     total: int = 0
 
 

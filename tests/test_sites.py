@@ -36,8 +36,20 @@ def test_site_crud(client):
     assert client.get(f"/api/v1/sites/{site_id}").status_code == 200
     assert any(s["id"] == site_id for s in client.get("/api/v1/sites").json())
 
-    # delete, then 404
-    assert client.delete(f"/api/v1/sites/{site_id}").status_code == 204
+    # delete requires an exact name confirmation, then 404
+    bare = client.delete(f"/api/v1/sites/{site_id}")
+    assert bare.status_code == 422
+    wrong = client.delete(
+        f"/api/v1/sites/{site_id}", params={"confirm_name": "not-the-name"}
+    )
+    assert wrong.status_code == 409
+    assert client.get(f"/api/v1/sites/{site_id}").status_code == 200
+    assert (
+        client.delete(
+            f"/api/v1/sites/{site_id}", params={"confirm_name": payload["name"]}
+        ).status_code
+        == 204
+    )
     assert client.get(f"/api/v1/sites/{site_id}").status_code == 404
 
 

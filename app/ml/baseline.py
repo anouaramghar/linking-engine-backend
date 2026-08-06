@@ -14,12 +14,47 @@ exactly the same rules as the dense candidates it competes with, rather than a
 subset someone remembered to reimplement.
 """
 
+import re
 from collections.abc import Sequence
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
-TOP_K_SQL = text("""
+from app.config import settings
+
+# Navigational and transactional targets, from settings rather than literals so
+# a non-English site can supply its own without a code change or a migration.
+# Both halves are bound parameters: the terms are operator-supplied, and the URL
+# rule is a regex, so neither may be pasted into the statement text. An empty
+# list disables its half — `<> ALL('{}')` is already true for every row, and the
+# empty-pattern test short-circuits before the match.
+_LOW_VALUE_TARGET_SQL = """
+  AND lower(btrim(a2.title)) <> ALL(CAST(:low_value_titles AS text[]))
+  AND (:low_value_url_pattern = '' OR lower(a2.url) !~ :low_value_url_pattern)
+"""
+
+
+def low_value_target_params() -> dict[str, object]:
+    """The bound values behind `_LOW_VALUE_TARGET_SQL`.
+
+    The slugs become one alternation rather than one regex per slug: this runs
+    on the whole embedding join, before the top-k limit, so the row cost of the
+    rule matters. Each slug is escaped — a term like `c++` is a literal here,
+    not a quantifier that would fail the match or the parse.
+    """
+    slugs = "|".join(
+        re.escape(slug.strip().lower())
+        for slug in settings.low_value_target_url_slugs
+        if slug.strip()
+    )
+    titles = [title.strip().lower() for title in settings.low_value_target_titles]
+    return {
+        "low_value_titles": titles,
+        "low_value_url_pattern": rf"(^|/)({slugs})(/|[?#]|$)" if slugs else "",
+    }
+
+
+TOP_K_SQL = text(f"""
 SELECT a2.id AS target_id,
        1 - (e2.vector <=> e1.vector) AS score
 FROM embeddings e1
@@ -29,8 +64,15 @@ JOIN articles a2 ON a2.id = e2.article_id
 JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
-  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
+  AND (
+      a2.site_id = a1.site_id
+      OR (
+          candidate_site.platform = 'pool'
+          AND candidate_site.pool_source_approved IS TRUE
+          AND candidate_site.pool_source_quarantined IS FALSE))
   AND a2.is_active IS TRUE
+  AND (1 - (e2.vector <=> e1.vector)) >= :minimum_score
+  {_LOW_VALUE_TARGET_SQL}
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
       WHERE il.source_article_id = a1.id
@@ -41,6 +83,11 @@ WHERE a1.id = :article_id
       WHERE s.source_article_id = a1.id
         AND s.target_article_id = a2.id
         AND s.status != 'expired')
+  AND NOT EXISTS (          -- the reverse direction is already proposed or a link
+      SELECT 1 FROM suggestions s
+      WHERE s.source_article_id = a2.id
+        AND s.target_article_id = a1.id
+        AND s.status IN ('pending', 'approved', 'applying', 'applied'))
 ORDER BY e2.vector <=> e1.vector
 LIMIT :k
 """)
@@ -51,7 +98,11 @@ LIMIT :k
 # rules in SQL; the fingerprint and title rules in the ranker's in-memory corpus
 # — plus the near-duplicate vector ceiling, which only a vector comparison can
 # express and which a lexical candidate would otherwise slip past entirely.
-_PILOT_ELIGIBILITY_SQL = """
+#
+# The reverse-direction rule keeps A->B and B->A from both being proposed. The
+# first direction generated wins an otherwise symmetric choice; later sources
+# continue to their next eligible target instead of creating the mirror row.
+_PILOT_ELIGIBILITY_SQL = f"""
 FROM embeddings e1
 JOIN articles a1 ON a1.id = e1.article_id
 JOIN embeddings e2 ON e2.model = e1.model AND e2.article_id != e1.article_id
@@ -59,14 +110,21 @@ JOIN articles a2 ON a2.id = e2.article_id
 JOIN sites candidate_site ON candidate_site.id = a2.site_id
 WHERE a1.id = :article_id
   AND e1.model = :model
-  AND (a2.site_id = a1.site_id OR candidate_site.platform = 'pool')
+  AND (
+      a2.site_id = a1.site_id
+      OR (
+          candidate_site.platform = 'pool'
+          AND candidate_site.pool_source_approved IS TRUE
+          AND candidate_site.pool_source_quarantined IS FALSE))
   AND a2.is_active IS TRUE
+  {_LOW_VALUE_TARGET_SQL}
   AND (                     -- identical inputs are duplicate pages, not link candidates
       e1.content_fingerprint IS NULL
       OR e2.content_fingerprint IS NULL
       OR e2.content_fingerprint <> e1.content_fingerprint)
   AND lower(btrim(a2.title)) <> lower(btrim(a1.title))
   AND (e2.vector <=> e1.vector) > :duplicate_distance
+  AND (1 - (e2.vector <=> e1.vector)) >= :minimum_score
   AND NOT EXISTS (          -- already linked (editorial filter)
       SELECT 1 FROM internal_links il
       WHERE il.source_article_id = a1.id
@@ -77,6 +135,11 @@ WHERE a1.id = :article_id
       WHERE s.source_article_id = a1.id
         AND s.target_article_id = a2.id
         AND s.status != 'expired')
+  AND NOT EXISTS (          -- the reverse direction is already proposed or a link
+      SELECT 1 FROM suggestions s
+      WHERE s.source_article_id = a2.id
+        AND s.target_article_id = a1.id
+        AND s.status IN ('pending', 'approved', 'applying', 'applied'))
 """
 
 PILOT_TOP_K_SQL = text(f"""
@@ -107,7 +170,16 @@ WHERE e1.article_id = :article_id
 
 def top_candidates(db: Session, article_id: int, model: str, k: int) -> list[tuple[int, float]]:
     """The baseline query used by explicit comparisons and fallback."""
-    rows = db.execute(TOP_K_SQL, {"article_id": article_id, "model": model, "k": k}).all()
+    rows = db.execute(
+        TOP_K_SQL,
+        {
+            "article_id": article_id,
+            "model": model,
+            "k": k,
+            "minimum_score": settings.suggestion_min_score,
+            **low_value_target_params(),
+        },
+    ).all()
     return [(r.target_id, float(r.score)) for r in rows]
 
 
@@ -126,6 +198,8 @@ def eligible_top_candidates(
             "model": model,
             "k": k,
             "duplicate_distance": 1.0 - duplicate_similarity_threshold,
+            "minimum_score": settings.suggestion_min_score,
+            **low_value_target_params(),
         },
     ).all()
     return [(r.target_id, float(r.score)) for r in rows]
@@ -153,6 +227,8 @@ def eligible_candidate_scores(
             "model": model,
             "target_ids": list(target_ids),
             "duplicate_distance": 1.0 - duplicate_similarity_threshold,
+            "minimum_score": settings.suggestion_min_score,
+            **low_value_target_params(),
         },
     ).all()
     return {row.target_id: float(row.score) for row in rows}

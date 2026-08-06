@@ -1,7 +1,17 @@
 from fastapi import Depends, FastAPI
 
 from app.api.deps import require_api_key
-from app.api.routes import alerts, health, ingestion, jobs, publish, sites, suggestions
+from app.api.routes import (
+    admin_keys,
+    alerts,
+    health,
+    ingestion,
+    jobs,
+    pipelines,
+    publish,
+    sites,
+    suggestions,
+)
 
 app = FastAPI(title="LinkMesh Engine", version="0.1.0")
 
@@ -14,5 +24,7 @@ for router in [
     publish.router,
     jobs.router,
     alerts.router,
+    pipelines.router,
+    admin_keys.router,
 ]:
     app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])

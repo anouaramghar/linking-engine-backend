@@ -56,6 +56,10 @@ class DuplicateJobError(Exception):
         super().__init__(f"{run.kind} job already {run.status} for site {run.site_id}")
 
 
+class NonRetryableTaskError(RuntimeError):
+    """A terminal task failure that RQ must not schedule again."""
+
+
 @contextmanager
 def _site_enqueue_lock(site_id: int) -> Iterator[None]:
     # The work session commits the durable row before enqueueing. A dedicated
@@ -141,7 +145,14 @@ def reconcile_active_job_runs(db: Session, runs: list[JobRun]) -> list[JobRun]:
     return active
 
 
-def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
+def _enqueue_job_locked(
+    db: Session,
+    site_id: int,
+    kind: str,
+    fn,
+    job_timeout: int,
+    task_kwargs: dict | None = None,
+) -> JobRun:
     """Create the durable run row, then enqueue. Raises DuplicateJobError while an
     active run of this kind exists for the site."""
     active = db.scalars(
@@ -168,6 +179,7 @@ def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: i
         fn,
         site_id,
         job_run_id=run.id,
+        **(task_kwargs or {}),
         job_timeout=job_timeout,
         retry=Retry(max=2, interval=[30, 120]),  # limited automatic retries
         on_stopped=Callback(handle_job_stopped),
@@ -178,9 +190,23 @@ def _enqueue_job_locked(db: Session, site_id: int, kind: str, fn, job_timeout: i
     return run
 
 
-def enqueue_job(db: Session, site_id: int, kind: str, fn, job_timeout: int) -> JobRun:
+def enqueue_job(
+    db: Session,
+    site_id: int,
+    kind: str,
+    fn,
+    job_timeout: int,
+    task_kwargs: dict | None = None,
+) -> JobRun:
     with _site_enqueue_lock(site_id):
-        return _enqueue_job_locked(db, site_id, kind, fn, job_timeout)
+        return _enqueue_job_locked(
+            db,
+            site_id,
+            kind,
+            fn,
+            job_timeout,
+            task_kwargs=task_kwargs,
+        )
 
 
 def record_progress(
@@ -273,7 +299,16 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
             error = str(e)[:2000]
             current_job = get_current_job()
             retries_left = getattr(current_job, "retries_left", None)
-            final_attempt = current_job is None or retries_left is None or retries_left <= 0
+            non_retryable = isinstance(e, NonRetryableTaskError)
+            if non_retryable and current_job is not None:
+                # RQ checks this same in-memory Job after the function raises.
+                current_job.retries_left = 0
+            final_attempt = (
+                non_retryable
+                or current_job is None
+                or retries_left is None
+                or retries_left <= 0
+            )
             if run is not None:
                 now = datetime.now(timezone.utc)
                 if run.kind == "publication":

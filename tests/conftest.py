@@ -22,6 +22,7 @@ import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
+from pydantic import SecretStr
 
 #: Databases the suite must never write to, whatever the configuration says.
 #: ``linkmesh`` is the development database; ``postgres`` is the cluster's
@@ -117,12 +118,36 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 # Only now is importing the application safe: app.db reads settings.database_url at
 # import time, and the assignment above is what that read resolves to.
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import event, select  # noqa: E402
 
 from app.api.deps import require_api_key  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.db import SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Site  # noqa: E402
+from app.models import Site, Tenant  # noqa: E402
+from app.services.authorization import Principal, ensure_default_tenant  # noqa: E402
+
+
+@event.listens_for(Site, "before_insert")
+def _assign_default_tenant(mapper, connection, target: Site) -> None:
+    """Own tenant-less test sites under the default tenant.
+
+    This lives in the suite, not in the model, on purpose. Dozens of tests
+    predate tenancy and construct ``Site`` without an owner; backfilling them
+    here keeps those tests readable. Registering it on the model instead would
+    apply the same silent backfill to production inserts, turning "a code path
+    forgot to set tenant_id" from a NOT NULL failure into a live site quietly
+    filed under the tenant every admin can see.
+    """
+    if getattr(target, "tenant_id", None) is not None:
+        return
+    tenant_id = connection.scalar(select(Tenant.id).where(Tenant.slug == "default").limit(1))
+    if tenant_id is None:
+        result = connection.execute(
+            Tenant.__table__.insert().values(slug="default", name="Default").returning(Tenant.id)
+        )
+        tenant_id = result.scalar_one()
+    target.tenant_id = tenant_id
 
 
 def pytest_report_header() -> str:
@@ -152,11 +177,41 @@ def engine_is_bound_to_the_test_database():
 @pytest.fixture(autouse=True)
 def disable_api_key(monkeypatch):
     # Keep unrelated endpoint tests focused on their own behavior while auth
-    # tests remove this override and exercise the real dependency.
-    monkeypatch.setattr(settings, "api_key", "test-key")
-    app.dependency_overrides[require_api_key] = lambda: None
+    # tests remove this override and exercise the real dependency. Most ranking
+    # tests use deliberately orthogonal toy vectors to isolate quotas and state
+    # transitions; the dedicated score-floor test opts back into the production
+    # threshold explicitly.
+    monkeypatch.setattr(settings, "api_key", "")
+    monkeypatch.setattr(settings, "operator_api_keys", {})
+    monkeypatch.setattr(
+        settings,
+        "credential_encryption_key",
+        SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
+    )
+    monkeypatch.setattr(settings, "credential_decryption_keys", None)
+    monkeypatch.setattr(settings, "suggestion_min_score", 0.0)
+    # Admin principal so route-level site ownership checks pass without a key.
+    app.dependency_overrides[require_api_key] = lambda: Principal(
+        is_admin=True, source="legacy_env"
+    )
     yield
     app.dependency_overrides.pop(require_api_key, None)
+
+
+@pytest.fixture(autouse=True)
+def offline_publication_defaults(monkeypatch):
+    """Two things a publication run does to the outside world that tests must not.
+
+    The inter-article pause exists to be polite to a customer's host; against a
+    mock transport it only adds real seconds. Preflight placement generation
+    calls OpenRouter, which is a live third-party request and real money — with
+    a key present in `.env` the suite silently started making them, which is
+    both a cost and a source of four-minute test runs.
+
+    Tests that exercise either one override the setting themselves.
+    """
+    monkeypatch.setattr(settings, "publish_request_delay_seconds", 0.0)
+    monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
 
 
 @pytest.fixture
@@ -174,10 +229,12 @@ def db():
 @pytest.fixture
 def site(db):
     """A throwaway site, cascade-deleted after the test."""
+    tenant = ensure_default_tenant(db)
     site = Site(
         name="test-site",
         base_url=f"https://test-{uuid.uuid4().hex[:8]}.example.com",
         platform="wordpress",
+        tenant_id=tenant.id,
     )
     db.add(site)
     db.commit()
