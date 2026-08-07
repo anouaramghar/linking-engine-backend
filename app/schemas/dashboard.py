@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class DashboardUserOut(BaseModel):
@@ -10,11 +10,18 @@ class DashboardUserOut(BaseModel):
     telegram_id: int
     username: str | None
     display_name: str | None
+    photo_url: str | None = None
     status: str
     requested_at: datetime
     approved_at: datetime | None
     approved_by: str | None
     last_seen_at: datetime | None
+
+    @model_validator(mode="after")
+    def populate_photo_url(self) -> "DashboardUserOut":
+        if not self.photo_url:
+            self.photo_url = f"/api/v1/auth/users/{self.id}/avatar"
+        return self
 
 
 class LoginStartOut(BaseModel):

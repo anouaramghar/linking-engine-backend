@@ -88,6 +88,20 @@ class TelegramClient:
         result = self._call("getMe", {}, http_timeout=10.0)
         return result if isinstance(result, dict) else {}
 
+    def get_user_profile_photos(self, user_id: int, *, limit: int = 1) -> dict:
+        result = self._call("getUserProfilePhotos", {"user_id": user_id, "limit": limit}, http_timeout=10.0)
+        return result if isinstance(result, dict) else {}
+
+    def get_file(self, file_id: str) -> dict:
+        result = self._call("getFile", {"file_id": file_id}, http_timeout=10.0)
+        return result if isinstance(result, dict) else {}
+
+    def download_file(self, file_path: str) -> bytes:
+        url = f"{self._base_url}/file/bot{self._token}/{file_path}"
+        response = self._http.get(url, timeout=10.0)
+        response.raise_for_status()
+        return response.content
+
 
 def client_from_settings() -> TelegramClient | None:
     """The configured client, or None when dashboard login is switched off."""
@@ -95,6 +109,35 @@ def client_from_settings() -> TelegramClient | None:
     if token is None or not token.get_secret_value():
         return None
     return TelegramClient(token.get_secret_value())
+
+
+def get_user_profile_photo_bytes(client: TelegramClient, telegram_id: int) -> tuple[bytes, str] | None:
+    """Fetch profile photo bytes and media type for a Telegram user, if available."""
+    try:
+        photos_data = client.get_user_profile_photos(telegram_id, limit=1)
+        photos = photos_data.get("photos")
+        if not photos or not isinstance(photos, list) or len(photos) == 0:
+            return None
+        sizes = photos[0]
+        if not sizes or not isinstance(sizes, list) or len(sizes) == 0:
+            return None
+        last_item = sizes[-1]
+        file_id = last_item.get("file_id") if isinstance(last_item, dict) else None
+        if not file_id:
+            return None
+        file_info = client.get_file(file_id)
+        file_path = file_info.get("file_path")
+        if not file_path or not isinstance(file_path, str):
+            return None
+        data = client.download_file(file_path)
+        ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+        media_type = f"image/{ext}" if ext in ("png", "webp", "jpeg", "jpg") else "image/jpeg"
+        if media_type == "image/jpg":
+            media_type = "image/jpeg"
+        return data, media_type
+    except Exception as e:
+        logger.warning("failed_to_fetch_telegram_user_avatar", extra={"telegram_id": telegram_id, "error": str(e)})
+        return None
 
 
 def notify(telegram_id: int, text: str) -> None:

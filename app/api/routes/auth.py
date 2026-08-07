@@ -184,3 +184,27 @@ def revoke_dashboard_user(
     db.commit()
     db.refresh(user)
     return user
+
+
+@router.get("/users/{user_id}/avatar")
+def get_user_avatar(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _: DashboardUser = Depends(require_dashboard_session),
+) -> Response:
+    user = _target_user(db, user_id)
+    client = telegram.client_from_settings()
+    if client is None:
+        raise HTTPException(status_code=404, detail="Telegram bot not configured")
+
+    result = telegram.get_user_profile_photo_bytes(client, user.telegram_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="User profile picture not found")
+
+    avatar_bytes, media_type = result
+    return Response(
+        content=avatar_bytes,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+

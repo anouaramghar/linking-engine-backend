@@ -235,3 +235,24 @@ def test_opening_the_login_router_does_not_open_the_rest(monkeypatch):
     assert unauthenticated.post("/api/v1/auth/login/start").status_code in (200, 503)
     assert unauthenticated.get("/api/v1/sites").status_code == 401
     assert unauthenticated.get("/api/v1/suggestions").status_code == 401
+
+
+def test_dashboard_user_out_includes_photo_url(client, db):
+    _login_as(client, db, telegram_id=4242)
+    session = client.get("/api/v1/auth/session").json()
+    user = session["user"]
+    assert "photo_url" in user
+    assert user["photo_url"] == f"/api/v1/auth/users/{user['id']}/avatar"
+
+
+def test_user_avatar_endpoint_returns_404_when_user_has_no_photo(client, db, monkeypatch):
+    _login_as(client, db, telegram_id=4242)
+    session = client.get("/api/v1/auth/session").json()
+    user = session["user"]
+
+    # Mock telegram get_user_profile_photo_bytes to return None
+    monkeypatch.setattr("app.services.telegram.get_user_profile_photo_bytes", lambda _client, _tid: None)
+
+    res = client.get(f"/api/v1/auth/users/{user['id']}/avatar")
+    assert res.status_code == 404
+
