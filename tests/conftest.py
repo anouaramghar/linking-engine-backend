@@ -125,6 +125,7 @@ from app.config import settings  # noqa: E402
 from app.db import SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Site, Tenant  # noqa: E402
+from app.services import telegram  # noqa: E402
 from app.services.authorization import Principal, ensure_default_tenant  # noqa: E402
 
 
@@ -212,6 +213,22 @@ def offline_publication_defaults(monkeypatch):
     """
     monkeypatch.setattr(settings, "publish_request_delay_seconds", 0.0)
     monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
+
+
+@pytest.fixture(autouse=True)
+def offline_telegram(monkeypatch):
+    """Nothing in the suite may message Telegram for real.
+
+    `.env` carries a live bot token and the login tests set a fake one, so an
+    unpatched `notify` would either spam a real chat or post a bad token at
+    api.telegram.org. Tests that care what was sent take this fixture by name
+    and assert on the list.
+    """
+    sent: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        telegram, "notify", lambda telegram_id, text: sent.append((telegram_id, text))
+    )
+    return sent
 
 
 @pytest.fixture

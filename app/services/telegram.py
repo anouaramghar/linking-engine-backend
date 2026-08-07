@@ -16,6 +16,12 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# httpx logs every request line at INFO and the bot token sits in the URL path,
+# which is how the token reached the container logs once already. The guard
+# lives here rather than in one process's logging setup so that *any* process
+# able to reach Telegram gets it by importing this module.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 API_BASE = "https://api.telegram.org"
 
 #: Telegram holds the request open until an update arrives. Longer polls mean
@@ -89,3 +95,19 @@ def client_from_settings() -> TelegramClient | None:
     if token is None or not token.get_secret_value():
         return None
     return TelegramClient(token.get_secret_value())
+
+
+def notify(telegram_id: int, text: str) -> None:
+    """Tell one person something, best effort, from outside the bot process.
+
+    Never raises: the caller has already committed whatever it is reporting, and
+    a message Telegram refuses must not undo an approval. The cost of a failure
+    is that someone waits for a page refresh instead of a ping.
+    """
+    client = client_from_settings()
+    if client is None:
+        return
+    try:
+        client.send_message(telegram_id, text)
+    except Exception:
+        logger.warning("telegram_notify_failed", exc_info=True)

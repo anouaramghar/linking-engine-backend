@@ -23,10 +23,17 @@ from app.schemas.dashboard import (
     LoginStartOut,
     SessionOut,
 )
-from app.services import dashboard_auth
+from app.services import dashboard_auth, telegram
 from app.services.dashboard_auth import SESSION_COOKIE
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+#: Closes the loop the pending screen opens. Without it the only way to discover
+#: an approval is to keep trying the login until one works.
+ADMITTED_NOTICE = (
+    "You have been admitted to the LinkMesh dashboard.\n\n"
+    "Go back to it and press Sign in with Telegram."
+)
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
@@ -150,9 +157,15 @@ def approve_dashboard_user(
     db: Session = Depends(get_db),
 ) -> DashboardUser:
     user = _target_user(db, user_id)
+    was_waiting = user.status != "approved"
     dashboard_auth.approve_user(db, user, approved_by=str(approver.telegram_id))
     db.commit()
     db.refresh(user)
+    # After the commit, and only when something changed: the admission is what
+    # matters and must not be rolled back by a message Telegram refuses, and
+    # re-approving an approved account is a no-op nobody needs telling about.
+    if was_waiting:
+        telegram.notify(user.telegram_id, ADMITTED_NOTICE)
     return user
 
 

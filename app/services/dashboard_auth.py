@@ -319,6 +319,25 @@ def approve_user(db: Session, user: DashboardUser, approved_by: str) -> Dashboar
     return user
 
 
+def approved_telegram_ids(db: Session) -> list[int]:
+    """Everyone who can admit a newcomer — the only people worth telling.
+
+    There are no roles: approval is the only gate, so every approved user is a
+    potential approver and hears about every request.
+    """
+    return list(
+        db.scalars(select(DashboardUser.telegram_id).where(DashboardUser.status == "approved"))
+    )
+
+
+def describe_user(user: DashboardUser) -> str:
+    """How a person is named in an approval notice. The handle first, because
+    that is what an admin can recognise and check."""
+    if user.username:
+        return f"@{user.username}"
+    return user.display_name or f"Telegram ID {user.telegram_id}"
+
+
 def revoke_user(db: Session, user: DashboardUser) -> DashboardUser:
     """Remove access and end any session already open. Caller commits."""
     user.status = "revoked"

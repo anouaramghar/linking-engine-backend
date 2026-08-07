@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from app.api.deps import require_api_key
+from app.api.routes import auth as auth_routes
 from app.api.routes.auth import SESSION_COOKIE
 from app.config import settings
 from app.main import app
@@ -143,6 +144,29 @@ def test_approving_admits_the_next_login(client, db):
     assert response.status_code == 200
     assert response.json()["status"] == "approved"
     assert response.json()["approved_by"] == "4242"
+
+
+def test_approving_tells_the_person_they_are_in(client, db, offline_telegram):
+    """Otherwise the only way to discover an approval is to keep retrying."""
+    _login_as(client, db, telegram_id=4242)
+    nonce = client.post("/api/v1/auth/login/start").json()["nonce"]
+    newcomer = dashboard_auth.bind_nonce(db, nonce, telegram_id=9999)
+
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+
+    assert offline_telegram == [(9999, auth_routes.ADMITTED_NOTICE)]
+
+
+def test_re_approving_someone_already_in_says_nothing(client, db, offline_telegram):
+    _login_as(client, db, telegram_id=4242)
+    nonce = client.post("/api/v1/auth/login/start").json()["nonce"]
+    newcomer = dashboard_auth.bind_nonce(db, nonce, telegram_id=9999)
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+    offline_telegram.clear()
+
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+
+    assert offline_telegram == []
 
 
 def test_pending_users_are_listed_first(client, db):

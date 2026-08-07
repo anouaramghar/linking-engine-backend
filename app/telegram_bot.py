@@ -41,9 +41,18 @@ SIGNED_IN = "You are signed in. Return to the dashboard — it should be logging
 PENDING = (
     "Access requested.\n\n"
     "An approved user has to admit you before you can open the dashboard. "
-    "You will not be let in automatically."
+    "You will not be let in automatically.\n\n"
+    "They have been told you are waiting, and this bot will message you as soon "
+    "as one of them admits you."
 )
 REVOKED = "Your access to the dashboard has been removed. Ask an approved user to restore it."
+#: Sent to everyone already approved, because a request nobody hears about is a
+#: request nobody works.
+NEW_REQUEST = (
+    "{who} is asking for access to the LinkMesh dashboard.\n\n"
+    "Open the dashboard and use Access to admit them, or ignore this to leave "
+    "them out."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,36 +61,38 @@ class Reply:
     text: str
 
 
-def handle_update(db, update: dict) -> Reply | None:
-    """Decide what to say to one update. Pure enough to test without a network.
+def handle_update(db, update: dict) -> list[Reply]:
+    """Decide what to say about one update. Pure enough to test without a network.
 
-    Returns None for anything that is not a private text message, which covers
+    Returns a list because one update can need more than one message: a
+    first-time request answers the sender *and* alerts everyone who could admit
+    them. Empty for anything that is not a private text message, which covers
     edits, joins, and every other update type Telegram may add later.
     """
     message = update.get("message")
     if not isinstance(message, dict):
-        return None
+        return []
     sender = message.get("from")
     chat = message.get("chat")
     text = message.get("text")
     if not isinstance(sender, dict) or not isinstance(chat, dict) or not isinstance(text, str):
-        return None
+        return []
     if sender.get("is_bot"):
-        return None
+        return []
 
     telegram_id = sender.get("id")
     chat_id = chat.get("id")
     if not isinstance(telegram_id, int) or not isinstance(chat_id, int):
-        return None
+        return []
 
     if not text.startswith("/start"):
-        return Reply(chat_id, WELCOME)
+        return [Reply(chat_id, WELCOME)]
 
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         # A bare /start — someone opened the bot directly rather than from a
         # login link. There is nothing to bind.
-        return Reply(chat_id, WELCOME)
+        return [Reply(chat_id, WELCOME)]
 
     user = dashboard_auth.bind_nonce(
         db,
@@ -91,12 +102,19 @@ def handle_update(db, update: dict) -> Reply | None:
         display_name=sender.get("first_name"),
     )
     if user is None:
-        return Reply(chat_id, EXPIRED)
+        return [Reply(chat_id, EXPIRED)]
     if user.status == "approved":
-        return Reply(chat_id, SIGNED_IN)
+        return [Reply(chat_id, SIGNED_IN)]
     if user.status == "revoked":
-        return Reply(chat_id, REVOKED)
-    return Reply(chat_id, PENDING)
+        return [Reply(chat_id, REVOKED)]
+
+    # ponytail: every pending sign-in pings the approvers, not only the first
+    # one. Someone still waiting is worth repeating, and the alternative is a
+    # `notified_at` column; add it if the repeats ever become noise.
+    notice = NEW_REQUEST.format(who=dashboard_auth.describe_user(user))
+    return [Reply(chat_id, PENDING)] + [
+        Reply(approver_id, notice) for approver_id in dashboard_auth.approved_telegram_ids(db)
+    ]
 
 
 class _Stopper:
@@ -143,18 +161,19 @@ def run(
                 offset = update_id + 1
             db = SessionLocal()
             try:
-                reply = handle_update(db, update)
+                replies = handle_update(db, update)
             except Exception:
                 logger.exception("telegram_update_failed", extra={"update_id": update_id})
-                reply = None
+                replies = []
             finally:
                 db.close()
-            if reply is not None:
+            for reply in replies:
                 try:
                     client.send_message(reply.chat_id, reply.text)
                 except Exception:
                     # The binding already happened; a failed reply only costs
-                    # the human their confirmation message.
+                    # the human their confirmation message. One unreachable
+                    # approver must not stop the rest from being told.
                     logger.warning("telegram_reply_failed", exc_info=True)
 
     logger.info("telegram_bot_stopped")
