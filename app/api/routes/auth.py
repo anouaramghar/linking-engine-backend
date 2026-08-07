@@ -64,6 +64,10 @@ def start_login(db: Session = Depends(get_db)) -> LoginStartOut:
             status_code=503,
             detail="dashboard login is not configured; set TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME",
         )
+    # Housekeeping rides along with the operation that creates the garbage.
+    # Logins are rare and expired nonces are worthless, so a handful of deleted
+    # rows here is cheaper than owning a scheduler for it.
+    dashboard_auth.purge_expired_nonces(db)
     nonce = dashboard_auth.create_login_nonce(db)
     db.commit()
     deep_link = dashboard_auth.login_deep_link(nonce.nonce)

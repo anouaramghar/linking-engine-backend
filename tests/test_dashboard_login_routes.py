@@ -5,6 +5,8 @@ else, so the last test here pins that the rest of the API still refuses
 anonymous callers.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -50,6 +52,17 @@ def test_start_login_returns_a_deep_link(client):
     assert body["nonce"]
     assert body["deep_link"] == f"https://t.me/LinkMeshTestBot?start={body['nonce']}"
     assert body["expires_in_seconds"] > 0
+
+
+def test_start_login_clears_out_expired_nonces(client, db):
+    """Housekeeping rides along here because nothing else schedules it."""
+    stale = dashboard_auth.create_login_nonce(db)
+    stale.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.commit()
+
+    fresh = client.post("/api/v1/auth/login/start").json()["nonce"]
+
+    assert {row.nonce for row in db.query(LoginNonce).all()} == {fresh}
 
 
 def test_start_login_fails_closed_when_unconfigured(client, monkeypatch):
