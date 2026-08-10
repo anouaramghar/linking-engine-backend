@@ -296,17 +296,18 @@ def _mark_job_failure_progress(run: JobRun, *, terminal: bool, progress_at: date
     run.progress_at = progress_at
 
 
-def _run_task_body(fn, site_id: int, job_run_id: int | None) -> dict:
+def _run_task_body(fn, site_id: int, job_run_id: int | None, task_kwargs: dict) -> dict:
     parameters = signature(fn).parameters.values()
+    kwargs = dict(task_kwargs)
     if any(
         parameter.name == "job_run_id" or parameter.kind == Parameter.VAR_KEYWORD
         for parameter in parameters
     ):
-        return fn(site_id, job_run_id=job_run_id)
-    return fn(site_id)
+        kwargs["job_run_id"] = job_run_id
+    return fn(site_id, **kwargs)
 
 
-def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
+def run_durably(job_run_id: int | None, fn, site_id: int, **task_kwargs) -> dict:
     """Task-body wrapper: records start, attempt count, result or error. Re-raises so
     RQ can retry; the final attempt's failure stays recorded. Tolerates a missing row
     (job enqueued before this table existed, or site deleted meanwhile)."""
@@ -321,7 +322,7 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
             run.result = None
             db.commit()
         try:
-            result = _run_task_body(fn, site_id, job_run_id)
+            result = _run_task_body(fn, site_id, job_run_id, task_kwargs)
         except Exception as e:
             error = str(e)[:2000]
             current_job = get_current_job()

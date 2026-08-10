@@ -161,13 +161,16 @@ class Settings(BaseSettings):
     # write traffic LinkMesh ever sends a customer site, and shared hosting
     # answers that with a WAF block rather than a Retry-After we could honour.
     publish_request_delay_seconds: float = Field(default=0.5, ge=0.0, le=60.0)
-    # Placements missing at publication time are generated in a preflight pass,
-    # because the review queue is worked in bulk and a bulk-approved row never
-    # had its drawer opened. Each is a model call of a few seconds, so the pass
-    # is capped: past this many the rest publish as the appended block, exactly
-    # as they do today. 0 disables preflight and restores lazy-only generation.
+    # Placements missing when publication plans are *prepared* are generated in
+    # one pass, because the review queue is worked in bulk and a selected row
+    # never had its drawer opened. This is the last moment a model may be asked:
+    # a placement generated after approval cannot change the approved edit, so
+    # the appended block an operator saw stays the block that is published. Each
+    # call is a few seconds, so the pass is capped: past this many the rest are
+    # prepared as the appended block. 0 disables it and restores lazy-only
+    # generation.
     publish_max_placement_calls_per_run: int = Field(default=200, ge=0, le=5_000)
-    # How many preflight placement calls run at once. The pass is latency-bound
+    # How many preparation placement calls run at once. The pass is latency-bound
     # on an external API, not CPU-bound; the ceiling is the provider's rate
     # limit, not ours.
     publish_placement_concurrency: int = Field(default=4, ge=1, le=16)

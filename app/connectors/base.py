@@ -23,6 +23,23 @@ from app.models.suggestion import Suggestion
 #: same as one we did.
 LinkOutcome = Literal["inserted", "block", "already_present"]
 
+#: What one approved plan did to the live article.
+#:
+#: "already_applied" is not a lesser success: it is how a retry after a crash
+#: between the WordPress POST and the database commit finishes correctly, by
+#: recognising its own earlier write instead of making a second one.
+PlannedEditOutcome = Literal["written", "already_applied"]
+
+
+class StalePlanError(RuntimeError):
+    """The live article is neither the approved before nor the approved after.
+
+    Typed, because it must never be treated as a transient failure: RQ retrying
+    it would only re-read the same changed article. The approved artifact is
+    simply no longer valid, and a human has to prepare and approve a new one
+    against the article as it now is.
+    """
+
 
 @dataclass(frozen=True)
 class LinkPreview:
@@ -87,22 +104,32 @@ class ContentConnector(ABC):
     def supports_incremental_sync(self) -> bool: ...
 
     @abstractmethod
-    def apply_links(
-        self, suggestions: list[Suggestion], *, dry_run: bool = False
-    ) -> list[LinkOutcome]:
-        """Write every approved link for ONE source article, in a single edit.
+    def apply_planned_edit(
+        self, source, *, original_html: str, updated_html: str
+    ) -> PlannedEditOutcome:
+        """Send one already-approved article edit, and nothing else.
+
+        The only write interface publication has. It receives finished bytes: no
+        suggestion, no target, no anchor, no placement — nothing it could use to
+        re-decide anything, which is the point. What a human approved is what
+        leaves the process.
+
+        Contract, given the live content of `source`:
+
+        - equal to `original_html`  -> POST `updated_html` verbatim, "written"
+        - equal to `updated_html`   -> no POST, "already_applied"
+        - anything else             -> no POST, raise `StalePlanError`
 
         Batched per article rather than per suggestion: each link used to cost
         its own GET and POST, so three links into one post meant six requests
-        and three WordPress revisions. Returns one outcome per suggestion, in
-        the order given.
-
-        `dry_run` reads the live post and decides exactly as a real run would,
-        then returns without writing — the only way to see what publication will
-        do to a customer's article before it does it. HTML connector:
-        NotImplementedError (A3).
+        and three WordPress revisions. HTML connector: NotImplementedError (A3).
         """
 
     def preview_links(self, suggestions: list[Suggestion]) -> LinkPreview:
-        """Read and render one article without saving it."""
+        """Read and render one article without saving it.
+
+        Preparation only. This is where every rendering decision is made and
+        frozen; publication never calls it, because a second rendering could
+        differ from the one an operator approved.
+        """
         raise NotImplementedError("this connector does not support publication previews")

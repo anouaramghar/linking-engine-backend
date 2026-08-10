@@ -10,7 +10,7 @@ from app.api.deps import get_db, require_api_key, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
 from app.ml.llm import openrouter
 from app.ml.llm.openrouter import OpenRouterError, OpenRouterNotConfigured
-from app.models import Article, Site, Suggestion
+from app.models import Article, PublicationPlan, Site, Suggestion
 from app.schemas.job import JobAccepted
 from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
@@ -90,6 +90,22 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
     return outputs
 
 
+def _bound_to_an_approved_plan():
+    """Whether a named human is already bound to an exact edit containing this row.
+
+    That approval is a signed statement about specific bytes. Letting the row be
+    undone or rejected afterwards would leave the approved artifact describing a
+    link nobody wants any more, and the worker sends artifacts, not statuses.
+    Invalidating the plan is the way back — not editing one of its inputs.
+    """
+    return exists(
+        select(1).where(
+            PublicationPlan.id == Suggestion.publication_plan_id,
+            PublicationPlan.status == "approved",
+        )
+    )
+
+
 def _review_values(status: str) -> dict:
     """What a review writes, whichever path issued it.
 
@@ -100,12 +116,18 @@ def _review_values(status: str) -> dict:
     ever revived by an editor deciding on it again, and leaving the count at the
     limit re-quarantines it on its very next attempt — which makes re-approval
     look like it worked and change nothing.
+
+    Any surviving plan link goes with it. The only rows that reach here still
+    carrying one are those whose plan failed, and deciding on such a row again is
+    exactly the explicit reselection that recovery calls for. The plan row itself
+    is untouched, so the artifact that failed remains readable.
     """
     return {
         "status": status,
         "reviewed_at": None if status == "pending" else datetime.now(timezone.utc),
         "publish_attempts": 0,
         "publish_error": None,
+        "publication_plan_id": None,
     }
 
 
@@ -125,7 +147,11 @@ def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]
     return set(
         db.scalars(
             update(Suggestion)
-            .where(*conditions, Suggestion.status.notin_(UNREVIEWABLE))
+            .where(
+                *conditions,
+                Suggestion.status.notin_(UNREVIEWABLE),
+                ~_bound_to_an_approved_plan(),
+            )
             .values(**_review_values(status))
             .returning(Suggestion.id)
             .execution_options(synchronize_session=False)
@@ -162,6 +188,10 @@ def _review_matching_counts(
         .where(
             Suggestion.id == candidates.c.id,
             *conditions,
+            # Guarded here rather than in `candidates`, so a row an operator has
+            # already approved as part of an exact edit is reported as skipped
+            # instead of vanishing from the rule's own count.
+            ~_bound_to_an_approved_plan(),
         )
         .values(**_review_values(status))
         .returning(Suggestion.id)

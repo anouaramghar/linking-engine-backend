@@ -245,12 +245,20 @@ def db():
 
 @pytest.fixture
 def site(db):
-    """A throwaway site, cascade-deleted after the test."""
+    """A throwaway site, cascade-deleted after the test.
+
+    It carries a WordPress account, because a site without one cannot be
+    prepared for publication at all and most callers here are exercising what
+    happens *after* that gate. Only the username is set: the password is an
+    encrypted column whose key is installed by an autouse fixture, and
+    `has_wordpress_credentials` — the thing the gate reads — tests the username.
+    """
     tenant = ensure_default_tenant(db)
     site = Site(
         name="test-site",
         base_url=f"https://test-{uuid.uuid4().hex[:8]}.example.com",
         platform="wordpress",
+        wp_username="editor",
         tenant_id=tenant.id,
     )
     db.add(site)

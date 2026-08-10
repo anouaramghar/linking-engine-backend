@@ -18,8 +18,8 @@ from app.config import settings
 from app.connectors.base import (
     ArticleData,
     ContentConnector,
-    LinkOutcome,
     OutboundLink,
+    PlannedEditOutcome,
     SiteMetadata,
 )
 from app.connectors.http_limits import check_crawl_deadline, get_limited_http_response
@@ -29,7 +29,6 @@ from app.connectors.url_guard import (
     request_guard,
     validate_url,
 )
-from app.models.suggestion import Suggestion
 
 #: Anchors are phrases; a link wrapping a whole section is stored truncated.
 _MAX_ANCHOR_TEXT_CHARS = 300
@@ -165,9 +164,9 @@ class HTMLConnector(ContentConnector):
     def supports_incremental_sync(self) -> bool:
         return False
 
-    def apply_links(
-        self, suggestions: list[Suggestion], *, dry_run: bool = False
-    ) -> list[LinkOutcome]:
+    def apply_planned_edit(
+        self, source, *, original_html: str, updated_html: str
+    ) -> PlannedEditOutcome:
         # A3 resolved: design ready (FTP hypothesis documented), no implementation —
         # HTML sites are secondary, WordPress is the v1 priority.
         raise NotImplementedError("writing to static HTML sites is not supported in v1 (A3)")

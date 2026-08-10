@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from app.models import Article, IngestionRun, InternalLink, JobRun, Suggestion
+from app.models import Article, IngestionRun, InternalLink, JobRun, Site, Suggestion
 
 
 def _payload():
@@ -220,3 +220,63 @@ def test_orphan_filter_ignores_expired_links(client, db, site):
     assert inactive_article.id not in orphan_ids
     assert expired_target.id in orphan_ids
     assert current_target.id not in orphan_ids
+
+
+def _unauthenticated_site(client, db):
+    """A site created through the API, so it starts with no account attached."""
+    site_id = client.post("/api/v1/sites", json=_payload()).json()["id"]
+    return db.get(Site, site_id)
+
+
+def test_wordpress_credentials_can_be_set_rotated_and_cleared(client, db):
+    """A site with a dead application password must be repairable in place.
+
+    Before this route existed the only way to change one was to delete the site,
+    which also deleted its articles, its internal links, and its review history.
+    """
+    site = _unauthenticated_site(client, db)
+    assert client.get(f"/api/v1/sites/{site.id}").json()["has_wordpress_credentials"] is False
+
+    created = client.put(
+        f"/api/v1/sites/{site.id}/credentials",
+        json={"wp_username": "editor", "wp_app_password": "abcd efgh ijkl mnop"},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["has_wordpress_credentials"] is True
+
+    # Rotation is the same call, and never has to prove the old value: WordPress
+    # stores a hash, and the password is being replaced precisely because it stopped
+    # working.
+    rotated = client.put(
+        f"/api/v1/sites/{site.id}/credentials",
+        json={"wp_username": "editor", "wp_app_password": "qrst uvwx yzab cdef"},
+    )
+    assert rotated.status_code == 200, rotated.text
+    db.refresh(site)
+    assert site.wp_app_password == "qrst uvwx yzab cdef"
+
+    cleared = client.delete(f"/api/v1/sites/{site.id}/credentials")
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["has_wordpress_credentials"] is False
+    db.refresh(site)
+    assert site.wp_username is None
+    assert site.wp_app_password is None
+
+
+def test_credentials_require_both_halves_and_a_wordpress_site(client, db):
+    site = _unauthenticated_site(client, db)
+    partial = client.put(
+        f"/api/v1/sites/{site.id}/credentials",
+        json={"wp_username": "editor"},
+    )
+    assert partial.status_code == 422
+
+    site.platform = "html"
+    db.commit()
+    wrong_platform = client.put(
+        f"/api/v1/sites/{site.id}/credentials",
+        json={"wp_username": "editor", "wp_app_password": "abcd efgh ijkl mnop"},
+    )
+    assert wrong_platform.status_code == 409
+    db.refresh(site)
+    assert site.wp_username is None

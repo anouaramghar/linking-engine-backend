@@ -39,6 +39,7 @@ from app.schemas.site import (
     SiteBulkRequest,
     SiteBulkResult,
     SiteCreate,
+    SiteCredentials,
     SiteOut,
 )
 from app.services.ingestion_service import latest_run
@@ -447,6 +448,50 @@ def reactivate_pool_source(
     site.pool_source_last_reactivated_at = datetime.now(UTC)
     site.pool_source_last_reactivated_by = operator_id
     record_pool_source_audit_event(db, site, "reactivated", operator_id)
+    db.commit()
+    db.refresh(site)
+    return _fresh_site_out(db, site)
+
+
+@router.put("/{site_id}/credentials", response_model=SiteOut)
+def set_wordpress_credentials(
+    payload: SiteCredentials,
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    """Give an existing site a WordPress account, or replace the one it has.
+
+    Creation is the only other place a credential can be set, so before this an
+    application password that was revoked, rotated, or simply never supplied
+    left the site permanently unable to publish: the only route back was
+    deleting the site and losing its articles, links, and review history.
+
+    Replacing is deliberately the same call as setting. WordPress hashes an
+    application password, so the old value cannot be read back and compared, and
+    a "change" that had to prove the previous value would be unusable exactly
+    when it is needed — after the old one stopped working.
+    """
+    if site.platform != "wordpress":
+        raise HTTPException(409, "WordPress credentials are only valid for WordPress sites")
+    site.wp_username = payload.wp_username
+    site.wp_app_password = payload.wp_app_password
+    db.commit()
+    db.refresh(site)
+    return _fresh_site_out(db, site)
+
+
+@router.delete("/{site_id}/credentials", response_model=SiteOut)
+def clear_wordpress_credentials(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    """Detach the account without deleting the site.
+
+    The site keeps crawling public pages; it stops being publishable, and the
+    queue says so before anyone prepares edits for it.
+    """
+    site.wp_username = None
+    site.wp_app_password = None
     db.commit()
     db.refresh(site)
     return _fresh_site_out(db, site)

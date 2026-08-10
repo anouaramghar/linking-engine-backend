@@ -1,66 +1,129 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from app.connectors.base import LinkOutcome
 
+#: A SHA-256 digest, lower-case hexadecimal. Length-checked at the schema so a
+#: truncated or mistyped hash is a 422 rather than a puzzling 409.
+PLAN_HASH_LENGTH = 64
+
+#: An approval is one screenful of edits an operator actually read. A bound is
+#: what keeps "approve everything" from coming back through the request body.
+MAX_PLANS_PER_APPROVAL = 100
+
 
 class PendingPublicationSite(BaseModel):
+    """The two numbers that mean different things, kept apart.
+
+    `selected_suggestions` is editorial intent awaiting preparation or a fresh
+    preview. `approved_plans` is exact artifacts a named human has bound
+    themselves to, which are the only things that may be queued.
+    """
+
     site_id: int
-    awaiting_publication: int
+    selected_suggestions: int
+    approved_plans: int
+    #: Whether preparing this site's edits can succeed at all. False means no
+    #: WordPress account is attached, so every source article would cost a live
+    #: request and return the same 401. Said here, before the operator spends
+    #: that, rather than discovered inside an empty review.
+    can_publish: bool = True
 
 
-class PlannedLink(BaseModel):
-    """One approved suggestion, and what publication would do with it."""
+class PlanLink(BaseModel):
+    """One link inside a prepared plan, exactly as it was rendered."""
 
+    position: int
     suggestion_id: int
-    source_article_id: int
-    source_url: str
     target_url: str
-    outcome: LinkOutcome
-    #: The phrase the link would be written on, when the outcome is "inserted".
+    #: The phrase the link was written on. Displayed when the outcome is
+    #: "inserted"; retained either way because it is part of the hashed artifact.
     anchor_text: str | None = None
+    outcome: LinkOutcome
 
 
-class PlannedArticle(BaseModel):
-    """One exact WordPress edit, shown without saving it."""
+class PublicationPlanOut(BaseModel):
+    """One persisted, immutable edit an operator may approve.
 
+    The HTML is the whole point: `updated_html` is byte-for-byte what will be
+    sent to WordPress if this plan is approved and the live post still equals
+    `original_html`. Nothing renders it again.
+    """
+
+    id: int
+    status: str
+    plan_hash: str
     source_article_id: int
     source_url: str
     original_html: str
     updated_html: str
-    links: list[PlannedLink]
+    links: list[PlanLink]
 
 
-class PublicationPreviewError(BaseModel):
+class PublicationPreparationError(BaseModel):
+    """A source article deliberately left out of this batch.
+
+    It does not silently join publication later; it needs its own preparation.
+    """
+
     source_article_id: int
     source_url: str
     message: str
 
 
-class PublicationDryRun(BaseModel):
-    """What a publication run would write, decided against the live posts.
+class PublicationPreparationOut(BaseModel):
+    """What preparation produced, and what it could not.
 
-    Read-only where it matters: the posts are fetched exactly as a real run
-    fetches them and the same decisions are made, but no article is written and
-    no suggestion is claimed.
-
-    Placements are the one exception. Missing ones are generated and stored
-    before the preview is computed — otherwise every bulk-approved row would
-    show as "block" here and then publish in-text, which is a preview that
-    predicts the wrong thing. The generation is the same bounded, once-per-row
-    pass publication runs, so the publish that follows reuses these choices
-    rather than paying again. `placements_missing` counts what that pass could
-    not cover: rows past its budget, or whose model call failed. Those show as
-    "block" here and may still become in-text links at publication.
+    `has_more` says more source articles remain unshown. It never means they
+    will be included in the approval the operator is about to give.
     """
 
     site_id: int
-    approved: int
-    previewed: int
-    placements_missing: int
-    inserted: int
-    block: int
-    already_present: int
-    planned: list[PlannedLink]
-    articles: list[PlannedArticle]
-    errors: list[PublicationPreviewError]
-    truncated: bool
+    selected_suggestions: int
+    plans: list[PublicationPlanOut]
+    errors: list[PublicationPreparationError]
+    has_more: bool
+
+
+class PlanApproval(BaseModel):
+    """One plan, named by id *and* by the hash the operator was shown.
+
+    The hash is what makes this an approval of a specific edit rather than of a
+    row id whose contents may since have changed.
+    """
+
+    id: int
+    plan_hash: str = Field(min_length=PLAN_HASH_LENGTH, max_length=PLAN_HASH_LENGTH)
+
+
+class PlanApprovalRequest(BaseModel):
+    plans: list[PlanApproval] = Field(min_length=1, max_length=MAX_PLANS_PER_APPROVAL)
+
+    @field_validator("plans")
+    @classmethod
+    def _reject_duplicate_ids(cls, plans: list[PlanApproval]) -> list[PlanApproval]:
+        """The same plan twice, possibly with two different hashes, is not a
+        request the server can satisfy honestly."""
+        ids = [plan.id for plan in plans]
+        if len(set(ids)) != len(ids):
+            raise ValueError("each publication plan may appear only once in an approval")
+        return plans
+
+
+class PlanApprovalResult(BaseModel):
+    approved: list[int]
+    #: Recorded on every approved plan. Echoed back so the dashboard can show
+    #: who the engine believes just approved these edits.
+    approved_by: str
+
+
+class PublicationQueueRequest(BaseModel):
+    """The exact approved plans this click is allowed to enqueue."""
+
+    plan_ids: list[int] = Field(min_length=1, max_length=MAX_PLANS_PER_APPROVAL)
+
+    @field_validator("plan_ids")
+    @classmethod
+    def _reject_duplicate_ids(cls, plan_ids: list[int]) -> list[int]:
+        if len(set(plan_ids)) != len(plan_ids):
+            raise ValueError("each publication plan may be queued only once")
+        return plan_ids

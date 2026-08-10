@@ -21,7 +21,9 @@ from app.connectors.base import (
     LinkPreview,
     LinkOutcome,
     OutboundLink,
+    PlannedEditOutcome,
     SiteMetadata,
+    StalePlanError,
     TaxonomyData,
 )
 from app.connectors.http_limits import (
@@ -914,21 +916,39 @@ class WordPressConnector(ContentConnector):
             outcomes.append(outcome)
         return LinkPreview(original, content, outcomes)
 
-    def apply_links(
-        self, suggestions: list[Suggestion], *, dry_run: bool = False
-    ) -> list[LinkOutcome]:
-        preview = self.preview_links(suggestions)
-        if not suggestions or preview.updated_content == preview.original_content or dry_run:
-            return preview.outcomes
-        source = suggestions[0].source_article
-        # WordPress core exposes no compare-and-swap precondition on post
-        # updates. Re-read immediately before the full-content replacement and
-        # refuse if an editor changed it while LinkMesh prepared the links.
-        if self._read_post_for_edit(source) != preview.original_content:
-            raise RuntimeError(
-                f"WordPress post {source.external_id} changed while LinkMesh prepared it; retry"
+    def apply_planned_edit(
+        self, source, *, original_html: str, updated_html: str
+    ) -> PlannedEditOutcome:
+        """Send exactly `updated_html`, and only while the post still equals the
+        approved `original_html`.
+
+        Nothing here is decided. No suggestion reaches this method, so no anchor
+        can be re-located, no fallback can be re-chosen, and no change to a
+        target URL, a connector setting, or the placement model after approval
+        can alter the bytes that are sent.
+
+        The read immediately before the write is retained because WordPress core
+        exposes no compare-and-swap precondition on post updates. It narrows the
+        window; it cannot close it. That residual race is documented rather than
+        papered over — see docs/design/immutable-publication-plans.md.
+
+        Recognising our own earlier write as `already_applied` is what makes a
+        crash between the POST and the database commit recoverable: the retry
+        finalizes state instead of appending the same links a second time.
+        """
+        if not source.external_id:
+            raise ValueError(f"article {source.id} has no WP post id")
+
+        live = self._read_post_for_edit(source)
+        if live == updated_html:
+            return "already_applied"
+        if live != original_html:
+            raise StalePlanError(
+                f"WordPress post {source.external_id} no longer matches the approved "
+                "plan; the article changed after it was approved, so nothing was written"
             )
-        update = self._post_content(source, preview.updated_content)
+
+        update = self._post_content(source, updated_html)
         update.raise_for_status()
-        self._warn_if_marker_stripped(source, preview.updated_content, update)
-        return preview.outcomes
+        self._warn_if_marker_stripped(source, updated_html, update)
+        return "written"

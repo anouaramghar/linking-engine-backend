@@ -139,7 +139,7 @@ class _TooManyArticlesConnector(ContentConnector):
     def supports_incremental_sync(self):
         return False
 
-    def apply_links(self, suggestions, *, dry_run=False):
+    def apply_planned_edit(self, source, *, original_html, updated_html):
         raise NotImplementedError
 
 

@@ -59,7 +59,7 @@ class StubConnector(ContentConnector):
     def supports_incremental_sync(self):
         return False
 
-    def apply_links(self, suggestions, *, dry_run=False):
+    def apply_planned_edit(self, source, *, original_html, updated_html):
         pass
 
 
@@ -474,7 +474,8 @@ def test_recrawl_expires_inactive_article_suggestions(db, site, client, monkeypa
     assert review.status_code == 409
     assert client.get(f"/api/v1/publish/{site.id}/status").json() == {
         "applied": 1,
-        "awaiting_publication": 0,
+        "selected_suggestions": 0,
+        "approved_plans": 0,
     }
 
 

@@ -67,6 +67,17 @@ class Site(Base):
     pool_source_last_reactivated_by: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    @property
+    def has_wordpress_credentials(self) -> bool:
+        """Whether an account exists that could edit this site's posts.
+
+        Publication reads each post with `context=edit` before it writes, and
+        WordPress refuses that anonymously. Tested on the username so that
+        listing sites does not decrypt a password per row; the two are only ever
+        written as a pair.
+        """
+        return self.platform == "wordpress" and bool(self.wp_username)
+
 
 class IngestionRun(Base):
     __tablename__ = "ingestion_runs"

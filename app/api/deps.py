@@ -71,11 +71,10 @@ def require_operator_identity(
     attaches the legacy service key, which is rejected below, so before login
     existed every pool approval from the UI failed with a 401.
 
-    An operator-mapped env key (matching the raw header) is next, then database
-    admin keys and an operator-key principal, so key-based deployments and
-    scripts still work; the legacy service key and tenant keys cannot. With no
-    authentication configured at all, the development box signs as
-    ``local-development``.
+    An operator-mapped env key (matching the raw header) is next. Database admin,
+    legacy service, and tenant keys are deliberately rejected: they identify a
+    credential, not the person making the approval. With no authentication
+    configured at all, the development box signs as ``local-development``.
     """
     user = dashboard_auth.verify_session(db, session_token)
     if user is not None:
@@ -83,10 +82,10 @@ def require_operator_identity(
 
     if principal.is_admin and principal.source == "operator" and principal.operator_id is not None:
         return principal.operator_id
-    if principal.is_admin and principal.source == "db" and principal.key_id is not None:
-        return f"admin-key:{principal.key_id}"
     if (
-        settings.environment == "development"
+        principal.source == "legacy_env"
+        and principal.is_admin
+        and settings.environment == "development"
         and not settings.api_key
         and not settings.operator_api_keys
     ):

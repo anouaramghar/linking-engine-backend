@@ -600,7 +600,16 @@ def test_paged_queue_and_bulk_rule_agree_on_the_same_filter(client, db, site):
     assert sorted(remaining) == ["approved", "approved", "approved", "pending"]
 
 
-def test_pending_publication_lists_only_sites_with_approved_backlogs(client, db, site, other_site):
+def test_pending_publication_separates_selected_rows_from_approved_plans(
+    client, db, site, other_site
+):
+    """Two numbers, because they ask for two different things.
+
+    Selected suggestions need someone to prepare and approve an exact edit.
+    Approved plans need only a job. Reporting them as one "awaiting publication"
+    is what let a dashboard offer a publish button for work no human had ever
+    seen rendered.
+    """
     pair, other_pair = _pair(db, site), _pair(db, other_site)
     _suggest(db, site, pair, 0.90, status="approved")
     _suggest(db, site, pair, 0.80, status="approved")
@@ -610,13 +619,11 @@ def test_pending_publication_lists_only_sites_with_approved_backlogs(client, db,
 
     pending = client.get("/api/v1/publish/pending").json()
     owned = {
-        row["site_id"]: row["awaiting_publication"]
+        row["site_id"]: (row["selected_suggestions"], row["approved_plans"])
         for row in pending
         if row["site_id"] in {site.id, other_site.id}
     }
 
-    assert owned == {site.id: 2}
-    assert (
-        client.get(f"/api/v1/publish/{site.id}/status").json()["awaiting_publication"]
-        == owned[site.id]
-    )
+    assert owned == {site.id: (2, 0)}
+    status = client.get(f"/api/v1/publish/{site.id}/status").json()
+    assert (status["selected_suggestions"], status["approved_plans"]) == (2, 0)

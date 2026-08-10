@@ -120,6 +120,15 @@ class Suggestion(Base):
     # Why the last attempt failed, so a quarantined row explains itself without
     # a log search.
     publish_error: Mapped[str | None] = mapped_column(Text)
+    # The approved artifact this row is part of. Set only at final plan approval,
+    # never at preparation: until a human approves the exact edit, a selected
+    # suggestion belongs to nothing. Retained after success for audit, cleared
+    # when a plan goes stale or a failed row is explicitly selected again.
+    # ON DELETE SET NULL rather than CASCADE — deleting a plan must never delete
+    # the editorial decisions that fed it.
+    publication_plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("publication_plans.id", ondelete="SET NULL"), index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
