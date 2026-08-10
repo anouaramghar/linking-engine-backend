@@ -70,7 +70,13 @@ def _delete_audit_events(db, site_id: int) -> None:
     db.commit()
 
 
-def test_pool_schema_defaults_to_daily_and_rejects_credentials():
+def test_pool_schema_defaults_to_daily_and_rejects_credentials(monkeypatch):
+    # `SiteCreate` relaxes the HTTPS and private-address rules when this is on,
+    # and settings fall back to the developer's .env, which the suite shares.
+    # Pinned here so this asserts the guard rather than the machine it runs on,
+    # as `test_url_guard` and `test_site_bulk_import` already do.
+    monkeypatch.setattr(settings, "allow_unsafe_crawl_targets", False)
+
     payload = SiteCreate(
         name="Wikipedia",
         base_url="https://en.wikipedia.org/wiki/Search_engine_optimization",
