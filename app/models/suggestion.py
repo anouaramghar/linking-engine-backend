@@ -172,6 +172,9 @@ class BulkReviewOperation(Base):
     """Durable identity for one server-side bulk rule and its exact undo cohort."""
 
     __tablename__ = "bulk_review_operations"
+    __table_args__ = (
+        Index("ix_bulk_review_operations_created_at", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     actor: Mapped[str] = mapped_column(String(255))
@@ -188,6 +191,9 @@ class BulkReviewOperationItem(Base):
     """One suggestion changed by a bulk rule, stored without sending huge ID lists."""
 
     __tablename__ = "bulk_review_operation_items"
+    __table_args__ = (
+        Index("ix_bulk_review_operation_items_suggestion_id", "suggestion_id"),
+    )
 
     operation_id: Mapped[str] = mapped_column(
         ForeignKey("bulk_review_operations.id", ondelete="CASCADE"), primary_key=True
