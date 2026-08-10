@@ -34,7 +34,6 @@ class DashboardUser(Base):
     # Both are display-only and may change under us; identity is telegram_id.
     username: Mapped[str | None] = mapped_column(String(255))
     display_name: Mapped[str | None] = mapped_column(String(255))
-    photo_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     status: Mapped[str] = mapped_column(
         DashboardUserStatus, default="pending", server_default="pending", index=True
     )

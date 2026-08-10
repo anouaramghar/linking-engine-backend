@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, computed_field
 
 
 class DashboardUserOut(BaseModel):
@@ -10,18 +10,24 @@ class DashboardUserOut(BaseModel):
     telegram_id: int
     username: str | None
     display_name: str | None
-    photo_url: str | None = None
     status: str
     requested_at: datetime
     approved_at: datetime | None
     approved_by: str | None
     last_seen_at: datetime | None
 
-    @model_validator(mode="after")
-    def populate_photo_url(self) -> "DashboardUserOut":
-        if not self.photo_url:
-            self.photo_url = f"/api/v1/auth/users/{self.id}/avatar"
-        return self
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def photo_url(self) -> str:
+        """Where the browser can fetch this account's Telegram picture.
+
+        Derived rather than stored. Telegram hands out a photo URL only through
+        the *login widget*, and this dashboard signs in over a bot deep link, so
+        there has never been a value to persist — the route below re-fetches the
+        current photo from Telegram on request, which also means an account that
+        changes its picture is not stuck showing last year's.
+        """
+        return f"/api/v1/auth/users/{self.id}/avatar"
 
 
 class LoginStartOut(BaseModel):
