@@ -27,6 +27,8 @@ from app.schemas.external_policy import (
 from app.schemas.pool_audit import PoolSourceAuditEventOut
 from app.schemas.site import (
     ArticleOut,
+    EditorialRankingPolicyOut,
+    EditorialRankingPolicyUpdate,
     SiteBulkCreated,
     SiteBulkFailure,
     SiteBulkRequest,
@@ -333,6 +335,39 @@ def list_external_source_evaluations(
 ) -> ExternalSourceEvaluationList:
     site = _managed_site_or_409(db, site_id)
     return ExternalSourceEvaluationList(items=source_evaluations(db, site))
+
+
+def _editorial_policy_out(site: Site) -> EditorialRankingPolicyOut:
+    return EditorialRankingPolicyOut(
+        site_id=site.id,
+        enabled=site.editorial_feedback_enabled,
+        min_score_percent=site.editorial_min_score_percent,
+        feedback_weight=site.editorial_feedback_weight,
+        min_samples=site.editorial_feedback_min_samples,
+    )
+
+
+@router.get("/{site_id}/editorial-ranking-policy", response_model=EditorialRankingPolicyOut)
+def get_editorial_ranking_policy(
+    site_id: int, db: Session = Depends(get_db)
+) -> EditorialRankingPolicyOut:
+    return _editorial_policy_out(_managed_site_or_409(db, site_id))
+
+
+@router.put("/{site_id}/editorial-ranking-policy", response_model=EditorialRankingPolicyOut)
+def update_editorial_ranking_policy(
+    site_id: int,
+    payload: EditorialRankingPolicyUpdate,
+    db: Session = Depends(get_db),
+) -> EditorialRankingPolicyOut:
+    site = _managed_site_or_409(db, site_id)
+    site.editorial_feedback_enabled = payload.enabled
+    site.editorial_min_score_percent = payload.min_score_percent
+    site.editorial_feedback_weight = payload.feedback_weight
+    site.editorial_feedback_min_samples = payload.min_samples
+    db.commit()
+    db.refresh(site)
+    return _editorial_policy_out(site)
 
 
 @router.get(

@@ -1,16 +1,27 @@
+import csv
+import io
+import json
 import logging
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import exists, func, literal, or_, select, text, tuple_, update
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import exists, func, insert, literal, or_, select, text, tuple_, update
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from app.api.deps import get_audit_actor, get_db
 from app.api.pagination import MAX_PAGE_SIZE
 from app.ml.llm import openrouter
 from app.ml.llm.openrouter import OpenRouterError, OpenRouterNotConfigured
-from app.models import Article, Site, Suggestion, SuggestionEvent
+from app.models import (
+    Article,
+    BulkReviewOperation,
+    BulkReviewOperationItem,
+    Site,
+    Suggestion,
+    SuggestionEvent,
+)
 from app.schemas.job import JobAccepted
 from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
@@ -19,10 +30,13 @@ from app.schemas.suggestion import (
     BulkReview,
     BulkReviewFilter,
     BulkReviewFilterResult,
+    BulkReviewUndoResult,
     PlacementOut,
     SuggestionCounts,
     SuggestionCursor,
     SuggestionEventOut,
+    TraceEventOut,
+    TraceEventPage,
     SuggestionOut,
     SuggestionPage,
     SuggestionReview,
@@ -144,7 +158,10 @@ def _set_audit_actor(db: Session, actor: str) -> None:
 
 
 def _review_matching_counts(
-    db: Session, conditions: Sequence, status: str
+    db: Session,
+    conditions: Sequence,
+    status: str,
+    operation_id: str | None = None,
 ) -> tuple[int, int, list[int] | None]:
     """Summarize one stable candidate cohort and update its reviewable rows.
 
@@ -174,11 +191,25 @@ def _review_matching_counts(
         .execution_options(synchronize_session=False)
         .cte("reviewed_rows")
     )
-    bounded_reviewed_ids = select(reviewed_rows.c.id).limit(MAX_BULK_REVIEW).subquery()
+    reviewed_source = reviewed_rows
+    reviewed_id = reviewed_rows.c.id
+    if operation_id is not None:
+        saved_rows = (
+            insert(BulkReviewOperationItem)
+            .from_select(
+                ["operation_id", "suggestion_id"],
+                select(literal(operation_id), reviewed_rows.c.id),
+            )
+            .returning(BulkReviewOperationItem.suggestion_id)
+            .cte("saved_reviewed_rows")
+        )
+        reviewed_source = saved_rows
+        reviewed_id = saved_rows.c.suggestion_id
+    bounded_reviewed_ids = select(reviewed_id.label("id")).limit(MAX_BULK_REVIEW).subquery()
     result = db.execute(
         select(
             select(func.count()).select_from(candidates).scalar_subquery().label("matched"),
-            select(func.count()).select_from(reviewed_rows).scalar_subquery().label("reviewed"),
+            select(func.count()).select_from(reviewed_source).scalar_subquery().label("reviewed"),
             select(func.array_agg(bounded_reviewed_ids.c.id))
             .select_from(bounded_reviewed_ids)
             .scalar_subquery()
@@ -327,6 +358,184 @@ def _queue_conditions(
     return conditions
 
 
+def _trace_event_query(
+    *,
+    trace_id: str | None = None,
+    actor: str | None = None,
+    event_type: str | None = None,
+    status: str | None = None,
+    site_id: int | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+):
+    source = aliased(Article)
+    target = aliased(Article)
+    statement = (
+        select(
+            SuggestionEvent,
+            Suggestion.trace_id.label("trace_id"),
+            Suggestion.site_id.label("site_id"),
+            Site.name.label("site_name"),
+            source.title.label("source_title"),
+            target.title.label("target_title"),
+            Suggestion.status.label("suggestion_status"),
+            Suggestion.publish_error.label("publish_error"),
+        )
+        .join(Suggestion, Suggestion.id == SuggestionEvent.suggestion_id)
+        .join(Site, Site.id == Suggestion.site_id)
+        .join(source, source.id == Suggestion.source_article_id)
+        .join(target, target.id == Suggestion.target_article_id)
+    )
+    if trace_id and trace_id.strip():
+        statement = statement.where(
+            Suggestion.trace_id.ilike(_like_pattern(trace_id.strip()), escape=_LIKE_ESCAPE)
+        )
+    if actor and actor.strip():
+        statement = statement.where(
+            SuggestionEvent.actor.ilike(_like_pattern(actor.strip()), escape=_LIKE_ESCAPE)
+        )
+    if event_type and event_type.strip():
+        statement = statement.where(SuggestionEvent.event_type == event_type.strip())
+    if status and status.strip():
+        statement = statement.where(Suggestion.status == status.strip())
+    if site_id is not None:
+        statement = statement.where(Suggestion.site_id == site_id)
+    if date_from is not None:
+        statement = statement.where(SuggestionEvent.created_at >= date_from)
+    if date_to is not None:
+        statement = statement.where(SuggestionEvent.created_at <= date_to)
+    return statement
+
+
+def _trace_event_out(row) -> TraceEventOut:
+    event = row[0]
+    return TraceEventOut(
+        id=event.id,
+        suggestion_id=event.suggestion_id,
+        event_type=event.event_type,
+        actor=event.actor,
+        details=event.details or {},
+        created_at=event.created_at,
+        trace_id=row.trace_id,
+        site_id=row.site_id,
+        site_name=row.site_name,
+        source_title=row.source_title,
+        target_title=row.target_title,
+        suggestion_status=row.suggestion_status,
+        publish_error=row.publish_error,
+    )
+
+
+@router.get("/suggestion-events", response_model=TraceEventPage)
+def list_trace_events(
+    trace_id: str | None = Query(None, max_length=MAX_SEARCH_TERM),
+    actor: str | None = Query(None, max_length=255),
+    event_type: str | None = Query(None, max_length=50),
+    status: str | None = Query(None, max_length=30),
+    site_id: int | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> TraceEventPage:
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must be before date_to")
+    statement = _trace_event_query(
+        trace_id=trace_id,
+        actor=actor,
+        event_type=event_type,
+        status=status,
+        site_id=site_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
+    rows = db.execute(
+        statement.order_by(SuggestionEvent.created_at.desc(), SuggestionEvent.id.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    return TraceEventPage(
+        items=[_trace_event_out(row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+def _csv_safe(value: object) -> str:
+    rendered = json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else str(value or "")
+    return f"'{rendered}" if rendered.startswith(("=", "+", "-", "@")) else rendered
+
+
+@router.get("/suggestion-events/export.csv")
+def export_trace_events_csv(
+    trace_id: str | None = Query(None, max_length=MAX_SEARCH_TERM),
+    actor: str | None = Query(None, max_length=255),
+    event_type: str | None = Query(None, max_length=50),
+    status: str | None = Query(None, max_length=30),
+    site_id: int | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    db: Session = Depends(get_db),
+) -> Response:
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must be before date_to")
+    rows = db.execute(
+        _trace_event_query(
+            trace_id=trace_id,
+            actor=actor,
+            event_type=event_type,
+            status=status,
+            site_id=site_id,
+            date_from=date_from,
+            date_to=date_to,
+        ).order_by(SuggestionEvent.created_at.desc(), SuggestionEvent.id.desc())
+    ).all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "event_id",
+            "trace_id",
+            "suggestion_id",
+            "site",
+            "source_title",
+            "target_title",
+            "event_type",
+            "actor",
+            "current_status",
+            "created_at",
+            "publish_error",
+            "details",
+        ]
+    )
+    for row in rows:
+        item = _trace_event_out(row)
+        writer.writerow(
+            [
+                _csv_safe(item.id),
+                _csv_safe(item.trace_id),
+                _csv_safe(item.suggestion_id),
+                _csv_safe(item.site_name),
+                _csv_safe(item.source_title),
+                _csv_safe(item.target_title),
+                _csv_safe(item.event_type),
+                _csv_safe(item.actor),
+                _csv_safe(item.suggestion_status),
+                _csv_safe(item.created_at.isoformat()),
+                _csv_safe(item.publish_error),
+                _csv_safe(item.details),
+            ]
+        )
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="linkmesh-traceability.csv"'},
+    )
+
+
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
 @router.post("/suggestions/bulk-review")
 def bulk_review(
@@ -386,8 +595,27 @@ def bulk_review_by_filter(
         target_origin=payload.target_origin,
         exclude_reciprocal=payload.exclude_reciprocal,
     )
+    operation = BulkReviewOperation(
+        id=str(uuid4()),
+        actor=actor[:255],
+        from_status=payload.match_status,
+        to_status=payload.status,
+    )
+    db.add(operation)
+    db.flush()
     _set_audit_actor(db, actor)
-    matched, reviewed, reviewed_ids = _review_matching_counts(db, conditions, payload.status)
+    matched, reviewed, reviewed_ids = _review_matching_counts(
+        db,
+        conditions,
+        payload.status,
+        operation_id=operation.id,
+    )
+    undo_operation_id: str | None = operation.id
+    if reviewed:
+        operation.reviewed_count = reviewed
+    else:
+        db.delete(operation)
+        undo_operation_id = None
     db.commit()
     logger.info(
         "suggestion review actor=%s mode=filter status=%s reviewed=%s skipped=%s",
@@ -400,7 +628,70 @@ def bulk_review_by_filter(
         reviewed=reviewed,
         skipped=matched - reviewed,
         reviewed_ids=reviewed_ids,
+        undo_operation_id=undo_operation_id,
         status=payload.status,
+    )
+
+
+@router.post(
+    "/suggestions/bulk-review-operations/{operation_id}/undo",
+    response_model=BulkReviewUndoResult,
+)
+def undo_filtered_bulk_review(
+    operation_id: str,
+    db: Session = Depends(get_db),
+    actor: str = Depends(get_audit_actor),
+) -> BulkReviewUndoResult:
+    """Restore exactly the rows changed by one filtered bulk operation.
+
+    Rows that have since entered publication or received another decision are
+    deliberately skipped. Repeating the same request is idempotent and returns
+    the counts recorded by the first undo.
+    """
+    operation = db.scalar(
+        select(BulkReviewOperation)
+        .where(BulkReviewOperation.id == operation_id)
+        .with_for_update()
+    )
+    if operation is None:
+        raise HTTPException(status_code=404, detail="bulk review operation not found")
+    if operation.undone_at is not None:
+        return BulkReviewUndoResult(
+            restored=operation.undone_count or 0,
+            skipped=operation.skipped_count or 0,
+            status=operation.from_status,
+            already_undone=True,
+        )
+
+    cohort = select(BulkReviewOperationItem.suggestion_id).where(
+        BulkReviewOperationItem.operation_id == operation.id
+    )
+    _set_audit_actor(db, actor)
+    restored = db.execute(
+        update(Suggestion)
+        .where(
+            Suggestion.id.in_(cohort),
+            Suggestion.status == operation.to_status,
+        )
+        .values(**_review_values(operation.from_status))
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    skipped = operation.reviewed_count - restored
+    operation.undone_at = datetime.now(timezone.utc)
+    operation.undone_count = restored
+    operation.skipped_count = skipped
+    db.commit()
+    logger.info(
+        "suggestion review actor=%s mode=filtered-undo operation=%s restored=%s skipped=%s",
+        actor,
+        operation.id,
+        restored,
+        skipped,
+    )
+    return BulkReviewUndoResult(
+        restored=restored,
+        skipped=skipped,
+        status=operation.from_status,
     )
 
 

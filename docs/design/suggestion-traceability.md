@@ -21,7 +21,13 @@ transition cannot leave a false event behind.
 | Approved to applying | `publishing` | `publication-worker` |
 | Applying to applied | `applied` | `publication-worker` |
 | Approved to failed | `failed` | `publication-worker` |
+| Every failed remote write | `publish_attempt_failed` | `system:publication` |
 | Any active state to expired | `expired` | `policy-engine` |
+
+`publish_attempt_failed` stores the attempt number, full failure reason, and
+whether that attempt quarantined the suggestion. This keeps the complete
+publication error history even though `suggestions.publish_error` intentionally
+holds only the latest failure for the queue.
 
 Rows that predate the migration receive one `imported` snapshot containing
 their status, method, score and stored score components. The snapshot does not
@@ -42,3 +48,16 @@ of history size.
 The drawer explains the ranking from the data that actually selected the row:
 cosine similarity for baseline suggestions and BM25 plus semantic similarity
 for Hybrid suggestions. It then shows the trace id and lifecycle activity.
+
+The dedicated dashboard uses these endpoints:
+
+```http
+GET /api/v1/suggestion-events
+GET /api/v1/suggestion-events/export.csv
+```
+
+Both accept Trace ID, actor, event type, current status, site, and date-range
+filters. The paged dashboard exposes full event JSON, the current publication
+error, and a copyable Trace ID. CSV export applies the same filters to the full
+matching cohort rather than only the visible page. Spreadsheet formula prefixes
+are escaped before export.

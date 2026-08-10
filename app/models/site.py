@@ -1,6 +1,6 @@
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -62,6 +62,18 @@ class Site(Base):
     # Unknown stays NULL instead of pretending that the source connection date
     # is the age of a domain on the public internet.
     domain_registered_at: Mapped[date | None] = mapped_column(Date)
+    editorial_feedback_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true"
+    )
+    editorial_min_score_percent: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    editorial_feedback_weight: Mapped[float] = mapped_column(
+        Float, default=0.20, server_default="0.20"
+    )
+    editorial_feedback_min_samples: Mapped[int] = mapped_column(
+        Integer, default=10, server_default="10"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

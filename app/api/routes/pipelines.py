@@ -1,9 +1,18 @@
+import logging
+from datetime import UTC, datetime
+from time import monotonic, sleep
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from rq.command import send_stop_job_command
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db
-from app.models import PipelineBatch, PipelineSiteRun, Site
+from app.api.deps import get_audit_actor, get_db
+from app.db import SessionLocal
+from app.models import JobRun, PipelineBatch, PipelineSiteRun, Site
 from app.schemas.pipeline import PipelineBatchCreate, PipelineBatchOut, PipelineSiteRunOut
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.services.pipeline_service import (
@@ -12,9 +21,12 @@ from app.services.pipeline_service import (
     update_pipeline_site,
 )
 from app.tasks.pipeline import analyze_pipeline_site, ingest_pipeline_site
+from app.tasks.queues import redis_conn
 
 
 router = APIRouter(prefix="/pipelines", tags=["pipelines"])
+logger = logging.getLogger(__name__)
+TERMINAL_BATCH_STATUSES = {"succeeded", "failed", "partial_failed", "cancelled"}
 
 
 def _batch_out(db: Session, batch: PipelineBatch) -> PipelineBatchOut:
@@ -119,6 +131,109 @@ def get_pipeline_batch(batch_id: int, db: Session = Depends(get_db)) -> Pipeline
     batch = db.get(PipelineBatch, batch_id)
     if batch is None:
         raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    return _batch_out(db, batch)
+
+
+@router.get("/batches/{batch_id}/events")
+def stream_pipeline_batch(batch_id: int) -> StreamingResponse:
+    # Do not hold the request dependency's database session for the lifetime of
+    # a potentially long stream. Each snapshot gets a short read-only session.
+    with SessionLocal() as initial_db:
+        if initial_db.get(PipelineBatch, batch_id) is None:
+            raise HTTPException(404, f"pipeline batch {batch_id} not found")
+
+    def events():
+        previous = None
+        last_sent = monotonic()
+        while True:
+            with SessionLocal() as stream_db:
+                batch = stream_db.get(PipelineBatch, batch_id)
+                if batch is None:
+                    yield 'event: error\ndata: {"detail":"batch deleted"}\n\n'
+                    return
+                payload = _batch_out(stream_db, batch).model_dump_json()
+                terminal = batch.status in TERMINAL_BATCH_STATUSES
+            now = monotonic()
+            if payload != previous:
+                yield f"event: batch\ndata: {payload}\n\n"
+                previous = payload
+                last_sent = now
+            elif now - last_sent >= 15:
+                yield ": keep-alive\n\n"
+                last_sent = now
+            if terminal:
+                yield "event: done\ndata: {}\n\n"
+                return
+            sleep(1)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _stop_queue_job(db: Session, job_run_id: int | None, reason: str) -> None:
+    if job_run_id is None:
+        return
+    run = db.get(JobRun, job_run_id)
+    if run is None or not run.queue_job_id:
+        return
+    try:
+        job = Job.fetch(run.queue_job_id, connection=redis_conn)
+        status = job.get_status(refresh=True)
+        if status in {"queued", "deferred", "scheduled"}:
+            job.cancel()
+        elif status == "started":
+            send_stop_job_command(redis_conn, job.id)
+    except NoSuchJobError:
+        pass
+    except Exception:
+        logger.exception("could not stop RQ job %s during pipeline cancellation", run.queue_job_id)
+    if run.status in {"queued", "running"}:
+        run.status = "failed"
+        run.error = reason
+        run.finished_at = datetime.now(UTC)
+
+
+@router.post("/batches/{batch_id}/cancel", response_model=PipelineBatchOut)
+def cancel_pipeline_batch(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    actor: str = Depends(get_audit_actor),
+) -> PipelineBatchOut:
+    batch = db.scalar(
+        select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update()
+    )
+    if batch is None:
+        raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    if batch.status in {"succeeded", "failed", "partial_failed"}:
+        raise HTTPException(409, f"pipeline batch {batch_id} is already {batch.status}")
+    if batch.status == "cancelled":
+        return _batch_out(db, batch)
+
+    reason = f"Cancelled by {actor}"
+    items = list(
+        db.scalars(
+            select(PipelineSiteRun)
+            .where(PipelineSiteRun.batch_id == batch_id)
+            .with_for_update()
+        )
+    )
+    now = datetime.now(UTC)
+    for item in items:
+        if item.status in {"succeeded", "failed"}:
+            continue
+        _stop_queue_job(db, item.ingestion_job_run_id, reason)
+        _stop_queue_job(db, item.analysis_job_run_id, reason)
+        item.status = "cancelled"
+        item.error = reason
+        item.finished_at = now
+    batch.status = "cancelled"
+    batch.started_at = batch.started_at or now
+    batch.finished_at = now
+    db.commit()
+    db.refresh(batch)
     return _batch_out(db, batch)
 
 

@@ -16,6 +16,12 @@ from app.ml.baseline import top_candidates
 from app.ml.hybrid import HybridRanker, RankedCandidate
 from app.services.job_service import record_progress
 from app.services.external_link_policy import external_target_context
+from app.services.editorial_feedback import (
+    FEEDBACK_CANDIDATE_POOL,
+    load_editorial_feedback,
+    rerank_with_editorial_feedback,
+    score_percent,
+)
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
@@ -261,6 +267,7 @@ def generate_suggestions(
                 site.suggestion_mode,
                 ranking_mode_override,
             )
+            feedback_profile = load_editorial_feedback(db, site)
             if comparison_only and ranking_mode != "shadow":
                 raise ValueError("comparison-only analysis requires shadow ranking")
             suggestion_cap = settings.hybrid_max_suggestions_per_article
@@ -360,12 +367,17 @@ def generate_suggestions(
                     eligible_sources += 1
                 method = "baseline_cosine"
                 candidate_rows: list[RankedCandidate]
+                candidate_pool_limit = (
+                    max(remaining, FEEDBACK_CANDIDATE_POOL)
+                    if feedback_profile is not None and has_capacity and not comparison_only
+                    else remaining
+                )
                 if ranking_mode == "baseline" or (ranking_mode == "shadow" and not shadow_selected):
                     candidate_rows = _baseline_rows(
                         db,
                         article_id,
                         model,
-                        remaining,
+                        candidate_pool_limit,
                         allowed_target_ids=allowed_target_ids,
                     )
                 elif hybrid_ranker is None:
@@ -375,7 +387,7 @@ def generate_suggestions(
                             db,
                             article_id,
                             model,
-                            remaining,
+                            candidate_pool_limit,
                             allowed_target_ids=allowed_target_ids,
                         )
                         if has_capacity
@@ -383,7 +395,9 @@ def generate_suggestions(
                     )
                 else:
                     try:
-                        ranking_limit = suggestion_cap if shadow_selected else remaining
+                        ranking_limit = (
+                            suggestion_cap if shadow_selected else candidate_pool_limit
+                        )
                         ranking = hybrid_ranker.rank(
                             db,
                             source_id=article_id,
@@ -437,13 +451,28 @@ def generate_suggestions(
                                 db,
                                 article_id,
                                 model,
-                                remaining,
+                                candidate_pool_limit,
                                 allowed_target_ids=allowed_target_ids,
                             )
                             if has_capacity
                             else []
                         )
 
+                feedback_components: dict[int, dict] = {}
+                if has_capacity and not comparison_only:
+                    candidate_rows = [
+                        candidate
+                        for candidate in candidate_rows
+                        if score_percent(candidate.semantic_score)
+                        >= site.editorial_min_score_percent
+                    ]
+                    if feedback_profile is not None:
+                        candidate_rows, feedback_components = rerank_with_editorial_feedback(
+                            candidate_rows,
+                            feedback_profile,
+                            weight=site.editorial_feedback_weight,
+                        )
+                    candidate_rows = candidate_rows[:remaining]
                 if comparison_only:
                     candidate_rows = []
                 for candidate in candidate_rows:
@@ -472,6 +501,15 @@ def generate_suggestions(
                                         if candidate.target_id in external_trust
                                         else {}
                                     ),
+                                    **(
+                                        {
+                                            "editorial_feedback": feedback_components[
+                                                candidate.target_id
+                                            ]
+                                        }
+                                        if candidate.target_id in feedback_components
+                                        else {}
+                                    ),
                                 }
                                 or None
                             ),
@@ -498,6 +536,11 @@ def generate_suggestions(
                 "external_candidates_blocked": sum(
                     not evaluation.eligible for evaluation in external_trust.values()
                 ),
+                "editorial_feedback_applied": feedback_profile is not None,
+                "editorial_feedback_samples": (
+                    feedback_profile.samples if feedback_profile is not None else 0
+                ),
+                "editorial_min_score_percent": site.editorial_min_score_percent,
             }
             if ranking_mode != "baseline":
                 result.update(

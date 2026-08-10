@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import UTC, date, datetime, timedelta
 from statistics import fmean, median
+from math import floor
 
 from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session, aliased
@@ -19,6 +20,7 @@ from app.schemas.evaluation import (
     OrphanTrendPoint,
     PlacementMetrics,
     PublicationMetrics,
+    ScoreRangeMetrics,
     SiteEvaluationMetrics,
 )
 
@@ -307,6 +309,52 @@ def _site_metrics(
     return sorted(metrics, key=lambda item: (-item.suggestions, item.site_name, item.site_id))
 
 
+def _score_range_metrics(
+    db: Session,
+    site_id: int | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+) -> list[ScoreRangeMetrics]:
+    definitions = [(0, 59), (60, 69), (70, 79), (80, 89), (90, 100)]
+    grouped = {definition: defaultdict(int) for definition in definitions}
+    rows = db.execute(
+        select(Suggestion.score, Suggestion.status).where(
+            *_suggestion_conditions(site_id, date_from, date_to)
+        )
+    )
+    for score, status in rows:
+        percent = max(0, min(100, floor(float(score) * 100 + 0.5)))
+        bucket = next(
+            definition
+            for definition in definitions
+            if definition[0] <= percent <= definition[1]
+        )
+        grouped[bucket]["suggestions"] += 1
+        if status == "pending":
+            grouped[bucket]["pending"] += 1
+        elif status in ACCEPTED_STATUSES:
+            grouped[bucket]["accepted"] += 1
+        elif status == "rejected":
+            grouped[bucket]["rejected"] += 1
+    return [
+        ScoreRangeMetrics(
+            label=f"{minimum}-{maximum}%",
+            minimum=minimum,
+            maximum=maximum,
+            suggestions=grouped[(minimum, maximum)]["suggestions"],
+            pending=grouped[(minimum, maximum)]["pending"],
+            accepted=grouped[(minimum, maximum)]["accepted"],
+            rejected=grouped[(minimum, maximum)]["rejected"],
+            acceptance_rate=_rate(
+                grouped[(minimum, maximum)]["accepted"],
+                grouped[(minimum, maximum)]["accepted"]
+                + grouped[(minimum, maximum)]["rejected"],
+            ),
+        )
+        for minimum, maximum in definitions
+    ]
+
+
 def _bucket_kind(date_from: datetime, date_to: datetime) -> str:
     days = max(1, (date_to - date_from).days)
     if days <= 31:
@@ -498,6 +546,7 @@ def evaluation_metrics(
         trend=_trend(db, site_id, date_from, date_to),
         orphan_trend=_orphan_trend(db, site_id, date_from, date_to),
         methods=_method_metrics(db, site_id, date_from, date_to),
+        score_ranges=_score_range_metrics(db, site_id, date_from, date_to),
         sites=_site_metrics(db, site_id, date_from, date_to),
     )
 

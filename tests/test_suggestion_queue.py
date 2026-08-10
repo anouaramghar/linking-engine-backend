@@ -338,6 +338,7 @@ def test_bulk_rule_approves_displayed_threshold_with_reviewed_ids(
         threshold_percent=80,
     ).json()
 
+    assert isinstance(body.pop("undo_operation_id"), str)
     assert body == {
         "reviewed": 2,
         "skipped": 0,
@@ -364,6 +365,7 @@ def test_bulk_rule_rejects_strictly_below_the_same_threshold(client, db, site):
         threshold_percent=80,
     ).json()
 
+    assert isinstance(body.pop("undo_operation_id"), str)
     assert body == {
         "reviewed": 1,
         "skipped": 0,
@@ -407,6 +409,7 @@ def test_bulk_rule_default_match_status_is_pending(client, db, site):
         threshold_percent=100,
     ).json()
 
+    assert isinstance(body.pop("undo_operation_id"), str)
     assert body == {
         "reviewed": 1,
         "skipped": 0,
@@ -504,10 +507,11 @@ def test_small_filtered_review_can_be_undone_by_returned_ids(client, db, site):
     assert db.get(Suggestion, pending.id).reviewed_at is None
 
 
-def test_large_filtered_review_returns_counts_without_ids(client, db, site):
+def test_large_filtered_review_has_exact_idempotent_server_side_undo(client, db, site):
     pair = _pair(db, site)
-    for _ in range(MAX_BULK_REVIEW + 1):
-        _suggest(db, site, pair, 0.90)
+    suggestions = [
+        _suggest(db, site, pair, 0.90) for _ in range(MAX_BULK_REVIEW + 1)
+    ]
     db.commit()
 
     body = _rule(
@@ -517,11 +521,39 @@ def test_large_filtered_review_returns_counts_without_ids(client, db, site):
         threshold_percent=80,
     ).json()
 
+    operation_id = body.pop("undo_operation_id")
+    assert isinstance(operation_id, str)
     assert body == {
         "reviewed": MAX_BULK_REVIEW + 1,
         "skipped": 0,
         "reviewed_ids": None,
         "status": "approved",
+    }
+
+    # A row that has moved on since the review must not be overwritten by Undo.
+    suggestions[0].status = "applied"
+    db.commit()
+    undone = client.post(
+        f"/api/v1/suggestions/bulk-review-operations/{operation_id}/undo"
+    )
+    assert undone.status_code == 200
+    assert undone.json() == {
+        "restored": MAX_BULK_REVIEW,
+        "skipped": 1,
+        "status": "pending",
+        "already_undone": False,
+    }
+    assert _status(db, suggestions[0].id) == "applied"
+    assert _status(db, suggestions[-1].id) == "pending"
+
+    repeated = client.post(
+        f"/api/v1/suggestions/bulk-review-operations/{operation_id}/undo"
+    )
+    assert repeated.json() == {
+        "restored": MAX_BULK_REVIEW,
+        "skipped": 1,
+        "status": "pending",
+        "already_undone": True,
     }
 
 
@@ -541,6 +573,7 @@ def test_bulk_rule_matching_nothing_is_not_an_error(client, db, site):
         "reviewed": 0,
         "skipped": 0,
         "reviewed_ids": [],
+        "undo_operation_id": None,
         "status": "approved",
     }
 

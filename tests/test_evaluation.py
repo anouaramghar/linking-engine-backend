@@ -156,6 +156,19 @@ def test_evaluation_metrics_use_real_editorial_and_delivery_data(client, db, sit
             "average_semantic_score": 0.815,
         },
     ]
+    ranges = {item["label"]: item for item in payload["score_ranges"]}
+    assert ranges["60-69%"]["acceptance_rate"] == 1.0
+    assert ranges["70-79%"]["acceptance_rate"] == 0.0
+    assert ranges["80-89%"] == {
+        "label": "80-89%",
+        "minimum": 80,
+        "maximum": 89,
+        "suggestions": 2,
+        "pending": 1,
+        "accepted": 1,
+        "rejected": 0,
+        "acceptance_rate": 1.0,
+    }
     assert payload["sites"] == [
         {
             "site_id": site.id,

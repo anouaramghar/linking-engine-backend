@@ -8,13 +8,20 @@ from app.models.link import InternalLink
 from app.models.pool_audit import PoolSourceAuditEvent
 from app.models.pipeline import PipelineBatch, PipelineSiteRun
 from app.models.site import IngestionRun, Site
-from app.models.suggestion import Suggestion, SuggestionEvent
+from app.models.suggestion import (
+    BulkReviewOperation,
+    BulkReviewOperationItem,
+    Suggestion,
+    SuggestionEvent,
+)
 
 __all__ = [
     "Base",
     "Alert",
     "Article",
     "ArticleTaxonomy",
+    "BulkReviewOperation",
+    "BulkReviewOperationItem",
     "Embedding",
     "EvaluationSnapshot",
     "ExternalLinkPolicy",

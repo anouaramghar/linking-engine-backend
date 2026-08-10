@@ -59,6 +59,17 @@ class MethodMetrics(BaseModel):
     average_semantic_score: float | None
 
 
+class ScoreRangeMetrics(BaseModel):
+    label: str
+    minimum: int
+    maximum: int
+    suggestions: int
+    pending: int
+    accepted: int
+    rejected: int
+    acceptance_rate: float | None
+
+
 class SiteEvaluationMetrics(BaseModel):
     site_id: int
     site_name: str
@@ -108,6 +119,7 @@ class EvaluationMetricsOut(BaseModel):
     trend: list[EvaluationTrendPoint]
     orphan_trend: list[OrphanTrendPoint]
     methods: list[MethodMetrics]
+    score_ranges: list[ScoreRangeMetrics]
     sites: list[SiteEvaluationMetrics]
 
 

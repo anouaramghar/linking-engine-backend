@@ -7,6 +7,14 @@ sites while tracking each site independently. See
 [docs/batch-pipeline.md](docs/batch-pipeline.md) for the API, statuses, and retry
 procedure.
 
+## Review reliability and traceability
+
+Large reversible review operations, exact partial-failure recovery, and their
+API contracts are documented in
+[docs/design/bulk-review-reliability.md](docs/design/bulk-review-reliability.md).
+The searchable audit dashboard and publication-attempt history are documented
+in [docs/design/suggestion-traceability.md](docs/design/suggestion-traceability.md).
+
 ## Evaluation dashboard history
 
 The evaluation API computes editorial, placement, publishing, method, and site

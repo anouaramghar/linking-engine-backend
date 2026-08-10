@@ -40,7 +40,7 @@ from app.config import settings
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
 from app.ml.llm import openrouter
-from app.models import Article, JobRun, Site, Suggestion
+from app.models import Article, JobRun, Site, Suggestion, SuggestionEvent
 from app.services import placement_service
 from app.services.publication_progress import (
     begin_publication_attempt,
@@ -500,11 +500,17 @@ def _record_attempt_failure(db, suggestion_ids: list[int], reason: str) -> int:
     """
     limit = settings.publish_max_suggestion_attempts
     try:
-        db.execute(
-            update(Suggestion)
-            .where(Suggestion.id.in_(suggestion_ids), Suggestion.status == "approved")
-            .values(publish_attempts=Suggestion.publish_attempts + 1, publish_error=reason[:2000])
-            .execution_options(synchronize_session=False)
+        updated_ids = list(
+            db.scalars(
+                update(Suggestion)
+                .where(Suggestion.id.in_(suggestion_ids), Suggestion.status == "approved")
+                .values(
+                    publish_attempts=Suggestion.publish_attempts + 1,
+                    publish_error=reason[:2000],
+                )
+                .returning(Suggestion.id)
+                .execution_options(synchronize_session=False)
+            )
         )
         quarantined = db.execute(
             update(Suggestion)
@@ -516,6 +522,24 @@ def _record_attempt_failure(db, suggestion_ids: list[int], reason: str) -> int:
             .values(status="failed")
             .execution_options(synchronize_session=False)
         ).rowcount
+        attempts = db.execute(
+            select(Suggestion.id, Suggestion.publish_attempts, Suggestion.status).where(
+                Suggestion.id.in_(updated_ids)
+            )
+        ).all()
+        db.add_all(
+            SuggestionEvent(
+                suggestion_id=suggestion_id,
+                event_type="publish_attempt_failed",
+                actor="system:publication",
+                details={
+                    "reason": reason[:2000],
+                    "attempt": attempt_count,
+                    "terminal": status == "failed",
+                },
+            )
+            for suggestion_id, attempt_count, status in attempts
+        )
         db.commit()
         return quarantined
     except Exception:

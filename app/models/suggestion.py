@@ -166,3 +166,32 @@ class SuggestionEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     suggestion: Mapped[Suggestion] = relationship(back_populates="events")
+
+
+class BulkReviewOperation(Base):
+    """Durable identity for one server-side bulk rule and its exact undo cohort."""
+
+    __tablename__ = "bulk_review_operations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    actor: Mapped[str] = mapped_column(String(255))
+    from_status: Mapped[str] = mapped_column(String(20))
+    to_status: Mapped[str] = mapped_column(String(20))
+    reviewed_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    undone_count: Mapped[int | None] = mapped_column(Integer)
+    skipped_count: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class BulkReviewOperationItem(Base):
+    """One suggestion changed by a bulk rule, stored without sending huge ID lists."""
+
+    __tablename__ = "bulk_review_operation_items"
+
+    operation_id: Mapped[str] = mapped_column(
+        ForeignKey("bulk_review_operations.id", ondelete="CASCADE"), primary_key=True
+    )
+    suggestion_id: Mapped[int] = mapped_column(
+        ForeignKey("suggestions.id", ondelete="CASCADE"), primary_key=True
+    )

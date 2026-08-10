@@ -599,6 +599,10 @@ def test_a_suggestion_that_keeps_failing_is_quarantined(db, site, articles, monk
     assert stored.status == "failed"
     assert stored.publish_attempts == 2
     assert "WP stayed unavailable" in stored.publish_error
+    attempts = [event for event in stored.events if event.event_type == "publish_attempt_failed"]
+    assert [event.details["attempt"] for event in attempts] == [1, 2]
+    assert [event.details["terminal"] for event in attempts] == [False, True]
+    assert all("WP stayed unavailable" in event.details["reason"] for event in attempts)
 
 
 def test_quarantine_disables_the_remaining_rq_retry(

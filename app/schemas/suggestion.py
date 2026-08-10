@@ -31,6 +31,23 @@ class SuggestionEventOut(BaseModel):
     created_at: datetime
 
 
+class TraceEventOut(SuggestionEventOut):
+    trace_id: str
+    site_id: int
+    site_name: str
+    source_title: str
+    target_title: str
+    suggestion_status: str
+    publish_error: str | None = None
+
+
+class TraceEventPage(BaseModel):
+    items: list[TraceEventOut]
+    total: int
+    limit: int
+    offset: int
+
+
 class SuggestionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -182,9 +199,17 @@ class BulkReviewFilter(BaseModel):
 
 
 class BulkReviewFilterResult(BaseModel):
-    """Counts for every review, plus ids while an exact undo remains practical."""
+    """Counts for every review and a durable exact-undo operation."""
 
     reviewed: int
     skipped: int
     reviewed_ids: list[int] | None
+    undo_operation_id: str | None
     status: ReviewStatus
+
+
+class BulkReviewUndoResult(BaseModel):
+    restored: int
+    skipped: int
+    status: ReviewStatus
+    already_undone: bool = False
