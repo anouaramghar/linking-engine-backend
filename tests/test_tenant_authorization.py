@@ -324,7 +324,10 @@ def test_last_used_at_survives_a_read_only_request(real_auth, db):
         first = record.last_used_at
         assert real_auth.get("/api/v1/sites", headers={"X-API-Key": key}).status_code == 200
         db.expire_all()
-        assert db.scalar(select(ApiKey).where(ApiKey.prefix == key.split("_", 3)[2])).last_used_at == first
+        assert (
+            db.scalar(select(ApiKey).where(ApiKey.prefix == key.split("_", 3)[2])).last_used_at
+            == first
+        )
 
         # Age it past the window and the next request refreshes it.
         record = db.scalar(select(ApiKey).where(ApiKey.prefix == key.split("_", 3)[2]))
@@ -333,7 +336,10 @@ def test_last_used_at_survives_a_read_only_request(real_auth, db):
         stale = record.last_used_at
         assert real_auth.get("/api/v1/sites", headers={"X-API-Key": key}).status_code == 200
         db.expire_all()
-        assert db.scalar(select(ApiKey).where(ApiKey.prefix == key.split("_", 3)[2])).last_used_at > stale
+        assert (
+            db.scalar(select(ApiKey).where(ApiKey.prefix == key.split("_", 3)[2])).last_used_at
+            > stale
+        )
 
 
 def test_minting_requires_a_pepper_outside_development(monkeypatch, db):
@@ -468,6 +474,24 @@ def test_tenant_may_read_but_not_create_pool_sources(real_auth, db):
         )
 
 
+def test_tenant_key_cannot_mutate_a_pool_source_owned_by_its_own_tenant(real_auth, db):
+    """Pool authority is based on platform, not an accidentally matching tenant id."""
+    with _tenant(db, "pool-row-owner") as (tenant, key):
+        pool = _site(db, tenant, platform="pool", name="same-tenant-pool", approved_pool=True)
+        headers = {"X-API-Key": key}
+
+        assert real_auth.get(f"/api/v1/sites/{pool.id}", headers=headers).status_code == 200
+        assert real_auth.post(f"/api/v1/sites/{pool.id}/ingest", headers=headers).status_code == 403
+        assert (
+            real_auth.delete(
+                f"/api/v1/sites/{pool.id}",
+                headers=headers,
+                params={"confirm_name": pool.name},
+            ).status_code
+            == 403
+        )
+
+
 def test_bulk_import_cannot_smuggle_a_pool_source(real_auth, db):
     """The check runs on the validated row, so casing cannot get around it."""
     with _tenant(db, "smuggler") as (_tenant_row, key):
@@ -476,16 +500,24 @@ def test_bulk_import_cannot_smuggle_a_pool_source(real_auth, db):
             headers={"X-API-Key": key},
             json={
                 "sites": [
-                    {"name": "ordinary", "base_url": "https://ordinary.example.com", "platform": "html"},
-                    {"name": "sneaky", "base_url": "https://sneaky.example.com", "platform": "POOL"},
+                    {
+                        "name": "ordinary",
+                        "base_url": "https://ordinary.example.com",
+                        "platform": "html",
+                    },
+                    {
+                        "name": "sneaky",
+                        "base_url": "https://sneaky.example.com",
+                        "platform": "POOL",
+                    },
                 ]
             },
         )
         assert response.status_code == 403
         # Nothing commits until the loop finishes, so the batch landed nowhere.
-        assert db.scalar(
-            select(Site).where(Site.base_url == "https://ordinary.example.com")
-        ) is None
+        assert (
+            db.scalar(select(Site).where(Site.base_url == "https://ordinary.example.com")) is None
+        )
 
 
 # --------------------------------------------------------------------------

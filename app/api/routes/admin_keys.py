@@ -65,7 +65,9 @@ def delete_tenant(
         raise HTTPException(404, f"tenant {tenant_id} not found")
     if tenant.slug == DEFAULT_TENANT_SLUG:
         raise HTTPException(409, "the default tenant cannot be deleted")
-    owned = db.scalar(select(func.count()).select_from(Site).where(Site.tenant_id == tenant_id)) or 0
+    owned = (
+        db.scalar(select(func.count()).select_from(Site).where(Site.tenant_id == tenant_id)) or 0
+    )
     if owned:
         raise HTTPException(
             409,

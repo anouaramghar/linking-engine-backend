@@ -36,25 +36,20 @@ def _update(text: str, *, telegram_id: int = 4242, update_id: int = 1, **sender)
     }
 
 
-def _nonce(db) -> str:
-    row = dashboard_auth.create_login_nonce(db)
-    db.commit()
-    return row.nonce
-
-
 def _texts(replies) -> list[str]:
     return [reply.text for reply in replies]
 
 
 def _approve(db, telegram_id: int, **sender) -> None:
     """Put someone on the far side of the gate, the way a real admin would."""
-    user = dashboard_auth.bind_nonce(db, _nonce(db), telegram_id=telegram_id, **sender)
+    user, code = dashboard_auth.create_login_code(db, telegram_id, **sender)
+    assert code is None
     dashboard_auth.approve_user(db, user, approved_by="bootstrap")
     db.commit()
 
 
-def test_start_with_a_nonce_records_a_pending_request(db):
-    replies = telegram_bot.handle_update(db, _update(f"/start {_nonce(db)}"))
+def test_start_records_a_pending_request(db):
+    replies = telegram_bot.handle_update(db, _update("/start login"))
 
     assert _texts(replies) == [telegram_bot.PENDING]
     user = db.query(DashboardUser).one()
@@ -69,7 +64,7 @@ def test_a_new_request_alerts_everyone_who_could_admit_it(db):
     _approve(db, 222)
 
     replies = telegram_bot.handle_update(
-        db, _update(f"/start {_nonce(db)}", telegram_id=4242, username="anouar")
+        db, _update("/start login", telegram_id=4242, username="anouar")
     )
 
     assert replies[0] == telegram_bot.Reply(4242, telegram_bot.PENDING)
@@ -84,61 +79,54 @@ def test_an_approved_user_signing_in_again_alerts_nobody(db):
     _approve(db, 111)
     _approve(db, 4242)
 
-    replies = telegram_bot.handle_update(db, _update(f"/start {_nonce(db)}", telegram_id=4242))
+    replies = telegram_bot.handle_update(db, _update("/start login", telegram_id=4242))
 
-    assert _texts(replies) == [telegram_bot.SIGNED_IN]
+    assert len(replies) == 1
+    assert "one-time code" in replies[0].text
 
 
 def test_a_request_with_no_handle_is_still_named_in_the_alert(db):
     _approve(db, 111)
 
     replies = telegram_bot.handle_update(
-        db, _update(f"/start {_nonce(db)}", telegram_id=4242, first_name="Anouar")
+        db, _update("/start login", telegram_id=4242, first_name="Anouar")
     )
 
     assert replies[1].text == telegram_bot.NEW_REQUEST.format(who="Anouar")
 
 
-def test_approved_user_is_told_they_are_signed_in(db):
+def test_approved_user_receives_a_one_time_code(db):
     _approve(db, 4242)
 
-    replies = telegram_bot.handle_update(db, _update(f"/start {_nonce(db)}"))
+    replies = telegram_bot.handle_update(db, _update("/start login"))
 
-    assert _texts(replies) == [telegram_bot.SIGNED_IN]
+    assert len(replies) == 1
+    assert "one-time code" in replies[0].text
 
 
 def test_revoked_user_is_told_so(db):
-    first = _nonce(db)
-    user = dashboard_auth.bind_nonce(db, first, telegram_id=4242)
+    user, code = dashboard_auth.create_login_code(db, 4242)
+    assert code is None
     dashboard_auth.revoke_user(db, user)
     db.commit()
 
-    replies = telegram_bot.handle_update(db, _update(f"/start {_nonce(db)}"))
+    replies = telegram_bot.handle_update(db, _update("/start login"))
 
     assert _texts(replies) == [telegram_bot.REVOKED]
 
 
-def test_expired_or_reused_nonce_says_so(db):
-    nonce = _nonce(db)
-    telegram_bot.handle_update(db, _update(f"/start {nonce}"))
+def test_start_payload_carries_no_authority(db):
+    replies = telegram_bot.handle_update(db, _update("/start attacker-controlled"))
 
-    replies = telegram_bot.handle_update(db, _update(f"/start {nonce}", telegram_id=9999))
-
-    assert _texts(replies) == [telegram_bot.EXPIRED]
+    assert _texts(replies) == [telegram_bot.PENDING]
+    assert db.query(DashboardUser).one().telegram_id == 4242
 
 
-def test_unknown_nonce_says_expired_rather_than_admitting_anything(db):
-    replies = telegram_bot.handle_update(db, _update("/start never-issued"))
-
-    assert _texts(replies) == [telegram_bot.EXPIRED]
-    assert db.query(DashboardUser).count() == 0
-
-
-def test_bare_start_explains_where_to_get_a_link(db):
+def test_bare_start_also_begins_the_identity_ceremony(db):
     replies = telegram_bot.handle_update(db, _update("/start"))
 
-    assert _texts(replies) == [telegram_bot.WELCOME]
-    assert db.query(DashboardUser).count() == 0
+    assert _texts(replies) == [telegram_bot.PENDING]
+    assert db.query(DashboardUser).count() == 1
 
 
 def test_chatter_gets_the_welcome_not_a_login(db):
@@ -148,9 +136,7 @@ def test_chatter_gets_the_welcome_not_a_login(db):
 
 
 def test_display_fields_are_captured_for_the_approval_queue(db):
-    telegram_bot.handle_update(
-        db, _update(f"/start {_nonce(db)}", username="anouar", first_name="Anouar")
-    )
+    telegram_bot.handle_update(db, _update("/start login", username="anouar", first_name="Anouar"))
 
     user = db.query(DashboardUser).one()
     assert user.username == "anouar"
@@ -195,7 +181,7 @@ class _FakeClient:
 
 def test_loop_acknowledges_updates_so_a_restart_cannot_replay_them(db, monkeypatch):
     monkeypatch.setattr(telegram_bot, "SessionLocal", lambda: db)
-    client = _FakeClient([[_update(f"/start {_nonce(db)}", update_id=77)]])
+    client = _FakeClient([[_update("/start login", update_id=77)]])
 
     telegram_bot.run(client, max_cycles=2)
 
@@ -207,7 +193,7 @@ def test_loop_acknowledges_updates_so_a_restart_cannot_replay_them(db, monkeypat
 def test_loop_sends_every_message_one_update_produces(db, monkeypatch):
     monkeypatch.setattr(telegram_bot, "SessionLocal", lambda: db)
     _approve(db, 111)
-    client = _FakeClient([[_update(f"/start {_nonce(db)}", username="anouar")]])
+    client = _FakeClient([[_update("/start login", username="anouar")]])
 
     telegram_bot.run(client, max_cycles=1)
 
@@ -221,7 +207,7 @@ def test_one_unreachable_approver_does_not_silence_the_rest(db, monkeypatch):
     monkeypatch.setattr(telegram_bot, "SessionLocal", lambda: db)
     _approve(db, 111)
     _approve(db, 222)
-    client = _FakeClient([[_update(f"/start {_nonce(db)}")]])
+    client = _FakeClient([[_update("/start login")]])
     # Someone who never opened a chat with the bot: Telegram refuses that one
     # message, and the others must still go out.
     original = client.send_message
@@ -241,7 +227,7 @@ def test_one_unreachable_approver_does_not_silence_the_rest(db, monkeypatch):
 def test_loop_survives_a_failed_poll(db, monkeypatch):
     monkeypatch.setattr(telegram_bot, "SessionLocal", lambda: db)
     monkeypatch.setattr(telegram_bot, "ERROR_BACKOFF_SECONDS", 0)
-    client = _FakeClient([[_update(f"/start {_nonce(db)}")]], fail_first=True)
+    client = _FakeClient([[_update("/start login")]], fail_first=True)
 
     telegram_bot.run(client, max_cycles=2)
 

@@ -228,17 +228,11 @@ def test_total_is_opt_in(client, db, site):
 
 
 def test_page_size_is_capped(client, site):
-    assert client.get(
-        "/api/v1/suggestions", params={"limit": MAX_PAGE_SIZE}
-    ).status_code == 200
-    assert client.get(
-        "/api/v1/suggestions", params={"limit": MAX_PAGE_SIZE + 1}
-    ).status_code == 422
+    assert client.get("/api/v1/suggestions", params={"limit": MAX_PAGE_SIZE}).status_code == 200
+    assert client.get("/api/v1/suggestions", params={"limit": MAX_PAGE_SIZE + 1}).status_code == 422
 
 
-def test_counts_report_every_status_and_a_total_matching_the_list(
-    client, db, site, other_site
-):
+def test_counts_report_every_status_and_a_total_matching_the_list(client, db, site, other_site):
     pair, other_pair = _pair(db, site), _pair(db, other_site)
     _suggest(db, site, pair, 0.10)
     _suggest(db, site, pair, 0.20)
@@ -287,9 +281,7 @@ def test_counts_respect_the_displayed_percent_window(client, db, site):
     assert (counts["pending"], counts["total"]) == (2, 2)
 
 
-def test_percent_threshold_partitions_exact_half_boundary(
-    client, db, site
-):
+def test_percent_threshold_partitions_exact_half_boundary(client, db, site):
     pair = _pair(db, site)
     below = _suggest(db, site, pair, 0.7949)
     at = _suggest(db, site, pair, 0.795)
@@ -321,9 +313,7 @@ def test_percent_threshold_partitions_exact_half_boundary(
     assert approve_half["total"] + reject_half["total"] == 3
 
 
-def test_bulk_rule_approves_displayed_threshold_with_reviewed_ids(
-    client, db, site, other_site
-):
+def test_bulk_rule_approves_displayed_threshold_with_reviewed_ids(client, db, site, other_site):
     pair, other_pair = _pair(db, site), _pair(db, other_site)
     below = _suggest(db, site, pair, 0.7949)
     at = _suggest(db, site, pair, 0.795)
@@ -546,12 +536,15 @@ def test_bulk_rule_matching_nothing_is_not_an_error(client, db, site):
 
 
 def test_bulk_rule_cannot_set_a_worker_owned_status(client, site):
-    assert _rule(
-        client,
-        status="applied",
-        site_id=site.id,
-        threshold_percent=80,
-    ).status_code == 422
+    assert (
+        _rule(
+            client,
+            status="applied",
+            site_id=site.id,
+            threshold_percent=80,
+        ).status_code
+        == 422
+    )
 
 
 def test_fleet_wide_bulk_rule_must_be_asked_for_explicitly(client, db, site):
@@ -603,15 +596,11 @@ def test_paged_queue_and_bulk_rule_agree_on_the_same_filter(client, db, site):
     ).json()
 
     assert listed["total"] == reviewed["reviewed"] == 3
-    remaining = db.scalars(
-        select(Suggestion.status).where(Suggestion.site_id == site.id)
-    ).all()
+    remaining = db.scalars(select(Suggestion.status).where(Suggestion.site_id == site.id)).all()
     assert sorted(remaining) == ["approved", "approved", "approved", "pending"]
 
 
-def test_pending_publication_lists_only_sites_with_approved_backlogs(
-    client, db, site, other_site
-):
+def test_pending_publication_lists_only_sites_with_approved_backlogs(client, db, site, other_site):
     pair, other_pair = _pair(db, site), _pair(db, other_site)
     _suggest(db, site, pair, 0.90, status="approved")
     _suggest(db, site, pair, 0.80, status="approved")
@@ -627,6 +616,7 @@ def test_pending_publication_lists_only_sites_with_approved_backlogs(
     }
 
     assert owned == {site.id: 2}
-    assert client.get(f"/api/v1/publish/{site.id}/status").json()[
-        "awaiting_publication"
-    ] == owned[site.id]
+    assert (
+        client.get(f"/api/v1/publish/{site.id}/status").json()["awaiting_publication"]
+        == owned[site.id]
+    )

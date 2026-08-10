@@ -24,8 +24,17 @@ from app.connectors.base import (
     SiteMetadata,
     TaxonomyData,
 )
-from app.connectors.http_limits import check_crawl_deadline, get_limited_http_response
-from app.connectors.url_guard import SSRFProtectedTransport, request_guard, validate_url
+from app.connectors.http_limits import (
+    check_crawl_deadline,
+    get_limited_http_response,
+    request_limited_http_response,
+)
+from app.connectors.url_guard import (
+    SSRFProtectedTransport,
+    UnsafeURLError,
+    request_guard,
+    validate_url,
+)
 from app.models.suggestion import Suggestion
 
 _API_DISCOVERY_REL = "https://api.w.org/"
@@ -339,6 +348,7 @@ class WordPressConnector(ContentConnector):
             self.client,
             url,
             max_bytes=settings.crawl_max_response_bytes,
+            crawl_started_at=self._crawl_started_at,
             **kwargs,
         )
 
@@ -419,9 +429,7 @@ class WordPressConnector(ContentConnector):
             key == "rest_route" for key, _value in parse_qsl(parts.query, keep_blank_values=True)
         )
         candidate = (
-            url
-            if has_rest_route
-            else parts._replace(path=parts.path.rstrip("/") + "/").geturl()
+            url if has_rest_route else parts._replace(path=parts.path.rstrip("/") + "/").geturl()
         )
         host = urlparse(candidate).netloc.lower()
         if host not in self._content_hosts and host != "public-api.wordpress.com":
@@ -432,9 +440,7 @@ class WordPressConnector(ContentConnector):
     def _discover_page_links(self) -> tuple[list[str], list[str]]:
         """Find WordPress API/feed links when the submitted URL is a page URL."""
         try:
-            response = self._get(
-                self.site.base_url, **self._request_kwargs(self.site.base_url)
-            )
+            response = self._get(self.site.base_url, **self._request_kwargs(self.site.base_url))
         except httpx.HTTPError:
             return [], []
 
@@ -588,9 +594,7 @@ class WordPressConnector(ContentConnector):
             if total_pages is not None:
                 declared_total = int(total_pages)
                 if declared_total > settings.crawl_max_wordpress_pages:
-                    raise ValueError(
-                        "WordPress pagination exceeded the configured page limit"
-                    )
+                    raise ValueError("WordPress pagination exceeded the configured page limit")
                 if page >= declared_total:
                     return
             elif page >= settings.crawl_max_wordpress_pages:
@@ -615,7 +619,9 @@ class WordPressConnector(ContentConnector):
 
     def _internal_hrefs(self, content_html: str, page_url: str) -> list[str]:
         """Hrefs pointing at this site's host, resolved absolute (handles /relative/ links)."""
-        return [link.url for link in self._internal_links_from_tree(_parse_html(content_html), page_url)]
+        return [
+            link.url for link in self._internal_links_from_tree(_parse_html(content_html), page_url)
+        ]
 
     def _all_hrefs(self, content_html: str, page_url: str) -> list[str]:
         """Every href on the page, resolved absolute, whatever host it points at.
@@ -701,11 +707,19 @@ class WordPressConnector(ContentConnector):
     def _to_article(
         self, post: dict, taxonomy_map: dict[tuple[str, int], TaxonomyData]
     ) -> ArticleData:
-        post_host = urlparse(post["link"]).netloc.lower()
-        if (
-            self._host.lower() == "wordpress.com"
-            and post_host.endswith(".wordpress.com")
-        ):
+        post_url = post.get("link")
+        if not isinstance(post_url, str):
+            raise ValueError("WordPress returned a post without an HTTP(S) link")
+        try:
+            validate_url(
+                post_url,
+                allow_private=settings.allow_unsafe_crawl_targets,
+                resolve_dns=False,
+            )
+        except UnsafeURLError as error:
+            raise ValueError(f"WordPress returned an unsafe post link: {error}") from error
+        post_host = urlparse(post_url).netloc.lower()
+        if self._host.lower() == "wordpress.com" and post_host.endswith(".wordpress.com"):
             self._content_hosts.add(post_host)
             self._canonical_host = post_host
         content_html = post["content"]["rendered"]
@@ -715,17 +729,15 @@ class WordPressConnector(ContentConnector):
             raise ValueError(
                 f"article content exceeded {settings.crawl_max_article_chars} characters"
             )
-        internal_urls = self._internal_links_from_tree(content_tree, post["link"])
+        internal_urls = self._internal_links_from_tree(content_tree, post_url)
         if len(internal_urls) > settings.crawl_max_links_per_article:
-            raise ValueError(
-                f"article link count exceeded {settings.crawl_max_links_per_article}"
-            )
+            raise ValueError(f"article link count exceeded {settings.crawl_max_links_per_article}")
         term_refs = [
             *(("category", term_id) for term_id in post.get("categories", [])),
             *(("tag", term_id) for term_id in post.get("tags", [])),
         ]
         return ArticleData(
-            url=post["link"],
+            url=post_url,
             external_id=str(post["id"]),
             title=_strip_html(post["title"]["rendered"]),
             content_text=content_text,
@@ -834,7 +846,14 @@ class WordPressConnector(ContentConnector):
         """Save `content`, pausing if the host asks us to slow down."""
         url = self._api_url(self._api_base_url or "", f"posts/{source.external_id}")
         return self._pausing_on_throttle(
-            lambda: self.client.post(url, json={"content": content}, **self._request_kwargs(url)),
+            lambda: request_limited_http_response(
+                self.client,
+                "POST",
+                url,
+                max_bytes=settings.crawl_max_response_bytes,
+                json={"content": content},
+                **self._request_kwargs(url),
+            ),
             f"saving post {source.external_id}",
         )
 
@@ -902,6 +921,13 @@ class WordPressConnector(ContentConnector):
         if not suggestions or preview.updated_content == preview.original_content or dry_run:
             return preview.outcomes
         source = suggestions[0].source_article
+        # WordPress core exposes no compare-and-swap precondition on post
+        # updates. Re-read immediately before the full-content replacement and
+        # refuse if an editor changed it while LinkMesh prepared the links.
+        if self._read_post_for_edit(source) != preview.original_content:
+            raise RuntimeError(
+                f"WordPress post {source.external_id} changed while LinkMesh prepared it; retry"
+            )
         update = self._post_content(source, preview.updated_content)
         update.raise_for_status()
         self._warn_if_marker_stripped(source, preview.updated_content, update)

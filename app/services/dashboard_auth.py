@@ -1,9 +1,9 @@
-"""Dashboard login: nonces, sessions, and who is admitted.
+"""Dashboard login: one-time Telegram codes, sessions, and admission.
 
-The browser proves nothing itself. It shows a nonce, the operator carries that
-nonce to the bot inside Telegram, the bot binds it to whoever sent it, and the
-browser then trades the nonce for a session cookie. Telegram is the identity
-provider; this module is the admission desk.
+The browser never creates a redeemable login link. Telegram gives the identified
+operator a one-time code, and the operator carries that code back to their browser.
+This direction matters: forwarding a bot link cannot give its creator somebody
+else's session. Telegram is the identity provider; this module is the admission desk.
 
 See ``docs/design/dashboard-authentication.md``.
 """
@@ -30,8 +30,10 @@ logger = logging.getLogger(__name__)
 #: cookie without importing a router that imports it back.
 SESSION_COOKIE = "linkmesh_session"
 
-_NONCE_BYTES = 24
 _SESSION_TOKEN_BYTES = 32
+_LOGIN_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+_LOGIN_CODE_GROUPS = 3
+_LOGIN_CODE_GROUP_SIZE = 4
 
 #: How much of a session's life may elapse before a request extends it. The
 #: slide is an UPDATE holding a row lock until commit, so extending on every
@@ -56,11 +58,11 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def login_deep_link(nonce: str) -> str | None:
+def login_deep_link() -> str | None:
     """The t.me URL the browser shows, or None when login is not configured."""
     if not settings.telegram_bot_username:
         return None
-    return f"https://t.me/{settings.telegram_bot_username}?start={nonce}"
+    return f"https://t.me/{settings.telegram_bot_username}?start=login"
 
 
 def dashboard_login_configured() -> bool:
@@ -68,55 +70,62 @@ def dashboard_login_configured() -> bool:
 
 
 # --------------------------------------------------------------------------
-# Nonces
+# One-time login codes
 # --------------------------------------------------------------------------
 
 
-def create_login_nonce(db: Session) -> LoginNonce:
-    """Start one login attempt. Caller commits."""
-    nonce = LoginNonce(
-        nonce=secrets.token_urlsafe(_NONCE_BYTES),
-        expires_at=_now() + timedelta(seconds=settings.dashboard_login_nonce_ttl_seconds),
-    )
-    db.add(nonce)
-    db.flush()
-    return nonce
+def _normalize_login_code(code: str) -> str:
+    return "".join(character for character in code.upper() if character.isalnum())
 
 
-def bind_nonce(
+def hash_login_code(code: str) -> str:
+    normalized = _normalize_login_code(code)
+    return hmac.new(_pepper(), f"login:{normalized}".encode(), hashlib.sha256).hexdigest()
+
+
+def create_login_code(
     db: Session,
-    nonce_value: str,
     telegram_id: int,
     *,
     username: str | None = None,
     display_name: str | None = None,
-) -> DashboardUser | None:
-    """Attach a Telegram identity to a pending nonce. Called by the bot.
+) -> tuple[DashboardUser, str | None]:
+    """Record the Telegram identity and issue a code only when it is approved.
 
-    Returns the user the nonce now belongs to, or None when the nonce is
-    unknown, expired, already bound, or already spent. Binding an unknown
-    Telegram ID *records a request*; it does not grant anything.
+    Caller commits. Any earlier unspent code for this account is invalidated so
+    the bot's newest message is the only one worth entering.
     """
     now = _now()
-    # Conditional update, so two `/start` messages racing on one nonce cannot
-    # both bind it to different accounts.
-    bound = db.execute(
+    user = upsert_user_request(db, telegram_id, username=username, display_name=display_name)
+    if user.status != "approved":
+        return user, None
+
+    db.execute(
         update(LoginNonce)
         .where(
-            LoginNonce.nonce == nonce_value,
+            LoginNonce.telegram_id == telegram_id,
             LoginNonce.consumed_at.is_(None),
-            LoginNonce.telegram_id.is_(None),
-            LoginNonce.expires_at > now,
         )
-        .values(telegram_id=telegram_id, bound_at=now)
-        .returning(LoginNonce.id)
-    ).scalar_one_or_none()
-    if bound is None:
-        return None
-
-    user = upsert_user_request(db, telegram_id, username=username, display_name=display_name)
-    db.commit()
-    return user
+        .values(consumed_at=now)
+    )
+    compact = "".join(
+        secrets.choice(_LOGIN_CODE_ALPHABET)
+        for _ in range(_LOGIN_CODE_GROUPS * _LOGIN_CODE_GROUP_SIZE)
+    )
+    raw_code = "-".join(
+        compact[index : index + _LOGIN_CODE_GROUP_SIZE]
+        for index in range(0, len(compact), _LOGIN_CODE_GROUP_SIZE)
+    )
+    db.add(
+        LoginNonce(
+            nonce=hash_login_code(raw_code),
+            telegram_id=telegram_id,
+            bound_at=now,
+            expires_at=now + timedelta(seconds=settings.dashboard_login_nonce_ttl_seconds),
+        )
+    )
+    db.flush()
+    return user, raw_code
 
 
 def upsert_user_request(
@@ -153,32 +162,30 @@ def upsert_user_request(
 
 @dataclass(frozen=True, slots=True)
 class LoginOutcome:
-    """What the polling browser should be told.
+    """What the browser should be told after submitting one code.
 
-    ``waiting`` is the only state worth polling again; every other state is
-    final for this nonce.
+    Every state is final for one code.
     """
 
-    state: str  # waiting | approved | pending | revoked | invalid
+    state: str  # approved | revoked | invalid
     token: str | None = None
     user: DashboardUser | None = None
 
 
-def redeem_nonce(db: Session, nonce_value: str) -> LoginOutcome:
-    """Trade a bound nonce for a session. Commits on any terminal outcome."""
+def redeem_login_code(db: Session, raw_code: str) -> LoginOutcome:
+    """Trade a Telegram-issued code for a session. Commits on every outcome."""
     now = _now()
-    nonce = db.scalar(select(LoginNonce).where(LoginNonce.nonce == nonce_value))
+    normalized = _normalize_login_code(raw_code)
+    if len(normalized) != _LOGIN_CODE_GROUPS * _LOGIN_CODE_GROUP_SIZE:
+        return LoginOutcome(state="invalid")
+    nonce = db.scalar(select(LoginNonce).where(LoginNonce.nonce == hash_login_code(normalized)))
     if nonce is None or nonce.consumed_at is not None or nonce.expires_at <= now:
         return LoginOutcome(state="invalid")
-    if nonce.telegram_id is None:
-        return LoginOutcome(state="waiting")
-
     user = db.scalar(select(DashboardUser).where(DashboardUser.telegram_id == nonce.telegram_id))
     if user is None:
         return LoginOutcome(state="invalid")
 
-    # Spend the nonce whatever the answer: a pending user re-polling forever
-    # would keep one login attempt alive indefinitely.
+    # Spend the code before deciding the outcome so it cannot be replayed.
     spent = db.execute(
         update(LoginNonce)
         .where(LoginNonce.id == nonce.id, LoginNonce.consumed_at.is_(None))
@@ -190,16 +197,20 @@ def redeem_nonce(db: Session, nonce_value: str) -> LoginOutcome:
 
     if user.status != "approved":
         db.commit()
-        return LoginOutcome(state=user.status, user=user)
+        return LoginOutcome(state="revoked", user=user)
 
     raw_token = issue_session(db, user)
     db.commit()
     return LoginOutcome(state="approved", token=raw_token, user=user)
 
 
-def purge_expired_nonces(db: Session) -> int:
-    """Housekeeping. Spent and expired nonces carry no value once past."""
-    removed = db.query(LoginNonce).filter(LoginNonce.expires_at <= _now()).delete()
+def purge_expired_login_codes(db: Session) -> int:
+    """Housekeeping. Spent and expired codes carry no value once past."""
+    removed = (
+        db.query(LoginNonce)
+        .filter((LoginNonce.expires_at <= _now()) | LoginNonce.consumed_at.is_not(None))
+        .delete(synchronize_session=False)
+    )
     db.commit()
     return removed
 
@@ -352,7 +363,8 @@ def ensure_bootstrap_admin(db: Session) -> DashboardUser | None:
 
     Without this the first login is a pending request with nobody able to
     approve it, and the dashboard is unreachable by design. Idempotent, and it
-    will promote that ID if it already requested access.
+    will promote that ID if it already requested access. A revoked bootstrap
+    account stays revoked; restarting the bot must never undo a deliberate ban.
     """
     telegram_id = settings.dashboard_bootstrap_admin_id
     if telegram_id is None:
@@ -362,7 +374,7 @@ def ensure_bootstrap_admin(db: Session) -> DashboardUser | None:
         user = DashboardUser(telegram_id=telegram_id, status="pending")
         db.add(user)
         db.flush()
-    if user.status != "approved":
+    if user.status == "pending":
         approve_user(db, user, "bootstrap")
     db.commit()
     return user

@@ -166,16 +166,12 @@ def _validate_embedding_dimension(model: str) -> None:
 
 
 def _ranking_mode(
-    site_id: int,
-    configured_mode: str,
     ranking_mode_override: str | None = None,
 ) -> str:
     if ranking_mode_override is not None:
         if ranking_mode_override not in {"baseline", "shadow", "hybrid"}:
             raise ValueError(f"unsupported ranking mode override: {ranking_mode_override}")
         return ranking_mode_override
-    # Hybrid is the product default. `configured_mode` remains in the signature
-    # for rolling API compatibility; only explicit comparison overrides differ.
     return "hybrid"
 
 
@@ -242,8 +238,6 @@ def generate_suggestions(
                         encoded_offset=encoded,
                     )
             ranking_mode = _ranking_mode(
-                site_id,
-                site.suggestion_mode,
                 ranking_mode_override,
             )
             if comparison_only and ranking_mode != "shadow":

@@ -175,9 +175,7 @@ def _expire_superseded(db, suggestion_ids: list[int]) -> int:
     ).rowcount
 
 
-def generate_missing_placements(
-    groups: list[tuple[int, list[int]]], job_run_id: int | None
-) -> int:
+def generate_missing_placements(groups: list[tuple[int, list[int]]], job_run_id: int | None) -> int:
     """Fill in placements for approved suggestions that never had a drawer opened.
 
     Generation is lazy by design: an analysis run produces far more suggestions
@@ -454,9 +452,7 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
                 f"{progress['attempt_failed']} publication suggestion(s) failed: {details}"
             )
         progress = complete_publication_success(progress)
-        record_progress_durably(
-            job_run_id, session=progress_db, **progress, **dict(outcome_counts)
-        )
+        record_progress_durably(job_run_id, session=progress_db, **progress, **dict(outcome_counts))
         return {
             "applied": progress["applied"],
             "failed": progress["failed"],

@@ -54,9 +54,7 @@ def test_internal_hrefs_skips_and_logs_malformed_links(monkeypatch):
         SimpleNamespace(warning=lambda *args: warnings.append(args)),
     )
 
-    assert c._internal_hrefs(content, "https://example.com/post/") == [
-        "https://example.com/valid/"
-    ]
+    assert c._internal_hrefs(content, "https://example.com/post/") == ["https://example.com/valid/"]
     assert warnings and "Skipping malformed WordPress href" in warnings[0][0]
 
 
@@ -116,6 +114,24 @@ def test_to_article_keeps_category_and_tag_with_same_wordpress_id():
     )
 
     assert article.taxonomies == [category, tag]
+
+
+def test_to_article_rejects_a_non_http_link_returned_by_wordpress():
+    c = make_connector()
+
+    with pytest.raises(ValueError, match="unsafe post link"):
+        c._to_article(
+            {
+                "id": 10,
+                "link": "javascript:alert(1)",
+                "title": {"rendered": "Post"},
+                "content": {"rendered": "<p>body</p>"},
+                "categories": [],
+                "tags": [],
+                "date_gmt": None,
+            },
+            {},
+        )
 
 
 def test_paginate_continues_when_total_pages_header_is_missing():
@@ -316,9 +332,7 @@ def test_wordpress_credentials_are_only_sent_to_configured_origin():
             )
         return httpx.Response(200, json=[])
 
-    connector.client = httpx.Client(
-        transport=httpx.MockTransport(handler), follow_redirects=True
-    )
+    connector.client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
     connector._api_candidates = ["https://example.com/wp-json/wp/v2/"]
 
     assert list(connector._paginate("categories")) == []
@@ -348,6 +362,7 @@ def test_query_based_api_root_is_used_for_publication():
     connector.apply_links([_suggestion()])
 
     assert [request.url.params["rest_route"] for request in requests] == [
+        "/wp/v2/posts/10",
         "/wp/v2/posts/10",
         "/wp/v2/posts/10",
     ]
@@ -541,7 +556,7 @@ def test_two_suggestions_competing_for_one_anchor():
 
 
 def test_an_anchor_overlapping_one_already_linked_is_not_split():
-    """"panel costs" straddles the first link's boundary, so it is no longer text."""
+    """ "panel costs" straddles the first link's boundary, so it is no longer text."""
     after_first = _republish(
         "<p>solar panel costs fell</p>", _suggestion(anchor_text="solar panel")
     )
@@ -553,9 +568,10 @@ def test_an_anchor_overlapping_one_already_linked_is_not_split():
 
 def test_a_plural_elsewhere_does_not_make_the_anchor_ambiguous():
     """Word boundaries earn this placement: "panels" would otherwise be a rival."""
-    assert _republish(
-        "<p>one panel here, many panels there</p>", _suggestion(anchor_text="panel")
-    ) == f"<p>one <a {IN_TEXT}>panel</a> here, many panels there</p>"
+    assert (
+        _republish("<p>one panel here, many panels there</p>", _suggestion(anchor_text="panel"))
+        == f"<p>one <a {IN_TEXT}>panel</a> here, many panels there</p>"
+    )
 
 
 #: Long enough that the two anchors are not crowding each other; the gap guard
@@ -726,9 +742,7 @@ def test_a_batch_reads_and_writes_the_post_once():
             return httpx.Response(200, json={"content": {"raw": raw}})
         return httpx.Response(200, json={})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     outcomes = c.apply_links(
         [
             _suggestion(anchor_text="solar panel"),
@@ -737,7 +751,7 @@ def test_a_batch_reads_and_writes_the_post_once():
         ]
     )
 
-    assert methods == ["GET", "POST"]
+    assert methods == ["GET", "GET", "POST"]
     assert outcomes == ["inserted", "inserted", "block"]
 
 
@@ -747,9 +761,32 @@ def test_a_batch_reports_one_outcome_per_suggestion_in_order():
     already = _second_target()
     _mock_publish(c, f'<p>solar panel costs</p><p><a href="{already.target_article.url}">x</a></p>')
 
-    assert c.apply_links(
-        [_suggestion(anchor_text="solar panel"), already, _pool_suggestion()]
-    ) == ["inserted", "already_present", "block"]
+    assert c.apply_links([_suggestion(anchor_text="solar panel"), already, _pool_suggestion()]) == [
+        "inserted",
+        "already_present",
+        "block",
+    ]
+
+
+def test_publication_refuses_to_overwrite_an_edit_made_during_preparation():
+    c = make_connector()
+    c._api_candidates = []
+    c._api_base_url = "https://example.com/wp-json/wp/v2/"
+    reads = iter(["<p>original</p>", "<p>human edit</p>"])
+    methods = []
+
+    def handler(request):
+        methods.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"content": {"raw": next(reads)}})
+        pytest.fail("a conflicting edit must prevent the WordPress POST")
+
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(RuntimeError, match="changed while LinkMesh prepared"):
+        c.apply_links([_suggestion()])
+
+    assert methods == ["GET", "GET"]
 
 
 def test_a_batch_that_changes_nothing_does_not_write():
@@ -776,9 +813,7 @@ def test_dry_run_computes_the_outcomes_without_saving():
     assert preview.original_content == "<p>solar panel costs fell</p>"
     assert f"<a {IN_TEXT}>solar panel</a>" in preview.updated_content
     assert preview.outcomes == ["inserted"]
-    assert c.apply_links([_suggestion(anchor_text="solar panel")], dry_run=True) == [
-        "inserted"
-    ]
+    assert c.apply_links([_suggestion(anchor_text="solar panel")], dry_run=True) == ["inserted"]
     assert captured == {}
 
 
@@ -799,9 +834,7 @@ def test_a_save_throttled_by_the_host_waits_the_requested_time(monkeypatch):
         headers = {"Retry-After": "12"} if status == 429 else {}
         return httpx.Response(status, json={}, headers=headers)
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     c.apply_links([_suggestion()])
 
     assert waited == [12.0]
@@ -827,13 +860,9 @@ def test_a_throttled_save_without_a_usable_delay_still_waits_sensibly(
         if request.method == "GET":
             return httpx.Response(200, json={"content": {"raw": "<p>body</p>"}})
         status = next(statuses)
-        return httpx.Response(
-            status, json={}, headers={"Retry-After": header} if header else {}
-        )
+        return httpx.Response(status, json={}, headers={"Retry-After": header} if header else {})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     c.apply_links([_suggestion()])
 
     assert waited == [expected]
@@ -859,9 +888,7 @@ def test_a_host_that_keeps_throttling_eventually_fails(monkeypatch):
         posts.append(request)
         return httpx.Response(429, json={})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     with pytest.raises(httpx.HTTPStatusError):
         c.apply_links([_suggestion()])
 
@@ -901,9 +928,7 @@ def test_a_marker_stripped_by_the_host_is_reported(caplog):
             return httpx.Response(200, json={"content": {"raw": "<p>solar panel costs</p>"}})
         return httpx.Response(200, json={"content": {"raw": "<p>solar panel costs</p>"}})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     with caplog.at_level("WARNING"):
         assert c.apply_links([_suggestion(anchor_text="solar panel")]) == ["inserted"]
 
@@ -919,9 +944,7 @@ def test_a_marker_that_survives_is_not_reported(caplog):
             raw = json.loads(request.content)["content"]
         return httpx.Response(200, json={"content": {"raw": raw}})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     with caplog.at_level("WARNING"):
         c.apply_links([_suggestion(anchor_text="solar panel")])
 
@@ -936,9 +959,7 @@ def test_a_successful_save_without_returned_raw_content_warns(caplog):
             return httpx.Response(200, json={"content": {"raw": "<p>solar panel costs</p>"}})
         return httpx.Response(200, json={})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     with caplog.at_level("WARNING"):
         c.apply_links([_suggestion(anchor_text="solar panel")])
 
@@ -957,7 +978,7 @@ def test_a_read_throttled_by_the_host_waits_and_retries(monkeypatch):
     c = make_connector()
     c._api_candidates = []  # REST discovery is its own GET; this test is about the read
     c._api_base_url = "https://example.com/wp-json/wp/v2/"
-    reads = iter([429, 200])
+    reads = iter([429, 200, 200])
 
     def handler(request):
         if request.method != "GET":
@@ -966,9 +987,7 @@ def test_a_read_throttled_by_the_host_waits_and_retries(monkeypatch):
             return httpx.Response(429, json={}, headers={"Retry-After": "7"})
         return httpx.Response(200, json={"content": {"raw": "<p>solar panel costs</p>"}})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
 
     assert c.apply_links([_suggestion(anchor_text="solar panel")]) == ["inserted"]
     assert waited == [7.0]

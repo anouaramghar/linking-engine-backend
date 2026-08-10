@@ -19,7 +19,8 @@ from app.config import settings
 from app.models import DashboardUser
 from app.schemas.dashboard import (
     DashboardUserOut,
-    LoginPollOut,
+    LoginCompleteIn,
+    LoginCompleteOut,
     LoginStartOut,
     SessionOut,
 )
@@ -72,33 +73,26 @@ def start_login(db: Session = Depends(get_db)) -> LoginStartOut:
             detail="dashboard login is not configured; set TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME",
         )
     # Housekeeping rides along with the operation that creates the garbage.
-    # Logins are rare and expired nonces are worthless, so a handful of deleted
+    # Logins are rare and expired codes are worthless, so a handful of deleted
     # rows here is cheaper than owning a scheduler for it.
-    dashboard_auth.purge_expired_nonces(db)
-    nonce = dashboard_auth.create_login_nonce(db)
-    db.commit()
-    deep_link = dashboard_auth.login_deep_link(nonce.nonce)
+    dashboard_auth.purge_expired_login_codes(db)
+    deep_link = dashboard_auth.login_deep_link()
     assert deep_link is not None  # configured check above guarantees a username
-    return LoginStartOut(
-        nonce=nonce.nonce,
-        deep_link=deep_link,
-        expires_in_seconds=settings.dashboard_login_nonce_ttl_seconds,
-    )
+    return LoginStartOut(deep_link=deep_link)
 
 
-@router.get("/login/{nonce}", response_model=LoginPollOut)
-def poll_login(nonce: str, response: Response, db: Session = Depends(get_db)) -> LoginPollOut:
-    """Ask whether the login finished. Sets the session cookie when it did.
-
-    Always 200: every state here is a normal answer to a normal question, and
-    the browser distinguishes them by `state`. A 401 would be indistinguishable
-    from the proxy refusing the request.
-    """
-    outcome = dashboard_auth.redeem_nonce(db, nonce)
+@router.post("/login/complete", response_model=LoginCompleteOut)
+def complete_login(
+    payload: LoginCompleteIn,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> LoginCompleteOut:
+    """Redeem the one-time code Telegram delivered to this operator."""
+    outcome = dashboard_auth.redeem_login_code(db, payload.code)
     if outcome.state == "approved" and outcome.token:
         _set_session_cookie(response, outcome.token)
     user = DashboardUserOut.model_validate(outcome.user) if outcome.user is not None else None
-    return LoginPollOut(state=outcome.state, user=user)
+    return LoginCompleteOut(state=outcome.state, user=user)
 
 
 @router.get("/session", response_model=SessionOut)
@@ -207,4 +201,3 @@ def get_user_avatar(
         media_type=media_type,
         headers={"Cache-Control": "public, max-age=86400"},
     )
-

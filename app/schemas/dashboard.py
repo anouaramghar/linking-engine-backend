@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
 class DashboardUserOut(BaseModel):
@@ -31,20 +32,17 @@ class DashboardUserOut(BaseModel):
 
 
 class LoginStartOut(BaseModel):
-    """What the browser needs to show a login prompt.
+    """What the browser needs to open the Telegram identity ceremony."""
 
-    The nonce is not a credential: holding it lets you *ask* whether the login
-    finished, and the answer is a session only for an approved account.
-    """
-
-    nonce: str
     deep_link: str
-    expires_in_seconds: int
 
 
-class LoginPollOut(BaseModel):
-    #: waiting | approved | pending | revoked | invalid
-    state: str
+class LoginCompleteIn(BaseModel):
+    code: str = Field(max_length=32)
+
+
+class LoginCompleteOut(BaseModel):
+    state: Literal["approved", "revoked", "invalid"]
     user: DashboardUserOut | None = None
 
 

@@ -206,6 +206,11 @@ def authorize_site(db: Session, principal: Principal, site_id: int) -> Site:
         raise HTTPException(status_code=404, detail=f"site {site_id} not found")
     if principal.is_admin:
         return site
+    if site.platform == POOL_PLATFORM:
+        raise HTTPException(
+            status_code=403,
+            detail="content-pool sources are shared infrastructure and require an admin key",
+        )
     if principal.tenant_id is None or site.tenant_id != principal.tenant_id:
         raise HTTPException(status_code=403, detail="access denied for this site")
     return site

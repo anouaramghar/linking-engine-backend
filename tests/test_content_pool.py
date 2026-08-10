@@ -11,6 +11,7 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import delete, select
 
+from app.api.deps import require_api_key
 from app.config import settings
 from app.connectors.registry import get_connector
 from app.connectors.rss_connector import RSSConnector
@@ -24,6 +25,7 @@ from app.models import (
     Suggestion,
 )
 from app.models.article import EMBEDDING_DIM
+from app.main import app
 from app.schemas.site import SiteCreate
 from app.connectors.url_guard import UnsafeURLError
 from app.services.ingestion_service import _reconcile_snapshot
@@ -330,9 +332,7 @@ def test_wikipedia_connector_bounds_empty_continuations(monkeypatch):
         return httpx.Response(
             200,
             headers={"content-type": "application/json"},
-            content=json.dumps(
-                {"query": {"pages": []}, "continue": {"gsroffset": calls}}
-            ).encode(),
+            content=json.dumps({"query": {"pages": []}, "continue": {"gsroffset": calls}}).encode(),
         )
 
     monkeypatch.setattr(settings, "pool_max_articles_per_source", 2)
@@ -635,6 +635,7 @@ def test_a_managed_domain_can_never_become_a_pool_target(client, db, monkeypatch
 
 
 def test_pool_approval_identity_comes_from_operator_key(client, db, monkeypatch):
+    app.dependency_overrides.pop(require_api_key, None)
     monkeypatch.setattr(settings, "operator_api_keys", {"alice": SecretStr("alice-key")})
     response = client.post(
         "/api/v1/sites",
@@ -1117,9 +1118,7 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
     ("approved", "quarantined"),
     [(False, False), (True, True)],
 )
-def test_hybrid_excludes_disabled_pool_sources(
-    db, site, monkeypatch, approved, quarantined
-):
+def test_hybrid_excludes_disabled_pool_sources(db, site, monkeypatch, approved, quarantined):
     monkeypatch.setattr(
         "app.ml.embeddings.encode",
         lambda texts: [_vector(1.0) for _text in texts],

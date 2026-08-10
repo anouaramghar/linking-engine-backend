@@ -255,17 +255,13 @@ def test_failed_apply_rolls_back_to_approved_for_retry(db, site, articles, monke
     assert _status(db, suggestion.id) == "applied"
 
 
-def test_retry_preserves_original_total_and_cumulative_applied(
-    db, site, articles, monkeypatch
-):
+def test_retry_preserves_original_total_and_cumulative_applied(db, site, articles, monkeypatch):
     suggestions = _suggestions_on_distinct_sources(db, site, articles[1], 10)
     final_suggestion_id = suggestions[-1].id
     run = JobRun(site_id=site.id, kind="publication")
     db.add(run)
     db.commit()
-    monkeypatch.setattr(
-        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1)
-    )
+    monkeypatch.setattr(job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1))
 
     def fail_last(suggestion):
         if suggestion.id == final_suggestion_id:
@@ -336,9 +332,7 @@ def test_retry_grows_total_for_suggestions_approved_between_attempts(
     run = JobRun(site_id=site.id, kind="publication")
     db.add(run)
     db.commit()
-    monkeypatch.setattr(
-        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1)
-    )
+    monkeypatch.setattr(job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1))
 
     def fail_last(suggestion):
         if suggestion.id == final_suggestion_id:
@@ -360,17 +354,13 @@ def test_retry_grows_total_for_suggestions_approved_between_attempts(
     assert stored.progress["applied"] == 15
 
 
-def test_retry_progress_exposes_latest_attempt_failure_count(
-    db, site, articles, monkeypatch
-):
+def test_retry_progress_exposes_latest_attempt_failure_count(db, site, articles, monkeypatch):
     for _ in range(3):
         _suggestion(db, site, *articles)
     run = JobRun(site_id=site.id, kind="publication")
     db.add(run)
     db.commit()
-    monkeypatch.setattr(
-        job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1)
-    )
+    monkeypatch.setattr(job_service, "get_current_job", lambda: SimpleNamespace(retries_left=1))
     _stub_connector(
         monkeypatch,
         lambda _suggestion: (_ for _ in ()).throw(RuntimeError("WordPress unavailable")),
@@ -387,9 +377,7 @@ def test_retry_progress_exposes_latest_attempt_failure_count(
     assert progress["failure_state"] == "retrying"
 
 
-def test_all_skipped_publication_persists_final_progress(
-    db, site, articles, monkeypatch
-):
+def test_all_skipped_publication_persists_final_progress(db, site, articles, monkeypatch):
     articles[0].is_active = False
     db.commit()
     _suggestion(db, site, *articles)
@@ -421,9 +409,7 @@ def test_all_skipped_publication_persists_final_progress(
     }
 
 
-def test_final_publication_failure_records_job_and_alerts(
-    db, site, articles, monkeypatch
-):
+def test_final_publication_failure_records_job_and_alerts(db, site, articles, monkeypatch):
     suggestion = _suggestion(db, site, *articles)
     run = JobRun(site_id=site.id, kind="publication")
     db.add(run)
@@ -524,9 +510,7 @@ def test_a_pair_already_linked_the_other_way_is_expired_not_left_approved(
     assert _status(db, back.id) == "expired"
 
 
-def test_both_directions_approved_together_publish_exactly_one(
-    db, site, articles, monkeypatch
-):
+def test_both_directions_approved_together_publish_exactly_one(db, site, articles, monkeypatch):
     """A bulk approval takes both halves; only one of them may be written.
 
     Which half is arbitrary, and the test says so rather than pretending
@@ -572,8 +556,7 @@ def test_the_same_direction_suggested_twice_is_not_mistaken_for_a_reciprocal(
 
 
 def _always_fails(monkeypatch, message="WP stayed unavailable"):
-    _stub_connector(
-        monkeypatch, lambda _s: (_ for _ in ()).throw(RuntimeError(message)))
+    _stub_connector(monkeypatch, lambda _s: (_ for _ in ()).throw(RuntimeError(message)))
 
 
 def test_a_suggestion_that_keeps_failing_is_quarantined(db, site, articles, monkeypatch):
@@ -601,9 +584,7 @@ def test_a_suggestion_that_keeps_failing_is_quarantined(db, site, articles, monk
     assert "WP stayed unavailable" in stored.publish_error
 
 
-def test_quarantine_disables_the_remaining_rq_retry(
-    db, site, articles, monkeypatch
-):
+def test_quarantine_disables_the_remaining_rq_retry(db, site, articles, monkeypatch):
     """A terminal row must not produce an empty retry that reports success."""
     monkeypatch.setattr(settings, "publish_max_suggestion_attempts", 1)
     suggestion = _suggestion(db, site, *articles)
@@ -660,10 +641,8 @@ def test_a_successful_publish_clears_the_failure_history(db, site, articles, mon
 # -- what was written (findings 12 and 14) ---------------------------------
 
 
-def test_each_suggestion_records_what_the_connector_actually_did(
-    db, site, articles, monkeypatch
-):
-    """"applied" says a write happened, not that a link is in the prose.
+def test_each_suggestion_records_what_the_connector_actually_did(db, site, articles, monkeypatch):
+    """ "applied" says a write happened, not that a link is in the prose.
 
     The in-text share is the number that says whether paying for placement
     generation is worth it, and there was nowhere to read it from.
@@ -843,7 +822,7 @@ def test_dry_run_previews_what_publication_would_write(client, db, site, article
         lambda site: SimpleNamespace(preview_links=preview_links),
     )
 
-    body = client.get(f"/api/v1/publish/{site.id}/dry-run").json()
+    body = client.post(f"/api/v1/publish/{site.id}/dry-run").json()
 
     assert prepared == [([(articles[0].id, [suggestion.id])], None)]
     assert asked == [[suggestion.id]]
@@ -894,7 +873,7 @@ def test_dry_run_is_bounded_and_survives_an_unreachable_post(
         lambda site: SimpleNamespace(preview_links=preview_links),
     )
 
-    body = client.get(f"/api/v1/publish/{site.id}/dry-run", params={"max_articles": 2}).json()
+    body = client.post(f"/api/v1/publish/{site.id}/dry-run", params={"max_articles": 2}).json()
 
     assert len(seen) == 2  # bounded
     assert body["approved"] == 3
@@ -908,7 +887,7 @@ def test_dry_run_is_bounded_and_survives_an_unreachable_post(
 def test_dry_run_refuses_a_content_pool_source(client, db, site):
     site.platform = "pool"
     db.commit()
-    assert client.get(f"/api/v1/publish/{site.id}/dry-run").status_code == 409
+    assert client.post(f"/api/v1/publish/{site.id}/dry-run").status_code == 409
 
 
 def test_review_endpoint_rejects_applied_and_applying(client, db, site, articles):
@@ -958,9 +937,7 @@ def _commit_fails_after(monkeypatch, allowed: int):
     monkeypatch.setattr(publication, "SessionLocal", factory)
 
 
-def test_a_commit_that_fails_does_not_count_its_links_as_applied(
-    db, site, articles, monkeypatch
-):
+def test_a_commit_that_fails_does_not_count_its_links_as_applied(db, site, articles, monkeypatch):
     """The claim rolls back to 'approved', so the counters have to roll back too.
 
     Counting a link the moment the connector returns means a failed commit
@@ -985,9 +962,7 @@ def test_a_commit_that_fails_does_not_count_its_links_as_applied(
     assert db.get(Suggestion, suggestion.id).publish_attempts == 0
 
 
-def test_failure_success_failure_keeps_committed_outcome_counts(
-    db, site, articles, monkeypatch
-):
+def test_failure_success_failure_keeps_committed_outcome_counts(db, site, articles, monkeypatch):
     """A later durable failure must not overwrite a successful middle group."""
     suggestions = _suggestions_on_distinct_sources(db, site, articles[1], 3)
     run = JobRun(site_id=site.id, kind="publication")
@@ -1016,9 +991,7 @@ def test_failure_success_failure_keeps_committed_outcome_counts(
     assert (progress["applied"], progress["failed"], progress["inserted"]) == (1, 2, 1)
 
 
-def test_a_partly_claimed_article_counts_each_suggestion_once(
-    db, site, articles, monkeypatch
-):
+def test_a_partly_claimed_article_counts_each_suggestion_once(db, site, articles, monkeypatch):
     """Skipped and failed are different rows; together they are still the group.
 
     One source article can hold several suggestions. Whatever is no longer
@@ -1095,9 +1068,7 @@ def test_re_approving_a_quarantined_suggestion_gives_it_a_real_second_chance(
 
     for status in ("pending", "approved"):  # what Undo then Accept sends
         assert (
-            client.put(
-                f"/api/v1/suggestions/{suggestion.id}", json={"status": status}
-            ).status_code
+            client.put(f"/api/v1/suggestions/{suggestion.id}", json={"status": status}).status_code
             == 200
         )
 

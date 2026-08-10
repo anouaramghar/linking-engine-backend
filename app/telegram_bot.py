@@ -1,4 +1,4 @@
-"""The login bot: binds a `/start <nonce>` to whoever sent it.
+"""The login bot: gives an identified Telegram user a one-time browser code.
 
 Run as its own process, alongside the API and the RQ worker:
 
@@ -31,13 +31,14 @@ ERROR_BACKOFF_SECONDS = 5
 
 WELCOME = (
     "This bot signs you in to the LinkMesh dashboard.\n\n"
-    "Open the dashboard, press Log in, and follow the link it gives you."
+    "Open the dashboard, press Sign in with Telegram, then press Start here. "
+    "I will give you a one-time code to enter back in the dashboard."
 )
-EXPIRED = (
-    "That login link has expired or was already used.\n\n"
-    "Go back to the dashboard and press Log in again."
+LOGIN_CODE = (
+    "Enter this one-time code in the LinkMesh dashboard:\n\n"
+    "{code}\n\n"
+    "It expires in a few minutes. Do not send it to anyone."
 )
-SIGNED_IN = "You are signed in. Return to the dashboard — it should be logging you in now."
 PENDING = (
     "Access requested.\n\n"
     "An approved user has to admit you before you can open the dashboard. "
@@ -88,23 +89,16 @@ def handle_update(db, update: dict) -> list[Reply]:
     if not text.startswith("/start"):
         return [Reply(chat_id, WELCOME)]
 
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        # A bare /start — someone opened the bot directly rather than from a
-        # login link. There is nothing to bind.
-        return [Reply(chat_id, WELCOME)]
-
-    user = dashboard_auth.bind_nonce(
+    user, code = dashboard_auth.create_login_code(
         db,
-        parts[1].strip(),
         telegram_id,
         username=sender.get("username"),
         display_name=sender.get("first_name"),
     )
-    if user is None:
-        return [Reply(chat_id, EXPIRED)]
+    db.commit()
     if user.status == "approved":
-        return [Reply(chat_id, SIGNED_IN)]
+        assert code is not None
+        return [Reply(chat_id, LOGIN_CODE.format(code=code))]
     if user.status == "revoked":
         return [Reply(chat_id, REVOKED)]
 
@@ -149,7 +143,7 @@ def run(
         except Exception as error:
             # A poll failure must never end the process: the dashboard would
             # keep offering a login that silently never completes.
-            logger.warning("telegram_poll_failed", exc_info=error)
+            logger.warning("telegram_poll_failed", extra={"error_type": type(error).__name__})
             time.sleep(ERROR_BACKOFF_SECONDS)
             continue
 
@@ -162,19 +156,25 @@ def run(
             db = SessionLocal()
             try:
                 replies = handle_update(db, update)
-            except Exception:
-                logger.exception("telegram_update_failed", extra={"update_id": update_id})
+            except Exception as error:
+                logger.warning(
+                    "telegram_update_failed",
+                    extra={"update_id": update_id, "error_type": type(error).__name__},
+                )
                 replies = []
             finally:
                 db.close()
             for reply in replies:
                 try:
                     client.send_message(reply.chat_id, reply.text)
-                except Exception:
+                except Exception as error:
                     # The binding already happened; a failed reply only costs
                     # the human their confirmation message. One unreachable
                     # approver must not stop the rest from being told.
-                    logger.warning("telegram_reply_failed", exc_info=True)
+                    logger.warning(
+                        "telegram_reply_failed",
+                        extra={"error_type": type(error).__name__},
+                    )
 
     logger.info("telegram_bot_stopped")
 

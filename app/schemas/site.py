@@ -124,9 +124,6 @@ class SiteOut(BaseModel):
     pool_source_last_reactivated_at: datetime | None = None
     pool_source_last_reactivated_by: str | None = None
     suggestion_method: Literal["hybrid_bm25"] = "hybrid_bm25"
-    suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool = True
-    suggestion_comparison_enabled: bool = False
     suggestion_slots_available: int = 0
     created_at: datetime
     last_ingestion_status: str | None = None
@@ -137,16 +134,6 @@ class SiteOut(BaseModel):
     article_count: int = 0
     internal_link_count: int = 0
     last_crawl_at: datetime | None = None
-
-
-class SiteSuggestionModeUpdate(BaseModel):
-    suggestion_mode: Literal["standard", "experimental"]
-
-
-class SiteSuggestionModeState(BaseModel):
-    suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool
-    suggestion_comparison_enabled: bool
 
 
 class ArticleBrief(BaseModel):

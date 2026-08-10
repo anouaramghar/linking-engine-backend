@@ -10,8 +10,6 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://linkmesh:linkmesh@localhost:5432/linkmesh"
     redis_url: str = "redis://localhost:6379/0"
 
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
     environment: str = "development"
 
     # Static API key for all non-health endpoints; empty fails closed at the API boundary.
@@ -32,7 +30,7 @@ class Settings(BaseSettings):
     # An empty token disables dashboard login; the proxy then has no gate to
     # consult, so it must not be deployed with auth_request enabled.
     telegram_bot_token: SecretStr | None = None
-    # Used to build the t.me deep link the browser shows. No leading '@'.
+    # Used to build the static t.me deep link the browser shows. No leading '@'.
     telegram_bot_username: str = ""
     # Pre-approved Telegram user ID allowed to approve everyone else. Without it
     # the first login has nobody to admit it and the dashboard is unreachable.
@@ -41,16 +39,14 @@ class Settings(BaseSettings):
     # day without forcing a re-login over lunch.
     dashboard_session_ttl_minutes: int = Field(default=720, gt=0, le=43_200)
     # Long enough to switch to Telegram and press Start, short enough that an
-    # abandoned nonce is not a standing invitation.
+    # abandoned one-time code is not a standing invitation. The environment
+    # name stays stable for deployment compatibility.
     dashboard_login_nonce_ttl_seconds: int = Field(default=300, gt=0, le=3_600)
 
     # Fernet key used to encrypt WordPress application passwords at rest.
     credential_encryption_key: SecretStr | None = None
     # Comma-separated previous Fernet keys accepted only for decryption during rotation.
     credential_decryption_keys: SecretStr | None = None
-
-    # External search (v3)
-    tavily_api_key: str = ""
 
     # Placement context (v4): an OpenRouter-hosted model reads the source article
     # and picks the passage the link belongs in. Empty key disables the feature —
@@ -109,18 +105,43 @@ class Settings(BaseSettings):
     # segment. Emptying either list disables that half of the rule.
     low_value_target_titles: list[str] = Field(
         default=[
-            "login", "log in", "sign in", "sign up", "register", "registration",
-            "dashboard", "my account", "cart", "shopping cart", "checkout",
-            "privacy policy", "terms of service", "terms of use", "cookie policy",
+            "login",
+            "log in",
+            "sign in",
+            "sign up",
+            "register",
+            "registration",
+            "dashboard",
+            "my account",
+            "cart",
+            "shopping cart",
+            "checkout",
+            "privacy policy",
+            "terms of service",
+            "terms of use",
+            "cookie policy",
             "support portal",
         ]
     )
     low_value_target_url_slugs: list[str] = Field(
         default=[
-            "login", "log-in", "sign-in", "sign-up", "signup", "register",
-            "registration", "dashboard", "my-account", "cart", "shopping-cart",
-            "checkout", "privacy-policy", "terms-of-service", "terms-of-use",
-            "cookie-policy", "support-portal",
+            "login",
+            "log-in",
+            "sign-in",
+            "sign-up",
+            "signup",
+            "register",
+            "registration",
+            "dashboard",
+            "my-account",
+            "cart",
+            "shopping-cart",
+            "checkout",
+            "privacy-policy",
+            "terms-of-service",
+            "terms-of-use",
+            "cookie-policy",
+            "support-portal",
         ]
     )
 
@@ -190,6 +211,9 @@ class Settings(BaseSettings):
     pool_quarantine_failure_threshold: int = Field(default=3, ge=1, le=20)
     pool_poll_interval_seconds: int = Field(default=86400, ge=60)
     pool_poll_repeat_count: int = Field(default=3650, ge=1)
+
+    # One tenant cannot fill every stage queue while other tenants wait.
+    max_active_jobs_per_tenant: int = Field(default=100, ge=1, le=10_000)
 
     # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/
     # metadata destinations and require HTTPS when WP credentials are used.

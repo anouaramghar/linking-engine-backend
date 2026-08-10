@@ -27,5 +27,9 @@ class InternalLink(Base):
     last_seen_run_id: Mapped[int | None] = mapped_column(
         ForeignKey("ingestion_runs.id", ondelete="SET NULL")
     )
-    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

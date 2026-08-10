@@ -9,6 +9,7 @@ import pytest
 from app.config import Settings, settings
 from app.connectors.base import ArticleData, ContentConnector
 from app.connectors.html_crawler import HTMLConnector
+from app.connectors import http_limits
 from app.connectors.http_limits import ResponseTooLargeError, get_limited_http_response
 from app.connectors.wordpress import WordPressConnector
 from app.ml.hybrid import CorpusArticle, structured_terms
@@ -58,6 +59,26 @@ def test_bounded_http_response_does_not_decode_compressed_body_twice():
 
     assert response.content == payload
     assert "content-encoding" not in response.headers
+
+
+def test_streaming_response_rechecks_the_crawl_deadline_for_each_chunk(monkeypatch):
+    checked = []
+    monkeypatch.setattr(http_limits, "check_crawl_deadline", checked.append)
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"chunk", request=request)
+        )
+    )
+
+    response = get_limited_http_response(
+        client,
+        "https://example.com/data",
+        max_bytes=100,
+        crawl_started_at=123.0,
+    )
+
+    assert response.content == b"chunk"
+    assert checked == [123.0]
 
 
 def test_wordpress_pagination_has_a_local_page_budget(monkeypatch):

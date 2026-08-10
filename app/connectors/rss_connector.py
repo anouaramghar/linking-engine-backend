@@ -166,9 +166,9 @@ class RSSConnector(ContentConnector):
             return None
         content_html = _entry_html(entry)[: settings.pool_max_article_chars]
         title = (_text(entry.get("title")) or url)[: settings.pool_max_title_chars]
-        content_text = (
-            _text(content_html) or _text(entry.get("summary")) or title
-        )[: settings.pool_max_article_chars]
+        content_text = (_text(content_html) or _text(entry.get("summary")) or title)[
+            : settings.pool_max_article_chars
+        ]
         tags: list[TaxonomyData] = []
         seen_tags: set[str] = set()
         for tag in entry.get("tags") or []:

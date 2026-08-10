@@ -1,5 +1,4 @@
 from collections.abc import Iterator
-from secrets import compare_digest
 from typing import Annotated
 
 from fastapi import Cookie, Depends, Header, HTTPException
@@ -17,15 +16,6 @@ from app.services.authorization import (
     authorize_site_read,
     require_admin_principal,
 )
-
-
-def _operator_for_key(api_key: str | None) -> str | None:
-    if api_key is None:
-        return None
-    for operator_id, configured_key in settings.operator_api_keys.items():
-        if compare_digest(api_key, configured_key.get_secret_value()):
-            return operator_id
-    return None
 
 
 def get_db() -> Iterator[Session]:
@@ -70,7 +60,6 @@ def require_site_read(
 
 def require_operator_identity(
     principal: Annotated[Principal, Depends(require_api_key)],
-    x_api_key: Annotated[str | None, Header()] = None,
     session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
     db: Session = Depends(get_db),
 ) -> str:
@@ -92,9 +81,6 @@ def require_operator_identity(
     if user is not None:
         return f"telegram:{user.telegram_id}"
 
-    operator_id = _operator_for_key(x_api_key)
-    if operator_id is not None:
-        return operator_id
     if principal.is_admin and principal.source == "operator" and principal.operator_id is not None:
         return principal.operator_id
     if principal.is_admin and principal.source == "db" and principal.key_id is not None:

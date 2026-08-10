@@ -49,10 +49,10 @@ class DashboardUser(Base):
 
 
 class LoginNonce(Base):
-    """One login attempt, handed to Telegram and redeemed once.
+    """One hashed, short-lived code delivered to an approved Telegram user.
 
-    The browser never proves anything itself: it shows a nonce, the bot binds
-    that nonce to whoever sent it, and the browser then trades it for a session.
+    The historical table/column names stay in place to avoid a data migration;
+    neither the plaintext code nor a browser-created credential is stored.
     """
 
     __tablename__ = "dashboard_login_nonces"
@@ -61,7 +61,7 @@ class LoginNonce(Base):
     nonce: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    # Null until the bot sees `/start <nonce>`.
+    # The Telegram account the bot delivered this code to.
     telegram_id: Mapped[int | None] = mapped_column(BigInteger)
     bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     #: Set the moment it is traded for a session, or when a bound nonce belongs

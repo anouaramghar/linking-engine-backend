@@ -40,8 +40,6 @@ from app.schemas.site import (
     SiteBulkResult,
     SiteCreate,
     SiteOut,
-    SiteSuggestionModeState,
-    SiteSuggestionModeUpdate,
 )
 from app.services.ingestion_service import latest_run
 from app.services.pool_source_policy import (
@@ -133,12 +131,29 @@ def _latest_analyses(db: Session, site_ids: list[int]) -> dict[int, JobRun]:
     return {run.site_id: run for run in runs}
 
 
-def _suggestion_mode_state(_site: Site) -> SiteSuggestionModeState:
-    return SiteSuggestionModeState(
-        suggestion_mode="experimental",
-        suggestion_mode_managed=True,
-        suggestion_comparison_enabled=False,
+def _latest_ingestions(db: Session, site_ids: list[int]) -> dict[int, IngestionRun]:
+    """The newest crawl per listed site in one query, not one query per row."""
+    if not site_ids:
+        return {}
+    ranked = (
+        select(
+            IngestionRun.id.label("run_id"),
+            func.row_number()
+            .over(
+                partition_by=IngestionRun.site_id,
+                order_by=(IngestionRun.started_at.desc(), IngestionRun.id.desc()),
+            )
+            .label("position"),
+        )
+        .where(IngestionRun.site_id.in_(site_ids))
+        .subquery()
     )
+    runs = db.scalars(
+        select(IngestionRun)
+        .join(ranked, ranked.c.run_id == IngestionRun.id)
+        .where(ranked.c.position == 1)
+    ).all()
+    return {run.site_id: run for run in runs}
 
 
 def _site_out(
@@ -151,10 +166,6 @@ def _site_out(
     analysis: JobRun | None = None,
 ) -> SiteOut:
     item = SiteOut.model_validate(site)
-    mode = _suggestion_mode_state(site)
-    item.suggestion_mode = mode.suggestion_mode
-    item.suggestion_mode_managed = mode.suggestion_mode_managed
-    item.suggestion_comparison_enabled = mode.suggestion_comparison_enabled
     site_capacity = min(
         article_count * settings.hybrid_max_suggestions_per_article,
         settings.hybrid_max_active_suggestions_per_site,
@@ -292,6 +303,7 @@ def bulk_create_sites(
 def list_sites(
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
+    search: str | None = Query(None, min_length=1, max_length=255),
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> list[SiteOut]:
@@ -299,21 +311,26 @@ def list_sites(
     readable = readable_site_filter(principal)
     if readable is not None:
         query = query.where(readable)
+    if search:
+        pattern = f"%{search.strip()}%"
+        query = query.where(
+            Site.name.ilike(pattern) | Site.base_url.ilike(pattern) | Site.platform.ilike(pattern)
+        )
     sites = db.scalars(query.order_by(Site.id).limit(limit).offset(offset)).all()
     article_counts, internal_link_counts, active_suggestion_counts = _site_counts(
         db, [site.id for site in sites]
     )
     analyses = _latest_analyses(db, [site.id for site in sites])
+    ingestions = _latest_ingestions(db, [site.id for site in sites])
     out = []
     for site in sites:
-        run = latest_run(db, site.id)
         out.append(
             _site_out(
                 site,
                 article_count=article_counts.get(site.id, 0),
                 internal_link_count=internal_link_counts.get(site.id, 0),
                 active_suggestion_count=active_suggestion_counts.get(site.id, 0),
-                run=run,
+                run=ingestions.get(site.id),
                 analysis=analyses.get(site.id),
             )
         )
@@ -433,17 +450,6 @@ def reactivate_pool_source(
     db.commit()
     db.refresh(site)
     return _fresh_site_out(db, site)
-
-
-@router.put("/{site_id}/suggestion-mode", response_model=SiteSuggestionModeState)
-def update_suggestion_mode(
-    payload: SiteSuggestionModeUpdate,
-    site: Site = Depends(require_site_access),
-) -> SiteSuggestionModeState:
-    raise HTTPException(
-        409,
-        "Hybrid/BM25 is the global suggestion method and cannot be changed per site",
-    )
 
 
 @router.delete("/{site_id}", status_code=204)

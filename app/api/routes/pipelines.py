@@ -81,8 +81,7 @@ def create_pipeline_batch(
     if pool_sites:
         raise HTTPException(
             409,
-            "content-pool sources cannot generate suggestions: "
-            + ", ".join(map(str, pool_sites)),
+            "content-pool sources cannot generate suggestions: " + ", ".join(map(str, pool_sites)),
         )
 
     batch = PipelineBatch()

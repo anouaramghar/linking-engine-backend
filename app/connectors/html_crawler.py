@@ -78,9 +78,7 @@ class HTMLConnector(ContentConnector):
                 max_items=settings.crawl_max_sitemap_urls,
             )
             if len(urls) > settings.crawl_max_sitemap_urls:
-                raise ValueError(
-                    f"sitemap URL count exceeded {settings.crawl_max_sitemap_urls}"
-                )
+                raise ValueError(f"sitemap URL count exceeded {settings.crawl_max_sitemap_urls}")
         return urls
 
     def _parse_sitemap(self, url: str, xpath: str, *, max_items: int | None = None) -> list[str]:
@@ -89,6 +87,7 @@ class HTMLConnector(ContentConnector):
             self.client,
             url,
             max_bytes=settings.crawl_max_response_bytes,
+            crawl_started_at=self._crawl_started_at,
         )
         resp.raise_for_status()
         tree = etree.fromstring(resp.content, parser=_XML_PARSER)
@@ -121,6 +120,7 @@ class HTMLConnector(ContentConnector):
             self.client,
             url,
             max_bytes=settings.crawl_max_response_bytes,
+            crawl_started_at=self._crawl_started_at,
         )
         if resp.status_code != 200:
             return None
@@ -142,9 +142,7 @@ class HTMLConnector(ContentConnector):
             if urlparse(absolute := urljoin(url, anchor.get("href"))).netloc == self._host
         ]
         if len(internal) > settings.crawl_max_links_per_article:
-            raise ValueError(
-                f"article link count exceeded {settings.crawl_max_links_per_article}"
-            )
+            raise ValueError(f"article link count exceeded {settings.crawl_max_links_per_article}")
         return ArticleData(
             url=url,
             title=doc.title or url,

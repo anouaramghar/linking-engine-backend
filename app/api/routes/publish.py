@@ -65,7 +65,7 @@ def trigger_publication(
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
-@router.get("/{site_id}/dry-run", response_model=PublicationDryRun)
+@router.post("/{site_id}/dry-run", response_model=PublicationDryRun)
 def dry_run_publication(
     site: Site = Depends(require_site_access),
     # Each source article is a live request to the customer's site, so a

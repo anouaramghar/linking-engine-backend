@@ -53,8 +53,7 @@ def pool_source_domain(url: str) -> str:
 def is_pool_domain_allowed(url: str) -> bool:
     host = pool_source_domain(url)
     return any(
-        host == domain or host.endswith(f".{domain}")
-        for domain in configured_pool_domains()
+        host == domain or host.endswith(f".{domain}") for domain in configured_pool_domains()
     )
 
 

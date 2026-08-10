@@ -89,7 +89,9 @@ class TelegramClient:
         return result if isinstance(result, dict) else {}
 
     def get_user_profile_photos(self, user_id: int, *, limit: int = 1) -> dict:
-        result = self._call("getUserProfilePhotos", {"user_id": user_id, "limit": limit}, http_timeout=10.0)
+        result = self._call(
+            "getUserProfilePhotos", {"user_id": user_id, "limit": limit}, http_timeout=10.0
+        )
         return result if isinstance(result, dict) else {}
 
     def get_file(self, file_id: str) -> dict:
@@ -111,7 +113,9 @@ def client_from_settings() -> TelegramClient | None:
     return TelegramClient(token.get_secret_value())
 
 
-def get_user_profile_photo_bytes(client: TelegramClient, telegram_id: int) -> tuple[bytes, str] | None:
+def get_user_profile_photo_bytes(
+    client: TelegramClient, telegram_id: int
+) -> tuple[bytes, str] | None:
     """Fetch profile photo bytes and media type for a Telegram user, if available."""
     try:
         photos_data = client.get_user_profile_photos(telegram_id, limit=1)
@@ -135,8 +139,13 @@ def get_user_profile_photo_bytes(client: TelegramClient, telegram_id: int) -> tu
         if media_type == "image/jpg":
             media_type = "image/jpeg"
         return data, media_type
-    except Exception as e:
-        logger.warning("failed_to_fetch_telegram_user_avatar", extra={"telegram_id": telegram_id, "error": str(e)})
+    except Exception as error:
+        # httpx exception strings include the request URL, whose path contains
+        # the bot token. Keep the useful class without serialising the secret.
+        logger.warning(
+            "failed_to_fetch_telegram_user_avatar",
+            extra={"telegram_id": telegram_id, "error_type": type(error).__name__},
+        )
         return None
 
 
@@ -152,5 +161,5 @@ def notify(telegram_id: int, text: str) -> None:
         return
     try:
         client.send_message(telegram_id, text)
-    except Exception:
-        logger.warning("telegram_notify_failed", exc_info=True)
+    except Exception as error:
+        logger.warning("telegram_notify_failed", extra={"error_type": type(error).__name__})

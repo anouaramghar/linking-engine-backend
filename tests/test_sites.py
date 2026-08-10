@@ -23,9 +23,6 @@ def test_site_crud(client):
     assert site["article_count"] == 0
     assert site["internal_link_count"] == 0
     assert site["last_crawl_at"] is None
-    assert site["suggestion_mode"] == "experimental"
-    assert site["suggestion_mode_managed"] is True
-    assert site["suggestion_comparison_enabled"] is False
     assert site["suggestion_slots_available"] == 0
     site_id = site["id"]
 
@@ -39,9 +36,7 @@ def test_site_crud(client):
     # delete requires an exact name confirmation, then 404
     bare = client.delete(f"/api/v1/sites/{site_id}")
     assert bare.status_code == 422
-    wrong = client.delete(
-        f"/api/v1/sites/{site_id}", params={"confirm_name": "not-the-name"}
-    )
+    wrong = client.delete(f"/api/v1/sites/{site_id}", params={"confirm_name": "not-the-name"})
     assert wrong.status_code == 409
     assert client.get(f"/api/v1/sites/{site_id}").status_code == 200
     assert (
@@ -163,23 +158,11 @@ def test_analysis_state_is_reported_apart_from_the_crawl(client, db, site):
 
     detail = client.get(f"/api/v1/sites/{site.id}").json()
     item = next(
-        candidate
-        for candidate in client.get("/api/v1/sites").json()
-        if candidate["id"] == site.id
+        candidate for candidate in client.get("/api/v1/sites").json() if candidate["id"] == site.id
     )
     for response in (detail, item):
         assert response["last_analysis_status"] == "succeeded"
         assert datetime.fromisoformat(response["last_analysis_at"]) == analysed_at
-
-
-def test_suggestion_mode_is_global_and_cannot_be_changed(client, site):
-    response = client.put(
-        f"/api/v1/sites/{site.id}/suggestion-mode",
-        json={"suggestion_mode": "experimental"},
-    )
-
-    assert response.status_code == 409
-    assert "global suggestion method" in response.json()["detail"]
 
 
 def test_orphan_filter_ignores_expired_links(client, db, site):

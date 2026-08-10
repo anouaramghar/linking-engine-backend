@@ -1,8 +1,4 @@
-"""Dashboard login: admission, nonce lifecycle, and session validity.
-
-The security claim under test is that reaching the dashboard proves nothing.
-Every path here should end in "no session" unless a human admitted the account.
-"""
+"""Dashboard admission, Telegram code lifecycle, and session validity."""
 
 from datetime import UTC, datetime, timedelta
 
@@ -15,9 +11,6 @@ from app.services import dashboard_auth
 
 @pytest.fixture(autouse=True)
 def clean_dashboard_tables(db):
-    """These tables are global, not per-site, so a leaked row leaks into the
-    next test's counts the way a stranded ApiKey row does."""
-
     def wipe() -> None:
         db.query(DashboardSession).delete()
         db.query(LoginNonce).delete()
@@ -29,59 +22,79 @@ def clean_dashboard_tables(db):
     wipe()
 
 
-def _start_login(db) -> str:
-    nonce = dashboard_auth.create_login_nonce(db)
+def _request(db, telegram_id: int = 4242, **identity) -> DashboardUser:
+    user, code = dashboard_auth.create_login_code(db, telegram_id, **identity)
     db.commit()
-    return nonce.nonce
+    assert code is None
+    return user
 
 
-# --------------------------------------------------------------------------
-# Admission
-# --------------------------------------------------------------------------
-
-
-def test_first_login_records_a_request_and_grants_nothing(db):
-    nonce = _start_login(db)
-
-    user = dashboard_auth.bind_nonce(db, nonce, telegram_id=4242, username="anouar")
-
-    assert user is not None
-    assert user.status == "pending"
-    outcome = dashboard_auth.redeem_nonce(db, nonce)
-    assert outcome.state == "pending"
-    assert outcome.token is None
-
-
-def test_approved_user_receives_a_session(db):
-    nonce = _start_login(db)
-    user = dashboard_auth.bind_nonce(db, nonce, telegram_id=4242)
+def _approved_code(db, telegram_id: int = 4242) -> tuple[DashboardUser, str]:
+    user = _request(db, telegram_id)
     dashboard_auth.approve_user(db, user, approved_by="1")
     db.commit()
+    user, code = dashboard_auth.create_login_code(db, telegram_id)
+    db.commit()
+    assert code is not None
+    return user, code
 
-    outcome = dashboard_auth.redeem_nonce(db, nonce)
+
+def _approved_session(db, telegram_id: int = 4242) -> str:
+    _user, code = _approved_code(db, telegram_id)
+    token = dashboard_auth.redeem_login_code(db, code).token
+    assert token is not None
+    return token
+
+
+def test_first_telegram_contact_records_a_request_and_grants_nothing(db):
+    user, code = dashboard_auth.create_login_code(db, 4242, username="anouar")
+    db.commit()
+
+    assert user.status == "pending"
+    assert code is None
+    assert db.query(LoginNonce).count() == 0
+
+
+def test_approved_user_receives_a_one_time_code_and_session(db):
+    _user, code = _approved_code(db)
+
+    outcome = dashboard_auth.redeem_login_code(db, code)
 
     assert outcome.state == "approved"
     assert outcome.token
     assert dashboard_auth.verify_session(db, outcome.token) is not None
+    assert dashboard_auth.redeem_login_code(db, code).state == "invalid"
 
 
-def test_revoked_user_cannot_redeem(db):
-    nonce = _start_login(db)
-    user = dashboard_auth.bind_nonce(db, nonce, telegram_id=4242)
+def test_forwarding_the_browser_bot_link_cannot_yield_somebody_elses_session(db, monkeypatch):
+    """Regression for the old browser-nonce relay attack.
+
+    The link is static and carries no credential. Only the code sent back to the
+    Telegram account can be redeemed by a browser.
+    """
+    monkeypatch.setattr(settings, "telegram_bot_username", "linkmeshbot")
+    link = dashboard_auth.login_deep_link()
+    victim = _request(db, 9999)
+
+    assert link == "https://t.me/linkmeshbot?start=login"
+    assert victim.status == "pending"
+    assert dashboard_auth.redeem_login_code(db, link or "").state == "invalid"
+
+
+def test_revoked_user_receives_no_code(db):
+    user = _request(db)
     dashboard_auth.revoke_user(db, user)
     db.commit()
 
-    assert dashboard_auth.redeem_nonce(db, nonce).state == "revoked"
+    user, code = dashboard_auth.create_login_code(db, 4242)
+
+    assert user.status == "revoked"
+    assert code is None
 
 
 def test_revoking_ends_a_session_already_open(db):
-    """Revocation takes effect now, not at next login."""
-    nonce = _start_login(db)
-    user = dashboard_auth.bind_nonce(db, nonce, telegram_id=4242)
-    dashboard_auth.approve_user(db, user, approved_by="1")
-    db.commit()
-    token = dashboard_auth.redeem_nonce(db, nonce).token
-    assert dashboard_auth.verify_session(db, token) is not None
+    token = _approved_session(db)
+    user = db.query(DashboardUser).one()
 
     dashboard_auth.revoke_user(db, user)
     db.commit()
@@ -90,93 +103,60 @@ def test_revoking_ends_a_session_already_open(db):
 
 
 def test_display_name_refreshes_so_approvals_name_the_right_person(db):
-    first = _start_login(db)
-    dashboard_auth.bind_nonce(db, first, telegram_id=4242, username="old_handle")
-    second = _start_login(db)
-
-    user = dashboard_auth.bind_nonce(db, second, telegram_id=4242, username="new_handle")
+    _request(db, username="old_handle")
+    user = _request(db, username="new_handle")
 
     assert user.username == "new_handle"
     assert db.query(DashboardUser).count() == 1
 
 
-# --------------------------------------------------------------------------
-# Nonces
-# --------------------------------------------------------------------------
+def test_plaintext_login_code_is_never_stored(db):
+    _user, code = _approved_code(db)
+
+    stored = db.query(LoginNonce).one()
+    assert stored.nonce != code
+    assert code.replace("-", "") not in stored.nonce
 
 
-def test_nonce_is_single_use(db):
-    nonce = _start_login(db)
-    user = dashboard_auth.bind_nonce(db, nonce, telegram_id=4242)
-    dashboard_auth.approve_user(db, user, approved_by="1")
+def test_latest_code_invalidates_an_earlier_unspent_code(db):
+    _user, first = _approved_code(db)
+    _user, second = dashboard_auth.create_login_code(db, 4242)
     db.commit()
 
-    assert dashboard_auth.redeem_nonce(db, nonce).state == "approved"
-    assert dashboard_auth.redeem_nonce(db, nonce).state == "invalid"
+    assert second is not None
+    assert dashboard_auth.redeem_login_code(db, first).state == "invalid"
+    assert dashboard_auth.redeem_login_code(db, second).state == "approved"
 
 
-def test_pending_redeem_also_spends_the_nonce(db):
-    """Otherwise a pending browser polls forever and keeps the attempt alive."""
-    nonce = _start_login(db)
-    dashboard_auth.bind_nonce(db, nonce, telegram_id=4242)
-
-    assert dashboard_auth.redeem_nonce(db, nonce).state == "pending"
-    assert dashboard_auth.redeem_nonce(db, nonce).state == "invalid"
+def test_unknown_or_malformed_code_is_invalid(db):
+    assert dashboard_auth.redeem_login_code(db, "never-issued").state == "invalid"
+    assert dashboard_auth.redeem_login_code(db, "").state == "invalid"
 
 
-def test_unbound_nonce_tells_the_browser_to_keep_waiting(db):
-    assert dashboard_auth.redeem_nonce(db, _start_login(db)).state == "waiting"
-
-
-def test_unknown_nonce_is_invalid(db):
-    assert dashboard_auth.redeem_nonce(db, "never-issued").state == "invalid"
-
-
-def test_expired_nonce_cannot_bind_or_redeem(db):
-    nonce_row = dashboard_auth.create_login_nonce(db)
-    nonce_row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+def test_expired_code_cannot_be_redeemed(db):
+    _user, code = _approved_code(db)
+    row = db.query(LoginNonce).one()
+    row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     db.commit()
 
-    assert dashboard_auth.bind_nonce(db, nonce_row.nonce, telegram_id=4242) is None
-    assert dashboard_auth.redeem_nonce(db, nonce_row.nonce).state == "invalid"
+    assert dashboard_auth.redeem_login_code(db, code).state == "invalid"
 
 
-def test_second_start_cannot_rebind_a_claimed_nonce(db):
-    """Two `/start` messages racing must not let the loser take the session."""
-    nonce = _start_login(db)
-    assert dashboard_auth.bind_nonce(db, nonce, telegram_id=4242) is not None
-
-    assert dashboard_auth.bind_nonce(db, nonce, telegram_id=9999) is None
-
-
-def test_purge_removes_expired_nonces_only(db):
-    live = dashboard_auth.create_login_nonce(db)
-    stale = dashboard_auth.create_login_nonce(db)
-    stale.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+def test_purge_removes_expired_and_spent_codes(db):
+    _user, expired = _approved_code(db)
+    row = db.query(LoginNonce).one()
+    row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.commit()
+    _user, live = dashboard_auth.create_login_code(db, 4242)
     db.commit()
 
-    assert dashboard_auth.purge_expired_nonces(db) == 1
-    assert {row.nonce for row in db.query(LoginNonce).all()} == {live.nonce}
-
-
-# --------------------------------------------------------------------------
-# Sessions
-# --------------------------------------------------------------------------
-
-
-def _approved_session(db, telegram_id: int = 4242) -> str:
-    nonce = _start_login(db)
-    user = dashboard_auth.bind_nonce(db, nonce, telegram_id=telegram_id)
-    dashboard_auth.approve_user(db, user, approved_by="1")
-    db.commit()
-    token = dashboard_auth.redeem_nonce(db, nonce).token
-    assert token is not None
-    return token
+    assert dashboard_auth.purge_expired_login_codes(db) == 1
+    assert dashboard_auth.redeem_login_code(db, live or "").state == "approved"
+    assert dashboard_auth.redeem_login_code(db, expired).state == "invalid"
 
 
 def test_session_token_is_never_stored_in_plaintext(db):
     token = _approved_session(db)
-
     stored = db.query(DashboardSession).one()
     assert stored.token_hash != token
     assert token not in stored.token_hash
@@ -187,15 +167,12 @@ def test_expired_session_is_refused(db):
     stored = db.query(DashboardSession).one()
     stored.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     db.commit()
-
     assert dashboard_auth.verify_session(db, token) is None
 
 
 def test_logout_refuses_the_same_token_afterwards(db):
     token = _approved_session(db)
-
     dashboard_auth.revoke_session(db, token)
-
     assert dashboard_auth.verify_session(db, token) is None
 
 
@@ -205,44 +182,25 @@ def test_absent_or_unknown_token_is_refused(db):
     assert dashboard_auth.verify_session(db, "not-a-real-token") is None
 
 
-def test_session_slide_is_throttled(db, monkeypatch):
-    """Extending on every request would serialize all traffic on one session."""
+def test_session_slide_is_throttled_and_extends_expiry(db, monkeypatch):
     token = _approved_session(db)
     stored = db.query(DashboardSession).one()
     first_seen = stored.last_seen_at
-
-    dashboard_auth.verify_session(db, token)
-    db.refresh(stored)
-
-    assert stored.last_seen_at == first_seen  # inside the interval, so untouched
-
-    monkeypatch.setattr(dashboard_auth, "SESSION_SLIDE_INTERVAL", timedelta(seconds=0))
-    dashboard_auth.verify_session(db, token)
-    db.refresh(stored)
-
-    assert stored.last_seen_at > first_seen
-
-
-def test_slide_extends_expiry_not_just_last_seen(db, monkeypatch):
-    token = _approved_session(db)
-    stored = db.query(DashboardSession).one()
     original_expiry = stored.expires_at
 
+    dashboard_auth.verify_session(db, token)
+    db.refresh(stored)
+    assert stored.last_seen_at == first_seen
+
     monkeypatch.setattr(dashboard_auth, "SESSION_SLIDE_INTERVAL", timedelta(seconds=0))
     dashboard_auth.verify_session(db, token)
     db.refresh(stored)
-
+    assert stored.last_seen_at > first_seen
     assert stored.expires_at > original_expiry
-
-
-# --------------------------------------------------------------------------
-# Bootstrap
-# --------------------------------------------------------------------------
 
 
 def test_bootstrap_admin_is_pre_approved_and_idempotent(db, monkeypatch):
     monkeypatch.setattr(settings, "dashboard_bootstrap_admin_id", 777)
-
     first = dashboard_auth.ensure_bootstrap_admin(db)
     second = dashboard_auth.ensure_bootstrap_admin(db)
 
@@ -252,20 +210,17 @@ def test_bootstrap_admin_is_pre_approved_and_idempotent(db, monkeypatch):
     assert db.query(DashboardUser).count() == 1
 
 
-def test_bootstrap_promotes_an_existing_pending_request(db, monkeypatch):
-    """The admin may well have tried to log in before the ID was configured."""
-    nonce = _start_login(db)
-    dashboard_auth.bind_nonce(db, nonce, telegram_id=777)
+def test_bootstrap_promotes_pending_but_never_revoked_user(db, monkeypatch):
+    user = _request(db, 777)
     monkeypatch.setattr(settings, "dashboard_bootstrap_admin_id", 777)
+    assert dashboard_auth.ensure_bootstrap_admin(db).status == "approved"
 
-    user = dashboard_auth.ensure_bootstrap_admin(db)
-
-    assert user is not None and user.status == "approved"
-    assert db.query(DashboardUser).count() == 1
+    dashboard_auth.revoke_user(db, user)
+    db.commit()
+    assert dashboard_auth.ensure_bootstrap_admin(db).status == "revoked"
 
 
 def test_no_bootstrap_configured_admits_nobody(db, monkeypatch):
     monkeypatch.setattr(settings, "dashboard_bootstrap_admin_id", None)
-
     assert dashboard_auth.ensure_bootstrap_admin(db) is None
     assert db.query(DashboardUser).count() == 0

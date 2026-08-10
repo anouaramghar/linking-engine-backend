@@ -316,24 +316,32 @@ fi
 write_env DASHBOARD_BOOTSTRAP_ADMIN_ID "$ADMIN_ID"
 
 # ── 4 ─────────────────────────────────────────────────────────────────────
+RECREATE=(docker compose up -d api worker worker-analysis worker-publication telegram-bot)
+
 stage "Load the new settings" 1
-say "docker-compose reads .env at container start, so the API and worker need"
-say "a restart before they can see any of this."
+say "Compose resolves env_file when it *creates* a container, so 'restart'"
+say "would replay the old, empty values — the containers have to be recreated."
+say "telegram-bot is in the list because it is the one that reads the token and"
+say "pre-approves the admin ID you just chose; without it there is no login."
 printf '\n'
-if confirm "Restart the api and worker containers now?"; then
-  if docker compose restart api worker; then
-    printf '  %s✓%s Containers restarted.\n' "$GREEN" "$RESET"
+if confirm "Recreate the api, worker and telegram-bot containers now?"; then
+  if "${RECREATE[@]}"; then
+    printf '  %s✓%s Containers recreated.\n' "$GREEN" "$RESET"
   else
-    SKIPPED+=("restart the containers: docker compose restart api worker")
-    warn "Restart failed — do it by hand when convenient."
+    SKIPPED+=("recreate the containers: ${RECREATE[*]}")
+    warn "That failed — run it by hand when convenient."
   fi
 else
-  SKIPPED+=("restart the containers: docker compose restart api worker")
-  note "Skipped. Run 'docker compose restart api worker' when you're ready."
+  SKIPPED+=("recreate the containers: ${RECREATE[*]}")
+  note "Skipped. Run '${RECREATE[*]}' when you're ready."
 fi
 
 finish
 
-note "Next: the bot worker that listens for /start is not built yet, so logging"
-note "in end to end will not work until that lands. These values are what it needs."
+note "Log in from the dashboard now: press Sign in with Telegram, then Start in"
+note "the chat that opens. Copy its one-time code back into the dashboard tab."
+printf '\n'
+note "If the bot never answers, it is almost always this: check that no *other*"
+note "machine is polling the same token. Telegram delivers each message to one"
+note "listener only, so a second bot elsewhere silently swallows your logins."
 printf '\n'

@@ -67,17 +67,21 @@ dependency and works from a bare IP. It needs only *outbound* access to `api.tel
 which an inbound IP restriction does not block. If a public hostname and certificate ever
 exist, the widget becomes a drop-in UX improvement on the same data model.
 
-## Proposed flow
+## Implemented flow
 
-1. The dashboard is unauthenticated. It shows a login screen with a deep link and QR for
-   `https://t.me/<bot>?start=<nonce>`, where the nonce is single-use and short-lived.
-2. The operator opens it and presses Start. Telegram delivers `/start <nonce>` to the bot
-   together with the sender's Telegram user ID, which Telegram has already authenticated.
-3. The bot worker (long-polling `getUpdates`, so no inbound webhook) resolves the nonce and
-   binds it to that Telegram user ID.
-4. The dashboard polls the nonce endpoint. On success it receives a session cookie.
-5. Unknown Telegram IDs are recorded as **pending** and the login stops there with an
-   explanatory screen. An approved admin approves them; the next login succeeds.
+1. The dashboard opens the static deep link `https://t.me/<bot>?start=login`. It contains
+   no browser credential and is safe to forward.
+2. Telegram delivers the operator's authenticated Telegram identity to the long-polling
+   bot. No inbound webhook or public dashboard hostname is required.
+3. An unknown Telegram ID is recorded as **pending** and receives no code. An existing
+   approved operator must approve it; there is no automatic allowlist.
+4. On a later `/start`, an approved operator receives a short-lived, single-use code in
+   their private Telegram chat. Only an HMAC digest of that code is stored.
+5. The operator carries the code back to the original browser. Redeeming it creates the
+   `HttpOnly`, `SameSite=Lax` dashboard session cookie.
+
+The browser does not create or poll a redeemable Telegram token. This prevents a relayed
+browser-created bot link from signing the original browser in as the person who opened it.
 
 ## Single enforcement point
 
@@ -95,7 +99,8 @@ less.
 
 - `dashboard_users` — telegram user ID, username, status (`pending`/`approved`/`revoked`),
   who approved and when, last seen.
-- `login_nonces` — nonce, expiry, bound Telegram ID, consumed-at. Single use.
+- `login_nonces` — legacy table/column names containing an HMAC digest of the one-time
+  code, its expiry, the Telegram ID it belongs to, and consumed-at. Single use.
 - Sessions — cookie carrying a signed, expiring token; `HttpOnly`, `SameSite=Lax`,
   `Secure` once TLS terminates in front.
 
@@ -108,13 +113,15 @@ trail at `PoolAuditModal.tsx:36` already displays.
 
 ## Security and test expectations
 
-- Nonces are single-use, short-TTL, and rate-limited per IP; an unconsumed nonce leaks
-  nothing.
+- Codes are single-use, short-TTL, stored only as keyed digests, and issued only through
+  the operator's private Telegram conversation. Login start/completion is rate-limited at
+  the proxy.
+- The browser deep link is static and carries no credential.
 - A pending or revoked user is refused at `auth_request`, not merely hidden in the UI.
 - Revocation takes effect on the next request, not the next login.
 - Direct `/api/` access without a session returns 401 from the proxy, with no backend key
   attached. This is the regression test that pins FE-SEC-01 closed.
-- Existing suites stay green: 567 backend, 310 frontend.
+- Backend and frontend authentication regression suites must stay green.
 
 ## Explicitly out of scope
 
@@ -122,13 +129,10 @@ Per-person authorization, roles, and per-site scoping for dashboard users — ru
 the team lead. External users and public exposure. Replacing the scoped API keys, which
 stay for blast-radius containment.
 
-## Open questions for the team lead
+## Deployment choices
 
-1. **Bootstrap.** Who approves the first admin? Proposed default: seed one Telegram user ID
-   from the environment as pre-approved, and require it to approve everyone else.
-2. **Session lifetime.** Proposed default: 12 hours, sliding.
-3. **Widget later?** If a public hostname and certificate become available, is the one-click
-   widget worth adopting over the deep link?
-4. **Residual from the security review, unanswered.** WordPress application passwords cross
-   the network in cleartext unless TLS terminates in front of nginx. The firewall reduces
-   this but does not remove it. Worth fixing while auth is being touched.
+- `DASHBOARD_BOOTSTRAP_ADMIN_ID` may seed the first approved operator. It promotes a
+  pending user only; it never silently restores a revoked account on restart.
+- Sessions default to 12 hours.
+- The dashboard remains behind the IP-restricted firewall. TLS is still required anywhere
+  WordPress application passwords would otherwise cross an untrusted network.

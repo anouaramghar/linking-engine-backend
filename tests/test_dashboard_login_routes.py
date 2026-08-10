@@ -38,32 +38,44 @@ def configure_login(db, monkeypatch):
 
 def _login_as(client: TestClient, db, telegram_id: int = 4242) -> str:
     """Drive the full flow and return the session cookie."""
-    nonce = client.post("/api/v1/auth/login/start").json()["nonce"]
-    user = dashboard_auth.bind_nonce(db, nonce, telegram_id=telegram_id)
+    user, code = dashboard_auth.create_login_code(db, telegram_id)
+    assert code is None
     dashboard_auth.approve_user(db, user, approved_by="bootstrap")
     db.commit()
-    response = client.get(f"/api/v1/auth/login/{nonce}")
+    _user, code = dashboard_auth.create_login_code(db, telegram_id)
+    db.commit()
+    response = client.post("/api/v1/auth/login/complete", json={"code": code})
     assert response.json()["state"] == "approved"
     return response.cookies[SESSION_COOKIE]
+
+
+def _request_user(db, telegram_id: int, **identity) -> DashboardUser:
+    user, code = dashboard_auth.create_login_code(db, telegram_id, **identity)
+    db.commit()
+    assert code is None
+    return user
 
 
 def test_start_login_returns_a_deep_link(client):
     body = client.post("/api/v1/auth/login/start").json()
 
-    assert body["nonce"]
-    assert body["deep_link"] == f"https://t.me/LinkMeshTestBot?start={body['nonce']}"
-    assert body["expires_in_seconds"] > 0
+    assert "nonce" not in body
+    assert body["deep_link"] == "https://t.me/LinkMeshTestBot?start=login"
 
 
-def test_start_login_clears_out_expired_nonces(client, db):
+def test_start_login_clears_out_expired_codes(client, db):
     """Housekeeping rides along here because nothing else schedules it."""
-    stale = dashboard_auth.create_login_nonce(db)
+    user = _request_user(db, 4242)
+    dashboard_auth.approve_user(db, user, approved_by="bootstrap")
+    db.commit()
+    _user, _code = dashboard_auth.create_login_code(db, 4242)
+    stale = db.query(LoginNonce).one()
     stale.expires_at = datetime.now(UTC) - timedelta(seconds=1)
     db.commit()
 
-    fresh = client.post("/api/v1/auth/login/start").json()["nonce"]
+    client.post("/api/v1/auth/login/start")
 
-    assert {row.nonce for row in db.query(LoginNonce).all()} == {fresh}
+    assert db.query(LoginNonce).count() == 0
 
 
 def test_start_login_fails_closed_when_unconfigured(client, monkeypatch):
@@ -75,27 +87,24 @@ def test_start_login_fails_closed_when_unconfigured(client, monkeypatch):
     assert "not configured" in response.json()["detail"]
 
 
-def test_poll_reports_waiting_then_pending(client, db):
-    nonce = client.post("/api/v1/auth/login/start").json()["nonce"]
+def test_pending_user_gets_no_redeemable_code(client, db):
+    user = _request_user(db, 4242, username="anouar")
 
-    assert client.get(f"/api/v1/auth/login/{nonce}").json()["state"] == "waiting"
+    body = client.post("/api/v1/auth/login/complete", json={"code": "AAAA-BBBB-CCCC"}).json()
 
-    dashboard_auth.bind_nonce(db, nonce, telegram_id=4242, username="anouar")
-    body = client.get(f"/api/v1/auth/login/{nonce}").json()
-
-    assert body["state"] == "pending"
-    assert body["user"]["username"] == "anouar"
+    assert user.status == "pending"
+    assert body["state"] == "invalid"
     assert SESSION_COOKIE not in client.cookies
 
 
-def test_poll_sets_a_cookie_only_once_approved(client, db):
+def test_complete_sets_a_cookie_only_once_approved(client, db):
     token = _login_as(client, db)
 
     assert token
 
 
-def test_unknown_nonce_answers_invalid_rather_than_erroring(client):
-    body = client.get("/api/v1/auth/login/never-issued")
+def test_unknown_code_answers_invalid_rather_than_erroring(client):
+    body = client.post("/api/v1/auth/login/complete", json={"code": "AAAA-BBBB-CCCC"})
 
     assert body.status_code == 200
     assert body.json()["state"] == "invalid"
@@ -135,8 +144,7 @@ def test_admission_routes_require_a_session(client):
 
 def test_approving_admits_the_next_login(client, db):
     _login_as(client, db, telegram_id=4242)
-    pending_nonce = client.post("/api/v1/auth/login/start").json()["nonce"]
-    newcomer = dashboard_auth.bind_nonce(db, pending_nonce, telegram_id=9999)
+    newcomer = _request_user(db, 9999)
     assert newcomer.status == "pending"
 
     response = client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
@@ -149,8 +157,7 @@ def test_approving_admits_the_next_login(client, db):
 def test_approving_tells_the_person_they_are_in(client, db, offline_telegram):
     """Otherwise the only way to discover an approval is to keep retrying."""
     _login_as(client, db, telegram_id=4242)
-    nonce = client.post("/api/v1/auth/login/start").json()["nonce"]
-    newcomer = dashboard_auth.bind_nonce(db, nonce, telegram_id=9999)
+    newcomer = _request_user(db, 9999)
 
     client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
 
@@ -159,8 +166,7 @@ def test_approving_tells_the_person_they_are_in(client, db, offline_telegram):
 
 def test_re_approving_someone_already_in_says_nothing(client, db, offline_telegram):
     _login_as(client, db, telegram_id=4242)
-    nonce = client.post("/api/v1/auth/login/start").json()["nonce"]
-    newcomer = dashboard_auth.bind_nonce(db, nonce, telegram_id=9999)
+    newcomer = _request_user(db, 9999)
     client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
     offline_telegram.clear()
 
@@ -171,8 +177,7 @@ def test_re_approving_someone_already_in_says_nothing(client, db, offline_telegr
 
 def test_pending_users_are_listed_first(client, db):
     _login_as(client, db, telegram_id=4242)
-    nonce = client.post("/api/v1/auth/login/start").json()["nonce"]
-    dashboard_auth.bind_nonce(db, nonce, telegram_id=9999)
+    _request_user(db, 9999)
 
     listed = client.get("/api/v1/auth/users").json()
 
@@ -251,8 +256,9 @@ def test_user_avatar_endpoint_returns_404_when_user_has_no_photo(client, db, mon
     user = session["user"]
 
     # Mock telegram get_user_profile_photo_bytes to return None
-    monkeypatch.setattr("app.services.telegram.get_user_profile_photo_bytes", lambda _client, _tid: None)
+    monkeypatch.setattr(
+        "app.services.telegram.get_user_profile_photo_bytes", lambda _client, _tid: None
+    )
 
     res = client.get(f"/api/v1/auth/users/{user['id']}/avatar")
     assert res.status_code == 404
-

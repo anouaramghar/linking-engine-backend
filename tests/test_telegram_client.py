@@ -9,7 +9,10 @@ costs nothing and closes that gap.
 import httpx
 import pytest
 
+from app.services import telegram
 from app.services.telegram import TelegramClient, TelegramError
+
+_real_notify = telegram.notify
 
 
 def _client(handler) -> TelegramClient:
@@ -109,3 +112,25 @@ def test_an_http_error_is_not_swallowed():
 
     with pytest.raises(httpx.HTTPStatusError):
         _client(handler).get_updates(None)
+
+
+def test_best_effort_logging_never_serializes_the_bot_token(monkeypatch):
+    token = "super-secret-token"
+    warnings = []
+
+    class BrokenClient:
+        def send_message(self, *_args, **_kwargs):
+            request = httpx.Request("POST", f"https://api.telegram.org/bot{token}/sendMessage")
+            raise httpx.ConnectError("network down", request=request)
+
+    monkeypatch.setattr(telegram, "client_from_settings", lambda: BrokenClient())
+    monkeypatch.setattr(
+        telegram.logger,
+        "warning",
+        lambda message, *args, **kwargs: warnings.append((message, args, kwargs)),
+    )
+
+    _real_notify(4242, "hello")
+
+    assert token not in repr(warnings)
+    assert warnings == [("telegram_notify_failed", (), {"extra": {"error_type": "ConnectError"}})]

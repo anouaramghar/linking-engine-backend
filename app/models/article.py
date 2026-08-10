@@ -1,7 +1,18 @@
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -49,7 +60,9 @@ class Embedding(Base):
     __table_args__ = (UniqueConstraint("article_id", "model"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    article_id: Mapped[int] = mapped_column(ForeignKey("articles.id", ondelete="CASCADE"), index=True)
+    article_id: Mapped[int] = mapped_column(
+        ForeignKey("articles.id", ondelete="CASCADE"), index=True
+    )
     model: Mapped[str] = mapped_column(String(100))
     vector: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
     content_fingerprint: Mapped[str | None] = mapped_column(String(64))
