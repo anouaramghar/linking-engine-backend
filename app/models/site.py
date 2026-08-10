@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -58,6 +58,10 @@ class Site(Base):
         DateTime(timezone=True)
     )
     pool_source_last_reactivated_by: Mapped[str | None] = mapped_column(String(255))
+    # Operator-supplied registration date used by the deterministic trust score.
+    # Unknown stays NULL instead of pretending that the source connection date
+    # is the age of a domain on the public internet.
+    domain_registered_at: Mapped[date | None] = mapped_column(Date)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

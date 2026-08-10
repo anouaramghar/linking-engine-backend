@@ -6,17 +6,23 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, require_operator_identity
+from app.api.deps import get_audit_actor, get_db, require_operator_identity
 from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
 from app.models import (
     Article,
+    ExternalLinkPolicy,
     IngestionRun,
     InternalLink,
     JobRun,
     PoolSourceAuditEvent,
     Site,
     Suggestion,
+)
+from app.schemas.external_policy import (
+    ExternalLinkPolicyOut,
+    ExternalLinkPolicyUpdate,
+    ExternalSourceEvaluationList,
 )
 from app.schemas.pool_audit import PoolSourceAuditEventOut
 from app.schemas.site import (
@@ -30,13 +36,18 @@ from app.schemas.site import (
     SiteSuggestionModeState,
     SiteSuggestionModeUpdate,
 )
+from app.services.external_link_policy import (
+    expire_ineligible_external_suggestions,
+    policy_state,
+    source_evaluations,
+)
 from app.services.ingestion_service import latest_run
+from app.services.pool_source_audit import record_pool_source_audit_event
 from app.services.pool_source_policy import (
     PoolSourcePolicyError,
     expire_pool_target_suggestions,
     require_allowed_pool_domain,
 )
-from app.services.pool_source_audit import record_pool_source_audit_event
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -48,6 +59,26 @@ def _get_site_or_404(db: Session, site_id: int) -> Site:
     if site is None:
         raise HTTPException(404, f"site {site_id} not found")
     return site
+
+
+def _managed_site_or_409(db: Session, site_id: int) -> Site:
+    site = _get_site_or_404(db, site_id)
+    if site.platform == "pool":
+        raise HTTPException(409, "external-link policies belong to managed sites")
+    return site
+
+
+def _external_policy_out(
+    db: Session, site_id: int, *, expired_suggestions: int = 0
+) -> ExternalLinkPolicyOut:
+    state = policy_state(db, site_id)
+    stored = db.get(ExternalLinkPolicy, site_id)
+    return ExternalLinkPolicyOut(
+        **state.as_payload(),
+        updated_by=stored.updated_by if stored is not None else None,
+        updated_at=stored.updated_at if stored is not None else None,
+        expired_suggestions=expired_suggestions,
+    )
 
 
 def _first_error(exc: ValidationError) -> str:
@@ -261,6 +292,47 @@ def list_sites(
             )
         )
     return out
+
+
+@router.get("/{site_id}/external-link-policy", response_model=ExternalLinkPolicyOut)
+def get_external_link_policy(
+    site_id: int, db: Session = Depends(get_db)
+) -> ExternalLinkPolicyOut:
+    _managed_site_or_409(db, site_id)
+    return _external_policy_out(db, site_id)
+
+
+@router.put("/{site_id}/external-link-policy", response_model=ExternalLinkPolicyOut)
+def update_external_link_policy(
+    site_id: int,
+    payload: ExternalLinkPolicyUpdate,
+    db: Session = Depends(get_db),
+    operator_id: str = Depends(get_audit_actor),
+) -> ExternalLinkPolicyOut:
+    site = _managed_site_or_409(db, site_id)
+    policy = db.get(ExternalLinkPolicy, site_id)
+    if policy is None:
+        policy = ExternalLinkPolicy(site_id=site_id)
+        db.add(policy)
+    for field, value in payload.model_dump().items():
+        setattr(policy, field, value)
+    policy.updated_by = operator_id
+    db.flush()
+    expired = expire_ineligible_external_suggestions(db, site, actor=operator_id)
+    db.commit()
+    db.refresh(policy)
+    return _external_policy_out(db, site_id, expired_suggestions=expired)
+
+
+@router.get(
+    "/{site_id}/external-link-policy/sources",
+    response_model=ExternalSourceEvaluationList,
+)
+def list_external_source_evaluations(
+    site_id: int, db: Session = Depends(get_db)
+) -> ExternalSourceEvaluationList:
+    site = _managed_site_or_409(db, site_id)
+    return ExternalSourceEvaluationList(items=source_evaluations(db, site))
 
 
 @router.get(

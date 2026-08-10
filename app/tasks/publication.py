@@ -50,6 +50,7 @@ from app.services.publication_progress import (
     record_publication_skip,
     resume_outcome_counts,
 )
+from app.services.external_link_policy import expire_ineligible_external_suggestions
 from app.services.job_service import (
     NonRetryableTaskError,
     record_progress,
@@ -300,6 +301,19 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
         if site is None:
             raise ValueError(f"site {site_id} not found")
         connector = get_connector(site)
+        policy_expired = expire_ineligible_external_suggestions(
+            db,
+            site,
+            statuses=("approved",),
+            actor="system:publication-policy",
+        )
+        if policy_expired:
+            db.commit()
+            logger.info(
+                "expired %s approved external suggestion(s) blocked by site %s policy",
+                policy_expired,
+                site_id,
+            )
         groups, superseded = grouped_batch(db, site_id)
         if superseded:
             # Terminal, not skipped: this row can never publish, and left
@@ -467,6 +481,7 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
             "inserted": outcome_counts["inserted"],
             "block": outcome_counts["block"],
             "already_present": outcome_counts["already_present"],
+            "policy_expired": policy_expired,
         }
     finally:
         db.close()

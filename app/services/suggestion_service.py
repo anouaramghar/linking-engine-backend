@@ -15,6 +15,7 @@ from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
 from app.ml.hybrid import HybridRanker, RankedCandidate
 from app.services.job_service import record_progress
+from app.services.external_link_policy import external_target_context
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
@@ -179,7 +180,14 @@ def _ranking_mode(
     return "hybrid"
 
 
-def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[RankedCandidate]:
+def _baseline_rows(
+    db,
+    article_id: int,
+    model: str,
+    remaining: int,
+    *,
+    allowed_target_ids: set[int] | None = None,
+) -> list[RankedCandidate]:
     """The unchanged cosine path, in the shape the persistence loop expects.
 
     Baseline rows carry no score components: `score` is cosine similarity and
@@ -188,7 +196,13 @@ def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[Rank
     """
     return [
         RankedCandidate(target_id=target_id, semantic_score=score)
-        for target_id, score in top_candidates(db, article_id, model, remaining)
+        for target_id, score in top_candidates(
+            db,
+            article_id,
+            model,
+            remaining,
+            allowed_target_ids=allowed_target_ids,
+        )
     ]
 
 
@@ -217,17 +231,18 @@ def generate_suggestions(
                 raise ValueError(f"site {site_id} not found")
             if site.platform == "pool":
                 raise ValueError("content-pool sources cannot generate suggestions")
+            allowed_target_ids, external_trust = external_target_context(db, site)
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
             pool_site_ids = db.scalars(
-                select(Site.id)
+                select(Article.site_id)
                 .where(
-                    Site.platform == "pool",
-                    Site.pool_source_approved.is_(True),
-                    Site.pool_source_quarantined.is_(False),
+                    Article.id.in_(allowed_target_ids),
+                    Article.site_id != site_id,
                 )
-                .order_by(Site.id)
+                .distinct()
+                .order_by(Article.site_id)
             ).all()
             for pool_site_id in pool_site_ids:
                 # Different customer analyses may share the same pool. Reuse the
@@ -258,6 +273,7 @@ def generate_suggestions(
                         db,
                         site_id=site_id,
                         model=model,
+                        allowed_target_ids=allowed_target_ids,
                     )
                 except Exception:
                     # A PostgreSQL statement error leaves the transaction aborted.
@@ -350,6 +366,7 @@ def generate_suggestions(
                         article_id,
                         model,
                         remaining,
+                        allowed_target_ids=allowed_target_ids,
                     )
                 elif hybrid_ranker is None:
                     fallback_sources += 1
@@ -359,6 +376,7 @@ def generate_suggestions(
                             article_id,
                             model,
                             remaining,
+                            allowed_target_ids=allowed_target_ids,
                         )
                         if has_capacity
                         else []
@@ -420,6 +438,7 @@ def generate_suggestions(
                                 article_id,
                                 model,
                                 remaining,
+                                allowed_target_ids=allowed_target_ids,
                             )
                             if has_capacity
                             else []
@@ -438,7 +457,23 @@ def generate_suggestions(
                             # one meaning across the mixed queue.
                             score=candidate.semantic_score,
                             score_components=(
-                                candidate.score_components() if method == "hybrid_bm25" else None
+                                {
+                                    **(
+                                        candidate.score_components()
+                                        if method == "hybrid_bm25"
+                                        else {}
+                                    ),
+                                    **(
+                                        {
+                                            "external_trust": external_trust[
+                                                candidate.target_id
+                                            ].as_score_component()
+                                        }
+                                        if candidate.target_id in external_trust
+                                        else {}
+                                    ),
+                                }
+                                or None
                             ),
                             status="pending",
                         )
@@ -457,6 +492,12 @@ def generate_suggestions(
             result = {
                 "articles_encoded": encoded,
                 "suggestions_created": created,
+                "external_candidates_eligible": sum(
+                    evaluation.eligible for evaluation in external_trust.values()
+                ),
+                "external_candidates_blocked": sum(
+                    not evaluation.eligible for evaluation in external_trust.values()
+                ),
             }
             if ranking_mode != "baseline":
                 result.update(

@@ -25,6 +25,16 @@ The worker must listen to the `default` queue with the RQ scheduler enabled, as
 the provided Docker Compose worker does. Re-registering the script is safe: the
 job id is unique, and each site/date snapshot is updated rather than duplicated.
 
+## External-link safety
+
+Managed sites have independent outgoing-link policies covering HTTPS, trusted
+TLDs, domain age, allowlists, blocklists, and competitor domains. Owned domains
+are always protected. The same policy is enforced before ranking and again
+before publication, while approved content-pool sources remain the only source
+of external candidates. The trust formula and enforcement contract are
+documented in
+[`docs/design/external-link-safety.md`](docs/design/external-link-safety.md).
+
 ## Running the tests
 
 The suite runs against a real PostgreSQL and writes, updates, and deletes rows,

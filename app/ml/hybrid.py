@@ -20,7 +20,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, true
 from sqlalchemy.orm import Session, aliased
 
 from app.config import settings
@@ -192,11 +192,15 @@ class HybridRanker:
         *,
         articles: dict[int, CorpusArticle],
         blocked_targets: dict[int, set[int]],
+        allowed_target_ids: set[int] | None = None,
     ) -> None:
         if not articles:
             raise ValueError("hybrid ranking requires at least one active embedded article")
         self.articles = articles
         self.blocked_targets = blocked_targets
+        self.allowed_target_ids = (
+            tuple(sorted(allowed_target_ids)) if allowed_target_ids is not None else None
+        )
         self.terms_by_article = {
             article_id: structured_terms(article) for article_id, article in articles.items()
         }
@@ -212,7 +216,14 @@ class HybridRanker:
         self.fingerprint_groups = dict(fingerprint_groups)
 
     @classmethod
-    def load(cls, db: Session, *, site_id: int, model: str) -> "HybridRanker":
+    def load(
+        cls,
+        db: Session,
+        *,
+        site_id: int,
+        model: str,
+        allowed_target_ids: set[int] | None = None,
+    ) -> "HybridRanker":
         article_rows = list(
             db.execute(
                 select(
@@ -236,6 +247,9 @@ class HybridRanker:
                         ),
                     ),
                     Article.is_active.is_(True),
+                    Article.id.in_(allowed_target_ids)
+                    if allowed_target_ids is not None
+                    else true(),
                 )
                 .order_by(Article.id)
                 .limit(settings.analysis_max_corpus_articles + 1)
@@ -291,7 +305,11 @@ class HybridRanker:
             )
         ):
             blocked_targets[source_id].add(target_id)
-        return cls(articles=articles, blocked_targets=dict(blocked_targets))
+        return cls(
+            articles=articles,
+            blocked_targets=dict(blocked_targets),
+            allowed_target_ids=allowed_target_ids,
+        )
 
     def _duplicate_ids(self, source_id: int) -> set[int]:
         article = self.articles[source_id]
@@ -323,6 +341,11 @@ class HybridRanker:
             model,
             DENSE_POOL_SIZE,
             duplicate_similarity_threshold,
+            **(
+                {"allowed_target_ids": self.allowed_target_ids}
+                if self.allowed_target_ids is not None
+                else {}
+            ),
         )
         dense_ids = [target_id for target_id, _score in dense_rows]
         semantic_scores = dict(dense_rows)
@@ -359,6 +382,11 @@ class HybridRanker:
                     model,
                     lexical_only_ids,
                     duplicate_similarity_threshold,
+                    **(
+                        {"allowed_target_ids": self.allowed_target_ids}
+                        if self.allowed_target_ids is not None
+                        else {}
+                    ),
                 )
             )
             lexical_ids.extend(target_id for target_id in page_ids if target_id in semantic_scores)
@@ -403,7 +431,15 @@ class HybridRanker:
                     semantic_score=min(1.0, max(0.0, semantic_score)),
                 )
                 for target_id, semantic_score in top_candidates(
-                    db, source_id, model, DENSE_POOL_SIZE
+                    db,
+                    source_id,
+                    model,
+                    DENSE_POOL_SIZE,
+                    **(
+                        {"allowed_target_ids": self.allowed_target_ids}
+                        if self.allowed_target_ids is not None
+                        else {}
+                    ),
                 )
             )
         return HybridRanking(

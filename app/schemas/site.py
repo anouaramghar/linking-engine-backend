@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -18,6 +18,7 @@ class SiteCreate(BaseModel):
     crawl_frequency: Literal["manual", "daily"] | None = None
     wp_username: str | None = Field(default=None, max_length=255)
     wp_app_password: str | None = Field(default=None, max_length=255)
+    domain_registered_at: date | None = None
 
     @model_validator(mode="after")
     def safe_base_url(self) -> "SiteCreate":
@@ -34,6 +35,13 @@ class SiteCreate(BaseModel):
                 raise ValueError(str(error)) from error
         if self.platform != "pool" and self.crawl_frequency not in (None, "manual"):
             raise ValueError("daily crawl frequency is reserved for content-pool sources")
+        if self.platform != "pool" and self.domain_registered_at is not None:
+            raise ValueError("domain registration date is only valid for content-pool sources")
+        if (
+            self.domain_registered_at is not None
+            and self.domain_registered_at > datetime.now(UTC).date()
+        ):
+            raise ValueError("domain registration date cannot be in the future")
         if self.platform == "pool":
             # A pool source is external input and may arrive from a copied URL
             # containing a fragment, tracking parameters, or a default port.
@@ -129,6 +137,7 @@ class SiteOut(BaseModel):
     pool_source_quarantine_reason: str | None = None
     pool_source_last_reactivated_at: datetime | None = None
     pool_source_last_reactivated_by: str | None = None
+    domain_registered_at: date | None = None
     suggestion_method: Literal["hybrid_bm25"] = "hybrid_bm25"
     suggestion_mode: Literal["standard", "experimental"]
     suggestion_mode_managed: bool = True
