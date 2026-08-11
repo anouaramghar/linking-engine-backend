@@ -20,6 +20,8 @@ class PendingPublicationSite(BaseModel):
     """
 
     site_id: int
+    site_name: str
+    platform: str
     selected_suggestions: int
     approved_plans: int
     #: Whether preparing this site's edits can succeed at all. False means no
@@ -27,6 +29,16 @@ class PendingPublicationSite(BaseModel):
     #: request and return the same 401. Said here, before the operator spends
     #: that, rather than discovered inside an empty review.
     can_publish: bool = True
+
+
+class PendingPublicationPage(BaseModel):
+    """One bounded page; fleet totals are included only when requested."""
+
+    items: list[PendingPublicationSite]
+    next_cursor: int | None = None
+    total_sites: int | None = None
+    total_selected_suggestions: int | None = None
+    total_approved_plans: int | None = None
 
 
 class PlanLink(BaseModel):
@@ -82,6 +94,15 @@ class PublicationPreparationOut(BaseModel):
     plans: list[PublicationPlanOut]
     errors: list[PublicationPreparationError]
     has_more: bool
+
+
+class PublicationPlanHtml(BaseModel):
+    """Heavy exact bytes, loaded only when an operator opens advanced HTML."""
+
+    id: int
+    plan_hash: str
+    original_html: str
+    updated_html: str
 
 
 class PlanApproval(BaseModel):

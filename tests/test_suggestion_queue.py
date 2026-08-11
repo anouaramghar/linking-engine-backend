@@ -617,7 +617,7 @@ def test_pending_publication_separates_selected_rows_from_approved_plans(
     _suggest(db, other_site, other_pair, 0.60, status="pending")
     db.commit()
 
-    pending = client.get("/api/v1/publish/pending").json()
+    pending = client.get("/api/v1/publish/pending").json()["items"]
     owned = {
         row["site_id"]: (row["selected_suggestions"], row["approved_plans"])
         for row in pending

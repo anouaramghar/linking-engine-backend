@@ -434,7 +434,13 @@ def _supersede(db: Session, plan: PublicationPlan, reason: str) -> None:
     plan.failure_reason = reason[:MAX_REASON_CHARS]
 
 
-def prepare_site(db: Session, site, *, max_articles: int) -> PublicationPreparation:
+def prepare_site(
+    db: Session,
+    site,
+    *,
+    max_articles: int,
+    job_run_id: int | None = None,
+) -> PublicationPreparation:
     """Render and persist the exact edits an operator may now approve.
 
     Preparation is allowed to spend money and to read the customer's site: it
@@ -473,6 +479,13 @@ def prepare_site(db: Session, site, *, max_articles: int) -> PublicationPreparat
         has_more=len(groups) > max_articles,
     )
     batch = groups[:max_articles]
+    if job_run_id is not None:
+        record_progress_durably(
+            job_run_id,
+            stage="preparing",
+            completed=0,
+            total=len(batch),
+        )
     if not batch:
         return preparation
 
@@ -482,10 +495,17 @@ def prepare_site(db: Session, site, *, max_articles: int) -> PublicationPreparat
     db.expire_all()
 
     connector = get_connector(site)
-    for source_article_id, suggestion_ids in batch:
+    for completed, (source_article_id, suggestion_ids) in enumerate(batch, start=1):
         plan = _prepare_one(db, site, connector, source_article_id, suggestion_ids, preparation)
         if plan is not None:
             preparation.plans.append(plan)
+        if job_run_id is not None:
+            record_progress_durably(
+                job_run_id,
+                stage="preparing",
+                completed=completed,
+                total=len(batch),
+            )
     return preparation
 
 

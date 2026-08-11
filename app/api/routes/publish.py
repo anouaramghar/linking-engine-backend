@@ -19,12 +19,14 @@ from app.api.deps import get_db, require_api_key, require_operator_identity, req
 from app.models import PublicationPlan, Site, Suggestion
 from app.schemas.job import JobAccepted
 from app.schemas.publication import (
+    PendingPublicationPage,
     PendingPublicationSite,
     PlanApprovalRequest,
     PlanApprovalResult,
     PlanLink,
     PublicationQueueRequest,
     PublicationPlanOut,
+    PublicationPlanHtml,
     PublicationPreparationError,
     PublicationPreparationOut,
 )
@@ -32,7 +34,10 @@ from app.services import publication_plan_service
 from app.services.authorization import Principal, tenant_site_filter
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.services.publication_plan_service import PlanApprovalError
-from app.tasks.publication import publish_approved_plans
+from app.tasks.publication import (
+    prepare_publication_plans as prepare_publication_plans_job,
+    publish_approved_plans,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,52 +57,138 @@ def _plan_out(plan: PublicationPlan) -> PublicationPlanOut:
     )
 
 
-@router.get("/pending", response_model=list[PendingPublicationSite])
+def _pending_publication_query(principal: Principal, search: str | None = None):
+    selected = (
+        select(Suggestion.site_id, func.count().label("selected_suggestions"))
+        .where(
+            Suggestion.status == "approved",
+            Suggestion.publication_plan_id.is_(None),
+        )
+        .group_by(Suggestion.site_id)
+        .subquery()
+    )
+    approved = (
+        select(PublicationPlan.site_id, func.count().label("approved_plans"))
+        .where(PublicationPlan.status == "approved")
+        .group_by(PublicationPlan.site_id)
+        .subquery()
+    )
+    selected_count = func.coalesce(selected.c.selected_suggestions, 0)
+    approved_count = func.coalesce(approved.c.approved_plans, 0)
+    query = (
+        select(
+            Site.id.label("site_id"),
+            Site.name.label("site_name"),
+            Site.platform,
+            selected_count.label("selected_suggestions"),
+            approved_count.label("approved_plans"),
+            and_(
+                Site.platform == "wordpress",
+                Site.wp_username.is_not(None),
+                Site.wp_username != "",
+            ).label("can_publish"),
+        )
+        .outerjoin(selected, selected.c.site_id == Site.id)
+        .outerjoin(approved, approved.c.site_id == Site.id)
+        .where(or_(selected_count > 0, approved_count > 0))
+    )
+    owned = tenant_site_filter(principal)
+    if owned is not None:
+        query = query.where(owned)
+    if search:
+        pattern = f"%{search.strip()}%"
+        query = query.where(or_(Site.name.ilike(pattern), Site.base_url.ilike(pattern)))
+    return query
+
+
+@router.get("/pending", response_model=PendingPublicationPage)
 def pending_publication_sites(
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: int | None = Query(default=None, ge=1),
+    search: str | None = Query(default=None, min_length=1, max_length=255),
+    include_totals: bool = Query(default=True),
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
-) -> list[PendingPublicationSite]:
+) -> PendingPublicationPage:
     """Per site: work awaiting preparation, and artifacts awaiting a queue.
 
     Two independent counts rather than one "awaiting publication", because they
     ask for different actions. Selected suggestions need someone to prepare and
     approve them; approved plans need only a job.
     """
-    owned = tenant_site_filter(principal)
-
-    selected_query = (
-        select(Suggestion.site_id, func.count().label("selected"))
-        .where(
-            Suggestion.status == "approved",
-            Suggestion.publication_plan_id.is_(None),
-        )
-        .group_by(Suggestion.site_id)
+    inbox = _pending_publication_query(principal, search).subquery()
+    totals = (
+        db.execute(
+            select(
+                func.count(),
+                func.coalesce(func.sum(inbox.c.selected_suggestions), 0),
+                func.coalesce(func.sum(inbox.c.approved_plans), 0),
+            ).select_from(inbox)
+        ).one()
+        if include_totals
+        else (None, None, None)
     )
-    plans_query = (
-        select(PublicationPlan.site_id, func.count().label("approved_plans"))
-        .where(PublicationPlan.status == "approved")
-        .group_by(PublicationPlan.site_id)
+    page = select(inbox)
+    if cursor is not None:
+        page = page.where(inbox.c.site_id > cursor)
+    rows = db.execute(page.order_by(inbox.c.site_id).limit(limit + 1)).mappings().all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return PendingPublicationPage(
+        items=[PendingPublicationSite.model_validate(dict(row)) for row in rows],
+        next_cursor=rows[-1]["site_id"] if has_more and rows else None,
+        total_sites=totals[0],
+        total_selected_suggestions=totals[1],
+        total_approved_plans=totals[2],
     )
-    if owned is not None:
-        selected_query = selected_query.join(Site, Site.id == Suggestion.site_id).where(owned)
-        plans_query = plans_query.join(Site, Site.id == PublicationPlan.site_id).where(owned)
 
-    selected = dict(db.execute(selected_query).all())
-    approved = dict(db.execute(plans_query).all())
-    site_ids = sorted(set(selected) | set(approved))
-    # One query for the sites behind those counts, so the dashboard can say that
-    # a site cannot publish before anyone opens a review for it.
-    sites = db.scalars(select(Site).where(Site.id.in_(site_ids))).all() if site_ids else []
-    publishable = {site.id: site.has_wordpress_credentials for site in sites}
-    return [
-        PendingPublicationSite(
-            site_id=site_id,
-            selected_suggestions=selected.get(site_id, 0),
-            approved_plans=approved.get(site_id, 0),
-            can_publish=publishable.get(site_id, False),
+
+@router.get("/pending/{site_id}", response_model=PendingPublicationSite)
+def pending_publication_site(
+    site_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> PendingPublicationSite:
+    row = db.execute(
+        _pending_publication_query(principal).where(Site.id == site_id)
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(404, "this site has no publication work waiting")
+    return PendingPublicationSite.model_validate(dict(row))
+
+
+@router.post(
+    "/{site_id}/plans/prepare-async",
+    status_code=202,
+    response_model=JobAccepted,
+)
+def prepare_publication_plans_async(
+    site: Site = Depends(require_site_access),
+    operator_id: str = Depends(require_operator_identity),
+    max_articles: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> JobAccepted:
+    """Queue live preparation so slow WordPress reads never occupy an API worker."""
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources are read-only")
+    if not site.has_wordpress_credentials:
+        raise HTTPException(409, "this site has no WordPress account connected")
+    try:
+        run = enqueue_job(
+            db,
+            site.id,
+            "publication_preparation",
+            prepare_publication_plans_job,
+            job_timeout=900,
+            task_kwargs={"max_articles": max_articles},
+            requested_by=operator_id,
         )
-        for site_id in site_ids
-    ]
+    except DuplicateJobError as error:
+        if error.run.requested_by == operator_id and error.run.queue_job_id:
+            run = error.run
+        else:
+            raise HTTPException(409, "this site is already being prepared by another operator") from error
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
 @router.post("/{site_id}/plans/prepare", response_model=PublicationPreparationOut)
@@ -142,6 +233,31 @@ def prepare_publication_plans(
             for error in preparation.errors
         ],
         has_more=preparation.has_more,
+    )
+
+
+@router.get(
+    "/{site_id}/plans/{plan_id}/html",
+    response_model=PublicationPlanHtml,
+)
+def publication_plan_html(
+    plan_id: int,
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> PublicationPlanHtml:
+    plan = db.scalar(
+        select(PublicationPlan).where(
+            PublicationPlan.id == plan_id,
+            PublicationPlan.site_id == site.id,
+        )
+    )
+    if plan is None:
+        raise HTTPException(404, "publication plan not found")
+    return PublicationPlanHtml(
+        id=plan.id,
+        plan_hash=plan.plan_hash,
+        original_html=plan.original_html,
+        updated_html=plan.updated_html,
     )
 
 

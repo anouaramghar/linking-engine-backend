@@ -71,6 +71,14 @@ class Suggestion(Base):
             "id",
             postgresql_where=text("status <> 'expired'"),
         ),
+        Index(
+            "ix_suggestions_publication_pending",
+            "site_id",
+            "source_article_id",
+            "score",
+            "id",
+            postgresql_where=text("status = 'approved' AND publication_plan_id IS NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

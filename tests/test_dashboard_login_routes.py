@@ -56,11 +56,13 @@ def _request_user(db, telegram_id: int, **identity) -> DashboardUser:
     return user
 
 
-def test_start_login_returns_a_deep_link(client):
+def test_start_login_returns_a_deep_link_and_code_lifetime(client, monkeypatch):
+    monkeypatch.setattr(settings, "dashboard_login_nonce_ttl_seconds", 300)
     body = client.post("/api/v1/auth/login/start").json()
 
     assert "nonce" not in body
     assert body["deep_link"] == "https://t.me/LinkMeshTestBot?start=login"
+    assert body["expires_in_seconds"] == 300
 
 
 def test_start_login_clears_out_expired_codes(client, db):

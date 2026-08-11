@@ -48,6 +48,7 @@ from app.services.publication_plan_service import (
     PlanIntegrityError,
     load_approved_plans,
     mark_stale,
+    prepare_site,
     verify_integrity,
 )
 from app.services.publication_progress import (
@@ -68,6 +69,83 @@ from app.services.job_service import (
 logger = logging.getLogger(__name__)
 
 _PUBLISH_LOCK_NAMESPACE = 0x4C50  # "LP" - keyed by source article; see namespace registry
+
+
+def prepare_publication_plans(
+    site_id: int,
+    job_run_id: int | None = None,
+    max_articles: int = 10,
+) -> dict:
+    """Durably prepare one bounded, compact review batch for an operator."""
+    return run_durably(
+        job_run_id,
+        _prepare_publication_plans,
+        site_id,
+        max_articles=max_articles,
+    )
+
+
+def _prepare_publication_plans(
+    site_id: int,
+    job_run_id: int | None = None,
+    max_articles: int = 10,
+) -> dict:
+    with SessionLocal() as db:
+        site = db.get(Site, site_id)
+        if site is None:
+            raise ValueError(f"site {site_id} not found")
+        preparation = prepare_site(
+            db,
+            site,
+            max_articles=max_articles,
+            job_run_id=job_run_id,
+        )
+        suggestion_ids = [
+            item["suggestion_id"] for plan in preparation.plans for item in (plan.items or [])
+        ]
+        contexts = dict(
+            db.execute(
+                select(Suggestion.id, Suggestion.placement_context).where(
+                    Suggestion.id.in_(suggestion_ids)
+                )
+            ).all()
+        )
+        plans = []
+        for plan in preparation.plans:
+            links = [
+                {**item, "placement_context": contexts.get(item["suggestion_id"])}
+                for item in (plan.items or [])
+            ]
+            plans.append(
+                {
+                    "id": plan.id,
+                    "status": plan.status,
+                    "plan_hash": plan.plan_hash,
+                    "source_article_id": plan.source_article_id,
+                    "source_url": plan.source_url,
+                    "links": links,
+                }
+            )
+        record_progress_durably(
+            job_run_id,
+            stage="ready",
+            completed=len(preparation.plans),
+            total=min(max_articles, len(preparation.plans) + len(preparation.errors)),
+        )
+        return {
+            "site_id": site_id,
+            "selected_suggestions": preparation.selected_suggestions,
+            "plans": plans,
+            "errors": [
+                {
+                    "source_article_id": error.source_article_id,
+                    "source_url": error.source_url,
+                    "message": error.message,
+                }
+                for error in preparation.errors
+            ],
+            "has_more": preparation.has_more,
+        }
 
 
 def publish_approved_plans(

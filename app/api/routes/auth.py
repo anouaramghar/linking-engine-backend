@@ -78,7 +78,10 @@ def start_login(db: Session = Depends(get_db)) -> LoginStartOut:
     dashboard_auth.purge_expired_login_codes(db)
     deep_link = dashboard_auth.login_deep_link()
     assert deep_link is not None  # configured check above guarantees a username
-    return LoginStartOut(deep_link=deep_link)
+    return LoginStartOut(
+        deep_link=deep_link,
+        expires_in_seconds=settings.dashboard_login_nonce_ttl_seconds,
+    )
 
 
 @router.post("/login/complete", response_model=LoginCompleteOut)

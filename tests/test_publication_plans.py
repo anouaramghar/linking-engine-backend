@@ -890,8 +890,95 @@ def test_pending_reports_selected_rows_and_approved_plans_apart(
 
     row = next(
         entry
-        for entry in client.get("/api/v1/publish/pending").json()
+        for entry in client.get("/api/v1/publish/pending").json()["items"]
         if entry["site_id"] == site.id
     )
 
     assert (row["selected_suggestions"], row["approved_plans"]) == (0, 1)
+    assert (row["site_name"], row["platform"]) == (site.name, "wordpress")
+
+
+def test_pending_publication_is_cursor_paged_with_fleet_totals(client, db, site, articles):
+    marker = uuid.uuid4().hex[:8]
+    site.name = f"fleet-{marker}-one"
+    _suggestion(db, site, *articles)
+    other = Site(
+        tenant_id=site.tenant_id,
+        name=f"fleet-{marker}-two",
+        base_url=f"https://fleet-{marker}.example.com",
+        platform="wordpress",
+        wp_username="editor",
+    )
+    db.add(other)
+    db.flush()
+    source = Article(
+        site_id=other.id,
+        external_id="source",
+        url=f"{other.base_url}/source",
+        title="source",
+        content_text="source",
+    )
+    target = Article(
+        site_id=other.id,
+        external_id="target",
+        url=f"{other.base_url}/target",
+        title="target",
+        content_text="target",
+    )
+    db.add_all([source, target])
+    db.flush()
+    _suggestion(db, other, source, target)
+
+    first = client.get(
+        "/api/v1/publish/pending",
+        params={"limit": 1, "search": f"fleet-{marker}"},
+    ).json()
+    assert len(first["items"]) == 1
+    assert first["next_cursor"] == first["items"][0]["site_id"]
+    assert (first["total_sites"], first["total_selected_suggestions"]) == (2, 2)
+
+    second = client.get(
+        "/api/v1/publish/pending",
+        params={
+            "limit": 1,
+            "cursor": first["next_cursor"],
+            "search": f"fleet-{marker}",
+            "include_totals": False,
+        },
+    ).json()
+    assert len(second["items"]) == 1
+    assert second["next_cursor"] is None
+    assert second["items"][0]["site_id"] != first["items"][0]["site_id"]
+    assert second["total_sites"] is None
+
+
+def test_async_preparation_is_owned_and_queued(client, site, monkeypatch):
+    captured = {}
+
+    def enqueue(*args, **kwargs):
+        captured.update({"args": args, **kwargs})
+        return SimpleNamespace(id=42, queue_job_id="prepare-job", requested_by=kwargs["requested_by"])
+
+    monkeypatch.setattr("app.api.routes.publish.enqueue_job", enqueue)
+
+    response = client.post(f"/api/v1/publish/{site.id}/plans/prepare-async")
+
+    assert response.status_code == 202
+    assert response.json() == {"job_id": "prepare-job", "job_run_id": 42}
+    assert captured["args"][2] == "publication_preparation"
+    assert captured["requested_by"]
+    assert captured["task_kwargs"] == {"max_articles": 10}
+
+
+def test_exact_html_is_loaded_separately(client, db, site, articles, monkeypatch):
+    _, plan = _prepared(client, db, site, articles, monkeypatch)
+
+    response = client.get(f"/api/v1/publish/{site.id}/plans/{plan['id']}/html")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": plan["id"],
+        "plan_hash": plan["plan_hash"],
+        "original_html": plan["original_html"],
+        "updated_html": plan["updated_html"],
+    }

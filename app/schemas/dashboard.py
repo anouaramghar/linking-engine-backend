@@ -35,6 +35,7 @@ class LoginStartOut(BaseModel):
     """What the browser needs to open the Telegram identity ceremony."""
 
     deep_link: str
+    expires_in_seconds: int
 
 
 class LoginCompleteIn(BaseModel):

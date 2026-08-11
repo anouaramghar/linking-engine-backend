@@ -22,7 +22,13 @@ from app.db import SessionLocal, engine
 from app.models import IngestionRun, JobRun, Site
 from app.services.alerts import send_alert
 from app.services.publication_progress import mark_publication_failure
-from app.tasks.queues import analysis_queue, ingestion_queue, publication_queue, redis_conn
+from app.tasks.queues import (
+    analysis_queue,
+    ingestion_queue,
+    publication_preparation_queue,
+    publication_queue,
+    redis_conn,
+)
 
 _ENQUEUE_LOCK_NAMESPACE = 0x4C4A  # "LJ" — serializes enqueues per site
 _TENANT_ENQUEUE_LOCK_NAMESPACE = 0x4C54  # "LT" — serializes tenant quota checks
@@ -30,6 +36,7 @@ _TENANT_ENQUEUE_LOCK_NAMESPACE = 0x4C54  # "LT" — serializes tenant quota chec
 _QUEUES = {
     "ingestion": ingestion_queue,
     "analysis": analysis_queue,
+    "publication_preparation": publication_preparation_queue,
     "publication": publication_queue,
 }
 _RQ_ACTIVE_STATUSES = {"queued", "started", "deferred", "scheduled"}
@@ -165,6 +172,7 @@ def _enqueue_job_locked(
     fn,
     job_timeout: int,
     task_kwargs: dict | None = None,
+    requested_by: str | None = None,
 ) -> JobRun:
     """Create the durable run row, then enqueue. Raises DuplicateJobError while an
     active run of this kind exists for the site."""
@@ -197,7 +205,7 @@ def _enqueue_job_locked(
     if len(tenant_active) >= settings.max_active_jobs_per_tenant:
         raise JobCapacityError(tenant_id, settings.max_active_jobs_per_tenant)
 
-    run = JobRun(site_id=site_id, kind=kind)
+    run = JobRun(site_id=site_id, kind=kind, requested_by=requested_by)
     db.add(run)
     db.commit()
     job = _QUEUES[kind].enqueue(
@@ -222,6 +230,7 @@ def enqueue_job(
     fn,
     job_timeout: int,
     task_kwargs: dict | None = None,
+    requested_by: str | None = None,
 ) -> JobRun:
     tenant_id = db.scalar(select(Site.tenant_id).where(Site.id == site_id))
     if tenant_id is None:
@@ -235,6 +244,7 @@ def enqueue_job(
             fn,
             job_timeout,
             task_kwargs=task_kwargs,
+            requested_by=requested_by,
         )
 
 
