@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from time import sleep
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.orm import aliased, joinedload
 
 from app.config import settings
@@ -364,7 +364,10 @@ def _publish_approved(site_id: int, job_run_id: int | None = None) -> dict:
                         Suggestion.id.in_(suggestion_ids),
                         Suggestion.status == "approved",
                         Suggestion.source_article.has(Article.is_active.is_(True)),
-                        Suggestion.target_article.has(Article.is_active.is_(True)),
+                        or_(
+                            Suggestion.target_article_id.is_(None),
+                            Suggestion.target_article.has(Article.is_active.is_(True)),
+                        ),
                     )
                     .values(status="applying")
                 )

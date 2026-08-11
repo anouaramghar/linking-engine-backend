@@ -13,7 +13,9 @@ from app.db import SessionLocal, engine
 from app.models import Article, Embedding, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
+from app.ml.external.base import ExternalSearchProvider
 from app.ml.hybrid import HybridRanker, RankedCandidate
+from app.services.external_suggestion_service import fill_external_suggestion_gap
 from app.services.job_service import record_progress
 from app.services.external_link_policy import external_target_context
 from app.services.editorial_feedback import (
@@ -227,6 +229,7 @@ def generate_suggestions(
     *,
     ranking_mode_override: str | None = None,
     comparison_only: bool = False,
+    external_provider: ExternalSearchProvider | None = None,
 ) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
@@ -345,6 +348,10 @@ def generate_suggestions(
             shadow_overlap_total = 0.0
             shadow_exact_matches = 0
             hybrid_sources_selected = 0
+            external_searches = 0
+            external_created = 0
+            external_credits_used = 0
+            external_filtered: dict[str, int] = {}
             for article_id in article_ids:
                 if ranking_mode == "hybrid" and site_capacity <= 0:
                     break
@@ -517,7 +524,29 @@ def generate_suggestions(
                         )
                     )
                     created += 1
-                site_capacity -= len(candidate_rows)
+                external_for_source = 0
+                external_missing = remaining - len(candidate_rows)
+                if external_missing > 0 and has_capacity and not comparison_only:
+                    article = db.get(Article, article_id)
+                    if article is None:
+                        raise ValueError(f"source article {article_id} disappeared during analysis")
+                    external_outcome = fill_external_suggestion_gap(
+                        db,
+                        site=site,
+                        article=article,
+                        missing_slots=external_missing,
+                        model=model,
+                        job_run_id=job_run_id,
+                        provider=external_provider,
+                    )
+                    external_searches += external_outcome.searched
+                    external_for_source = external_outcome.created
+                    external_created += external_for_source
+                    external_credits_used += external_outcome.credits_used
+                    created += external_for_source
+                    for reason, count in external_outcome.filtered.items():
+                        external_filtered[reason] = external_filtered.get(reason, 0) + count
+                site_capacity -= len(candidate_rows) + external_for_source
                 record_progress(
                     db,
                     job_run_id,
@@ -525,11 +554,19 @@ def generate_suggestions(
                     created=created,
                     ranking_mode=ranking_mode,
                     hybrid_fallback_sources=fallback_sources,
+                    external_searches=external_searches,
+                    external_suggestions_created=external_created,
+                    external_credits_used=external_credits_used,
+                    external_filtered=external_filtered,
                 )
                 db.commit()
             result = {
                 "articles_encoded": encoded,
                 "suggestions_created": created,
+                "external_searches": external_searches,
+                "external_suggestions_created": external_created,
+                "external_credits_used": external_credits_used,
+                "external_filtered": external_filtered,
                 "external_candidates_eligible": sum(
                     evaluation.eligible for evaluation in external_trust.values()
                 ),

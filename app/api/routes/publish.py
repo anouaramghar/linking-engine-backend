@@ -138,7 +138,7 @@ def dry_run_publication(
                 suggestion_id=suggestion.id,
                 source_article_id=suggestion.source_article_id,
                 source_url=suggestion.source_article.url,
-                target_url=suggestion.target_article.url,
+                target_url=suggestion.resolved_target_url,
                 outcome=outcome,
                 anchor_text=suggestion.anchor_text if outcome == "inserted" else None,
             )

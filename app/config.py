@@ -25,8 +25,12 @@ class Settings(BaseSettings):
     # Comma-separated previous Fernet keys accepted only for decryption during rotation.
     credential_decryption_keys: SecretStr | None = None
 
-    # External search (v3)
+    # External search (v3). Search stays disabled while the API key is empty.
+    # Basic depth and a small per-request cap keep paid discovery predictable.
     tavily_api_key: str = ""
+    tavily_base_url: str = "https://api.tavily.com"
+    tavily_timeout_seconds: float = Field(default=10.0, gt=0.0, le=120.0)
+    tavily_max_results_per_request: int = Field(default=5, ge=1, le=5)
 
     # Placement context (v4): an OpenRouter-hosted model reads the source article
     # and picks the passage the link belongs in. Empty key disables the feature —

@@ -35,7 +35,7 @@ MIN_ANCHOR_CHARS = 2
 MAX_ANCHOR_CHARS = 120
 
 SYSTEM_PROMPT = """\
-You place internal links inside existing articles for an editorial team.
+You place links inside existing articles for an editorial team.
 
 You are given a SOURCE article and a TARGET article. Find the single best place \
 in the SOURCE article to link to the TARGET article.
@@ -193,15 +193,14 @@ def generate(suggestion: Suggestion, taken_anchors: Sequence[str] = ()) -> Place
     permanent for the row.
     """
     source = suggestion.source_article
-    target = suggestion.target_article
     answer = openrouter.complete_json(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=build_user_prompt(
             source_title=source.title,
             source_text=source.content_text[: settings.placement_max_source_chars],
-            target_title=target.title,
-            target_url=target.url,
-            target_text=target.content_text,
+            target_title=suggestion.resolved_target_title,
+            target_url=suggestion.resolved_target_url,
+            target_text=suggestion.resolved_target_text,
             taken_anchors=taken_anchors,
         ),
     )

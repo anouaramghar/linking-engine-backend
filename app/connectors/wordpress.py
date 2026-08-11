@@ -94,6 +94,21 @@ _MAX_ANCHOR_TEXT_CHARS = 300
 logger = logging.getLogger(__name__)
 
 
+def _suggestion_target_url(suggestion: Suggestion) -> str:
+    external_url = getattr(suggestion, "external_url", None)
+    if external_url:
+        return external_url
+    return suggestion.target_article.url
+
+
+def _suggestion_target_title(suggestion: Suggestion) -> str:
+    external_title = getattr(suggestion, "external_title", None)
+    if external_title:
+        return external_title
+    target = suggestion.target_article
+    return target.title if target is not None else _suggestion_target_url(suggestion)
+
+
 def _iso(dt_str: str | None) -> datetime | None:
     if not dt_str:
         return None
@@ -812,8 +827,7 @@ class WordPressConnector(ContentConnector):
         in-text splice; parse block delimiters and restrict to core text blocks
         if that shows up.
         """
-        target = suggestion.target_article
-        href = html.escape(target.url)
+        href = html.escape(_suggestion_target_url(suggestion))
         at_limit = content.count(_IN_TEXT_MARK) >= settings.publish_max_in_text_links_per_article
         span = (
             _anchor_span(content, suggestion.anchor_text)
@@ -827,7 +841,7 @@ class WordPressConnector(ContentConnector):
                 f"{content[start:end]}</a>{content[end:]}",
                 "inserted",
             )
-        anchor = html.escape(suggestion.anchor_text or target.title)
+        anchor = html.escape(suggestion.anchor_text or _suggestion_target_title(suggestion))
         return content + _READ_ALSO_BLOCK.format(href=href, anchor=anchor), "block"
 
     def _post_content(self, source, content: str) -> httpx.Response:
@@ -885,13 +899,14 @@ class WordPressConnector(ContentConnector):
         original = content
         outcomes: list[LinkOutcome] = []
         for suggestion in suggestions:
-            if suggestion.target_article.url in existing:
+            target_url = _suggestion_target_url(suggestion)
+            if target_url in existing:
                 outcomes.append("already_present")
                 continue
             content, outcome = self._insert_link(content, suggestion)
             # Two approved suggestions can point at the same target; the second
             # is already present by the time it is reached.
-            existing.add(suggestion.target_article.url)
+            existing.add(target_url)
             outcomes.append(outcome)
         return LinkPreview(original, content, outcomes)
 

@@ -17,7 +17,17 @@ MAX_BULK_REVIEW = MAX_ENGINE_PAGE_SIZE
 # is a performance bound as much as a validation one.
 MAX_SEARCH_TERM = 200
 
-TargetOrigin = Literal["internal", "content_pool"]
+TargetOrigin = Literal["internal", "content_pool", "web_search"]
+
+
+class SuggestionTargetBrief(BaseModel):
+    """A stored article or a direct external-search target."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None
+    title: str
+    url: str
 
 
 class SuggestionEventOut(BaseModel):
@@ -55,7 +65,7 @@ class SuggestionOut(BaseModel):
     trace_id: str
     site_id: int
     source_article: ArticleBrief
-    target_article: ArticleBrief
+    target_article: SuggestionTargetBrief
     #: Where the target lives relative to the site being reviewed.
     target_origin: TargetOrigin
     #: The site that owns the target article; useful when the target is external.
@@ -68,6 +78,11 @@ class SuggestionOut(BaseModel):
     #: the recipe names. Null for `baseline_cosine`, whose score already is its
     #: whole explanation.
     score_components: dict | None = None
+    provider: str | None = None
+    provider_request_id: str | None = None
+    provider_score: float | None = None
+    search_query: str | None = None
+    external_snippet: str | None = None
     status: str
     anchor_text: str | None
     publish_outcome: str | None = None

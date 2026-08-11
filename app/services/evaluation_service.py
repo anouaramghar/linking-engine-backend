@@ -631,15 +631,24 @@ def evaluation_suggestions(
     ]
     id_query = (
         select(Suggestion.id)
-        .join(target, target.id == Suggestion.target_article_id)
+        .outerjoin(target, target.id == Suggestion.target_article_id)
         .where(*conditions)
     )
     total = db.scalar(select(func.count()).select_from(id_query.subquery())) or 0
     rows = db.execute(
-        select(Suggestion, Site.name, source.title, target.title)
+        select(
+            Suggestion,
+            Site.name,
+            source.title,
+            func.coalesce(
+                target.title,
+                Suggestion.external_title,
+                Suggestion.external_url,
+            ),
+        )
         .join(Site, Site.id == Suggestion.site_id)
         .join(source, source.id == Suggestion.source_article_id)
-        .join(target, target.id == Suggestion.target_article_id)
+        .outerjoin(target, target.id == Suggestion.target_article_id)
         .where(*conditions)
         .order_by(Suggestion.created_at.desc(), Suggestion.id.desc())
         .limit(limit)
@@ -678,7 +687,11 @@ def evaluation_export_rows(
                 Suggestion.trace_id,
                 Site.name,
                 source.title,
-                target.title,
+                func.coalesce(
+                    target.title,
+                    Suggestion.external_title,
+                    Suggestion.external_url,
+                ),
                 Suggestion.method,
                 Suggestion.score,
                 Suggestion.status,
@@ -690,7 +703,7 @@ def evaluation_export_rows(
             )
             .join(Site, Site.id == Suggestion.site_id)
             .join(source, source.id == Suggestion.source_article_id)
-            .join(target, target.id == Suggestion.target_article_id)
+            .outerjoin(target, target.id == Suggestion.target_article_id)
             .where(*_suggestion_conditions(site_id, date_from, date_to))
             .order_by(Suggestion.created_at.desc(), Suggestion.id.desc())
         )

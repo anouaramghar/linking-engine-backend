@@ -3,6 +3,7 @@ from app.models.alert import Alert
 from app.models.article import Article, ArticleTaxonomy, Embedding, Taxonomy
 from app.models.evaluation import EvaluationSnapshot
 from app.models.external_policy import ExternalLinkPolicy
+from app.models.external_search_audit import ExternalSearchAuditEvent
 from app.models.job import JobRun
 from app.models.link import InternalLink
 from app.models.pool_audit import PoolSourceAuditEvent
@@ -25,6 +26,7 @@ __all__ = [
     "Embedding",
     "EvaluationSnapshot",
     "ExternalLinkPolicy",
+    "ExternalSearchAuditEvent",
     "IngestionRun",
     "InternalLink",
     "JobRun",

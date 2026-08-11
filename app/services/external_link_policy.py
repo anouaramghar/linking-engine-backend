@@ -53,6 +53,24 @@ class TrustEvaluation:
         }
 
 
+@dataclass(frozen=True)
+class WebSearchSafetyEvaluation:
+    """Hard URL/domain guards for a dynamic web-search candidate."""
+
+    domain: str
+    eligible: bool
+    reasons: tuple[str, ...]
+    checks: dict[str, bool]
+
+    def as_score_component(self) -> dict:
+        return {
+            "domain": self.domain,
+            "eligible": self.eligible,
+            "reasons": list(self.reasons),
+            "checks": self.checks,
+        }
+
+
 def policy_state(db: Session, site_id: int) -> PolicyState:
     policy = db.get(ExternalLinkPolicy, site_id)
     if policy is None:
@@ -81,6 +99,60 @@ def managed_domains(db: Session) -> dict[str, int]:
 
 def _matches_any(domain: str, rules: tuple[str, ...]) -> bool:
     return any(domain_matches(domain, rule) for rule in rules)
+
+
+def evaluate_web_search_url(
+    *,
+    source_site: Site,
+    target_url: str,
+    policy: PolicyState,
+    owned_domains: dict[str, int],
+) -> WebSearchSafetyEvaluation:
+    """Apply the approved hard guards without pretending Tavily is a pool source."""
+
+    del source_site  # Reserved for future source-relative guards.
+    try:
+        domain = domain_from_url(target_url)
+    except ValueError:
+        return WebSearchSafetyEvaluation(
+            domain="invalid",
+            eligible=False,
+            reasons=("target URL has an invalid domain",),
+            checks={
+                "https": False,
+                "blocklisted": False,
+                "competitor": False,
+                "owned_domain": False,
+            },
+        )
+
+    https = urlsplit(target_url).scheme.lower() == "https"
+    blocklisted = _matches_any(domain, policy.blocklist_domains)
+    competitor = _matches_any(domain, policy.competitor_domains)
+    owned = any(domain_matches(domain, owned_domain) for owned_domain in owned_domains)
+    reasons: list[str] = []
+    if not policy.external_links_enabled:
+        reasons.append("external links are disabled for this site")
+    if not https:
+        reasons.append("HTTPS is required for web-search targets")
+    if blocklisted:
+        reasons.append("domain is blocklisted")
+    if competitor:
+        reasons.append("domain is marked as a competitor")
+    if owned:
+        reasons.append("domain belongs to a managed site")
+
+    return WebSearchSafetyEvaluation(
+        domain=domain,
+        eligible=not reasons,
+        reasons=tuple(reasons),
+        checks={
+            "https": https,
+            "blocklisted": blocklisted,
+            "competitor": competitor,
+            "owned_domain": owned,
+        },
+    )
 
 
 def _domain_age_days(target_url: str, target_site: Site) -> int | None:
@@ -318,7 +390,11 @@ def expire_ineligible_external_suggestions(
         )
         .options(joinedload(Suggestion.target_article))
     ).all()
-    target_site_ids = {row.target_article.site_id for row in suggestions}
+    target_site_ids = {
+        row.target_article.site_id
+        for row in suggestions
+        if row.target_article is not None
+    }
     target_sites = {
         site.id: site
         for site in db.scalars(select(Site).where(Site.id.in_(target_site_ids))).all()
@@ -326,16 +402,29 @@ def expire_ineligible_external_suggestions(
     expired = 0
     now = datetime.now(UTC)
     for suggestion in suggestions:
-        target_site = target_sites[suggestion.target_article.site_id]
-        if target_site.id == source_site.id:
-            continue
-        evaluation = evaluate_external_url(
-            source_site=source_site,
-            target_site=target_site,
-            target_url=suggestion.target_article.url,
-            policy=policy,
-            owned_domains=owned,
-        )
+        if suggestion.external_url is not None:
+            evaluation = evaluate_web_search_url(
+                source_site=source_site,
+                target_url=suggestion.external_url,
+                policy=policy,
+                owned_domains=owned,
+            )
+            details_key = "external_safety"
+        else:
+            target = suggestion.target_article
+            if target is None:
+                continue
+            target_site = target_sites[target.site_id]
+            if target_site.id == source_site.id:
+                continue
+            evaluation = evaluate_external_url(
+                source_site=source_site,
+                target_site=target_site,
+                target_url=target.url,
+                policy=policy,
+                owned_domains=owned,
+            )
+            details_key = "external_trust"
         if evaluation.eligible:
             continue
         previous = suggestion.status
@@ -348,7 +437,7 @@ def expire_ineligible_external_suggestions(
                 details={
                     "from_status": previous,
                     "to_status": "expired",
-                    "external_trust": evaluation.as_score_component(),
+                    details_key: evaluation.as_score_component(),
                 },
                 created_at=now,
             )

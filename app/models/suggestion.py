@@ -2,6 +2,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import (
+    CheckConstraint,
     DateTime,
     Enum,
     Float,
@@ -23,6 +24,7 @@ SuggestionMethod = Enum(
     "baseline_cosine",
     "hybrid_bm25",
     "gnn_graphsage",
+    "external_search",
     name="suggestion_method",
     native_enum=False,
     length=30,
@@ -72,6 +74,17 @@ class Suggestion(Base):
             "id",
             postgresql_where=text("status <> 'expired'"),
         ),
+        Index(
+            "uq_suggestions_active_source_external_url",
+            "source_article_id",
+            "external_url",
+            unique=True,
+            postgresql_where=text("external_url IS NOT NULL AND status <> 'expired'"),
+        ),
+        CheckConstraint(
+            "(target_article_id IS NOT NULL) <> (external_url IS NOT NULL)",
+            name="ck_suggestions_exactly_one_target",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -88,9 +101,19 @@ class Suggestion(Base):
     source_article_id: Mapped[int] = mapped_column(
         ForeignKey("articles.id", ondelete="CASCADE"), index=True
     )
-    target_article_id: Mapped[int] = mapped_column(
+    target_article_id: Mapped[int | None] = mapped_column(
         ForeignKey("articles.id", ondelete="CASCADE"), index=True
     )
+    # Dynamic web-search targets are intentionally not imported as articles.
+    # Content-pool articles are reusable corpus documents; a Tavily result is a
+    # per-query candidate whose provider provenance belongs on this suggestion.
+    external_url: Mapped[str | None] = mapped_column(String(2048))
+    external_title: Mapped[str | None] = mapped_column(Text)
+    external_snippet: Mapped[str | None] = mapped_column(Text)
+    provider: Mapped[str | None] = mapped_column(String(50))
+    provider_request_id: Mapped[str | None] = mapped_column(String(255))
+    provider_score: Mapped[float | None] = mapped_column(Float)
+    search_query: Mapped[str | None] = mapped_column(Text)
     method: Mapped[str] = mapped_column(SuggestionMethod)
     # Cosine semantic similarity, for every method. The dashboard percentage, its
     # thresholds, and the global queue order all read this one column, so it has
@@ -135,12 +158,34 @@ class Suggestion(Base):
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     source_article: Mapped[Article] = relationship(foreign_keys=[source_article_id])
-    target_article: Mapped[Article] = relationship(foreign_keys=[target_article_id])
+    target_article: Mapped[Article | None] = relationship(foreign_keys=[target_article_id])
     events: Mapped[list["SuggestionEvent"]] = relationship(
         back_populates="suggestion",
         cascade="all, delete-orphan",
         order_by="SuggestionEvent.created_at",
     )
+
+    @property
+    def resolved_target_url(self) -> str:
+        if self.target_article is not None:
+            return self.target_article.url
+        if self.external_url is not None:
+            return self.external_url
+        raise ValueError(f"suggestion {self.id} has no target URL")
+
+    @property
+    def resolved_target_title(self) -> str:
+        if self.target_article is not None:
+            return self.target_article.title
+        if self.external_title is not None:
+            return self.external_title
+        return self.resolved_target_url
+
+    @property
+    def resolved_target_text(self) -> str:
+        if self.target_article is not None:
+            return self.target_article.content_text
+        return self.external_snippet or self.external_title or ""
 
 
 class SuggestionEvent(Base):

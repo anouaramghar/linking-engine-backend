@@ -35,12 +35,13 @@ from app.schemas.suggestion import (
     SuggestionCounts,
     SuggestionCursor,
     SuggestionEventOut,
-    TraceEventOut,
-    TraceEventPage,
     SuggestionOut,
     SuggestionPage,
     SuggestionReview,
+    SuggestionTargetBrief,
     TargetOrigin,
+    TraceEventOut,
+    TraceEventPage,
 )
 from app.services import placement_service
 from app.services.job_service import DuplicateJobError, enqueue_job
@@ -67,7 +68,11 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
     owning site is the source of truth for the dashboard label.
     """
 
-    target_site_ids = {suggestion.target_article.site_id for suggestion in suggestions}
+    target_site_ids = {
+        suggestion.target_article.site_id
+        for suggestion in suggestions
+        if suggestion.target_article is not None
+    }
     target_sites = {
         site_id: (name, platform)
         for site_id, name, platform in db.execute(
@@ -76,21 +81,35 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
     }
     outputs = []
     for suggestion in suggestions:
-        target_site_name, target_platform = target_sites[suggestion.target_article.site_id]
+        if suggestion.target_article is None:
+            target = SuggestionTargetBrief(
+                id=None,
+                title=suggestion.resolved_target_title,
+                url=suggestion.resolved_target_url,
+            )
+            target_origin = "web_search"
+            target_site_name = (suggestion.provider or "web search").replace("_", " ").title()
+        else:
+            target_site_name, target_platform = target_sites[suggestion.target_article.site_id]
+            target = SuggestionTargetBrief.model_validate(suggestion.target_article)
+            target_origin = "content_pool" if target_platform == "pool" else "internal"
         outputs.append(
             SuggestionOut(
                 id=suggestion.id,
                 trace_id=suggestion.trace_id,
                 site_id=suggestion.site_id,
                 source_article=ArticleBrief.model_validate(suggestion.source_article),
-                target_article=ArticleBrief.model_validate(suggestion.target_article),
-                target_origin=(
-                    "content_pool" if target_platform == "pool" else "internal"
-                ),
+                target_article=target,
+                target_origin=target_origin,
                 target_site_name=target_site_name,
                 method=suggestion.method,
                 score=suggestion.score,
                 score_components=suggestion.score_components,
+                provider=suggestion.provider,
+                provider_request_id=suggestion.provider_request_id,
+                provider_score=suggestion.provider_score,
+                search_query=suggestion.search_query,
+                external_snippet=suggestion.external_snippet,
                 status=suggestion.status,
                 anchor_text=suggestion.anchor_text,
                 publish_outcome=suggestion.publish_outcome,
@@ -260,6 +279,7 @@ def _title_matches(term: str):
                 Article.title.ilike(pattern, escape=_LIKE_ESCAPE),
             )
         ),
+        Suggestion.external_title.ilike(pattern, escape=_LIKE_ESCAPE),
     )
 
 
@@ -276,6 +296,10 @@ def _target_is_pool():
         .join(Site, Site.id == Article.site_id)
         .where(Article.id == Suggestion.target_article_id, Site.platform == "pool")
     )
+
+
+def _target_is_web_search():
+    return Suggestion.external_url.is_not(None)
 
 
 def _has_stronger_reverse_pair():
@@ -352,7 +376,12 @@ def _queue_conditions(
         conditions.append(_title_matches(q.strip()))
     if target_origin is not None:
         is_pool = _target_is_pool()
-        conditions.append(is_pool if target_origin == "content_pool" else ~is_pool)
+        if target_origin == "web_search":
+            conditions.append(_target_is_web_search())
+        elif target_origin == "content_pool":
+            conditions.append(is_pool)
+        else:
+            conditions.extend((Suggestion.external_url.is_(None), ~is_pool))
     if exclude_reciprocal:
         conditions.append(~_has_stronger_reverse_pair())
     return conditions
@@ -377,14 +406,18 @@ def _trace_event_query(
             Suggestion.site_id.label("site_id"),
             Site.name.label("site_name"),
             source.title.label("source_title"),
-            target.title.label("target_title"),
+            func.coalesce(
+                target.title,
+                Suggestion.external_title,
+                Suggestion.external_url,
+            ).label("target_title"),
             Suggestion.status.label("suggestion_status"),
             Suggestion.publish_error.label("publish_error"),
         )
         .join(Suggestion, Suggestion.id == SuggestionEvent.suggestion_id)
         .join(Site, Site.id == Suggestion.site_id)
         .join(source, source.id == Suggestion.source_article_id)
-        .join(target, target.id == Suggestion.target_article_id)
+        .outerjoin(target, target.id == Suggestion.target_article_id)
     )
     if trace_id and trace_id.strip():
         statement = statement.where(
