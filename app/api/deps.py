@@ -1,11 +1,21 @@
 from collections.abc import Iterator
-from secrets import compare_digest
+from typing import Annotated
 
-from fastapi import Header, HTTPException
+from fastapi import Cookie, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import SessionLocal
+from app.models import Site
+from app.services import dashboard_auth
+from app.services.dashboard_auth import SESSION_COOKIE
+from app.services.authorization import (
+    Principal,
+    authenticate_api_key,
+    authorize_site,
+    authorize_site_read,
+    require_admin_principal,
+)
 
 
 def get_db() -> Iterator[Session]:
@@ -16,11 +26,100 @@ def get_db() -> Iterator[Session]:
         db.close()
 
 
-def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    if not settings.api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="API authentication is not configured",
-        )
-    if x_api_key is None or not compare_digest(x_api_key, settings.api_key):
-        raise HTTPException(status_code=401, detail="invalid or missing X-API-Key header")
+def require_api_key(
+    x_api_key: Annotated[str | None, Header()] = None,
+    db: Session = Depends(get_db),
+) -> Principal:
+    """Authenticate every protected route. Returns the request principal."""
+    return authenticate_api_key(db, x_api_key)
+
+
+def require_admin(
+    principal: Annotated[Principal, Depends(require_api_key)],
+) -> Principal:
+    return require_admin_principal(principal)
+
+
+def require_site_access(
+    site_id: int,
+    principal: Annotated[Principal, Depends(require_api_key)],
+    db: Session = Depends(get_db),
+) -> Site:
+    """Ownership for mutating and operational routes. Pool sources are admin-only."""
+    return authorize_site(db, principal, site_id)
+
+
+def require_site_read(
+    site_id: int,
+    principal: Annotated[Principal, Depends(require_api_key)],
+    db: Session = Depends(get_db),
+) -> Site:
+    """Read access, which additionally covers the shared content pool."""
+    return authorize_site_read(db, principal, site_id)
+
+
+def require_operator_identity(
+    principal: Annotated[Principal, Depends(require_api_key)],
+    session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    db: Session = Depends(get_db),
+) -> str:
+    """Human identity for pool audit actions.
+
+    A logged-in dashboard session is the primary path: it names a person rather
+    than a shared credential, which is the entire point of an audit trail. It is
+    also what lets the dashboard perform these actions at all — the proxy
+    attaches the legacy service key, which is rejected below, so before login
+    existed every pool approval from the UI failed with a 401.
+
+    An operator-mapped env key (matching the raw header) is next. Database admin,
+    legacy service, and tenant keys are deliberately rejected: they identify a
+    credential, not the person making the approval. With no authentication
+    configured at all, the development box signs as ``local-development``.
+    """
+    user = dashboard_auth.verify_session(db, session_token)
+    if user is not None:
+        return f"telegram:{user.telegram_id}"
+
+    if principal.is_admin and principal.source == "operator" and principal.operator_id is not None:
+        return principal.operator_id
+    if (
+        principal.source == "legacy_env"
+        and principal.is_admin
+        and settings.environment == "development"
+        and not settings.api_key
+        and not settings.operator_api_keys
+    ):
+        return "local-development"
+    raise HTTPException(
+        status_code=401,
+        detail="an operator-specific X-API-Key is required for this action",
+    )
+
+
+def get_audit_actor(
+    principal: Annotated[Principal, Depends(require_api_key)],
+    session_token: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    db: Session = Depends(get_db),
+) -> str:
+    """Trusted actor label for ordinary state-changing API operations.
+
+    Operator keys retain their human identity. The service key remains valid for
+    dashboard reviews, but is recorded plainly as automation rather than being
+    mistaken for a named editor.
+    """
+    user = dashboard_auth.verify_session(db, session_token)
+    if user is not None:
+        return f"telegram:{user.telegram_id}"
+    if principal.operator_id is not None:
+        return principal.operator_id[:255]
+    if (
+        settings.environment == "development"
+        and not settings.api_key
+        and not settings.operator_api_keys
+    ):
+        return "local-development"
+    if principal.source == "legacy_env":
+        return "service-api"
+    if principal.key_id is not None:
+        return f"api-key:{principal.key_id}"
+    return "authenticated-api"

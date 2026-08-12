@@ -19,6 +19,32 @@ The stored `score` remains cosine semantic similarity so the dashboard percentag
 has one meaning. `score_components` records the Hybrid recipe, BM25 score, ranks,
 and final ordering used to select the row.
 
+## Editorial feedback reranking
+
+Each normal site can enable a per-site editorial policy:
+
+```http
+GET /api/v1/sites/{site_id}/editorial-ranking-policy
+PUT /api/v1/sites/{site_id}/editorial-ranking-policy
+```
+
+The policy controls a minimum semantic score, the weight of editorial feedback,
+and the minimum number of decisions required before feedback becomes active.
+Until that sample floor is reached, generation preserves the original Hybrid
+ordering.
+
+Once active, accepted and rejected suggestions are grouped into stable semantic
+score ranges. Bayesian smoothing toward the site's overall acceptance rate keeps
+one small bucket from dominating the rank. The configured feedback weight blends
+that acceptance signal with the original candidate order. Every affected row
+stores the sample count, score bucket, smoothed rate, original rank, feedback
+rank, and combined score in `score_components.editorial_feedback` so the decision
+is explainable and reproducible.
+
+The Evaluation dashboard reports acceptance/rejection by those same score ranges,
+which lets an editor adjust a site's threshold with observed outcomes rather than
+guessing.
+
 ## Existing-link correctness
 
 Ingestion resolves WordPress internal links against the canonical article URL.

@@ -29,6 +29,7 @@ class JobRunOut(BaseModel):
     kind: str
     status: JobStatusValue
     queue_job_id: str | None
+    requested_by: str | None
     attempts: int
     result: dict | None
     progress: dict | None

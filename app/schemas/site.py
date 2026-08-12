@@ -1,10 +1,12 @@
-from datetime import datetime
+from datetime import UTC, date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.config import settings
 from app.connectors.url_guard import UnsafeURLError, validate_url
+from app.ml.external.cleaning import normalize_external_url
+from app.security.credentials import CredentialEncryptionError, validate_credential_encryption_key
 
 MAX_BULK_SITES = 1000
 
@@ -16,6 +18,7 @@ class SiteCreate(BaseModel):
     crawl_frequency: Literal["manual", "daily"] | None = None
     wp_username: str | None = Field(default=None, max_length=255)
     wp_app_password: str | None = Field(default=None, max_length=255)
+    domain_registered_at: date | None = None
 
     @model_validator(mode="after")
     def safe_base_url(self) -> "SiteCreate":
@@ -23,8 +26,28 @@ class SiteCreate(BaseModel):
             raise ValueError("wp_username and wp_app_password must be provided together")
         if self.platform != "wordpress" and (self.wp_username or self.wp_app_password):
             raise ValueError("WordPress credentials are only valid for WordPress sites")
+        if self.wp_app_password:
+            try:
+                # Fail before the request reaches the database. The actual value is
+                # encrypted by the model's database type on write.
+                validate_credential_encryption_key()
+            except CredentialEncryptionError as error:
+                raise ValueError(str(error)) from error
         if self.platform != "pool" and self.crawl_frequency not in (None, "manual"):
             raise ValueError("daily crawl frequency is reserved for content-pool sources")
+        if self.platform != "pool" and self.domain_registered_at is not None:
+            raise ValueError("domain registration date is only valid for content-pool sources")
+        if (
+            self.domain_registered_at is not None
+            and self.domain_registered_at > datetime.now(UTC).date()
+        ):
+            raise ValueError("domain registration date cannot be in the future")
+        if self.platform == "pool":
+            # A pool source is external input and may arrive from a copied URL
+            # containing a fragment, tracking parameters, or a default port.
+            # Store one canonical representation so the unique base_url
+            # constraint catches repeated registrations of the same source.
+            self.base_url = normalize_external_url(self.base_url)
         allow = settings.allow_unsafe_crawl_targets
         try:
             validate_url(
@@ -41,6 +64,29 @@ class SiteCreate(BaseModel):
         self.base_url = self.base_url.rstrip("/")
         if self.crawl_frequency is None:
             self.crawl_frequency = "daily" if self.platform == "pool" else "manual"
+        return self
+
+
+class SiteCredentials(BaseModel):
+    """A WordPress account for a site that already exists.
+
+    Separate from `SiteCreate` because rotation is not creation: the base URL,
+    the platform, and the tenant are settled, and only the account may move. An
+    application password that is revoked, or one that was never given, otherwise
+    leaves the site unpublishable with no way back but deleting it.
+    """
+
+    wp_username: str = Field(min_length=1, max_length=255)
+    wp_app_password: str = Field(min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def encryption_configured(self) -> "SiteCredentials":
+        try:
+            # Fail before the request reaches the database, exactly as creation
+            # does: the value is encrypted by the model's database type on write.
+            validate_credential_encryption_key()
+        except CredentialEncryptionError as error:
+            raise ValueError(str(error)) from error
         return self
 
 
@@ -101,6 +147,7 @@ class SiteOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    tenant_id: int
     name: str
     base_url: str
     platform: str
@@ -114,11 +161,18 @@ class SiteOut(BaseModel):
     pool_source_quarantine_reason: str | None = None
     pool_source_last_reactivated_at: datetime | None = None
     pool_source_last_reactivated_by: str | None = None
+    domain_registered_at: date | None = None
+    editorial_feedback_enabled: bool = True
+    editorial_min_score_percent: int = 0
+    editorial_feedback_weight: float = 0.20
+    editorial_feedback_min_samples: int = 10
     suggestion_method: Literal["hybrid_bm25"] = "hybrid_bm25"
-    suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool = True
-    suggestion_comparison_enabled: bool = False
     suggestion_slots_available: int = 0
+    #: Whether an account exists that could edit this site's posts. Read from
+    #: the model's property, which tests the username alone — the password is an
+    #: encrypted column, and decrypting every row of a list page to learn a
+    #: boolean would be work for nothing. The two are always written together.
+    has_wordpress_credentials: bool = False
     created_at: datetime
     last_ingestion_status: str | None = None
     # Last *finished* analysis, so a crawled site reads differently from an
@@ -130,32 +184,19 @@ class SiteOut(BaseModel):
     last_crawl_at: datetime | None = None
 
 
-class PoolSourceApproval(BaseModel):
-    approved_by: str = Field(min_length=1, max_length=255)
-
-    @field_validator("approved_by")
-    @classmethod
-    def normalize_approver(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("approved_by must not be blank")
-        return normalized
-
-
-class PoolSourceReactivation(BaseModel):
-    reactivated_by: str = Field(min_length=1, max_length=255)
-
-    @field_validator("reactivated_by")
-    @classmethod
-    def normalize_reviewer(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("reactivated_by must not be blank")
-        return normalized
-
-
 class SiteSuggestionModeUpdate(BaseModel):
     suggestion_mode: Literal["standard", "experimental"]
+
+
+class EditorialRankingPolicyUpdate(BaseModel):
+    enabled: bool = True
+    min_score_percent: int = Field(ge=0, le=100)
+    feedback_weight: float = Field(ge=0.0, le=1.0)
+    min_samples: int = Field(ge=1, le=10_000)
+
+
+class EditorialRankingPolicyOut(EditorialRankingPolicyUpdate):
+    site_id: int
 
 
 class SiteSuggestionModeState(BaseModel):

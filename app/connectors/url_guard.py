@@ -152,9 +152,7 @@ class ValidatingNetworkBackend(httpcore.NetworkBackend):
                     f"host {host!r} resolved to invalid address {sockaddr[0]!r}"
                 ) from error
             if not self._allow_private and not _is_public_address(address):
-                raise UnsafeURLError(
-                    f"host {host!r} resolves to non-public address {address}"
-                )
+                raise UnsafeURLError(f"host {host!r} resolves to non-public address {address}")
         return infos
 
     def connect_tcp(

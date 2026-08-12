@@ -9,7 +9,11 @@ from app.db import Base
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers defaults to True, which switches off every logger
+    # the application has already created. Harmless for `alembic upgrade` in its
+    # own process; not harmless when a migration is driven from Python, where it
+    # silently leaves the rest of the process with no logging at all.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

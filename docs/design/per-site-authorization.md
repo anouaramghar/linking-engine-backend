@@ -1,6 +1,7 @@
 # Per-site authorization design
 
-Status: proposal only. This document does not authorize or include implementation.
+Status: implemented on `feat/trust-boundary` (phase 2). Open questions below were
+resolved with the defaults in `docs/design/trust-boundary-phase2.md`.
 
 ## Problem and threat model
 

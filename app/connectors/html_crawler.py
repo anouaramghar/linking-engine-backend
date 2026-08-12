@@ -15,7 +15,13 @@ import trafilatura
 from lxml import etree, html as lxml_html
 
 from app.config import settings
-from app.connectors.base import ArticleData, ContentConnector, SiteMetadata
+from app.connectors.base import (
+    ArticleData,
+    ContentConnector,
+    OutboundLink,
+    PlannedEditOutcome,
+    SiteMetadata,
+)
 from app.connectors.http_limits import check_crawl_deadline, get_limited_http_response
 from app.connectors.url_guard import (
     SSRFProtectedTransport,
@@ -23,8 +29,9 @@ from app.connectors.url_guard import (
     request_guard,
     validate_url,
 )
-from app.models.suggestion import Suggestion
 
+#: Anchors are phrases; a link wrapping a whole section is stored truncated.
+_MAX_ANCHOR_TEXT_CHARS = 300
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 # Sitemap XML is untrusted input — no entity resolution, no network fetches
 _XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
@@ -70,9 +77,7 @@ class HTMLConnector(ContentConnector):
                 max_items=settings.crawl_max_sitemap_urls,
             )
             if len(urls) > settings.crawl_max_sitemap_urls:
-                raise ValueError(
-                    f"sitemap URL count exceeded {settings.crawl_max_sitemap_urls}"
-                )
+                raise ValueError(f"sitemap URL count exceeded {settings.crawl_max_sitemap_urls}")
         return urls
 
     def _parse_sitemap(self, url: str, xpath: str, *, max_items: int | None = None) -> list[str]:
@@ -81,6 +86,7 @@ class HTMLConnector(ContentConnector):
             self.client,
             url,
             max_bytes=settings.crawl_max_response_bytes,
+            crawl_started_at=self._crawl_started_at,
         )
         resp.raise_for_status()
         tree = etree.fromstring(resp.content, parser=_XML_PARSER)
@@ -113,6 +119,7 @@ class HTMLConnector(ContentConnector):
             self.client,
             url,
             max_bytes=settings.crawl_max_response_bytes,
+            crawl_started_at=self._crawl_started_at,
         )
         if resp.status_code != 200:
             return None
@@ -125,14 +132,16 @@ class HTMLConnector(ContentConnector):
             )
         tree = lxml_html.fromstring(resp.text)
         internal = [
-            urljoin(url, href)
-            for href in tree.xpath("//a/@href")
-            if urlparse(urljoin(url, href)).netloc == self._host
+            OutboundLink(
+                url=absolute,
+                anchor_text=" ".join(anchor.text_content().split())[:_MAX_ANCHOR_TEXT_CHARS]
+                or None,
+            )
+            for anchor in tree.xpath("//a[@href]")
+            if urlparse(absolute := urljoin(url, anchor.get("href"))).netloc == self._host
         ]
         if len(internal) > settings.crawl_max_links_per_article:
-            raise ValueError(
-                f"article link count exceeded {settings.crawl_max_links_per_article}"
-            )
+            raise ValueError(f"article link count exceeded {settings.crawl_max_links_per_article}")
         return ArticleData(
             url=url,
             title=doc.title or url,
@@ -141,7 +150,7 @@ class HTMLConnector(ContentConnector):
             language=None,
             published_at=None,  # trafilatura dates are unreliable; left for v2 heuristics
             taxonomies=[],  # no structured source on static HTML (A14)
-            outbound_internal_urls=internal,
+            outbound_internal_links=internal,
         )
 
     def get_site_metadata(self) -> SiteMetadata:
@@ -155,7 +164,9 @@ class HTMLConnector(ContentConnector):
     def supports_incremental_sync(self) -> bool:
         return False
 
-    def apply_link(self, suggestion: Suggestion) -> None:
+    def apply_planned_edit(
+        self, source, *, original_html: str, updated_html: str
+    ) -> PlannedEditOutcome:
         # A3 resolved: design ready (FTP hypothesis documented), no implementation —
         # HTML sites are secondary, WordPress is the v1 priority.
         raise NotImplementedError("writing to static HTML sites is not supported in v1 (A3)")

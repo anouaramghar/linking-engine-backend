@@ -13,7 +13,7 @@ from sqlalchemy import select
 import app.services.job_service as job_service
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Alert, IngestionRun, JobRun
+from app.models import Alert, IngestionRun, JobRun, Site
 from app.schemas.job import JobRunOut
 from app.services import alerts as alert_service
 from app.services.job_service import (
@@ -123,6 +123,28 @@ def test_duplicate_trigger_rejected_while_active(client, db, site, cleanup_rq):
     cleanup_rq.append(analysis.json()["job_id"])
 
 
+def test_tenant_active_job_quota_spans_different_sites(client, db, site, cleanup_rq, monkeypatch):
+    monkeypatch.setattr(settings, "max_active_jobs_per_tenant", 1)
+    other = Site(
+        tenant_id=site.tenant_id,
+        name="quota-peer",
+        base_url="https://quota-peer.example.com",
+        platform="html",
+    )
+    db.add(other)
+    db.commit()
+
+    first = client.post(f"/api/v1/sites/{site.id}/ingest")
+    cleanup_rq.append(first.json()["job_id"])
+    second = client.post(f"/api/v1/sites/{other.id}/ingest")
+
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert "tenant" in second.json()["detail"]
+    db.delete(other)
+    db.commit()
+
+
 def test_lost_job_is_reconciled_and_retriggerable(client, db, site, cleanup_rq, monkeypatch):
     alerts = []
     monkeypatch.setattr(
@@ -144,19 +166,17 @@ def test_lost_job_is_reconciled_and_retriggerable(client, db, site, cleanup_rq, 
     assert lost.status == "failed"
     assert "lost from queue" in lost.error
     assert lost.finished_at is not None
-    assert alerts == [
-        (
-            "LinkMesh ingestion job lost",
-            {
-                "site_id": site.id,
-                "kind": "ingestion",
-                "job_run_id": lost.id,
-                "attempts": 0,
-                "error": "lost from queue before completion",
-            },
-            {"kind": "job_lost", "site_id": site.id},
-        )
-    ]
+    assert (
+        "LinkMesh ingestion job lost",
+        {
+            "site_id": site.id,
+            "kind": "ingestion",
+            "job_run_id": lost.id,
+            "attempts": 0,
+            "error": "lost from queue before completion",
+        },
+        {"kind": "job_lost", "site_id": site.id},
+    ) in alerts
 
 
 def test_final_job_failure_sends_alert(db, site, monkeypatch):
@@ -213,9 +233,7 @@ def test_nonfinal_job_failure_does_not_send_alert(db, site, monkeypatch):
         enqueue_job(db, site.id, "analysis", lambda: None, job_timeout=60)
 
 
-def test_killed_work_horse_keeps_job_queued_and_reconciles_ingestion(
-    db, site, monkeypatch
-):
+def test_killed_work_horse_keeps_job_queued_and_reconciles_ingestion(db, site, monkeypatch):
     started_at = datetime.now(timezone.utc)
     run = JobRun(
         site_id=site.id,
@@ -253,9 +271,7 @@ def test_killed_work_horse_keeps_job_queued_and_reconciles_ingestion(
         status="running",
         started_at=started_at,
     )
-    db.add_all(
-        [ingestion_run, stale_same_job_ingestion_run, unrelated_ingestion_run]
-    )
+    db.add_all([ingestion_run, stale_same_job_ingestion_run, unrelated_ingestion_run])
     db.commit()
     monkeypatch.setattr(
         job_service,
@@ -325,9 +341,7 @@ def test_terminal_killed_work_horse_fails_once_and_alerts_once(db, site, monkeyp
     ]
 
 
-def test_killed_work_horse_requeues_durable_success_when_rq_will_retry(
-    db, site, monkeypatch
-):
+def test_killed_work_horse_requeues_durable_success_when_rq_will_retry(db, site, monkeypatch):
     finished_at = datetime.now(timezone.utc)
     run = JobRun(
         site_id=site.id,
@@ -362,9 +376,7 @@ def test_killed_work_horse_requeues_durable_success_when_rq_will_retry(
     assert "waitpid status 9" in stored.error
 
 
-def test_terminal_killed_work_horse_preserves_committed_success(
-    db, site, monkeypatch, caplog
-):
+def test_terminal_killed_work_horse_preserves_committed_success(db, site, monkeypatch, caplog):
     finished_at = datetime.now(timezone.utc)
     result = {"suggestions_created": 7}
     run = JobRun(
@@ -433,9 +445,7 @@ def test_abandoned_job_stays_queued_when_rq_will_retry(db, site, monkeypatch):
     assert stored.error == "job abandoned after worker termination"
 
 
-def test_terminal_abandoned_job_preserves_committed_success(
-    db, site, monkeypatch
-):
+def test_terminal_abandoned_job_preserves_committed_success(db, site, monkeypatch):
     finished_at = datetime.now(timezone.utc)
     result = {"suggestions_created": 7}
     run = JobRun(
@@ -606,9 +616,7 @@ def test_stopped_job_fails_linked_ingestion_and_alerts_once(db, site, monkeypatc
     ]
 
 
-def test_stopped_job_preserves_success_committed_before_rq_stop(
-    db, site, monkeypatch
-):
+def test_stopped_job_preserves_success_committed_before_rq_stop(db, site, monkeypatch):
     finished_at = datetime.now(timezone.utc)
     result = {"suggestions_created": 7}
     run = JobRun(
@@ -642,9 +650,7 @@ def test_stopped_job_preserves_success_committed_before_rq_stop(
     assert stored.error is None
 
 
-def test_killed_work_horse_falls_back_to_job_run_id_from_rq_kwargs(
-    db, site, monkeypatch
-):
+def test_killed_work_horse_falls_back_to_job_run_id_from_rq_kwargs(db, site, monkeypatch):
     run = JobRun(
         site_id=site.id,
         kind="publication",
@@ -675,9 +681,7 @@ def test_killed_work_horse_falls_back_to_job_run_id_from_rq_kwargs(
     assert stored.finished_at is not None
 
 
-def test_killed_ingestion_without_started_attempt_does_not_guess_run(
-    db, site, monkeypatch
-):
+def test_killed_ingestion_without_started_attempt_does_not_guess_run(db, site, monkeypatch):
     run = JobRun(
         site_id=site.id,
         kind="ingestion",
@@ -847,9 +851,7 @@ def test_live_rq_status_uses_stable_public_vocabulary(
     body = client.get(f"/api/v1/jobs/{run.queue_job_id}").json()
 
     assert body["status"] == public_status
-    assert body["result"] == (
-        {"suggestions_created": 2} if public_status == "succeeded" else None
-    )
+    assert body["result"] == ({"suggestions_created": 2} if public_status == "succeeded" else None)
 
 
 @pytest.mark.parametrize("rq_status", ["failed", "stopped", "canceled"])
@@ -890,9 +892,7 @@ def test_live_terminal_rq_status_prefers_committed_durable_success(
     assert listed["result"] == body["result"]
 
 
-def test_live_failure_is_not_masked_without_durable_success(
-    client, db, site, monkeypatch
-):
+def test_live_failure_is_not_masked_without_durable_success(client, db, site, monkeypatch):
     run = JobRun(
         site_id=site.id,
         kind="analysis",
@@ -955,9 +955,7 @@ def test_list_active_job_runs_excludes_terminal_work(client, db, site):
     assert {item["status"] for item in active} == {"queued", "running"}
 
 
-def test_list_active_job_runs_reconciles_stale_unqueued_work(
-    client, db, site, monkeypatch
-):
+def test_list_active_job_runs_reconciles_stale_unqueued_work(client, db, site, monkeypatch):
     stale = JobRun(
         site_id=site.id,
         kind="ingestion",

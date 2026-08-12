@@ -12,8 +12,10 @@ from app.services.job_service import run_durably
 from app.services.pool_source_policy import (
     PoolSourceFetchError,
     PoolSourcePolicyError,
+    expire_pool_target_suggestions,
     require_approved_pool_source,
 )
+from app.services.pool_source_audit import record_pool_source_audit_event
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +57,23 @@ def _record_pool_ingestion_failure(site_id: int, error: Exception) -> None:
         if site is None or site.platform != "pool":
             return
         site.pool_source_consecutive_failures += 1
-        if site.pool_source_consecutive_failures >= settings.pool_quarantine_failure_threshold:
+        should_quarantine = (
+            site.pool_source_consecutive_failures >= settings.pool_quarantine_failure_threshold
+        )
+        if should_quarantine:
+            newly_quarantined = not site.pool_source_quarantined
             site.pool_source_quarantined = True
             site.pool_source_quarantined_at = datetime.now(UTC)
             site.pool_source_quarantine_reason = str(error)[:2000]
+            expire_pool_target_suggestions(db, site.id, reason="quarantined")
+            if newly_quarantined:
+                record_pool_source_audit_event(
+                    db,
+                    site,
+                    "quarantined",
+                    "system",
+                    reason=site.pool_source_quarantine_reason,
+                )
         db.commit()
 
 

@@ -17,16 +17,55 @@ MAX_BULK_REVIEW = MAX_ENGINE_PAGE_SIZE
 # is a performance bound as much as a validation one.
 MAX_SEARCH_TERM = 200
 
-TargetOrigin = Literal["internal", "content_pool"]
+TargetOrigin = Literal["internal", "content_pool", "web_search"]
+
+
+class SuggestionTargetBrief(BaseModel):
+    """A stored article or a direct external-search target."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None
+    title: str
+    url: str
+
+
+class SuggestionEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    suggestion_id: int
+    event_type: str
+    actor: str
+    details: dict
+    created_at: datetime
+
+
+class TraceEventOut(SuggestionEventOut):
+    trace_id: str
+    site_id: int
+    site_name: str
+    source_title: str
+    target_title: str
+    suggestion_status: str
+    publish_error: str | None = None
+
+
+class TraceEventPage(BaseModel):
+    items: list[TraceEventOut]
+    total: int
+    limit: int
+    offset: int
 
 
 class SuggestionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    trace_id: str
     site_id: int
     source_article: ArticleBrief
-    target_article: ArticleBrief
+    target_article: SuggestionTargetBrief
     #: Where the target lives relative to the site being reviewed.
     target_origin: TargetOrigin
     #: The site that owns the target article; useful when the target is external.
@@ -39,9 +78,40 @@ class SuggestionOut(BaseModel):
     #: the recipe names. Null for `baseline_cosine`, whose score already is its
     #: whole explanation.
     score_components: dict | None = None
+    provider: str | None = None
+    provider_request_id: str | None = None
+    provider_score: float | None = None
+    search_query: str | None = None
+    external_snippet: str | None = None
     status: str
     anchor_text: str | None
+    publish_outcome: str | None = None
+    publish_attempts: int = 0
+    publish_error: str | None = None
     created_at: datetime
+
+
+class PlacementOut(BaseModel):
+    """Where in the source article the link would go.
+
+    Generated on demand rather than during analysis, so this is not part of
+    `SuggestionOut` — a queue page must not pay for a model call per row.
+
+    `found` is the field to branch on. A null `placement_context` with
+    `found=false` is a real answer: the model read the article and no passage
+    fit. The client renders that, not a spinner.
+    """
+
+    suggestion_id: int
+    found: bool
+    #: A passage copied verbatim from the source article, or null.
+    placement_context: str | None
+    #: A contiguous substring of `placement_context`, so a client can highlight
+    #: it by searching the context rather than by trusting an offset.
+    anchor_text: str | None
+    #: Which model produced this, for traceability once several have run.
+    llm_model: str | None
+    generated_at: datetime
 
 
 # 'pending' lets an editor undo a decision; 'applied' is set exclusively by the
@@ -92,6 +162,10 @@ class SuggestionCounts(BaseModel):
     applying: int = 0
     applied: int = 0
     expired: int = 0
+    # Quarantined after repeated publication failures. Counted in `total` because
+    # the list endpoint returns these rows, and a chip the editor cannot see is
+    # how a stuck suggestion stays stuck.
+    failed: int = 0
     total: int = 0
 
 
@@ -140,9 +214,17 @@ class BulkReviewFilter(BaseModel):
 
 
 class BulkReviewFilterResult(BaseModel):
-    """Counts for every review, plus ids while an exact undo remains practical."""
+    """Counts for every review and a durable exact-undo operation."""
 
     reviewed: int
     skipped: int
     reviewed_ids: list[int] | None
+    undo_operation_id: str | None
     status: ReviewStatus
+
+
+class BulkReviewUndoResult(BaseModel):
+    restored: int
+    skipped: int
+    status: ReviewStatus
+    already_undone: bool = False

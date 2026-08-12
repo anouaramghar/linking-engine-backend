@@ -70,9 +70,9 @@ services:
 
   worker:
     <<: *app-service
-    # one worker drains all stage queues; split into dedicated workers when load justifies it
-    # ("default" kept last to drain jobs enqueued before the per-stage queues existed)
-    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "ingestion", "analysis", "publication", "default"]
+    # Keep the legacy service name for setup scripts; it owns ingestion plus
+    # pre-stage jobs left on the historical default queue.
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "ingestion", "default"]
     depends_on:
       db:
         condition: service_healthy
@@ -82,6 +82,58 @@ services:
         condition: service_completed_successfully
     volumes:
       - hf_cache:/home/linkmesh/.cache/huggingface
+
+  worker-analysis:
+    <<: *app-service
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "analysis"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - hf_cache:/home/linkmesh/.cache/huggingface
+
+  worker-publication:
+    <<: *app-service
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "publication"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker-publication-preparation:
+    <<: *app-service
+    # Live reads and placement generation cannot occupy API or publication
+    # capacity. Scale this service across sites; per-site duplicate guards remain.
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "publication-preparation"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - hf_cache:/home/linkmesh/.cache/huggingface
+
+  telegram-bot:
+    <<: *app-service
+    # Long-polls Telegram for dashboard logins. Exactly one replica: two
+    # concurrent getUpdates calls on one token make Telegram reject both with a
+    # 409, so scaling this is a way to break login rather than speed it up.
+    command: ["python", "-m", "app.telegram_bot"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

@@ -5,7 +5,8 @@ import logging
 import re
 from collections.abc import Iterator
 from datetime import datetime, timezone
-from time import monotonic
+from email.utils import parsedate_to_datetime
+from time import monotonic, sleep
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 import httpx
@@ -14,9 +15,28 @@ from lxml.etree import ParserError
 from lxml.html import HtmlElement
 
 from app.config import settings
-from app.connectors.base import ArticleData, ContentConnector, SiteMetadata, TaxonomyData
-from app.connectors.http_limits import check_crawl_deadline, get_limited_http_response
-from app.connectors.url_guard import SSRFProtectedTransport, request_guard, validate_url
+from app.connectors.base import (
+    ArticleData,
+    ContentConnector,
+    LinkPreview,
+    LinkOutcome,
+    OutboundLink,
+    PlannedEditOutcome,
+    SiteMetadata,
+    StalePlanError,
+    TaxonomyData,
+)
+from app.connectors.http_limits import (
+    check_crawl_deadline,
+    get_limited_http_response,
+    request_limited_http_response,
+)
+from app.connectors.url_guard import (
+    SSRFProtectedTransport,
+    UnsafeURLError,
+    request_guard,
+    validate_url,
+)
 from app.models.suggestion import Suggestion
 
 _API_DISCOVERY_REL = "https://api.w.org/"
@@ -30,7 +50,74 @@ _FEED_MEDIA_TYPES = {
     "text/xml",
 }
 _XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
+#: Elements a link may be spliced inside. An allowlist, not a list of forbidden
+#: regions, because the forbidden list can never close: raw post content is the
+#: customer's own markup and the next unlisted element is one custom block away.
+#: A position is prose only when *every* element open around it is listed here,
+#: so a heading wrapped around a themed <span> is still a heading and a quoted
+#: passage stays the words of whoever was quoted. Leaving an element out only
+#: costs an in-text link — the suggestion still publishes, as the appended
+#: block — while letting one in is how a link ends up in a code sample.
+_SPLICE_OK = frozenset(
+    # containers a paragraph legitimately sits inside
+    "div section article main ul ol dl".split()
+    # the text containers themselves
+    + "p li dd".split()
+    # inline formatting that can wrap part of a sentence
+    + "em strong b i u span small sub sup mark".split()
+)
+#: At least one of these must contain tagged prose. Structural containers are
+#: allowed around them, but their own direct text is not body copy. An empty
+#: stack remains valid for classic-editor content where WordPress adds <p> only
+#: while rendering.
+_SPLICE_TEXT = frozenset({"p", "li", "dd"})
+#: Elements with no closing tag, which would otherwise stay open for ever and
+#: block every later position in the post.
+_VOID_ELEMENTS = frozenset(
+    "area base br col embed hr img input link meta param source track wbr".split()
+)
+#: One tag or comment. Comments carry no name — Gutenberg stores its block
+#: delimiters and their attributes in them, and they open nothing.
+_TAG_RE = re.compile(r"<!--.*?-->|<(/?)([a-zA-Z][^\s/>]*)[^>]*?(/?)>", re.DOTALL)
+#: Shortcodes are excluded separately because they are plain text to the scan
+#: above: one sits inside a perfectly ordinary paragraph, and a tag spliced into
+#: its attributes breaks it.
+_SHORTCODE_RE = re.compile(r"\[[^\]]*\]")
+#: Stamped on every link spliced into prose, so the per-article in-text limit can
+#: be counted from the post itself. An editor's own links are theirs and are not
+#: counted; nothing else in the pipeline reads this, and it stays inert if the
+#: limit is later removed. It also makes an automated link identifiable to a
+#: human reading the post source, which an unmarked one is not.
+_IN_TEXT_MARK = 'data-linkmesh="in-text"'
+#: The appended paragraph, serialized as a Gutenberg block. Without the
+#: delimiters the block editor cannot recognise it and shows the whole trailing
+#: run as one "Classic" block, which an editor then has to convert by hand.
+_READ_ALSO_BLOCK = '\n<!-- wp:paragraph -->\n<p>Read also: <a href="{href}">{anchor}</a></p>\n<!-- /wp:paragraph -->'
+#: Statuses worth pausing for rather than failing: rate limiting, and the
+#: temporary unavailability shared hosting returns under load.
+_RETRY_STATUSES = frozenset({429, 503})
+_RETRY_ATTEMPTS = 2
+_RETRY_FALLBACK_SECONDS = 5.0
+_RETRY_MAX_SECONDS = 60.0
+#: An anchor is a phrase. A link wrapping a whole section, or an image whose alt
+#: text runs long, is stored truncated rather than uncapped.
+_MAX_ANCHOR_TEXT_CHARS = 300
 logger = logging.getLogger(__name__)
+
+
+def _suggestion_target_url(suggestion: Suggestion) -> str:
+    external_url = getattr(suggestion, "external_url", None)
+    if external_url:
+        return external_url
+    return suggestion.target_article.url
+
+
+def _suggestion_target_title(suggestion: Suggestion) -> str:
+    external_title = getattr(suggestion, "external_title", None)
+    if external_title:
+        return external_title
+    target = suggestion.target_article
+    return target.title if target is not None else _suggestion_target_url(suggestion)
 
 
 def _iso(dt_str: str | None) -> datetime | None:
@@ -62,6 +149,138 @@ def _safe_join(page_url: str, href: str) -> str | None:
     except ValueError:
         logger.warning("Skipping malformed WordPress href on %r: %r", page_url, href[:200])
         return None
+
+
+def _anchor_regex(anchor: str) -> re.Pattern[str]:
+    """Match `anchor` in raw post content, absorbing how WordPress stores it.
+
+    An anchor is chosen and verified against the article's *rendered* text with
+    whitespace collapsed, but the post is edited through its *raw* content. The
+    two differ in two ways common enough to be worth tolerating — the `&nbsp;`
+    WordPress writes for spacing, and escaped ampersands. Everything else is
+    matched literally: an anchor broken up by inline tags simply is not found,
+    which is the right outcome, not a missed case.
+
+    Word-boundary guards are conditional because an anchor may legitimately begin
+    or end on punctuation, where a blanket `\\b` asserts the opposite of what is
+    wanted. They stop "panel" from linking the middle of "solarpanel", and they
+    also *earn* placements: without them "panel" matches "panels" too, and two
+    candidates means no placement at all.
+    """
+    prefix = r"(?<!\w)" if anchor[:1].isalnum() or anchor[:1] == "_" else ""
+    suffix = r"(?!\w)" if anchor[-1:].isalnum() or anchor[-1:] == "_" else ""
+    return re.compile(
+        prefix
+        + "".join(
+            r"(?:\s|&nbsp;|&#160;)+"
+            if token.isspace()
+            else r"(?:&|&amp;)"
+            if token == "&"
+            else re.escape(token)
+            for token in re.findall(r"\s+|.", anchor)
+        )
+        + suffix
+    )
+
+
+def _prose_regions(content: str) -> list[tuple[int, int]]:
+    """Spans of raw post content that are ordinary prose, as (start, end) offsets.
+
+    One left-to-right pass tracking which elements are open. Text is prose when
+    nothing unlisted is open around it — including when nothing is open at all,
+    which is how the classic editor stores a post: bare paragraphs separated by
+    blank lines, with the <p> tags added at render time.
+
+    Tags and comments are never part of a region, so block delimiters, tag
+    attributes, and <script>/<style> bodies are excluded by construction rather
+    than each by its own rule. An unclosed tag blocks the rest of the post
+    rather than the reverse.
+    """
+    regions: list[tuple[int, int]] = []
+    stack: list[str] = []
+    blocked = 0  # how many open elements are absent from _SPLICE_OK
+    cursor = 0
+    for match in _TAG_RE.finditer(content):
+        prose_open = not stack or any(name in _SPLICE_TEXT for name in stack)
+        if not blocked and prose_open and match.start() > cursor:
+            regions.append((cursor, match.start()))
+        cursor = match.end()
+        closing, name, self_closing = match.groups()
+        if name is None:  # a comment opens nothing
+            continue
+        name = name.lower()
+        if closing:
+            if name in stack:
+                # Innermost match, so </div> closes the inner one of a nested pair.
+                index = len(stack) - 1 - stack[::-1].index(name)
+                blocked -= sum(1 for open_name in stack[index:] if open_name not in _SPLICE_OK)
+                del stack[index:]
+        elif not self_closing and name not in _VOID_ELEMENTS:
+            stack.append(name)
+            blocked += name not in _SPLICE_OK
+    prose_open = not stack or any(name in _SPLICE_TEXT for name in stack)
+    if not blocked and prose_open and cursor < len(content):
+        regions.append((cursor, len(content)))
+    return regions
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """How long the server asked us to wait, bounded.
+
+    Both legal HTTP forms are accepted: delta-seconds and an absolute date.
+    """
+    raw = (response.headers.get("retry-after") or "").strip()
+    try:
+        return min(max(float(raw), 0.0), _RETRY_MAX_SECONDS)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(raw)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            return min(max(seconds, 0.0), _RETRY_MAX_SECONDS)
+        except (TypeError, ValueError, OverflowError):
+            return _RETRY_FALLBACK_SECONDS
+
+
+def _crowds_existing_link(content: str, span: tuple[int, int]) -> bool:
+    """True when another automated link sits too close to `span` to add one more.
+
+    Two links a few words apart read as spam even when each is defensible on its
+    own. Measured in raw characters because that is what the splice already
+    works in, and the bound only has to be roughly right to stop the obvious
+    case. Only our own links are counted: an editor's are theirs to place.
+    """
+    gap = settings.publish_min_in_text_gap_chars
+    if gap <= 0:
+        return False
+    start, end = span
+    return any(
+        start - gap < mark.start() < end + gap
+        for mark in re.finditer(re.escape(_IN_TEXT_MARK), content)
+    )
+
+
+def _anchor_span(content: str, anchor: str) -> tuple[int, int] | None:
+    """The single position `anchor` can be safely linked in place, or None.
+
+    None covers every reason not to link in place, because they are one outcome
+    to the caller: the anchor is absent from the raw content, or present only
+    outside prose, or present more than once. That last case is a genuine
+    unknown — with two candidates there is no evidence which passage the model
+    meant, and the appended block links the target correctly either way. Offsets
+    rather than a rewritten document: everything outside the two insertion points
+    stays byte-for-byte the customer's own markup.
+    """
+    regions = _prose_regions(content)
+    shortcodes = [match.span() for match in _SHORTCODE_RE.finditer(content)]
+    spans = [
+        match.span()
+        for match in _anchor_regex(anchor).finditer(content)
+        if any(start <= match.start() and match.end() <= end for start, end in regions)
+        and not any(start < match.end() and match.start() < end for start, end in shortcodes)
+    ]
+    return spans[0] if len(spans) == 1 else None
 
 
 class WordPressConnector(ContentConnector):
@@ -125,16 +344,52 @@ class WordPressConnector(ContentConnector):
             kwargs["auth"] = self._auth
         return kwargs
 
-    def _get(self, url: str, **kwargs) -> httpx.Response:
+    def _begin_crawl(self) -> None:
+        """Start the crawl clock, once, at the top of a crawl.
+
+        Explicit rather than started by whichever request happens to come first,
+        because this connector also serves the publication worker and a large
+        approved batch is not a crawl overrunning its budget. Sharing one clock
+        made a long publication run fail every remaining suggestion with "crawl
+        exceeded ...", and finish only because RQ retried the job with a fresh
+        connector. Publication is bounded by its own approved batch and by the
+        RQ job timeout.
+        """
         if self._crawl_started_at is None:
             self._crawl_started_at = monotonic()
-        check_crawl_deadline(self._crawl_started_at)
+
+    def _get(self, url: str, **kwargs) -> httpx.Response:
+        if self._crawl_started_at is not None:
+            check_crawl_deadline(self._crawl_started_at)
         return get_limited_http_response(
             self.client,
             url,
             max_bytes=settings.crawl_max_response_bytes,
+            crawl_started_at=self._crawl_started_at,
             **kwargs,
         )
+
+    def _pausing_on_throttle(self, send, what: str) -> httpx.Response:
+        """Run `send`, honouring the host's own Retry-After before spending an attempt.
+
+        A publication run is the densest traffic LinkMesh ever sends a customer
+        site, and shared hosting answers that with 429 or 503. Retrying
+        immediately just collects another one.
+
+        Reads need this as much as writes do. A batch reads the post before it
+        saves it, and a throttled read raises like any other failure — which
+        charges the suggestion a publication attempt and, three transient
+        throttles later, quarantines a perfectly healthy row.
+        """
+        for attempt in range(_RETRY_ATTEMPTS + 1):
+            response = send()
+            if response.status_code not in _RETRY_STATUSES or attempt == _RETRY_ATTEMPTS:
+                return response
+            pause = _retry_after_seconds(response)
+            logger.warning(
+                "WordPress returned HTTP %s %s; waiting %.1fs", response.status_code, what, pause
+            )
+            sleep(pause)
 
     @staticmethod
     def _looks_like_json(response: httpx.Response) -> bool:
@@ -191,9 +446,7 @@ class WordPressConnector(ContentConnector):
             key == "rest_route" for key, _value in parse_qsl(parts.query, keep_blank_values=True)
         )
         candidate = (
-            url
-            if has_rest_route
-            else parts._replace(path=parts.path.rstrip("/") + "/").geturl()
+            url if has_rest_route else parts._replace(path=parts.path.rstrip("/") + "/").geturl()
         )
         host = urlparse(candidate).netloc.lower()
         if host not in self._content_hosts and host != "public-api.wordpress.com":
@@ -204,9 +457,7 @@ class WordPressConnector(ContentConnector):
     def _discover_page_links(self) -> tuple[list[str], list[str]]:
         """Find WordPress API/feed links when the submitted URL is a page URL."""
         try:
-            response = self._get(
-                self.site.base_url, **self._request_kwargs(self.site.base_url)
-            )
+            response = self._get(self.site.base_url, **self._request_kwargs(self.site.base_url))
         except httpx.HTTPError:
             return [], []
 
@@ -315,7 +566,9 @@ class WordPressConnector(ContentConnector):
         last_response: httpx.Response | None = None
         for base_url in candidates:
             url = self._with_params(self._api_url(base_url, self._resource(path)), params)
-            response = self._get(url, **self._request_kwargs(url))
+            response = self._pausing_on_throttle(
+                lambda url=url: self._get(url, **self._request_kwargs(url)), f"reading {url}"
+            )
             last_response = response
             if self._api_base_url is not None or self._looks_like_json(response):
                 self._api_base_url = base_url
@@ -358,9 +611,7 @@ class WordPressConnector(ContentConnector):
             if total_pages is not None:
                 declared_total = int(total_pages)
                 if declared_total > settings.crawl_max_wordpress_pages:
-                    raise ValueError(
-                        "WordPress pagination exceeded the configured page limit"
-                    )
+                    raise ValueError("WordPress pagination exceeded the configured page limit")
                 if page >= declared_total:
                     return
             elif page >= settings.crawl_max_wordpress_pages:
@@ -385,7 +636,9 @@ class WordPressConnector(ContentConnector):
 
     def _internal_hrefs(self, content_html: str, page_url: str) -> list[str]:
         """Hrefs pointing at this site's host, resolved absolute (handles /relative/ links)."""
-        return self._internal_hrefs_from_tree(_parse_html(content_html), page_url)
+        return [
+            link.url for link in self._internal_links_from_tree(_parse_html(content_html), page_url)
+        ]
 
     def _all_hrefs(self, content_html: str, page_url: str) -> list[str]:
         """Every href on the page, resolved absolute, whatever host it points at.
@@ -428,18 +681,28 @@ class WordPressConnector(ContentConnector):
             return parsed._replace(netloc=self._canonical_host, path=path).geturl()
         return url
 
-    def _internal_hrefs_from_tree(self, tree: HtmlElement | None, page_url: str) -> list[str]:
+    def _internal_links_from_tree(
+        self, tree: HtmlElement | None, page_url: str
+    ) -> list[OutboundLink]:
+        """Internal links with the words they were written on.
+
+        The anchor is read from the element rather than the href attribute
+        because this is the only moment it exists: neither article's text can
+        reconstruct it afterwards, and it is what an over-optimization report
+        needs to see forty pages pointing at one target with identical wording.
+        """
         if tree is None:
             return []
-        hrefs = []
-        for href in tree.xpath("//a/@href"):
-            joined = _safe_join(page_url, href)
+        links = []
+        for anchor in tree.xpath("//a[@href]"):
+            joined = _safe_join(page_url, anchor.get("href"))
             if joined is None:
                 continue
             absolute = self._canonicalize_url(joined)
             if self._is_internal_url(absolute):
-                hrefs.append(absolute)
-        return hrefs
+                text = " ".join(anchor.text_content().split())[:_MAX_ANCHOR_TEXT_CHARS]
+                links.append(OutboundLink(url=absolute, anchor_text=text or None))
+        return links
 
     def resolve_internal_url(self, url: str) -> str:
         """Resolve redirect aliases without changing external-origin policy."""
@@ -461,11 +724,19 @@ class WordPressConnector(ContentConnector):
     def _to_article(
         self, post: dict, taxonomy_map: dict[tuple[str, int], TaxonomyData]
     ) -> ArticleData:
-        post_host = urlparse(post["link"]).netloc.lower()
-        if (
-            self._host.lower() == "wordpress.com"
-            and post_host.endswith(".wordpress.com")
-        ):
+        post_url = post.get("link")
+        if not isinstance(post_url, str):
+            raise ValueError("WordPress returned a post without an HTTP(S) link")
+        try:
+            validate_url(
+                post_url,
+                allow_private=settings.allow_unsafe_crawl_targets,
+                resolve_dns=False,
+            )
+        except UnsafeURLError as error:
+            raise ValueError(f"WordPress returned an unsafe post link: {error}") from error
+        post_host = urlparse(post_url).netloc.lower()
+        if self._host.lower() == "wordpress.com" and post_host.endswith(".wordpress.com"):
             self._content_hosts.add(post_host)
             self._canonical_host = post_host
         content_html = post["content"]["rendered"]
@@ -475,17 +746,15 @@ class WordPressConnector(ContentConnector):
             raise ValueError(
                 f"article content exceeded {settings.crawl_max_article_chars} characters"
             )
-        internal_urls = self._internal_hrefs_from_tree(content_tree, post["link"])
+        internal_urls = self._internal_links_from_tree(content_tree, post_url)
         if len(internal_urls) > settings.crawl_max_links_per_article:
-            raise ValueError(
-                f"article link count exceeded {settings.crawl_max_links_per_article}"
-            )
+            raise ValueError(f"article link count exceeded {settings.crawl_max_links_per_article}")
         term_refs = [
             *(("category", term_id) for term_id in post.get("categories", [])),
             *(("tag", term_id) for term_id in post.get("tags", [])),
         ]
         return ArticleData(
-            url=post["link"],
+            url=post_url,
             external_id=str(post["id"]),
             title=_strip_html(post["title"]["rendered"]),
             content_text=content_text,
@@ -493,10 +762,11 @@ class WordPressConnector(ContentConnector):
             language=None,  # language filter disabled (A5) — fleet is 100% English
             published_at=_iso(post.get("date_gmt")),
             taxonomies=[taxonomy_map[ref] for ref in term_refs if ref in taxonomy_map],
-            outbound_internal_urls=internal_urls,
+            outbound_internal_links=internal_urls,
         )
 
     def fetch_articles(self) -> Iterator[ArticleData]:
+        self._begin_crawl()
         taxonomy_map = self._taxonomy_map()
         for article_number, post in enumerate(
             self._paginate("posts", {"status": "publish"}),
@@ -507,11 +777,13 @@ class WordPressConnector(ContentConnector):
             yield self._to_article(post, taxonomy_map)
 
     def fetch_article_by_url(self, url: str) -> ArticleData | None:
+        self._begin_crawl()
         slug = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
         posts = self._json(self._api_get("posts", params={"slug": slug}))
         return self._to_article(posts[0], self._taxonomy_map()) if posts else None
 
     def get_site_metadata(self) -> SiteMetadata:
+        self._begin_crawl()
         root = self._json(self._api_get(""))
         head = self._api_get("posts", params={"per_page": 1})
         return SiteMetadata(
@@ -526,27 +798,172 @@ class WordPressConnector(ContentConnector):
 
     # -- writing (publication worker) --------------------------------------
 
-    def apply_link(self, suggestion: Suggestion) -> None:
-        source = suggestion.source_article
-        target = suggestion.target_article
+    def _read_post_for_edit(self, source) -> str:
+        """The post's raw content, or a diagnosis of why it cannot be read."""
+        response = self._api_get(f"posts/{source.external_id}", params={"context": "edit"})
+        if response.status_code in {401, 403}:
+            # WordPress refuses `context=edit` before it returns any content, so
+            # this is what a wrong role or a revoked application password looks
+            # like. Untranslated it reaches the alert as a bare HTTP 403.
+            raise ValueError(
+                f"WordPress rejected an edit-context read of post {source.external_id} "
+                f"with HTTP {response.status_code}: the account "
+                f"{self.site.wp_username or '(none)'} needs permission to edit posts on "
+                f"{self.site.base_url}"
+            )
+        payload = self._json(response)
+        try:
+            return payload["content"]["raw"]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"WordPress returned post {source.external_id} without editable content; "
+                "publication needs an account that can edit posts"
+            ) from error
+
+    def _insert_link(self, content: str, suggestion: Suggestion) -> tuple[str, LinkOutcome]:
+        """One link into `content`: in the prose when that is safe, appended otherwise.
+
+        In-text when the stored placement can still be located in the live post,
+        the post is not already at its in-text limit, and the position is not
+        crowding a link we placed earlier — appended block otherwise, never
+        both. One link per suggestion keeps the caller's idempotency check
+        meaningful and the target linked once per article.
+
+        The anchor is re-located here rather than trusted: it was verified
+        against a crawl of the rendered page, which is neither this string nor
+        this old. The in-text count is read from the content rather than from
+        the suggestion table because the limit is a property of the article, and
+        because a suggestion that published as a block did not consume a slot in
+        the prose.
+
+        ponytail: a block that also stores its text as a delimiter attribute
+        (rare, mostly third-party) reads as invalid in the editor after an
+        in-text splice; parse block delimiters and restrict to core text blocks
+        if that shows up.
+        """
+        href = html.escape(_suggestion_target_url(suggestion))
+        at_limit = content.count(_IN_TEXT_MARK) >= settings.publish_max_in_text_links_per_article
+        span = (
+            _anchor_span(content, suggestion.anchor_text)
+            if suggestion.anchor_text and not at_limit
+            else None
+        )
+        if span is not None and not _crowds_existing_link(content, span):
+            start, end = span
+            return (
+                f'{content[:start]}<a {_IN_TEXT_MARK} href="{href}">'
+                f"{content[start:end]}</a>{content[end:]}",
+                "inserted",
+            )
+        anchor = html.escape(suggestion.anchor_text or _suggestion_target_title(suggestion))
+        return content + _READ_ALSO_BLOCK.format(href=href, anchor=anchor), "block"
+
+    def _post_content(self, source, content: str) -> httpx.Response:
+        """Save `content`, pausing if the host asks us to slow down."""
+        url = self._api_url(self._api_base_url or "", f"posts/{source.external_id}")
+        return self._pausing_on_throttle(
+            lambda: request_limited_http_response(
+                self.client,
+                "POST",
+                url,
+                max_bytes=settings.crawl_max_response_bytes,
+                json={"content": content},
+                **self._request_kwargs(url),
+            ),
+            f"saving post {source.external_id}",
+        )
+
+    def _warn_if_marker_stripped(self, source, sent: str, response: httpx.Response) -> None:
+        """The in-text cap is only real if the marker survives the save.
+
+        Modern WordPress keeps `data-*` under KSES, so this is not the default
+        case — but a plugin that filters `wp_kses_allowed_html` can drop it, and
+        then the count is always zero and the cap silently stops existing. A
+        warning rather than a failure: the link itself published correctly.
+        """
+        expected = sent.count(_IN_TEXT_MARK)
+        if not expected:
+            return
+        try:
+            stored = ((response.json() or {}).get("content") or {}).get("raw")
+        except ValueError:
+            stored = None
+        if not isinstance(stored, str):
+            logger.warning(
+                "WordPress saved post %s but did not return editable content; "
+                "the in-text marker could not be verified",
+                source.external_id,
+            )
+            return
+        if stored.count(_IN_TEXT_MARK) >= expected:
+            return
+        logger.warning(
+            "WordPress stored %s of %s in-text markers on post %s; the per-article "
+            "in-text cap cannot be enforced while the marker is being stripped",
+            stored.count(_IN_TEXT_MARK),
+            expected,
+            source.external_id,
+        )
+
+    def preview_links(self, suggestions: list[Suggestion]) -> LinkPreview:
+        if not suggestions:
+            return LinkPreview("", "", [])
+        source = suggestions[0].source_article
         if not source.external_id:
             raise ValueError(f"article {source.id} has no WP post id")
-        resp = self._api_get(f"posts/{source.external_id}", params={"context": "edit"})
-        content = self._json(resp)["content"]["raw"]
-        if content.strip():
-            # exact href match, not substring — "/post" must not match href="/post-2".
-            # Every href, not just internal ones: the retry-safety this gives the
-            # publication worker has to hold for external content-pool targets too.
-            existing = set(self._all_hrefs(content, source.url))
-            if target.url in existing:
-                return  # link already present — idempotent
-        # ponytail: appended "read also" block; in-text placement + anchor generation is v4
-        anchor = html.escape(suggestion.anchor_text or target.title)
-        content += f'\n<p>Read also: <a href="{html.escape(target.url)}">{anchor}</a></p>'
-        url = self._api_url(self._api_base_url or "", f"posts/{source.external_id}")
-        update = self.client.post(
-            url,
-            json={"content": content},
-            **self._request_kwargs(url),
-        )
+        content = self._read_post_for_edit(source)
+        # exact href match, not substring — "/post" must not match href="/post-2".
+        # Every href, not just internal ones: the retry-safety this gives the
+        # publication worker has to hold for external content-pool targets too.
+        existing = set(self._all_hrefs(content, source.url)) if content.strip() else set()
+
+        original = content
+        outcomes: list[LinkOutcome] = []
+        for suggestion in suggestions:
+            target_url = _suggestion_target_url(suggestion)
+            if target_url in existing:
+                outcomes.append("already_present")
+                continue
+            content, outcome = self._insert_link(content, suggestion)
+            # Two approved suggestions can point at the same target; the second
+            # is already present by the time it is reached.
+            existing.add(target_url)
+            outcomes.append(outcome)
+        return LinkPreview(original, content, outcomes)
+
+    def apply_planned_edit(
+        self, source, *, original_html: str, updated_html: str
+    ) -> PlannedEditOutcome:
+        """Send exactly `updated_html`, and only while the post still equals the
+        approved `original_html`.
+
+        Nothing here is decided. No suggestion reaches this method, so no anchor
+        can be re-located, no fallback can be re-chosen, and no change to a
+        target URL, a connector setting, or the placement model after approval
+        can alter the bytes that are sent.
+
+        The read immediately before the write is retained because WordPress core
+        exposes no compare-and-swap precondition on post updates. It narrows the
+        window; it cannot close it. That residual race is documented rather than
+        papered over — see docs/design/immutable-publication-plans.md.
+
+        Recognising our own earlier write as `already_applied` is what makes a
+        crash between the POST and the database commit recoverable: the retry
+        finalizes state instead of appending the same links a second time.
+        """
+        if not source.external_id:
+            raise ValueError(f"article {source.id} has no WP post id")
+
+        live = self._read_post_for_edit(source)
+        if live == updated_html:
+            return "already_applied"
+        if live != original_html:
+            raise StalePlanError(
+                f"WordPress post {source.external_id} no longer matches the approved "
+                "plan; the article changed after it was approved, so nothing was written"
+            )
+
+        update = self._post_content(source, updated_html)
         update.raise_for_status()
+        self._warn_if_marker_stripped(source, updated_html, update)
+        return "written"

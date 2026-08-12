@@ -15,6 +15,7 @@ from app.connectors.base import ArticleData, TaxonomyData
 from app.connectors.http_limits import check_crawl_deadline
 from app.connectors.registry import get_connector
 from app.db import SessionLocal, engine
+from app.ml.external.cleaning import normalize_external_url
 from app.models import (
     Article,
     ArticleTaxonomy,
@@ -163,19 +164,29 @@ def _upsert_taxonomies(
         )
 
 
-def _upsert_link(db: Session, source_id: int, target_id: int, run_id: int) -> None:
+def _upsert_link(
+    db: Session,
+    source_id: int,
+    target_id: int,
+    run_id: int,
+    anchor_text: str | None = None,
+) -> None:
     db.execute(
         pg_insert(InternalLink)
         .values(
             source_article_id=source_id,
             target_article_id=target_id,
+            anchor_text=anchor_text,
             is_active=True,
             last_seen_run_id=run_id,
         )
         .on_conflict_do_update(
             index_elements=["source_article_id", "target_article_id"],
             # first_seen_at stays immutable for history (Phase 0, finding 3).
+            # anchor_text is refreshed: an editor rewording a link is exactly
+            # the change an anchor-distribution report needs to see.
             set_={
+                "anchor_text": anchor_text,
                 "is_active": True,
                 "last_seen_at": func.now(),
                 "last_seen_run_id": run_id,
@@ -260,6 +271,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         # for atomicity; use staging and promotion before scaling to very large crawls.
         crawl_started_at = monotonic()
         url_to_id: dict[str, int] = {}
+        external_urls_seen: set[str] = set()
         outbound: list[tuple[int, list[str]]] = []
         article_ids: set[int] = set()
         articles_seen = 0
@@ -288,19 +300,29 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                 raise ValueError(
                     f"article content exceeded {settings.crawl_max_article_chars} characters"
                 )
-            if len(art.outbound_internal_urls) > settings.crawl_max_links_per_article:
+            if site.platform == "pool":
+                try:
+                    normalized_external_url = normalize_external_url(art.url)
+                except ValueError as error:
+                    raise PoolSourceFetchError(str(error)) from error
+                # Feeds often repeat the same article with a tracking URL or a
+                # different query order. Keep the first (normally newest) entry
+                # and never let those aliases create distinct Article rows.
+                if normalized_external_url in external_urls_seen:
+                    continue
+                external_urls_seen.add(normalized_external_url)
+                art = art.model_copy(update={"url": normalized_external_url})
+            if len(art.outbound_internal_links) > settings.crawl_max_links_per_article:
                 raise ValueError(
                     f"article link count exceeded {settings.crawl_max_links_per_article}"
                 )
-            total_outbound_links += len(art.outbound_internal_urls)
+            total_outbound_links += len(art.outbound_internal_links)
             if total_outbound_links > settings.crawl_max_total_links:
-                raise ValueError(
-                    f"crawl link count exceeded {settings.crawl_max_total_links}"
-                )
+                raise ValueError(f"crawl link count exceeded {settings.crawl_max_total_links}")
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id
-            outbound.append((article_id, art.outbound_internal_urls))
+            outbound.append((article_id, art.outbound_internal_links))
             article_ids.add(article_id)
             articles = len(article_ids)
             if articles % 50 == 0 and articles != last_progress_count:
@@ -326,15 +348,15 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         links = 0
         seen: set[tuple[int, int]] = set()
         resolve_internal_url = getattr(connector, "resolve_internal_url", None)
-        for source_id, urls in outbound:
+        for source_id, outbound_links in outbound:
             check_crawl_deadline(crawl_started_at)
-            for url in urls:
+            for link in outbound_links:
                 check_crawl_deadline(crawl_started_at)
-                target_id = url_to_id.get(normalize_url(url))
+                target_id = url_to_id.get(normalize_url(link.url))
                 if target_id is None and resolve_internal_url is not None:
-                    target_id = url_to_id.get(normalize_url(resolve_internal_url(url)))
+                    target_id = url_to_id.get(normalize_url(resolve_internal_url(link.url)))
                 if target_id and target_id != source_id and (source_id, target_id) not in seen:
-                    _upsert_link(db, source_id, target_id, run.id)
+                    _upsert_link(db, source_id, target_id, run.id, link.anchor_text)
                     seen.add((source_id, target_id))
                     links += 1
 

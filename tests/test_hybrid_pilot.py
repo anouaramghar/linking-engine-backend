@@ -157,7 +157,7 @@ def eligibility_corpus(db, site):
             slug="same-title",
             title="  TOMATO CANNING BASICS  ",
             content=f"{LEXICAL_BODY} reprint",
-            vector=_similar_vector(0.60, axis=6),
+            vector=_similar_vector(0.80, axis=6),
         ),
         # Byte-identical content fingerprint.
         "same_fingerprint": _add_article(
@@ -166,7 +166,7 @@ def eligibility_corpus(db, site):
             slug="same-fingerprint",
             title="Canning tomatoes duplicate",
             content=f"{LEXICAL_BODY} copy",
-            vector=_similar_vector(0.55, axis=7),
+            vector=_similar_vector(0.75, axis=7),
             fingerprint=_fingerprint("Tomato canning basics", LEXICAL_BODY),
         ),
         "inactive": _add_article(
@@ -175,7 +175,7 @@ def eligibility_corpus(db, site):
             slug="inactive",
             title="Retired canning guide",
             content=f"{LEXICAL_BODY} retired",
-            vector=_similar_vector(0.50, axis=8),
+            vector=_similar_vector(0.70, axis=8),
             is_active=False,
         ),
         "linked": _add_article(
@@ -184,7 +184,7 @@ def eligibility_corpus(db, site):
             slug="linked",
             title="Canning jars explained",
             content=f"{LEXICAL_BODY} jars",
-            vector=_similar_vector(0.45, axis=9),
+            vector=_similar_vector(0.65, axis=9),
         ),
         "decided": _add_article(
             db,
@@ -192,7 +192,31 @@ def eligibility_corpus(db, site):
             slug="decided",
             title="Water bath canning",
             content=f"{LEXICAL_BODY} bath",
-            vector=_similar_vector(0.40, axis=10),
+            vector=_similar_vector(0.60, axis=10),
+        ),
+        "low_value_title": _add_article(
+            db,
+            site,
+            slug="customer-entry",
+            title="My Account",
+            content=f"{LEXICAL_BODY} account",
+            vector=_similar_vector(0.39, axis=12),
+        ),
+        "low_value_url": _add_article(
+            db,
+            site,
+            slug="support-portal",
+            title="Customer help center",
+            content=f"{LEXICAL_BODY} support",
+            vector=_similar_vector(0.38, axis=13),
+        ),
+        "useful_login_article": _add_article(
+            db,
+            site,
+            slug="guide-to-login-security",
+            title="How to secure login pages",
+            content=f"{LEXICAL_BODY} authentication guide",
+            vector=_similar_vector(0.37, axis=14),
         ),
         "eligible": _add_article(
             db,
@@ -200,7 +224,7 @@ def eligibility_corpus(db, site):
             slug="eligible",
             title="Altitude adjustments for canning",
             content=f"{LEXICAL_BODY} altitude chart",
-            vector=_similar_vector(0.35, axis=11),
+            vector=_similar_vector(0.55, axis=11),
         ),
     }
     db.flush()
@@ -338,7 +362,7 @@ def test_every_exclusion_rule_applies_to_lexically_retrieved_candidates(
     ranking = _rank(db, site, source)
 
     delivered = {candidate.target_id for candidate in ranking.candidates}
-    assert delivered == {targets["eligible"].id}
+    assert delivered == {targets["eligible"].id, targets["useful_login_article"].id}
     for name in (
         "vector_duplicate",
         "same_title",
@@ -346,9 +370,52 @@ def test_every_exclusion_rule_applies_to_lexically_retrieved_candidates(
         "inactive",
         "linked",
         "decided",
+        "low_value_title",
+        "low_value_url",
     ):
         assert targets[name].id not in delivered, f"{name} should have been excluded"
     assert source.id not in delivered
+
+
+def test_low_value_targets_are_configured_rather_than_fixed(
+    db, site, eligibility_corpus, monkeypatch
+):
+    """The deny-list is a setting, so a site in another language can replace it.
+
+    Emptying both lists must deliver the two pages the shipped English terms
+    exclude, and nothing else may change: every other exclusion rule is
+    independent of this one.
+    """
+    source, targets = eligibility_corpus
+    monkeypatch.setattr(settings, "low_value_target_titles", [])
+    monkeypatch.setattr(settings, "low_value_target_url_slugs", [])
+
+    delivered = {candidate.target_id for candidate in _rank(db, site, source).candidates}
+
+    assert targets["low_value_title"].id in delivered
+    assert targets["low_value_url"].id in delivered
+    for name in ("vector_duplicate", "same_title", "same_fingerprint", "inactive", "linked"):
+        assert targets[name].id not in delivered, f"{name} should still be excluded"
+
+
+def test_low_value_slugs_match_whole_segments_and_survive_regex_characters(
+    db, site, eligibility_corpus, monkeypatch
+):
+    """A configured slug is a literal path segment, not a pattern.
+
+    `guide-to-login-security` contains "login" and must survive, which is the
+    segment boundary doing work. The `c++` term is the escaping: unescaped it is
+    an invalid quantifier and Postgres rejects the whole statement.
+    """
+    source, targets = eligibility_corpus
+    monkeypatch.setattr(settings, "low_value_target_titles", [])
+    monkeypatch.setattr(settings, "low_value_target_url_slugs", ["c++", "support-portal"])
+
+    delivered = {candidate.target_id for candidate in _rank(db, site, source).candidates}
+
+    assert targets["useful_login_article"].id in delivered
+    assert targets["low_value_url"].id not in delivered
+    assert targets["low_value_title"].id in delivered
 
 
 def test_a_lexical_only_near_duplicate_is_excluded_by_the_vector_rule(db, site, eligibility_corpus):
@@ -485,9 +552,6 @@ def test_pilot_rows_store_cosine_as_the_score_and_bm25_in_the_components(
     db, site, eligibility_corpus
 ):
     source, targets = eligibility_corpus
-    site.suggestion_mode = "experimental"
-    db.commit()
-
     generate_suggestions(site.id)
 
     row = db.scalars(
@@ -503,7 +567,7 @@ def test_pilot_rows_store_cosine_as_the_score_and_bm25_in_the_components(
     components = row.score_components
     assert row.score == pytest.approx(components["semantic"])
     assert 0.0 <= row.score <= 1.0
-    assert row.score == pytest.approx(0.35, abs=1e-6)
+    assert row.score == pytest.approx(0.55, abs=1e-6)
 
     # BM25 is reported separately, raw, and is not rescaled into anything that
     # reads as a confidence.
@@ -537,8 +601,6 @@ def test_comparison_rows_store_no_components(db, site):
 
 def test_the_api_serves_the_components_for_a_pilot_row(db, site, client, eligibility_corpus):
     source, _targets = eligibility_corpus
-    site.suggestion_mode = "experimental"
-    db.commit()
     generate_suggestions(site.id)
 
     response = client.get(f"/api/v1/suggestions/{site.id}", params={"method": "hybrid_bm25"})
@@ -561,8 +623,10 @@ def test_committed_defaults_enable_global_hybrid():
 
     assert defaults.hybrid_max_sources_per_run == 50
     assert defaults.hybrid_max_suggestions_per_article == 3
+    assert defaults.hybrid_max_lifetime_links_per_article == 5
     assert defaults.hybrid_max_active_suggestions_per_site == 1500
     assert defaults.suggestion_duplicate_similarity_threshold == 0.99
+    assert defaults.suggestion_min_score == 0.50
 
 
 def test_default_site_uses_the_hybrid_path(db, site):
@@ -576,7 +640,7 @@ def test_default_site_uses_the_hybrid_path(db, site):
     assert result["ranking_mode"] == "hybrid"
 
 
-def test_hybrid_uses_the_configured_per_source_cap(db, site, monkeypatch):
+def test_hybrid_respects_the_configured_per_source_cap(db, site, monkeypatch):
     articles = _make_articles(db, site)
     monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 2)
 
@@ -586,7 +650,9 @@ def test_hybrid_uses_the_configured_per_source_cap(db, site, monkeypatch):
     counts = {
         article.id: sum(row.source_article_id == article.id for row in rows) for article in articles
     }
-    assert set(counts.values()) == {2}
+    assert rows
+    assert max(counts.values()) == 2
+    assert all(count <= 2 for count in counts.values())
     assert {row.method for row in rows} == {"hybrid_bm25"}
 
 

@@ -6,38 +6,87 @@ from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db
+from app.api.deps import (
+    get_audit_actor,
+    get_db,
+    require_api_key,
+    require_operator_identity,
+    require_site_access,
+    require_site_read,
+)
 from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
-from app.models import Article, IngestionRun, InternalLink, JobRun, Site, Suggestion
+from app.models import (
+    Article,
+    ExternalLinkPolicy,
+    IngestionRun,
+    InternalLink,
+    JobRun,
+    PoolSourceAuditEvent,
+    Site,
+    Suggestion,
+)
+from app.schemas.external_policy import (
+    ExternalLinkPolicyOut,
+    ExternalLinkPolicyUpdate,
+    ExternalSourceEvaluationList,
+)
+from app.services.authorization import (
+    Principal,
+    authorize_site_read,
+    readable_site_filter,
+    require_creatable_platform,
+    resolve_create_tenant_id,
+)
+from app.schemas.pool_audit import PoolSourceAuditEventOut
 from app.schemas.site import (
     ArticleOut,
+    EditorialRankingPolicyOut,
+    EditorialRankingPolicyUpdate,
     SiteBulkCreated,
     SiteBulkFailure,
     SiteBulkRequest,
     SiteBulkResult,
     SiteCreate,
+    SiteCredentials,
     SiteOut,
-    PoolSourceApproval,
-    PoolSourceReactivation,
-    SiteSuggestionModeState,
-    SiteSuggestionModeUpdate,
+)
+from app.services.external_link_policy import (
+    expire_ineligible_external_suggestions,
+    policy_state,
+    source_evaluations,
 )
 from app.services.ingestion_service import latest_run
-from app.services.pool_source_policy import PoolSourcePolicyError, require_allowed_pool_domain
+from app.services.pool_source_audit import record_pool_source_audit_event
+from app.services.pool_source_policy import (
+    PoolSourcePolicyError,
+    expire_pool_target_suggestions,
+    require_allowed_pool_domain,
+    require_no_pbn_conflict,
+)
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
 DUPLICATE_REASON = "a site with this base_url already exists"
 
 
-def _get_site_or_404(db: Session, site_id: int) -> Site:
-    site = db.get(Site, site_id)
-    if site is None:
-        raise HTTPException(404, f"site {site_id} not found")
+def _managed_site_or_409(site: Site) -> Site:
+    if site.platform == "pool":
+        raise HTTPException(409, "external-link policies belong to managed sites")
     return site
 
 
+def _external_policy_out(
+    db: Session, site_id: int, *, expired_suggestions: int = 0
+) -> ExternalLinkPolicyOut:
+    state = policy_state(db, site_id)
+    stored = db.get(ExternalLinkPolicy, site_id)
+    return ExternalLinkPolicyOut(
+        **state.as_payload(),
+        updated_by=stored.updated_by if stored is not None else None,
+        updated_at=stored.updated_at if stored is not None else None,
+        expired_suggestions=expired_suggestions,
+    )
 def _first_error(exc: ValidationError) -> str:
     """Flatten a row's validation failure into one reviewer-readable line."""
     error = exc.errors()[0]
@@ -114,12 +163,29 @@ def _latest_analyses(db: Session, site_ids: list[int]) -> dict[int, JobRun]:
     return {run.site_id: run for run in runs}
 
 
-def _suggestion_mode_state(_site: Site) -> SiteSuggestionModeState:
-    return SiteSuggestionModeState(
-        suggestion_mode="experimental",
-        suggestion_mode_managed=True,
-        suggestion_comparison_enabled=False,
+def _latest_ingestions(db: Session, site_ids: list[int]) -> dict[int, IngestionRun]:
+    """The newest crawl per listed site in one query, not one query per row."""
+    if not site_ids:
+        return {}
+    ranked = (
+        select(
+            IngestionRun.id.label("run_id"),
+            func.row_number()
+            .over(
+                partition_by=IngestionRun.site_id,
+                order_by=(IngestionRun.started_at.desc(), IngestionRun.id.desc()),
+            )
+            .label("position"),
+        )
+        .where(IngestionRun.site_id.in_(site_ids))
+        .subquery()
     )
+    runs = db.scalars(
+        select(IngestionRun)
+        .join(ranked, ranked.c.run_id == IngestionRun.id)
+        .where(ranked.c.position == 1)
+    ).all()
+    return {run.site_id: run for run in runs}
 
 
 def _site_out(
@@ -132,10 +198,6 @@ def _site_out(
     analysis: JobRun | None = None,
 ) -> SiteOut:
     item = SiteOut.model_validate(site)
-    mode = _suggestion_mode_state(site)
-    item.suggestion_mode = mode.suggestion_mode
-    item.suggestion_mode_managed = mode.suggestion_mode_managed
-    item.suggestion_comparison_enabled = mode.suggestion_comparison_enabled
     site_capacity = min(
         article_count * settings.hybrid_max_suggestions_per_article,
         settings.hybrid_max_active_suggestions_per_site,
@@ -155,10 +217,29 @@ def _site_out(
 
 
 @router.post("", status_code=201, response_model=SiteOut)
-def create_site(payload: SiteCreate, db: Session = Depends(get_db)) -> Site:
-    if db.scalar(select(Site).where(Site.base_url == payload.base_url)):
+def create_site(
+    payload: SiteCreate,
+    tenant_id: int | None = Query(None, ge=1),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> Site:
+    owner_tenant_id = resolve_create_tenant_id(db, principal, tenant_id=tenant_id)
+    require_creatable_platform(principal, payload.platform)
+    # Scoped to the owner: a URL another tenant already holds is not this
+    # tenant's conflict, and reporting it would expose their inventory.
+    if db.scalar(
+        select(Site.id).where(
+            Site.base_url == payload.base_url,
+            Site.tenant_id == owner_tenant_id,
+        )
+    ):
         raise HTTPException(409, DUPLICATE_REASON)
-    site = Site(**payload.model_dump())
+    if payload.platform != "pool":
+        try:
+            require_no_pbn_conflict(db, payload.base_url, as_pool=False)
+        except PoolSourcePolicyError as error:
+            raise HTTPException(409, str(error)) from error
+    site = Site(**payload.model_dump(), tenant_id=owner_tenant_id)
     db.add(site)
     db.commit()
     db.refresh(site)
@@ -166,7 +247,12 @@ def create_site(payload: SiteCreate, db: Session = Depends(get_db)) -> Site:
 
 
 @router.post("/bulk", response_model=SiteBulkResult)
-def bulk_create_sites(payload: SiteBulkRequest, db: Session = Depends(get_db)) -> SiteBulkResult:
+def bulk_create_sites(
+    payload: SiteBulkRequest,
+    tenant_id: int | None = Query(None, ge=1),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> SiteBulkResult:
     """Create many sites in one request, reporting the outcome of every row.
 
     Partial success is the contract: a row that fails validation or collides with an
@@ -177,6 +263,7 @@ def bulk_create_sites(payload: SiteBulkRequest, db: Session = Depends(get_db)) -
     skipped: list[SiteBulkFailure] = []
     rejected: list[SiteBulkFailure] = []
     seen: set[str] = set()
+    owner_tenant_id = resolve_create_tenant_id(db, principal, tenant_id=tenant_id)
 
     for index, row in enumerate(payload.sites, start=1):
         try:
@@ -186,6 +273,12 @@ def bulk_create_sites(payload: SiteBulkRequest, db: Session = Depends(get_db)) -
                 SiteBulkFailure(row=index, base_url=row.base_url, reason=_first_error(exc))
             )
             continue
+
+        # Checked against the validated row, not the raw one, so a differently
+        # cased "POOL" cannot slip past. Authorization aborts the whole upload
+        # rather than reporting a skipped row: nothing is committed until the
+        # end of the loop, so the batch lands all-or-nothing on this path.
+        require_creatable_platform(principal, item.platform)
 
         # `item.base_url` is normalized by SiteCreate, so both checks compare like for like.
         if item.base_url in seen:
@@ -199,13 +292,27 @@ def bulk_create_sites(payload: SiteBulkRequest, db: Session = Depends(get_db)) -
             continue
         seen.add(item.base_url)
 
-        if db.scalar(select(Site.id).where(Site.base_url == item.base_url)):
+        if db.scalar(
+            select(Site.id).where(
+                Site.base_url == item.base_url,
+                Site.tenant_id == owner_tenant_id,
+            )
+        ):
             skipped.append(
                 SiteBulkFailure(row=index, base_url=item.base_url, reason=DUPLICATE_REASON)
             )
             continue
 
-        site = Site(**item.model_dump())
+        if item.platform != "pool":
+            try:
+                require_no_pbn_conflict(db, item.base_url, as_pool=False)
+            except PoolSourcePolicyError as error:
+                rejected.append(
+                    SiteBulkFailure(row=index, base_url=item.base_url, reason=str(error))
+                )
+                continue
+
+        site = Site(**item.model_dump(), tenant_id=owner_tenant_id)
         try:
             with db.begin_nested():
                 db.add(site)
@@ -228,32 +335,115 @@ def bulk_create_sites(payload: SiteBulkRequest, db: Session = Depends(get_db)) -
 def list_sites(
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
+    search: str | None = Query(None, min_length=1, max_length=255),
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> list[SiteOut]:
-    sites = db.scalars(select(Site).order_by(Site.id).limit(limit).offset(offset)).all()
+    query = select(Site)
+    readable = readable_site_filter(principal)
+    if readable is not None:
+        query = query.where(readable)
+    if search:
+        pattern = f"%{search.strip()}%"
+        query = query.where(
+            Site.name.ilike(pattern) | Site.base_url.ilike(pattern) | Site.platform.ilike(pattern)
+        )
+    sites = db.scalars(query.order_by(Site.id).limit(limit).offset(offset)).all()
     article_counts, internal_link_counts, active_suggestion_counts = _site_counts(
         db, [site.id for site in sites]
     )
     analyses = _latest_analyses(db, [site.id for site in sites])
+    ingestions = _latest_ingestions(db, [site.id for site in sites])
     out = []
     for site in sites:
-        run = latest_run(db, site.id)
         out.append(
             _site_out(
                 site,
                 article_count=article_counts.get(site.id, 0),
                 internal_link_count=internal_link_counts.get(site.id, 0),
                 active_suggestion_count=active_suggestion_counts.get(site.id, 0),
-                run=run,
+                run=ingestions.get(site.id),
                 analysis=analyses.get(site.id),
             )
         )
     return out
 
 
-@router.get("/{site_id}", response_model=SiteOut)
-def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
-    site = _get_site_or_404(db, site_id)
+@router.get("/{site_id}/external-link-policy", response_model=ExternalLinkPolicyOut)
+def get_external_link_policy(
+    site: Site = Depends(require_site_read), db: Session = Depends(get_db)
+) -> ExternalLinkPolicyOut:
+    _managed_site_or_409(site)
+    return _external_policy_out(db, site.id)
+
+
+@router.put("/{site_id}/external-link-policy", response_model=ExternalLinkPolicyOut)
+def update_external_link_policy(
+    payload: ExternalLinkPolicyUpdate,
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+    operator_id: str = Depends(get_audit_actor),
+) -> ExternalLinkPolicyOut:
+    _managed_site_or_409(site)
+    policy = db.get(ExternalLinkPolicy, site.id)
+    if policy is None:
+        policy = ExternalLinkPolicy(site_id=site.id)
+        db.add(policy)
+    for field, value in payload.model_dump().items():
+        setattr(policy, field, value)
+    policy.updated_by = operator_id
+    db.flush()
+    expired = expire_ineligible_external_suggestions(db, site, actor=operator_id)
+    db.commit()
+    db.refresh(policy)
+    return _external_policy_out(db, site.id, expired_suggestions=expired)
+
+
+@router.get(
+    "/{site_id}/external-link-policy/sources",
+    response_model=ExternalSourceEvaluationList,
+)
+def list_external_source_evaluations(
+    site: Site = Depends(require_site_read), db: Session = Depends(get_db)
+) -> ExternalSourceEvaluationList:
+    _managed_site_or_409(site)
+    return ExternalSourceEvaluationList(items=source_evaluations(db, site))
+
+
+def _editorial_policy_out(site: Site) -> EditorialRankingPolicyOut:
+    return EditorialRankingPolicyOut(
+        site_id=site.id,
+        enabled=site.editorial_feedback_enabled,
+        min_score_percent=site.editorial_min_score_percent,
+        feedback_weight=site.editorial_feedback_weight,
+        min_samples=site.editorial_feedback_min_samples,
+    )
+
+
+@router.get("/{site_id}/editorial-ranking-policy", response_model=EditorialRankingPolicyOut)
+def get_editorial_ranking_policy(
+    site: Site = Depends(require_site_read),
+) -> EditorialRankingPolicyOut:
+    return _editorial_policy_out(_managed_site_or_409(site))
+
+
+@router.put("/{site_id}/editorial-ranking-policy", response_model=EditorialRankingPolicyOut)
+def update_editorial_ranking_policy(
+    payload: EditorialRankingPolicyUpdate,
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> EditorialRankingPolicyOut:
+    _managed_site_or_409(site)
+    site.editorial_feedback_enabled = payload.enabled
+    site.editorial_min_score_percent = payload.min_score_percent
+    site.editorial_feedback_weight = payload.feedback_weight
+    site.editorial_feedback_min_samples = payload.min_samples
+    db.commit()
+    db.refresh(site)
+    return _editorial_policy_out(site)
+
+
+def _fresh_site_out(db: Session, site: Site) -> SiteOut:
     article_counts, internal_link_counts, active_suggestion_counts = _site_counts(db, [site.id])
     run = latest_run(db, site.id)
     return _site_out(
@@ -266,49 +456,92 @@ def get_site(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
     )
 
 
-@router.post("/{site_id}/pool-source/approval", response_model=SiteOut)
-def approve_pool_source(
+@router.get(
+    "/{site_id}/pool-source/audit-events",
+    response_model=list[PoolSourceAuditEventOut],
+)
+def list_pool_source_audit_events(
     site_id: int,
-    payload: PoolSourceApproval,
+    principal: Principal = Depends(require_api_key),
+    limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[PoolSourceAuditEvent]:
+    # The audit trail intentionally survives site deletion (traceability), so
+    # keep reading it for a missing site — but only for a principal broad
+    # enough that its ownership cannot be checked against a deleted site.
+    site = db.get(Site, site_id)
+    if site is not None:
+        authorize_site_read(db, principal, site.id)
+    elif not principal.is_admin:
+        raise HTTPException(status_code=403, detail="access denied for this site")
+    return db.scalars(
+        select(PoolSourceAuditEvent)
+        .where(PoolSourceAuditEvent.site_id == site_id)
+        .order_by(PoolSourceAuditEvent.created_at.desc(), PoolSourceAuditEvent.id.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+
+@router.get("/{site_id}", response_model=SiteOut)
+def get_site(
+    site: Site = Depends(require_site_read),
     db: Session = Depends(get_db),
 ) -> SiteOut:
-    site = _get_site_or_404(db, site_id)
+    return _fresh_site_out(db, site)
+
+
+@router.post("/{site_id}/pool-source/approval", response_model=SiteOut)
+def approve_pool_source(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+    operator_id: str = Depends(require_operator_identity),
+) -> SiteOut:
     if site.platform != "pool":
-        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+        raise HTTPException(409, f"site {site.id} is not a content-pool source")
     try:
         require_allowed_pool_domain(site.base_url)
+        require_no_pbn_conflict(db, site.base_url, as_pool=True)
     except PoolSourcePolicyError as error:
         raise HTTPException(409, str(error)) from error
     site.pool_source_approved = True
     site.pool_source_approved_at = datetime.now(UTC)
-    site.pool_source_approved_by = payload.approved_by
+    site.pool_source_approved_by = operator_id
+    record_pool_source_audit_event(db, site, "approved", operator_id)
     db.commit()
-    return get_site(site_id, db)
+    db.refresh(site)
+    return _fresh_site_out(db, site)
 
 
 @router.delete("/{site_id}/pool-source/approval", response_model=SiteOut)
-def revoke_pool_source_approval(site_id: int, db: Session = Depends(get_db)) -> SiteOut:
-    site = _get_site_or_404(db, site_id)
+def revoke_pool_source_approval(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+    operator_id: str = Depends(require_operator_identity),
+) -> SiteOut:
     if site.platform != "pool":
-        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+        raise HTTPException(409, f"site {site.id} is not a content-pool source")
     site.pool_source_approved = False
     site.pool_source_approved_at = None
     site.pool_source_approved_by = None
+    expire_pool_target_suggestions(db, site.id, reason="revoked")
+    record_pool_source_audit_event(db, site, "revoked", operator_id)
     db.commit()
-    return get_site(site_id, db)
+    db.refresh(site)
+    return _fresh_site_out(db, site)
 
 
 @router.post("/{site_id}/pool-source/reactivate", response_model=SiteOut)
 def reactivate_pool_source(
-    site_id: int,
-    payload: PoolSourceReactivation,
+    site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
+    operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
-    site = _get_site_or_404(db, site_id)
     if site.platform != "pool":
-        raise HTTPException(409, f"site {site_id} is not a content-pool source")
+        raise HTTPException(409, f"site {site.id} is not a content-pool source")
     if not site.pool_source_approved:
-        raise HTTPException(409, f"pool source site {site_id} must be approved first")
+        raise HTTPException(409, f"pool source site {site.id} must be approved first")
     try:
         require_allowed_pool_domain(site.base_url)
     except PoolSourcePolicyError as error:
@@ -318,41 +551,86 @@ def reactivate_pool_source(
     site.pool_source_quarantined_at = None
     site.pool_source_quarantine_reason = None
     site.pool_source_last_reactivated_at = datetime.now(UTC)
-    site.pool_source_last_reactivated_by = payload.reactivated_by
+    site.pool_source_last_reactivated_by = operator_id
+    record_pool_source_audit_event(db, site, "reactivated", operator_id)
     db.commit()
-    return get_site(site_id, db)
+    db.refresh(site)
+    return _fresh_site_out(db, site)
 
 
-@router.put("/{site_id}/suggestion-mode", response_model=SiteSuggestionModeState)
-def update_suggestion_mode(
-    site_id: int,
-    payload: SiteSuggestionModeUpdate,
+@router.put("/{site_id}/credentials", response_model=SiteOut)
+def set_wordpress_credentials(
+    payload: SiteCredentials,
+    site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
-) -> SiteSuggestionModeState:
-    _get_site_or_404(db, site_id)
-    raise HTTPException(
-        409,
-        "Hybrid/BM25 is the global suggestion method and cannot be changed per site",
-    )
+) -> SiteOut:
+    """Give an existing site a WordPress account, or replace the one it has.
+
+    Creation is the only other place a credential can be set, so before this an
+    application password that was revoked, rotated, or simply never supplied
+    left the site permanently unable to publish: the only route back was
+    deleting the site and losing its articles, links, and review history.
+
+    Replacing is deliberately the same call as setting. WordPress hashes an
+    application password, so the old value cannot be read back and compared, and
+    a "change" that had to prove the previous value would be unusable exactly
+    when it is needed — after the old one stopped working.
+    """
+    if site.platform != "wordpress":
+        raise HTTPException(409, "WordPress credentials are only valid for WordPress sites")
+    site.wp_username = payload.wp_username
+    site.wp_app_password = payload.wp_app_password
+    db.commit()
+    db.refresh(site)
+    return _fresh_site_out(db, site)
+
+
+@router.delete("/{site_id}/credentials", response_model=SiteOut)
+def clear_wordpress_credentials(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    """Detach the account without deleting the site.
+
+    The site keeps crawling public pages; it stops being publishable, and the
+    queue says so before anyone prepares edits for it.
+    """
+    site.wp_username = None
+    site.wp_app_password = None
+    db.commit()
+    db.refresh(site)
+    return _fresh_site_out(db, site)
 
 
 @router.delete("/{site_id}", status_code=204)
-def delete_site(site_id: int, db: Session = Depends(get_db)) -> None:
-    db.delete(_get_site_or_404(db, site_id))  # ON DELETE CASCADE takes everything else
+def delete_site(
+    confirm_name: str = Query(
+        ...,
+        min_length=1,
+        description="Must exactly match the site name; stops accidental and CSRF-driven deletes.",
+    ),
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> None:
+    if confirm_name != site.name:
+        raise HTTPException(
+            409,
+            "confirm_name must exactly match the site name",
+        )
+    db.delete(site)  # ON DELETE CASCADE takes everything else
     db.commit()
 
 
 @router.get("/{site_id}/articles", response_model=list[ArticleOut])
 def list_articles(
-    site_id: int,
+    site: Site = Depends(require_site_read),
     orphans: bool = False,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[Article]:
-    _get_site_or_404(db, site_id)
     query = select(Article).where(
-        Article.site_id == site_id,
+        Article.site_id == site.id,
         Article.is_active.is_(True),
     )
     if orphans:  # Expired links do not count (Phase 0, finding 3).

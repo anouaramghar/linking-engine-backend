@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic-settings>=2.4",
+    "cryptography>=43.0",
     # Database
     "sqlalchemy>=2.0",
     "alembic>=1.13",
@@ -28,7 +29,6 @@ ml = [
     # Heavy ML stack — install with: uv sync --extra ml
     "sentence-transformers>=3.0",
     "torch>=2.4",
-    "torch-geometric>=2.6",
 ]
 
 [dependency-groups]
