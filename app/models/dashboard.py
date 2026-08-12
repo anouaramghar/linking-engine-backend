@@ -7,7 +7,7 @@ holding full access. See ``docs/design/dashboard-authentication.md``.
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -36,6 +36,16 @@ class DashboardUser(Base):
     display_name: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(
         DashboardUserStatus, default="pending", server_default="pending", index=True
+    )
+    #: Whether this person may admit and remove other people.
+    #:
+    #: Approval used to be the only gate, which made every approved account an
+    #: approver. The team lead asked for one privileged group instead: everyone
+    #: approved still sees the whole dashboard, but only an admin may approve,
+    #: revoke, or promote. Deliberately a flag rather than a role table — one
+    #: group is the whole hierarchy that was asked for.
+    is_admin: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
     )
     requested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

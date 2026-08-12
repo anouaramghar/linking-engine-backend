@@ -206,8 +206,30 @@ def test_bootstrap_admin_is_pre_approved_and_idempotent(db, monkeypatch):
 
     assert first is not None and first.status == "approved"
     assert first.approved_by == "bootstrap"
+    assert first.is_admin is True
     assert second is not None and second.id == first.id
     assert db.query(DashboardUser).count() == 1
+
+
+def test_bootstrap_restores_admin_rights_to_an_already_approved_account(db, monkeypatch):
+    """The way back into a deployment whose last admin was demoted."""
+    monkeypatch.setattr(settings, "dashboard_bootstrap_admin_id", 777)
+    user = dashboard_auth.ensure_bootstrap_admin(db)
+    dashboard_auth.set_admin(db, user, False)
+    db.commit()
+
+    assert dashboard_auth.ensure_bootstrap_admin(db).is_admin is True
+
+
+def test_only_admins_are_told_about_a_new_request(db):
+    approver = _request(db, 111)
+    dashboard_auth.approve_user(db, approver, approved_by="bootstrap")
+    dashboard_auth.set_admin(db, approver, True)
+    bystander = _request(db, 222)
+    dashboard_auth.approve_user(db, bystander, approved_by="111")
+    db.commit()
+
+    assert dashboard_auth.admin_telegram_ids(db) == [111]
 
 
 def test_bootstrap_promotes_pending_but_never_revoked_user(db, monkeypatch):

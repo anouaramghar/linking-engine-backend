@@ -36,11 +36,16 @@ def configure_login(db, monkeypatch):
     wipe()
 
 
-def _login_as(client: TestClient, db, telegram_id: int = 4242) -> str:
-    """Drive the full flow and return the session cookie."""
+def _login_as(client: TestClient, db, telegram_id: int = 4242, admin: bool = True) -> str:
+    """Drive the full flow and return the session cookie.
+
+    Signed in as an admin unless a test is specifically about what an ordinary
+    approved account may do — approve and revoke belong to the admin group.
+    """
     user, code = dashboard_auth.create_login_code(db, telegram_id)
     assert code is None
     dashboard_auth.approve_user(db, user, approved_by="bootstrap")
+    dashboard_auth.set_admin(db, user, admin)
     db.commit()
     _user, code = dashboard_auth.create_login_code(db, telegram_id)
     db.commit()
@@ -142,6 +147,68 @@ def test_admission_routes_require_a_session(client):
     assert client.get("/api/v1/auth/users").status_code == 401
     assert client.post("/api/v1/auth/users/1/approve").status_code == 401
     assert client.post("/api/v1/auth/users/1/revoke").status_code == 401
+    assert client.post("/api/v1/auth/users/1/admin").status_code == 401
+    assert client.delete("/api/v1/auth/users/1/admin").status_code == 401
+
+
+def test_an_approved_non_admin_cannot_admit_or_remove_anyone(client, db):
+    """The gate Amir asked to see enforced past the hidden buttons.
+
+    A non-admin holds a perfectly good session, so every one of these requests
+    is authenticated. What stops them is authorization, in the API.
+    """
+    _login_as(client, db, telegram_id=4242, admin=False)
+    newcomer = _request_user(db, 9999)
+
+    assert client.get("/api/v1/auth/users").status_code == 200
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/approve").status_code == 403
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/revoke").status_code == 403
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/admin").status_code == 403
+    assert client.delete(f"/api/v1/auth/users/{newcomer.id}/admin").status_code == 403
+
+    db.refresh(newcomer)
+    assert newcomer.status == "pending"
+
+
+def test_the_roster_says_who_holds_the_keys(client, db):
+    _login_as(client, db, telegram_id=4242)
+    _request_user(db, 9999)
+
+    listed = client.get("/api/v1/auth/users").json()
+
+    assert {row["telegram_id"]: row["is_admin"] for row in listed} == {4242: True, 9999: False}
+
+
+def test_an_admin_can_promote_and_demote_another_account(client, db):
+    _login_as(client, db, telegram_id=4242)
+    newcomer = _request_user(db, 9999)
+
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/admin").status_code == 409
+
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/admin").json()["is_admin"] is True
+    assert client.delete(f"/api/v1/auth/users/{newcomer.id}/admin").json()["is_admin"] is False
+
+
+def test_an_admin_cannot_demote_themselves(client, db):
+    """Same rule as revoking yourself: the last admin out locks the door."""
+    _login_as(client, db, telegram_id=4242)
+    me = client.get("/api/v1/auth/session").json()["user"]["id"]
+
+    assert client.delete(f"/api/v1/auth/users/{me}/admin").status_code == 409
+    assert client.get("/api/v1/auth/session").json()["user"]["is_admin"] is True
+
+
+def test_a_promoted_account_keeps_its_access_when_demoted(client, db):
+    _login_as(client, db, telegram_id=4242)
+    newcomer = _request_user(db, 9999)
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+    client.post(f"/api/v1/auth/users/{newcomer.id}/admin")
+
+    body = client.delete(f"/api/v1/auth/users/{newcomer.id}/admin").json()
+
+    assert body["status"] == "approved"
+    assert body["is_admin"] is False
 
 
 def test_approving_admits_the_next_login(client, db):
@@ -195,6 +262,29 @@ def test_revoking_is_refused_for_your_own_account(client, db):
 
     assert response.status_code == 409
     assert client.get("/api/v1/auth/session").status_code == 200
+
+
+def test_revoking_an_admin_leaves_the_admin_group_alone(client, db):
+    """Suspending access and demoting somebody are two separate decisions.
+
+    Silently dropping the flag would make restoring a colleague a quiet
+    demotion nobody asked for and nobody is told about. "Remove admin" is the
+    action that changes membership, so a revoked admin comes back an admin.
+    """
+    _login_as(client, db, telegram_id=4242)
+    newcomer = _request_user(db, 9999)
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+    client.post(f"/api/v1/auth/users/{newcomer.id}/admin")
+
+    revoked = client.post(f"/api/v1/auth/users/{newcomer.id}/revoke").json()
+
+    assert revoked["status"] == "revoked"
+    assert revoked["is_admin"] is True
+
+    restored = client.post(f"/api/v1/auth/users/{newcomer.id}/approve").json()
+
+    assert restored["status"] == "approved"
+    assert restored["is_admin"] is True
 
 
 def test_revoking_someone_ends_their_open_session(client, db):

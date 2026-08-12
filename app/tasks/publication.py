@@ -42,6 +42,12 @@ from app.connectors.base import StalePlanError
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
 from app.models import Article, JobRun, PublicationPlan, Site, Suggestion, SuggestionEvent
+from app.schemas.publication import (
+    PublicationPreparationError,
+    PublicationPreparationJobLink,
+    PublicationPreparationJobPlan,
+    PublicationPreparationJobResult,
+)
 from app.services.alerts import send_alert
 from app.services.publication_plan_service import (
     MAX_REASON_CHARS,
@@ -111,42 +117,45 @@ def _prepare_publication_plans(
                 )
             ).all()
         )
-        plans = []
-        for plan in preparation.plans:
-            links = [
-                {**item, "placement_context": contexts.get(item["suggestion_id"])}
-                for item in (plan.items or [])
-            ]
-            plans.append(
-                {
-                    "id": plan.id,
-                    "status": plan.status,
-                    "plan_hash": plan.plan_hash,
-                    "source_article_id": plan.source_article_id,
-                    "source_url": plan.source_url,
-                    "links": links,
-                }
+        plans = [
+            PublicationPreparationJobPlan(
+                id=plan.id,
+                status=plan.status,
+                plan_hash=plan.plan_hash,
+                source_article_id=plan.source_article_id,
+                source_url=plan.source_url,
+                links=[
+                    PublicationPreparationJobLink(
+                        **{**item, "placement_context": contexts.get(item["suggestion_id"])}
+                    )
+                    for item in (plan.items or [])
+                ],
             )
+            for plan in preparation.plans
+        ]
         record_progress_durably(
             job_run_id,
             stage="ready",
             completed=len(preparation.plans),
             total=min(max_articles, len(preparation.plans) + len(preparation.errors)),
         )
-        return {
-            "site_id": site_id,
-            "selected_suggestions": preparation.selected_suggestions,
-            "plans": plans,
-            "errors": [
-                {
-                    "source_article_id": error.source_article_id,
-                    "source_url": error.source_url,
-                    "message": error.message,
-                }
+        # Named, validated, and only then serialized. The dashboard reads this
+        # JSON straight out of `JobRun.result`, so the last place a contract
+        # break can be caught cheaply is here, before it is persisted.
+        return PublicationPreparationJobResult(
+            site_id=site_id,
+            selected_suggestions=preparation.selected_suggestions,
+            plans=plans,
+            errors=[
+                PublicationPreparationError(
+                    source_article_id=error.source_article_id,
+                    source_url=error.source_url,
+                    message=error.message,
+                )
                 for error in preparation.errors
             ],
-            "has_more": preparation.has_more,
-        }
+            has_more=preparation.has_more,
+        ).model_dump(mode="json")
 
 
 def publish_approved_plans(

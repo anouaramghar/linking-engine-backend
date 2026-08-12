@@ -74,8 +74,21 @@ DASHBOARD_BOOTSTRAP_ADMIN_ID=123456789
 ```
 
 The bootstrap ID only promotes a pending user; restarting cannot restore a revoked operator.
-Approved dashboard users intentionally have full internal access. Keep the service behind
-the IP-restricted firewall; login is the second layer, not a replacement for the firewall.
+
+One privileged **admin group** owns access management. Only its members may approve or
+revoke an account, or add and remove admin rights, and every one of those routes depends
+on `require_dashboard_admin` — the restriction is enforced by the backend and returns 403,
+not merely hidden in the dashboard. An admin cannot revoke or demote themselves, because
+that leaves a dashboard nobody can admit anyone into.
+
+Approved dashboard users intentionally have full internal access to everything else. That
+is the whole of the difference: the admin group is about who may hand out access, not
+about which sites or data a signed-in operator can reach. Revoking an account suspends its
+access and leaves its admin membership alone, so restoring it restores the same
+membership; removing admin rights is the separate action that changes it.
+
+Keep the service behind the IP-restricted firewall; login is the second layer, not a
+replacement for the firewall.
 
 Per-site API keys remain available for limiting credential blast radius. They are not a
 human login or a client-isolation boundary. Content-pool sites remain admin-only even when

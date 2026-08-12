@@ -175,10 +175,16 @@ class SiteOut(BaseModel):
     has_wordpress_credentials: bool = False
     created_at: datetime
     last_ingestion_status: str | None = None
+    #: Why the last crawl failed, in the crawler's own words. Carried on the
+    #: list row so a failed site can say what went wrong where it is shown,
+    #: instead of sending the operator to the engine logs. Trimmed, because a
+    #: stack-trace-length message on every row is payload nobody reads.
+    last_ingestion_error: str | None = None
     # Last *finished* analysis, so a crawled site reads differently from an
     # analysed one once both jobs have left the active feed.
     last_analysis_status: str | None = None
     last_analysis_at: datetime | None = None
+    last_analysis_error: str | None = None
     article_count: int = 0
     internal_link_count: int = 0
     last_crawl_at: datetime | None = None

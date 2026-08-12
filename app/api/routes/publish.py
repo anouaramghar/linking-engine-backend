@@ -149,9 +149,11 @@ def pending_publication_site(
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> PendingPublicationSite:
-    row = db.execute(
-        _pending_publication_query(principal).where(Site.id == site_id)
-    ).mappings().first()
+    row = (
+        db.execute(_pending_publication_query(principal).where(Site.id == site_id))
+        .mappings()
+        .first()
+    )
     if row is None:
         raise HTTPException(404, "this site has no publication work waiting")
     return PendingPublicationSite.model_validate(dict(row))
@@ -187,7 +189,9 @@ def prepare_publication_plans_async(
         if error.run.requested_by == operator_id and error.run.queue_job_id:
             run = error.run
         else:
-            raise HTTPException(409, "this site is already being prepared by another operator") from error
+            raise HTTPException(
+                409, "this site is already being prepared by another operator"
+            ) from error
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 

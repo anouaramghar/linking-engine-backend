@@ -107,7 +107,7 @@ def handle_update(db, update: dict) -> list[Reply]:
     # `notified_at` column; add it if the repeats ever become noise.
     notice = NEW_REQUEST.format(who=dashboard_auth.describe_user(user))
     return [Reply(chat_id, PENDING)] + [
-        Reply(approver_id, notice) for approver_id in dashboard_auth.approved_telegram_ids(db)
+        Reply(approver_id, notice) for approver_id in dashboard_auth.admin_telegram_ids(db)
     ]
 
 

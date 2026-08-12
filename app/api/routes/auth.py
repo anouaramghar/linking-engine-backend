@@ -65,6 +65,19 @@ def require_dashboard_session(
     return user
 
 
+def require_dashboard_admin(
+    user: DashboardUser = Depends(require_dashboard_session),
+) -> DashboardUser:
+    """A dashboard user who is also in the admin group, or 403.
+
+    The gate lives here rather than in the browser. Hiding the buttons from a
+    non-admin is a courtesy; this is the part that decides.
+    """
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="dashboard admin required")
+    return user
+
+
 @router.post("/login/start", response_model=LoginStartOut)
 def start_login(db: Session = Depends(get_db)) -> LoginStartOut:
     if not dashboard_auth.dashboard_login_configured():
@@ -118,9 +131,10 @@ def logout(
 
 
 # --------------------------------------------------------------------------
-# Admission. Every approved user may admit others: the team lead specified
-# "full access once approved, no per-person scoping needed", so there is no
-# narrower role to check against.
+# Admission. Approval still grants the whole dashboard — there is no per-page
+# scoping — but admitting and removing people belongs to the admin group alone.
+# Listing stays open to any approved user so the roster is readable; only the
+# controls that change it are privileged.
 # --------------------------------------------------------------------------
 
 
@@ -150,7 +164,7 @@ def _target_user(db: Session, user_id: int) -> DashboardUser:
 @router.post("/users/{user_id}/approve", response_model=DashboardUserOut)
 def approve_dashboard_user(
     user_id: int,
-    approver: DashboardUser = Depends(require_dashboard_session),
+    approver: DashboardUser = Depends(require_dashboard_admin),
     db: Session = Depends(get_db),
 ) -> DashboardUser:
     user = _target_user(db, user_id)
@@ -169,15 +183,54 @@ def approve_dashboard_user(
 @router.post("/users/{user_id}/revoke", response_model=DashboardUserOut)
 def revoke_dashboard_user(
     user_id: int,
-    approver: DashboardUser = Depends(require_dashboard_session),
+    approver: DashboardUser = Depends(require_dashboard_admin),
     db: Session = Depends(get_db),
 ) -> DashboardUser:
     user = _target_user(db, user_id)
     if user.id == approver.id:
-        # Locking yourself out is recoverable only by another approved user, and
+        # Locking yourself out is recoverable only by another admin, and
         # possibly by nobody at all if you were the last one.
         raise HTTPException(status_code=409, detail="cannot revoke your own access")
     dashboard_auth.revoke_user(db, user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.post("/users/{user_id}/admin", response_model=DashboardUserOut)
+def grant_dashboard_admin(
+    user_id: int,
+    _: DashboardUser = Depends(require_dashboard_admin),
+    db: Session = Depends(get_db),
+) -> DashboardUser:
+    """Add somebody to the admin group. Only an admin may.
+
+    An account has to be inside before it can hold the keys, so this refuses a
+    pending or revoked user rather than silently arming a flag that takes effect
+    at some later approval nobody connects to this action.
+    """
+    user = _target_user(db, user_id)
+    if user.status != "approved":
+        raise HTTPException(status_code=409, detail="approve this account before making it admin")
+    dashboard_auth.set_admin(db, user, True)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.delete("/users/{user_id}/admin", response_model=DashboardUserOut)
+def revoke_dashboard_admin(
+    user_id: int,
+    approver: DashboardUser = Depends(require_dashboard_admin),
+    db: Session = Depends(get_db),
+) -> DashboardUser:
+    """Remove somebody from the admin group, leaving their access untouched."""
+    user = _target_user(db, user_id)
+    if user.id == approver.id:
+        # Same rule as revoking yourself, and for the same reason: the last
+        # admin demoting themselves leaves a dashboard nobody can admit into.
+        raise HTTPException(status_code=409, detail="cannot remove your own admin rights")
+    dashboard_auth.set_admin(db, user, False)
     db.commit()
     db.refresh(user)
     return user

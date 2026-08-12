@@ -765,11 +765,7 @@ def load_approved_plans(
     )
     if plan_ids is not None:
         query = query.where(PublicationPlan.id.in_(plan_ids))
-    return list(
-        db.scalars(
-            query.order_by(PublicationPlan.id)
-        ).all()
-    )
+    return list(db.scalars(query.order_by(PublicationPlan.id)).all())
 
 
 def mark_stale(db: Session, plan: PublicationPlan, reason: str) -> None:

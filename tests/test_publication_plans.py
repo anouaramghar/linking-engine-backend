@@ -13,6 +13,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import null
 from sqlalchemy.exc import IntegrityError, StatementError
 
@@ -22,7 +23,14 @@ from app.api.deps import require_api_key
 from app.db import SessionLocal
 from app.main import app
 from app.models import Article, PublicationPlan, Site, Suggestion
+from app.schemas.publication import (
+    PublicationPreparationError,
+    PublicationPreparationJobLink,
+    PublicationPreparationJobPlan,
+    PublicationPreparationJobResult,
+)
 from app.services import publication_plan_service
+from app.tasks.publication import _prepare_publication_plans
 from app.services.authorization import Principal, ensure_default_tenant
 from app.services.publication_plan_service import (
     PlanIntegrityError,
@@ -842,9 +850,7 @@ def test_queueing_a_site_with_an_approved_plan_is_accepted(client, db, site, art
     assert client.post(f"/api/v1/publish/{site.id}").status_code == 202
 
 
-def test_queueing_can_name_only_the_visible_approved_plans(
-    client, db, site, articles, monkeypatch
-):
+def test_queueing_can_name_only_the_visible_approved_plans(client, db, site, articles, monkeypatch):
     _, plan = _prepared(client, db, site, articles, monkeypatch)
     _approve(client, site, [plan])
     captured = {}
@@ -862,6 +868,74 @@ def test_queueing_can_name_only_the_visible_approved_plans(
 
     assert response.status_code == 202
     assert captured == {"plan_ids": [plan["id"]]}
+
+
+def test_a_body_less_queue_request_recovers_all_and_only_this_site_s_approved_plans(
+    db, site, articles
+):
+    """The reload path: a browser that no longer knows which plans it approved.
+
+    Omitting `plan_ids` is not "queue whatever is lying around". It is the
+    documented site-wide recovery, so the cohort handed to the worker has to be
+    every approved plan of *this* site and nothing else — not a plan that was
+    only prepared, and not another site's approved work.
+    """
+    approved = _plan(db, site, articles[0], status="approved")
+    prepared_only = _plan(db, site, articles[1], status="prepared")
+    tenant = ensure_default_tenant(db)
+    neighbour = Site(
+        name="neighbour-site",
+        base_url=f"https://neighbour-{uuid.uuid4().hex[:8]}.example.com",
+        platform="wordpress",
+        wp_username="editor",
+        tenant_id=tenant.id,
+    )
+    db.add(neighbour)
+    db.commit()
+    db.refresh(neighbour)
+    neighbour_article = Article(
+        site_id=neighbour.id,
+        url=f"{neighbour.base_url}/src",
+        title="src",
+        content_text="a",
+    )
+    db.add(neighbour_article)
+    db.commit()
+    db.refresh(neighbour_article)
+    try:
+        elsewhere = _plan(db, neighbour, neighbour_article, status="approved")
+
+        recovered = publication_plan_service.load_approved_plans(db, site.id)
+
+        assert [plan.id for plan in recovered] == [approved.id]
+        assert prepared_only.id not in {plan.id for plan in recovered}
+        assert elsewhere.id not in {plan.id for plan in recovered}
+    finally:
+        db.delete(neighbour)
+        db.commit()
+
+
+def test_a_body_less_queue_request_names_no_plan_ids_for_the_worker(
+    client, db, site, articles, monkeypatch
+):
+    """Recovery is a site-wide job, so it must not pin a stale id list.
+
+    The browser reaching this path is exactly the one that has forgotten which
+    plans it approved; sending a guess would 409 on every plan it got wrong.
+    """
+    _plan(db, site, articles[0], status="approved")
+    captured: dict = {"task_kwargs": "unset"}
+
+    def enqueue(_db, _site_id, _kind, _task, job_timeout, task_kwargs=None):
+        captured["task_kwargs"] = task_kwargs
+        return SimpleNamespace(id=124, queue_job_id="publication-124")
+
+    monkeypatch.setattr("app.api.routes.publish.enqueue_job", enqueue)
+
+    response = client.post(f"/api/v1/publish/{site.id}")
+
+    assert response.status_code == 202
+    assert captured["task_kwargs"] is None
 
 
 def test_database_admin_key_is_not_a_human_approval_identity(
@@ -957,7 +1031,9 @@ def test_async_preparation_is_owned_and_queued(client, site, monkeypatch):
 
     def enqueue(*args, **kwargs):
         captured.update({"args": args, **kwargs})
-        return SimpleNamespace(id=42, queue_job_id="prepare-job", requested_by=kwargs["requested_by"])
+        return SimpleNamespace(
+            id=42, queue_job_id="prepare-job", requested_by=kwargs["requested_by"]
+        )
 
     monkeypatch.setattr("app.api.routes.publish.enqueue_job", enqueue)
 
@@ -968,6 +1044,158 @@ def test_async_preparation_is_owned_and_queued(client, site, monkeypatch):
     assert captured["args"][2] == "publication_preparation"
     assert captured["requested_by"]
     assert captured["task_kwargs"] == {"max_articles": 10}
+
+
+# -- the asynchronous result is a contract, not a loose dictionary -----------
+
+
+def test_the_async_preparation_result_carries_everything_the_review_reads():
+    """The worker's whole output, validated the way the worker builds it.
+
+    The dashboard reads this JSON straight out of `JobRun.result`, so anything
+    it needs — the passage under each link, the articles left out, and the two
+    counts a batch must never conflate — has to survive `model_dump`.
+    """
+    result = PublicationPreparationJobResult(
+        site_id=4,
+        selected_suggestions=2,
+        plans=[
+            PublicationPreparationJobPlan(
+                id=55,
+                status="prepared",
+                plan_hash="a" * 64,
+                source_article_id=10,
+                source_url="https://example.com/source",
+                links=[
+                    PublicationPreparationJobLink(
+                        position=0,
+                        suggestion_id=1,
+                        target_url="https://example.com/target",
+                        anchor_text="solar panel",
+                        outcome="inserted",
+                        placement_context="solar panel costs",
+                    ),
+                    PublicationPreparationJobLink(
+                        position=1,
+                        suggestion_id=2,
+                        target_url="https://example.com/known",
+                        anchor_text=None,
+                        outcome="already_present",
+                    ),
+                ],
+            )
+        ],
+        errors=[
+            PublicationPreparationError(
+                source_article_id=99,
+                source_url="https://example.com/broken",
+                message="post is gone",
+            )
+        ],
+        has_more=True,
+    )
+
+    payload = result.model_dump(mode="json")
+
+    assert payload["site_id"] == 4
+    assert payload["selected_suggestions"] == 2
+    assert payload["has_more"] is True
+    assert payload["errors"] == [
+        {
+            "source_article_id": 99,
+            "source_url": "https://example.com/broken",
+            "message": "post is gone",
+        }
+    ]
+    assert payload["plans"][0]["links"][0]["placement_context"] == "solar panel costs"
+    # A link with no stored passage says so rather than dropping the field, so
+    # the dashboard never has to tell "absent" from "not sent".
+    assert payload["plans"][0]["links"][1]["placement_context"] is None
+    # The two HTML bodies stay behind their own endpoint: this result is polled
+    # every 1.5 seconds until the job settles.
+    assert "original_html" not in payload["plans"][0]
+    assert "updated_html" not in payload["plans"][0]
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["site_id", "selected_suggestions", "plans", "errors", "has_more"],
+)
+def test_an_incomplete_async_result_cannot_be_built_at_all(missing):
+    """Construction is the runtime boundary, so a broken contract raises here.
+
+    Before this model the worker returned a hand-built dictionary: a renamed or
+    dropped field passed every test and was discovered by an operator looking at
+    an empty review.
+    """
+    fields = {
+        "site_id": 4,
+        "selected_suggestions": 0,
+        "plans": [],
+        "errors": [],
+        "has_more": False,
+    }
+    del fields[missing]
+
+    with pytest.raises(ValidationError):
+        PublicationPreparationJobResult(**fields)
+
+
+def test_an_outcome_outside_the_domain_is_refused_in_the_worker():
+    """`LinkOutcome` is the existing domain enum; this does not restate it."""
+    with pytest.raises(ValidationError):
+        PublicationPreparationJobLink(
+            position=0,
+            suggestion_id=1,
+            target_url="https://example.com/target",
+            anchor_text="anchor",
+            outcome="invented",
+        )
+
+
+def test_the_worker_stores_a_validated_result(db, site, articles, monkeypatch):
+    """End to end: what `_prepare_publication_plans` returns is the model's JSON."""
+    suggestion = _suggestion(db, site, *articles)
+
+    def fake_prepare(_db, _site, *, max_articles, job_run_id=None):
+        plan = _plan(db, site, articles[0])
+        plan.items = [
+            {
+                "position": 0,
+                "suggestion_id": suggestion.id,
+                "target_url": articles[1].url,
+                "anchor_text": "anchor",
+                "outcome": "inserted",
+            }
+        ]
+        db.commit()
+        return SimpleNamespace(
+            plans=[plan],
+            errors=[
+                SimpleNamespace(
+                    source_article_id=99,
+                    source_url="https://example.com/broken",
+                    message="post is gone",
+                )
+            ],
+            selected_suggestions=1,
+            has_more=True,
+        )
+
+    monkeypatch.setattr("app.tasks.publication.prepare_site", fake_prepare)
+    monkeypatch.setattr(
+        "app.tasks.publication.record_progress_durably", lambda *args, **kwargs: None
+    )
+
+    payload = _prepare_publication_plans(site.id)
+
+    # Round-tripping it proves the stored JSON still satisfies the contract the
+    # dashboard was typed against.
+    assert PublicationPreparationJobResult.model_validate(payload).site_id == site.id
+    assert payload["selected_suggestions"] == 1
+    assert payload["has_more"] is True
+    assert payload["plans"][0]["links"][0]["outcome"] == "inserted"
+    assert payload["errors"][0]["message"] == "post is gone"
 
 
 def test_exact_html_is_loaded_separately(client, db, site, articles, monkeypatch):

@@ -330,14 +330,33 @@ def approve_user(db: Session, user: DashboardUser, approved_by: str) -> Dashboar
     return user
 
 
-def approved_telegram_ids(db: Session) -> list[int]:
+def set_admin(db: Session, user: DashboardUser, is_admin: bool) -> DashboardUser:
+    """Move a person in or out of the privileged group. Caller commits.
+
+    Admission is a separate axis: promoting somebody does not admit them, and an
+    account that is not approved holds no power from this flag alone.
+    """
+    user.is_admin = is_admin
+    logger.info(
+        "dashboard_admin_changed",
+        extra={"telegram_id": user.telegram_id, "is_admin": is_admin},
+    )
+    return user
+
+
+def admin_telegram_ids(db: Session) -> list[int]:
     """Everyone who can admit a newcomer — the only people worth telling.
 
-    There are no roles: approval is the only gate, so every approved user is a
-    potential approver and hears about every request.
+    Approval alone no longer carries that power, so an approved non-admin is not
+    notified about a request they could not act on.
     """
     return list(
-        db.scalars(select(DashboardUser.telegram_id).where(DashboardUser.status == "approved"))
+        db.scalars(
+            select(DashboardUser.telegram_id).where(
+                DashboardUser.status == "approved",
+                DashboardUser.is_admin.is_(True),
+            )
+        )
     )
 
 
@@ -359,12 +378,16 @@ def revoke_user(db: Session, user: DashboardUser) -> DashboardUser:
 
 
 def ensure_bootstrap_admin(db: Session) -> DashboardUser | None:
-    """Pre-approve the configured Telegram ID.
+    """Pre-approve the configured Telegram ID and put it in the admin group.
 
     Without this the first login is a pending request with nobody able to
     approve it, and the dashboard is unreachable by design. Idempotent, and it
     will promote that ID if it already requested access. A revoked bootstrap
     account stays revoked; restarting the bot must never undo a deliberate ban.
+
+    The admin flag is (re)set even for an account that is already approved: this
+    is the documented way back into a deployment whose last admin was removed,
+    and it is the only path that does not need a database console.
     """
     telegram_id = settings.dashboard_bootstrap_admin_id
     if telegram_id is None:
@@ -376,5 +399,7 @@ def ensure_bootstrap_admin(db: Session) -> DashboardUser | None:
         db.flush()
     if user.status == "pending":
         approve_user(db, user, "bootstrap")
+    if user.status == "approved" and not user.is_admin:
+        set_admin(db, user, True)
     db.commit()
     return user

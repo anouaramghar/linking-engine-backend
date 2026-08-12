@@ -137,6 +137,56 @@ class PlanApprovalResult(BaseModel):
     approved_by: str
 
 
+class PublicationPreparationJobLink(BaseModel):
+    """One link as the asynchronous worker reports it.
+
+    `PlanLink` plus the sentence the link lands in. The passage is not part of
+    the hashed artifact — it is read from the suggestion at preparation time —
+    so it is carried here rather than added to `PlanLink`.
+    """
+
+    position: int
+    suggestion_id: int
+    target_url: str
+    anchor_text: str | None = None
+    outcome: LinkOutcome
+    #: The passage the operator reads instead of raw HTML. Absent when the
+    #: suggestion never carried one.
+    placement_context: str | None = None
+
+
+class PublicationPreparationJobPlan(BaseModel):
+    """One prepared plan, without the two HTML bodies.
+
+    The exact bytes stay behind `GET /publish/{site}/plans/{id}/html`: a batch of
+    ten articles carries megabytes of markup, and a job result is polled every
+    1.5 seconds until it settles.
+    """
+
+    id: int
+    status: str
+    plan_hash: str
+    source_article_id: int
+    source_url: str
+    links: list[PublicationPreparationJobLink]
+
+
+class PublicationPreparationJobResult(BaseModel):
+    """What `prepare_publication_plans` stores in `JobRun.result`.
+
+    The worker used to hand-build anonymous dictionaries here, so a field that
+    drifted from what the dashboard reads was only discovered by an operator
+    looking at a broken review. Constructing this model is the runtime boundary:
+    a malformed result raises in the worker instead of being persisted.
+    """
+
+    site_id: int
+    selected_suggestions: int
+    plans: list[PublicationPreparationJobPlan]
+    errors: list[PublicationPreparationError]
+    has_more: bool
+
+
 class PublicationQueueRequest(BaseModel):
     """The exact approved plans this click is allowed to enqueue."""
 

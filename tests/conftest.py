@@ -201,7 +201,7 @@ def disable_api_key(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def offline_publication_defaults(monkeypatch):
-    """Two things a publication run does to the outside world that tests must not.
+    """External calls a test run must not make unless it opts in explicitly.
 
     The inter-article pause exists to be polite to a customer's host; against a
     mock transport it only adds real seconds. Preflight placement generation
@@ -213,6 +213,7 @@ def offline_publication_defaults(monkeypatch):
     """
     monkeypatch.setattr(settings, "publish_request_delay_seconds", 0.0)
     monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
+    monkeypatch.setattr(settings, "tavily_api_key", "")
 
 
 @pytest.fixture(autouse=True)

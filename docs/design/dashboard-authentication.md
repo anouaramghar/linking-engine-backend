@@ -42,6 +42,17 @@ From the team lead on 2026-08-06, in response to the 2026-08-05 report:
   approve. Explicitly not an allowlist: "not automatic just from being on a list."
 - **No per-person scoping.** "full access once approved... everyone's internal and sees
   everything." Authentication and admission only; no roles.
+
+Amended on 2026-08-11, after the team lead read the live dashboard:
+
+- **One privileged admin group.** Approve and revoke belong to admins alone — "we do have
+  a bigger custom hierarchy system... but given how tight time is right now, keep it
+  simple: limit approve/revoke power to one privileged admin group, nothing more
+  elaborate for now." Everything else stays as above: an approved account still sees the
+  whole dashboard.
+- **Enforced in the API.** "just confirm that's actually enforced on the backend, not just
+  hidden in the UI." `require_dashboard_admin` answers 403 for an approved non-admin; the
+  hidden buttons are only the courtesy on top of it.
 - **Server stays behind the IP-restricted firewall, not public.** "Firewall as the network
   layer, login plus admin approval as the second layer on top."
 - **Scoped API keys stay**, reframed as blast-radius containment rather than client
@@ -98,7 +109,8 @@ less.
 ## Data model
 
 - `dashboard_users` — telegram user ID, username, status (`pending`/`approved`/`revoked`),
-  who approved and when, last seen.
+  `is_admin`, who approved and when, last seen. `is_admin` is the whole hierarchy: one
+  group, granted and removed by an admin, and never by the person holding it.
 - `login_nonces` — legacy table/column names containing an HMAC digest of the one-time
   code, its expiry, the Telegram ID it belongs to, and consumed-at. Single use.
 - Sessions — cookie carrying a signed, expiring token; `HttpOnly`, `SameSite=Lax`,
@@ -118,6 +130,8 @@ trail at `PoolAuditModal.tsx:36` already displays.
   the proxy.
 - The browser deep link is static and carries no credential.
 - A pending or revoked user is refused at `auth_request`, not merely hidden in the UI.
+- An approved non-admin may read the roster and gets 403 from approve, revoke, and both
+  admin-group routes.
 - Revocation takes effect on the next request, not the next login.
 - Direct `/api/` access without a session returns 401 from the proxy, with no backend key
   attached. This is the regression test that pins FE-SEC-01 closed.
@@ -131,8 +145,10 @@ stay for blast-radius containment.
 
 ## Deployment choices
 
-- `DASHBOARD_BOOTSTRAP_ADMIN_ID` may seed the first approved operator. It promotes a
-  pending user only; it never silently restores a revoked account on restart.
+- `DASHBOARD_BOOTSTRAP_ADMIN_ID` may seed the first approved operator, and puts it in the
+  admin group. It promotes a pending user only; it never silently restores a revoked
+  account on restart. It *does* restore the admin flag on an approved account, which is
+  the way back into a deployment whose last admin was demoted.
 - Sessions default to 12 hours.
 - The dashboard remains behind the IP-restricted firewall. TLS is still required anywhere
   WordPress application passwords would otherwise cross an untrusted network.

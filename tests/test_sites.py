@@ -125,6 +125,45 @@ def test_site_response_includes_active_counts_and_latest_crawl(client, db, site)
         assert response["suggestion_slots_available"] == 5
 
 
+def test_a_failed_crawl_reports_why_on_the_row(client, db, site):
+    """ "Crawl failed" with no reason sends the operator to the engine logs."""
+    db.add(
+        IngestionRun(
+            site_id=site.id,
+            status="failed",
+            error="  connection to https://vibe.com timed out\nafter 30s  ",
+        )
+    )
+    db.commit()
+
+    listed = client.get("/api/v1/sites").json()
+    item = next(candidate for candidate in listed if candidate["id"] == site.id)
+    detail = client.get(f"/api/v1/sites/{site.id}").json()
+
+    for response in (item, detail):
+        assert response["last_ingestion_status"] == "failed"
+        assert response["last_ingestion_error"] == (
+            "connection to https://vibe.com timed out after 30s"
+        )
+
+
+def test_a_succeeded_crawl_carries_no_failure_message(client, db, site):
+    db.add(IngestionRun(site_id=site.id, status="succeeded", error="a stale message"))
+    db.commit()
+
+    assert client.get(f"/api/v1/sites/{site.id}").json()["last_ingestion_error"] is None
+
+
+def test_a_long_failure_message_is_trimmed_for_the_row(client, db, site):
+    db.add(IngestionRun(site_id=site.id, status="failed", error="x" * 1000))
+    db.commit()
+
+    reported = client.get(f"/api/v1/sites/{site.id}").json()["last_ingestion_error"]
+
+    assert len(reported) == 300
+    assert reported.endswith("…")
+
+
 def test_analysis_state_is_reported_apart_from_the_crawl(client, db, site):
     """A crawled site and an analysed one must not look identical to the UI."""
     crawled_at = datetime.now(timezone.utc) - timedelta(hours=3)

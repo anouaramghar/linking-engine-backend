@@ -33,12 +33,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Undo the two additions. The column width is deliberately expand-only.
+
+    `kind` was widened to 20 -> 32 to hold 'publication_preparation', which is
+    23 characters. Narrowing it back would make PostgreSQL refuse the downgrade
+    the moment one such row exists, and those rows are operational evidence:
+    who asked for a preparation, when, and what it produced. Deleting them or
+    relabelling them 'publication' to fit the old width would corrupt the audit
+    trail to satisfy a schema step.
+
+    Leaving the column wide is safe for the application code this downgrade
+    returns to. That code writes kinds of at most 20 characters, and a wider
+    VARCHAR accepts every one of them.
+    """
     op.drop_index("ix_suggestions_publication_pending", table_name="suggestions")
     op.drop_column("job_runs", "requested_by")
-    op.alter_column(
-        "job_runs",
-        "kind",
-        existing_type=sa.String(length=32),
-        type_=sa.String(length=20),
-        existing_nullable=False,
-    )

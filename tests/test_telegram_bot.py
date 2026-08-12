@@ -40,11 +40,16 @@ def _texts(replies) -> list[str]:
     return [reply.text for reply in replies]
 
 
-def _approve(db, telegram_id: int, **sender) -> None:
-    """Put someone on the far side of the gate, the way a real admin would."""
+def _approve(db, telegram_id: int, admin: bool = True, **sender) -> None:
+    """Put someone on the far side of the gate, the way a real admin would.
+
+    Admitted as an admin by default: these tests are about who hears the door,
+    and only the admin group can answer it.
+    """
     user, code = dashboard_auth.create_login_code(db, telegram_id, **sender)
     assert code is None
     dashboard_auth.approve_user(db, user, approved_by="bootstrap")
+    dashboard_auth.set_admin(db, user, admin)
     db.commit()
 
 
@@ -73,6 +78,17 @@ def test_a_new_request_alerts_everyone_who_could_admit_it(db):
         telegram_bot.Reply(111, notice),
         telegram_bot.Reply(222, notice),
     ]
+
+
+def test_an_approved_non_admin_is_not_told_about_requests_they_cannot_act_on(db):
+    _approve(db, 111)
+    _approve(db, 222, admin=False)
+
+    replies = telegram_bot.handle_update(
+        db, _update("/start login", telegram_id=4242, username="anouar")
+    )
+
+    assert [reply.chat_id for reply in replies] == [4242, 111]
 
 
 def test_an_approved_user_signing_in_again_alerts_nobody(db):
