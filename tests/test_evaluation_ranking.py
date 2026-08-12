@@ -4,6 +4,8 @@ import hashlib
 import math
 from datetime import UTC, datetime
 
+import pytest
+
 from app.config import settings
 from app.ml.evaluation.ranking import EvaluationRanker
 from app.models import Article, Embedding, InternalLink, Site, Suggestion
@@ -276,6 +278,86 @@ def test_a_source_without_an_embedding_ranks_nothing(db):
 
     assert ranker.stats.source_articles == 0
     assert ranker.rank(db, source_id=source.id) == []
+
+    db.delete(site)
+    db.commit()
+
+
+def test_each_method_orders_the_same_candidates_its_own_way(db):
+    """The comparison table is only readable if the pool is shared.
+
+    Two targets, chosen so the two signals disagree: one is close in embedding
+    space and shares no title term, the other repeats the source's title terms and
+    is further away. A method that reordered the candidate set instead of the
+    ordering would make the table compare two different questions.
+    """
+    site = _site(db, "methods")
+    lexical_favourite = _article(
+        db,
+        site,
+        slug="sourdough-guide",
+        title="Sourdough jars guide",
+        published_at=OLD,
+        vector=_similar_vector(0.60, 2),
+    )
+    dense_favourite = _article(
+        db,
+        site,
+        slug="pickles",
+        title="Pickles and brine",
+        published_at=OLD,
+        vector=_similar_vector(0.95, 3),
+    )
+    source = _source(db, site, title="Sourdough jars")
+    db.commit()
+
+    ranker = _load(db, site, source)
+    ranked = ranker.rank_all(db, source_id=source.id)
+
+    assert set(ranked) == {"lexical", "dense", "hybrid"}
+    assert {tuple(sorted(order)) for order in ranked.values()} == {
+        tuple(sorted((lexical_favourite.id, dense_favourite.id)))
+    }
+    assert ranked["dense"] == [dense_favourite.id, lexical_favourite.id]
+    assert ranked["lexical"] == [lexical_favourite.id, dense_favourite.id]
+    # Production orders by BM25 and breaks ties on the fused rank, so the hybrid
+    # row follows the lexical one here rather than the dense one.
+    assert ranked["hybrid"] == [lexical_favourite.id, dense_favourite.id]
+
+    db.delete(site)
+    db.commit()
+
+
+def test_rank_returns_one_method_and_refuses_a_name_it_cannot_produce(db):
+    site = _site(db, "one-method")
+    target = _article(db, site, slug="target", title="Target jars", published_at=OLD)
+    source = _source(db, site)
+    db.commit()
+
+    ranker = _load(db, site, source)
+
+    assert ranker.rank(db, source_id=source.id, method="dense") == [target.id]
+    # The default stays hybrid: every caller written before the other methods
+    # existed still measures what production ships.
+    assert ranker.rank(db, source_id=source.id) == ranker.rank(
+        db, source_id=source.id, method="hybrid"
+    )
+    with pytest.raises(ValueError, match="unsupported ranking methods"):
+        ranker.rank_all(db, source_id=source.id, methods=("gnn",))
+
+    db.delete(site)
+    db.commit()
+
+
+def test_a_source_without_an_embedding_ranks_nothing_under_every_method(db):
+    site = _site(db, "unembedded-methods")
+    _article(db, site, slug="target", title="Target jars", published_at=OLD)
+    source = _source(db, site, embed=False)
+    db.commit()
+
+    ranked = _load(db, site, source).rank_all(db, source_id=source.id)
+
+    assert ranked == {"lexical": [], "dense": [], "hybrid": []}
 
     db.delete(site)
     db.commit()
