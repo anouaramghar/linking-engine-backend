@@ -61,6 +61,14 @@ def load_editorial_feedback(
     db: Session,
     site: Site,
 ) -> EditorialFeedbackProfile | None:
+    """This site's accept/reject history, or None when it must not steer ranking.
+
+    Off unless an operator switched it on for this site. The sample gate below is
+    a floor, not proof: it counts decided rows, and a bulk "reject everything
+    under 70" writes the same rows as ten considered ones. Nothing here has been
+    measured against a held-out set, so the feature stays opt-in per site until
+    the three-site baseline in the evidence plan exists.
+    """
     if not site.editorial_feedback_enabled or site.editorial_feedback_weight <= 0:
         return None
     rows = list(

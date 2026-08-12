@@ -287,8 +287,11 @@ def generate_missing_placements(
         generated = 0
         for source_results in results:
             for suggestion_id, placement in source_results:
-                placement_service.store(db, suggestion_id, placement)
-                generated += bool(placement.anchor_text)
+                # Counts what the row ends up holding, not what this pass
+                # generated: a concurrently stored placement keeps its own
+                # answer, and reporting ours would overstate the pass.
+                stored_placement = placement_service.store(db, suggestion_id, placement)
+                generated += bool(stored_placement.anchor_text)
         db.commit()
         if spent >= budget:
             logger.warning(

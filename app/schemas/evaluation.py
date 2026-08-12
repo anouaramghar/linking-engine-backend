@@ -105,12 +105,60 @@ class EvaluationComparison(BaseModel):
     publication_success_rate_change: float | None
 
 
+#: Sample states from the evidence plan, in the plan's own words.
+EvidenceSampleState = Literal[
+    "evidence_unavailable",
+    "more_individual_labels_required",
+    "three_site_baseline_ready",
+]
+
+
+class EvaluationProvenance(BaseModel):
+    """What this dashboard is, where its numbers come from, and what they cannot settle.
+
+    The evaluation page reports what the system did. That is not the same thing
+    as evidence that the system should keep doing it: the rows are whatever
+    editors happened to decide, with no held-out set, no frozen cohort and no
+    agreed label quality. Shipping the numbers without saying so invites exactly
+    the use the evidence plan forbids — pointing at a rate on this page to
+    justify a ranking or model change.
+
+    Every field here exists so a reader can tell how much weight the page bears
+    before reading a single percentage.
+    """
+
+    #: Deliberately fixed. A future evidence surface gets its own value; a reader
+    #: or a script must never have to guess which one it is looking at.
+    surface: Literal["operational_telemetry"] = "operational_telemetry"
+    schema_version: str
+    #: The build these numbers were computed by, or None when the deployment does
+    #: not record one. None is the honest answer, not a reason to omit the field.
+    commit: str | None
+    #: Newest suggestion included in the cohort. Nothing after this is counted.
+    evidence_cutoff: datetime | None
+    #: How the decisions were made, not how many there are.
+    individual_labels: int
+    bulk_labels: int
+    label_provenance: str
+    sample_state: EvidenceSampleState
+    #: Sites holding at least ``individual_label_target`` individual labels, and
+    #: how many the three-site baseline asks for.
+    sites_meeting_label_target: int
+    individual_label_target: int
+    baseline_site_target: int
+    limitations: list[str]
+    #: Always False for this surface. A ranking or model default may only move on
+    #: a versioned artifact from the three-site baseline.
+    supports_ranking_decisions: bool = False
+
+
 class EvaluationMetricsOut(BaseModel):
     generated_at: datetime
     site_id: int | None
     date_from: datetime | None
     date_to: datetime | None
     cohort_definition: str
+    provenance: EvaluationProvenance
     editorial: EditorialMetrics
     placement: PlacementMetrics
     publication: PublicationMetrics

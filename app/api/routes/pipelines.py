@@ -49,6 +49,30 @@ def _batch_out(db: Session, batch: PipelineBatch) -> PipelineBatchOut:
     )
 
 
+def _authorized_batch(db: Session, principal: Principal, batch_id: int) -> PipelineBatch:
+    """Load a batch the caller is allowed to act on, or raise 404/403.
+
+    A batch carries no tenant of its own: the sites it runs are its only
+    ownership evidence, so every one of them must be in scope. Reading, streaming
+    and cancelling all go through here, because a caller who may not see a batch
+    must not be able to stop it either.
+    """
+    batch = db.get(PipelineBatch, batch_id)
+    if batch is None:
+        raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    site_ids = list(
+        db.scalars(select(PipelineSiteRun.site_id).where(PipelineSiteRun.batch_id == batch.id))
+    )
+    if not site_ids and not principal.is_admin:
+        # Deleting a site cascades its runs away, which can empty a batch that
+        # still exists. Hiding it from tenants is right — there is nothing left
+        # to prove ownership with — but an admin should still see the record.
+        raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    for site_id in site_ids:
+        authorize_site(db, principal, site_id)
+    return batch
+
+
 def _enqueue_pipeline_stage(
     db: Session,
     item: PipelineSiteRun,
@@ -135,27 +159,24 @@ def get_pipeline_batch(
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> PipelineBatchOut:
-    batch = db.get(PipelineBatch, batch_id)
-    if batch is None:
-        raise HTTPException(404, f"pipeline batch {batch_id} not found")
-    items = list(db.scalars(select(PipelineSiteRun).where(PipelineSiteRun.batch_id == batch.id)))
-    if not items and not principal.is_admin:
-        # Deleting a site cascades its runs away, which can empty a batch that
-        # still exists. Hiding it from tenants is right — there is nothing left
-        # to prove ownership with — but an admin should still see the record.
-        raise HTTPException(404, f"pipeline batch {batch_id} not found")
-    for item in items:
-        authorize_site(db, principal, item.site_id)
-    return _batch_out(db, batch)
+    return _batch_out(db, _authorized_batch(db, principal, batch_id))
 
 
 @router.get("/batches/{batch_id}/events")
-def stream_pipeline_batch(batch_id: int) -> StreamingResponse:
-    # Do not hold the request dependency's database session for the lifetime of
-    # a potentially long stream. Each snapshot gets a short read-only session.
-    with SessionLocal() as initial_db:
-        if initial_db.get(PipelineBatch, batch_id) is None:
-            raise HTTPException(404, f"pipeline batch {batch_id} not found")
+def stream_pipeline_batch(
+    batch_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    # Authorized once, at connect time, through the same dependency as every
+    # other route here. The snapshots below carry site ids, job state and error
+    # text, so a caller who may not read this batch must not reach them.
+    _authorized_batch(db, principal, batch_id)
+    # Then hand the connection back before the stream starts. A dependency's
+    # session is only released once the response completes, which for a stream
+    # is however long the batch runs; each snapshot opens its own short
+    # read-only session instead.
+    db.close()
 
     def events():
         previous = None
@@ -214,9 +235,11 @@ def _stop_queue_job(db: Session, job_run_id: int | None, reason: str) -> None:
 @router.post("/batches/{batch_id}/cancel", response_model=PipelineBatchOut)
 def cancel_pipeline_batch(
     batch_id: int,
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
     actor: str = Depends(get_audit_actor),
 ) -> PipelineBatchOut:
+    _authorized_batch(db, principal, batch_id)
     batch = db.scalar(
         select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update()
     )

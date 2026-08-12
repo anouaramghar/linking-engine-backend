@@ -106,7 +106,12 @@ GET /api/v1/suggestion-events/export.csv
 ```
 
 Both accept Trace ID, actor, event type, current status, site, and date-range
-filters. The paged dashboard exposes full event JSON, the current publication
-error, and a copyable Trace ID. CSV export applies the same filters to the full
-matching cohort rather than only the visible page. Spreadsheet formula prefixes
-are escaped before export.
+filters. The event-type filter offers every event in the table above,
+`external_discovered` included — it is the one event that explains a paid
+external suggestion, so it cannot be the one an operator is unable to search
+for. The paged dashboard exposes full event JSON, the current publication error,
+and a copyable Trace ID. CSV export applies the same filters to the full matching
+cohort rather than only the visible page, and streams it: the rows are read in
+batches and written straight to the response, so an unfiltered export of the
+largest table in the schema does not have to fit in memory first. Spreadsheet
+formula prefixes are escaped before export.

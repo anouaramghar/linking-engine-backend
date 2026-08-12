@@ -19,7 +19,17 @@ from sqlalchemy import select
 from app.api.deps import require_api_key
 from app.config import settings
 from app.main import app
-from app.models import Alert, ApiKey, Article, Site, Suggestion, SuggestionEvent, Tenant
+from app.models import (
+    Alert,
+    ApiKey,
+    Article,
+    PipelineBatch,
+    PipelineSiteRun,
+    Site,
+    Suggestion,
+    SuggestionEvent,
+    Tenant,
+)
 from app.services.authorization import (
     LAST_USED_REFRESH,
     Principal,
@@ -677,3 +687,79 @@ def test_tenant_delete_refuses_while_sites_remain(monkeypatch, db):
         app.dependency_overrides[require_api_key] = lambda: Principal(
             is_admin=True, source="legacy_env"
         )
+
+
+# --------------------------------------------------------------------------
+# Pipeline batches
+# --------------------------------------------------------------------------
+
+
+def _batch(db, *sites) -> int:
+    batch = PipelineBatch(status="running")
+    db.add(batch)
+    db.flush()
+    db.add_all(
+        PipelineSiteRun(batch_id=batch.id, site_id=site.id, status="queued") for site in sites
+    )
+    db.commit()
+    return batch.id
+
+
+def test_foreign_pipeline_batch_cannot_be_read_streamed_or_cancelled(real_auth, db):
+    """Cancelling is a mutation of another scope's work, not a read of it.
+
+    Read was authorized site by site from the start; cancel and the live stream
+    were not, so any valid key could stop another scope's batch and watch its
+    site ids, job state and errors go by.
+    """
+    with _tenant(db, "runner") as (tenant_r, _), _tenant(db, "watcher") as (_w, key_w):
+        batch_id = _batch(db, _site(db, tenant_r))
+        headers = {"X-API-Key": key_w}
+        try:
+            assert real_auth.get(f"/api/v1/pipelines/batches/{batch_id}", headers=headers).status_code == 403
+            assert real_auth.get(f"/api/v1/pipelines/batches/{batch_id}/events", headers=headers).status_code == 403
+            assert real_auth.post(f"/api/v1/pipelines/batches/{batch_id}/cancel", headers=headers).status_code == 403
+            db.expire_all()
+            assert db.get(PipelineBatch, batch_id).status == "running"
+        finally:
+            db.delete(db.get(PipelineBatch, batch_id))
+            db.commit()
+
+
+def test_own_pipeline_batch_stays_cancellable(real_auth, db):
+    with _tenant(db, "cancels") as (tenant, key):
+        batch_id = _batch(db, _site(db, tenant))
+        try:
+            cancelled = real_auth.post(
+                f"/api/v1/pipelines/batches/{batch_id}/cancel", headers={"X-API-Key": key}
+            )
+            assert cancelled.status_code == 200, cancelled.text
+            assert cancelled.json()["status"] == "cancelled"
+        finally:
+            db.delete(db.get(PipelineBatch, batch_id))
+            db.commit()
+
+
+# --------------------------------------------------------------------------
+# Evaluation
+# --------------------------------------------------------------------------
+
+
+def test_evaluation_api_is_admin_only(real_auth, db):
+    """`site_id` is a filter, not a scope.
+
+    Omitting it reports on every site at once, so a scoped key that could reach
+    these routes would read fleet titles and export them as CSV — exactly the
+    blast radius scoped keys exist to bound.
+    """
+    with _tenant(db, "evaluator") as (tenant, key):
+        site = _site(db, tenant)
+        headers = {"X-API-Key": key}
+        assert real_auth.get("/api/v1/evaluation/metrics", headers=headers).status_code == 403
+        assert real_auth.get(
+            "/api/v1/evaluation/metrics", headers=headers, params={"site_id": site.id}
+        ).status_code == 403
+        assert real_auth.get(
+            "/api/v1/evaluation/suggestions", headers=headers, params={"metric": "decided"}
+        ).status_code == 403
+        assert real_auth.get("/api/v1/evaluation/export.csv", headers=headers).status_code == 403

@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     environment: str = "development"
+    # Commit this build was made from, set by the image build. Reported with the
+    # evaluation numbers so a figure can be traced back to the code that computed
+    # it. Empty means "this deployment does not record one", which is reported as
+    # unknown rather than guessed.
+    build_commit: str = ""
 
     # Static API key for all non-health endpoints; empty fails closed at the API boundary.
     # When set, this key is a legacy admin principal (all tenants) with a deprecation warning.

@@ -71,8 +71,16 @@ class Site(Base):
     # Unknown stays NULL instead of pretending that the source connection date
     # is the age of a domain on the public internet.
     domain_registered_at: Mapped[date | None] = mapped_column(Date)
+    # Off by default, deliberately. Editorial feedback reorders production
+    # results from approve/reject history, and that history is not yet evidence:
+    # it activates after ten mixed rows, counts bulk decisions the same as
+    # considered ones, and has never been measured against a held-out set. The
+    # evidence plan asks for three representative sites, 100 individual labels
+    # each and a versioned result before a ranking default may move. Until that
+    # exists an operator may switch it on per site and own the outcome; nothing
+    # switches it on for them.
     editorial_feedback_enabled: Mapped[bool] = mapped_column(
-        Boolean, default=True, server_default="true"
+        Boolean, default=False, server_default="false"
     )
     editorial_min_score_percent: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0"

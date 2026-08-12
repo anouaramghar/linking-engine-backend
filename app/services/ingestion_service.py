@@ -28,8 +28,8 @@ from app.models import (
 from app.services.job_service import record_progress_durably
 from app.services.pool_source_policy import PoolSourceFetchError
 
-# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 shared content
-# snapshot, 0x4C4A enqueue, and 0x4C50 publication.
+# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C42 PBN domain
+# check, 0x4C49 shared content snapshot, 0x4C4A enqueue, and 0x4C50 publication.
 _ARTICLE_UPSERT_LOCK_NAMESPACE = 0x4C41  # "LA"
 _INGESTION_LOCK_NAMESPACE = 0x4C49  # "LI", shared with suggestion_service
 

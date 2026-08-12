@@ -1,15 +1,15 @@
-import csv
-import io
 import json
 import logging
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import exists, func, insert, literal, or_, select, text, tuple_, update
 from sqlalchemy.orm import Session, aliased, joinedload
 
+from app.api.csv_stream import CSV_FETCH_BATCH, csv_response
 from app.api.deps import get_audit_actor, get_db, require_api_key, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
 from app.ml.llm import openrouter
@@ -556,6 +556,39 @@ def _csv_safe(value: object) -> str:
     return f"'{rendered}" if rendered.startswith(("=", "+", "-", "@")) else rendered
 
 
+TRACE_EXPORT_HEADER = (
+    "event_id",
+    "trace_id",
+    "suggestion_id",
+    "site",
+    "source_title",
+    "target_title",
+    "event_type",
+    "actor",
+    "current_status",
+    "created_at",
+    "publish_error",
+    "details",
+)
+
+
+def _trace_export_row(item: TraceEventOut) -> list[str]:
+    return [
+        _csv_safe(item.id),
+        _csv_safe(item.trace_id),
+        _csv_safe(item.suggestion_id),
+        _csv_safe(item.site_name),
+        _csv_safe(item.source_title),
+        _csv_safe(item.target_title),
+        _csv_safe(item.event_type),
+        _csv_safe(item.actor),
+        _csv_safe(item.suggestion_status),
+        _csv_safe(item.created_at.isoformat()),
+        _csv_safe(item.publish_error),
+        _csv_safe(item.details),
+    ]
+
+
 @router.get("/suggestion-events/export.csv")
 def export_trace_events_csv(
     trace_id: str | None = Query(None, max_length=MAX_SEARCH_TERM),
@@ -567,7 +600,14 @@ def export_trace_events_csv(
     date_to: datetime | None = None,
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
-) -> Response:
+) -> StreamingResponse:
+    """Stream the filtered lifecycle stream as CSV.
+
+    `suggestion_events` is append-only and the largest table in the schema, and
+    an export with no filters selects all of it. The rows are read in batches and
+    written straight to the response, so neither the result set nor the finished
+    file is ever held whole.
+    """
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from must be before date_to")
     if site_id is not None:
@@ -582,48 +622,14 @@ def export_trace_events_csv(
             tenant_id=_tenant_scope(principal),
             date_from=date_from,
             date_to=date_to,
-        ).order_by(SuggestionEvent.created_at.desc(), SuggestionEvent.id.desc())
-    ).all()
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(
-        [
-            "event_id",
-            "trace_id",
-            "suggestion_id",
-            "site",
-            "source_title",
-            "target_title",
-            "event_type",
-            "actor",
-            "current_status",
-            "created_at",
-            "publish_error",
-            "details",
-        ]
-    )
-    for row in rows:
-        item = _trace_event_out(row)
-        writer.writerow(
-            [
-                _csv_safe(item.id),
-                _csv_safe(item.trace_id),
-                _csv_safe(item.suggestion_id),
-                _csv_safe(item.site_name),
-                _csv_safe(item.source_title),
-                _csv_safe(item.target_title),
-                _csv_safe(item.event_type),
-                _csv_safe(item.actor),
-                _csv_safe(item.suggestion_status),
-                _csv_safe(item.created_at.isoformat()),
-                _csv_safe(item.publish_error),
-                _csv_safe(item.details),
-            ]
         )
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="linkmesh-traceability.csv"'},
+        .order_by(SuggestionEvent.created_at.desc(), SuggestionEvent.id.desc())
+        .execution_options(yield_per=CSV_FETCH_BATCH)
+    )
+    return csv_response(
+        TRACE_EXPORT_HEADER,
+        (_trace_export_row(_trace_event_out(row)) for row in rows),
+        filename="linkmesh-traceability.csv",
     )
 def _tenant_scope(principal: Principal) -> int | None:
     if principal.is_admin:
@@ -1056,7 +1062,9 @@ def get_suggestion_placement(
             # retries rather than inheriting a failure as a permanent verdict.
             logger.warning("placement generation failed for suggestion %s: %s", suggestion_id, e)
             raise HTTPException(502, "the placement model is unavailable; try again") from e
-        placement_service.store(db, suggestion_id, placement)
+        # `store` keeps the first generation, so a drawer that lost the race is
+        # shown the placement the row actually holds rather than its own answer.
+        placement = placement_service.store(db, suggestion_id, placement)
         db.commit()
 
     return PlacementOut(

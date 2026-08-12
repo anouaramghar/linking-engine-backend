@@ -151,8 +151,27 @@ def fill_external_suggestion_gap(
         outcome.filtered["empty_title"] += 1
         return outcome
 
-    search_provider = provider or TavilySearchProvider()
     policy = policy_state(db, site.id)
+    search_provider = provider or TavilySearchProvider()
+    if not policy.external_links_enabled:
+        # Before the per-candidate guard, not with it. The search is billed and
+        # it sends this article's title to a third party — both happen the moment
+        # the request leaves, and rejecting every result afterwards undoes
+        # neither. A site with external links switched off must produce no
+        # outbound request at all.
+        outcome.filtered["external_links_disabled"] += 1
+        _audit_event(
+            db,
+            site=site,
+            article=article,
+            job_run_id=job_run_id,
+            provider=search_provider.name,
+            request_id=None,
+            query=query,
+            decision="external_links_disabled",
+            details={"missing_slots": missing_slots},
+        )
+        return outcome
     owned = managed_domains(db)
     exclude_domains = sorted(
         set(owned) | set(policy.blocklist_domains) | set(policy.competitor_domains)

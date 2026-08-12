@@ -1,17 +1,29 @@
 from collections import defaultdict
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from statistics import fmean, median
 from math import floor
 
-from sqlalchemy import exists, func, select
+from sqlalchemy import exists, func, null, select
+from sqlalchemy.engine import Row
 from sqlalchemy.orm import Session, aliased
 
-from app.models import Article, EvaluationSnapshot, InternalLink, Site, Suggestion
+from app.config import settings
+from app.models import (
+    Article,
+    BulkReviewOperationItem,
+    EvaluationSnapshot,
+    InternalLink,
+    Site,
+    Suggestion,
+    SuggestionEvent,
+)
 from app.schemas.evaluation import (
     EditorialMetrics,
     EvaluationComparison,
     EvaluationMetric,
     EvaluationMetricsOut,
+    EvaluationProvenance,
     EvaluationSuggestionOut,
     EvaluationSuggestionPage,
     EvaluationTrendPoint,
@@ -29,6 +41,37 @@ DECIDED_STATUSES = (*ACCEPTED_STATUSES, "rejected")
 COHORT_DEFINITION = (
     "The date range selects suggestions generated during that period; all outcome metrics "
     "describe the current result of that same suggestion cohort."
+)
+#: Export rows fetched per database round trip. The export streams, so this is
+#: the only part of the result that is ever in memory at once.
+_EXPORT_FETCH_BATCH = 1_000
+
+#: Bumped whenever a field on ``EvaluationMetricsOut`` changes meaning, so a
+#: stored or exported answer can never be compared against a differently defined
+#: one without the difference being visible.
+EVALUATION_SCHEMA_VERSION = "evaluation_metrics_v1"
+
+#: Thresholds from docs/superpowers/plans/2026-08-11-evidence-driven-operations.md,
+#: Workstream 5: three operator-selected representative sites, at least 100
+#: individual labels each, before a default may move.
+INDIVIDUAL_LABEL_TARGET = 100
+BASELINE_SITE_TARGET = 3
+
+#: Read this before reading a percentage. Every item is a reason a number here
+#: cannot settle a ranking or model question, not a caveat about precision.
+EVALUATION_LIMITATIONS = (
+    "Operational telemetry, not an evidence artifact: there is no frozen cohort, "
+    "no held-out set and no versioned comparison run.",
+    "Acceptance is not correctness. It records what editors decided about what "
+    "they were shown, and the queue order they were shown is itself the thing "
+    "under question.",
+    "Bulk decisions are counted with individual ones in every rate on this page.",
+    "The cohort is whatever was generated in the selected range, so a change in "
+    "crawl or analysis volume moves these rates without anything about link "
+    "quality changing.",
+    "Semantic score is a ranking score. It is not confidence, accuracy or quality.",
+    "No site selection is frozen, so comparing two ranges compares two different "
+    "mixes of sites.",
 )
 
 
@@ -515,6 +558,64 @@ def _comparison(
     )
 
 
+def _provenance(
+    db: Session,
+    site_id: int | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+) -> EvaluationProvenance:
+    """Say what these numbers are before anyone reads a percentage off them.
+
+    The counts below separate decisions a person made row by row from decisions a
+    bulk rule made for a whole filter at once. Both are real editorial outcomes
+    and both belong in the operational numbers, but only the first is a *label*
+    in the sense the evidence plan means, and the page must not let the two be
+    read as the same evidence.
+    """
+    conditions = _suggestion_conditions(site_id, date_from, date_to)
+    decided = [*conditions, Suggestion.status.in_(DECIDED_STATUSES)]
+    from_bulk = (
+        select(BulkReviewOperationItem.suggestion_id)
+        .where(BulkReviewOperationItem.suggestion_id == Suggestion.id)
+        .correlate(Suggestion)
+        .exists()
+    )
+    individual = db.scalar(select(func.count()).select_from(Suggestion).where(*decided, ~from_bulk))
+    bulk = db.scalar(select(func.count()).select_from(Suggestion).where(*decided, from_bulk))
+    cutoff = db.scalar(select(func.max(Suggestion.created_at)).where(*conditions))
+
+    per_site = db.execute(
+        select(Suggestion.site_id, func.count())
+        .where(*decided, ~from_bulk)
+        .group_by(Suggestion.site_id)
+    ).all()
+    qualifying = sum(1 for _, count in per_site if count >= INDIVIDUAL_LABEL_TARGET)
+
+    if not individual and not bulk:
+        state = "evidence_unavailable"
+    elif qualifying >= BASELINE_SITE_TARGET:
+        state = "three_site_baseline_ready"
+    else:
+        state = "more_individual_labels_required"
+
+    return EvaluationProvenance(
+        schema_version=EVALUATION_SCHEMA_VERSION,
+        commit=settings.build_commit or None,
+        evidence_cutoff=cutoff,
+        individual_labels=individual or 0,
+        bulk_labels=bulk or 0,
+        label_provenance=(
+            f"{individual or 0} decisions made row by row, {bulk or 0} made by a bulk rule. "
+            "Both are counted in the rates on this page; only the first are individual labels."
+        ),
+        sample_state=state,
+        sites_meeting_label_target=qualifying,
+        individual_label_target=INDIVIDUAL_LABEL_TARGET,
+        baseline_site_target=BASELINE_SITE_TARGET,
+        limitations=list(EVALUATION_LIMITATIONS),
+    )
+
+
 def evaluation_metrics(
     db: Session,
     site_id: int | None = None,
@@ -530,6 +631,7 @@ def evaluation_metrics(
         date_from=date_from,
         date_to=date_to,
         cohort_definition=COHORT_DEFINITION,
+        provenance=_provenance(db, site_id, date_from, date_to),
         editorial=editorial,
         placement=placement,
         publication=publication,
@@ -604,8 +706,39 @@ def _drilldown_condition(metric: EvaluationMetric, target) -> list:
     return _orphan_help_condition(target)
 
 
-def _occurred_at(metric: EvaluationMetric, suggestion: Suggestion) -> datetime:
-    if metric in ("decided", "accepted", "rejected", "publish_failed"):
+#: When publication actually gave up on a row.
+#:
+#: ``suggestions`` has no failure timestamp: ``reviewed_at`` is when an editor
+#: approved the row, which is the moment *before* every publication attempt, and
+#: reporting it as the failure time can put the failure days before the attempt
+#: that caused it. The lifecycle stream does have the moment — the trigger writes
+#: ``failed`` on the transition, and the worker writes ``publish_attempt_failed``
+#: per attempt. The newest of the two is the answer for both paths that end a
+#: row: attempt exhaustion and plan retirement, which writes no attempt event of
+#: its own. A row re-approved after failing and failed again keeps the latest,
+#: which is the failure the current status describes.
+_LAST_FAILURE_AT = (
+    select(func.max(SuggestionEvent.created_at))
+    .where(
+        SuggestionEvent.suggestion_id == Suggestion.id,
+        SuggestionEvent.event_type.in_(("failed", "publish_attempt_failed")),
+    )
+    .correlate(Suggestion)
+    .scalar_subquery()
+)
+
+
+def _occurred_at(
+    metric: EvaluationMetric,
+    suggestion: Suggestion,
+    last_failure_at: datetime | None = None,
+) -> datetime:
+    if metric == "publish_failed":
+        # The fallback is for rows that failed before the lifecycle stream
+        # existed; they have no event to read, and no better time than the one
+        # already shown.
+        return last_failure_at or suggestion.reviewed_at or suggestion.created_at
+    if metric in ("decided", "accepted", "rejected"):
         return suggestion.reviewed_at or suggestion.created_at
     if metric == "placement_success":
         return suggestion.placement_generated_at or suggestion.created_at
@@ -635,6 +768,9 @@ def evaluation_suggestions(
         .where(*conditions)
     )
     total = db.scalar(select(func.count()).select_from(id_query.subquery())) or 0
+    # Only the failure drill-down pays for the correlated lookup, and only for
+    # the rows on this page.
+    failure_time = _LAST_FAILURE_AT if metric == "publish_failed" else null()
     rows = db.execute(
         select(
             Suggestion,
@@ -645,6 +781,7 @@ def evaluation_suggestions(
                 Suggestion.external_title,
                 Suggestion.external_url,
             ),
+            failure_time.label("last_failure_at"),
         )
         .join(Site, Site.id == Suggestion.site_id)
         .join(source, source.id == Suggestion.source_article_id)
@@ -665,9 +802,9 @@ def evaluation_suggestions(
             method=suggestion.method,
             score=suggestion.score,
             status=suggestion.status,
-            occurred_at=_occurred_at(metric, suggestion),
+            occurred_at=_occurred_at(metric, suggestion, last_failure_at),
         )
-        for suggestion, site_name, source_title, target_title in rows
+        for suggestion, site_name, source_title, target_title, last_failure_at in rows
     ]
     return EvaluationSuggestionPage(total=total, limit=limit, offset=offset, items=items)
 
@@ -677,10 +814,17 @@ def evaluation_export_rows(
     site_id: int | None,
     date_from: datetime | None,
     date_to: datetime | None,
-) -> list[tuple]:
+) -> Iterator[Row]:
+    """Stream the export cohort, one database batch at a time.
+
+    Deliberately an iterator and not a list: the caller writes each row straight
+    into the response, and a fleet-wide export with no filters is as large as the
+    suggestions table. Materializing it here would put that whole table in memory
+    twice — once as rows, once as the finished file — during an ordinary request.
+    """
     source = aliased(Article)
     target = aliased(Article)
-    return list(
+    return iter(
         db.execute(
             select(
                 Suggestion.id,
@@ -700,11 +844,13 @@ def evaluation_export_rows(
                 Suggestion.placement_generated_at,
                 Suggestion.applied_at,
                 Suggestion.publish_outcome,
+                _LAST_FAILURE_AT.label("last_failure_at"),
             )
             .join(Site, Site.id == Suggestion.site_id)
             .join(source, source.id == Suggestion.source_article_id)
             .outerjoin(target, target.id == Suggestion.target_article_id)
             .where(*_suggestion_conditions(site_id, date_from, date_to))
             .order_by(Suggestion.created_at.desc(), Suggestion.id.desc())
+            .execution_options(yield_per=_EXPORT_FETCH_BATCH)
         )
     )

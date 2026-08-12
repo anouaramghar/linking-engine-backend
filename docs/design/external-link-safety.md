@@ -62,8 +62,15 @@ candidates. It calls Tavily only when all of the following are true:
 - at least one suggestion slot is still open;
 - the site-wide queue still has capacity;
 - the run is creating suggestions rather than running comparison-only analysis;
-- the source title is non-empty; and
+- the source title is non-empty;
+- the site's external-link policy has external links **enabled**; and
 - `TAVILY_API_KEY` is configured.
+
+The policy check is made before the request, not against its results. The search
+is billed and it sends the source article's title to a third party, both at the
+moment the request leaves; rejecting every candidate afterwards undoes neither.
+A site with external links switched off therefore issues no outbound search at
+all, and records one `external_links_disabled` audit event saying so.
 
 The source title is the search query and is capped at 1,500 characters. Searches
 are issued synchronously, one source at a time. The provider request uses:

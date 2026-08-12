@@ -58,6 +58,16 @@ Amended on 2026-08-11, after the team lead read the live dashboard:
 - **Scoped API keys stay**, reframed as blast-radius containment rather than client
   isolation: "we don't have clients."
 
+### Consequence: fleet-wide reads are admin-only
+
+Containment only means something if a scoped key cannot reach fleet-wide data. Routes whose
+answer *is* an aggregate across every site therefore require an admin principal, because a
+`site_id` query parameter is a filter and not a scope — omitting it reports on the whole
+fleet. `/evaluation/*` (metrics, drill-down and CSV export) is admin-only for this reason,
+enforced as a router dependency rather than per route so a new endpoint cannot be added
+without it. Pipeline batches take the opposite shape: they name their sites, so they are
+authorized site by site instead.
+
 ## Why not the Telegram Login Widget
 
 The widget is the obvious reading of "Telegram login", but it does not fit this

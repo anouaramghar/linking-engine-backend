@@ -1,11 +1,11 @@
-import csv
 from datetime import datetime
-from io import StringIO
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db
+from app.api.csv_stream import csv_response
+from app.api.deps import get_db, require_admin
 from app.models import Site
 from app.schemas.evaluation import (
     EvaluationMetric,
@@ -18,7 +18,19 @@ from app.services.evaluation_service import (
     evaluation_suggestions,
 )
 
-router = APIRouter(prefix="/evaluation", tags=["evaluation"])
+# Admin-only, for the whole surface. Every route here answers fleet-wide
+# questions — `site_id` is a filter, not a scope, and omitting it reports on
+# every site at once. Scoped keys exist to bound blast radius, so a tenant key
+# that could read another site's titles and export them as CSV would defeat the
+# only containment the product model keeps. Narrowing this to "your sites only"
+# was rejected: the aggregate itself is the answer, and an aggregate filtered
+# per caller is a different, less useful metric that still leaks fleet totals
+# through comparison.
+router = APIRouter(
+    prefix="/evaluation",
+    tags=["evaluation"],
+    dependencies=[Depends(require_admin)],
+)
 
 
 def _validate_filters(
@@ -78,37 +90,43 @@ def _csv_safe(value: object) -> str:
     return rendered
 
 
+EXPORT_HEADER = (
+    "suggestion_id",
+    "trace_id",
+    "site",
+    "source_title",
+    "target_title",
+    "method",
+    "semantic_score",
+    "status",
+    "created_at",
+    "reviewed_at",
+    "placement_generated_at",
+    "applied_at",
+    "publish_outcome",
+    "last_failure_at",
+)
+
+
 @router.get("/export.csv")
 def export_evaluation_csv(
     site_id: int | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
     db: Session = Depends(get_db),
-) -> Response:
+) -> StreamingResponse:
+    """Stream the cohort as CSV.
+
+    Unfiltered, this is every suggestion in the database. It streams rather than
+    being assembled first, so the response is bounded by one batch of rows
+    instead of by the size of the table.
+    """
     _validate_filters(db, site_id, date_from, date_to)
-    output = StringIO(newline="")
-    writer = csv.writer(output)
-    writer.writerow(
-        [
-            "suggestion_id",
-            "trace_id",
-            "site",
-            "source_title",
-            "target_title",
-            "method",
-            "semantic_score",
-            "status",
-            "created_at",
-            "reviewed_at",
-            "placement_generated_at",
-            "applied_at",
-            "publish_outcome",
-        ]
-    )
-    for row in evaluation_export_rows(db, site_id, date_from, date_to):
-        writer.writerow([_csv_safe(value) for value in row])
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="linkmesh-evaluation.csv"'},
+    return csv_response(
+        EXPORT_HEADER,
+        (
+            [_csv_safe(value) for value in row]
+            for row in evaluation_export_rows(db, site_id, date_from, date_to)
+        ),
+        filename="linkmesh-evaluation.csv",
     )

@@ -162,7 +162,7 @@ class SiteOut(BaseModel):
     pool_source_last_reactivated_at: datetime | None = None
     pool_source_last_reactivated_by: str | None = None
     domain_registered_at: date | None = None
-    editorial_feedback_enabled: bool = True
+    editorial_feedback_enabled: bool = False
     editorial_min_score_percent: int = 0
     editorial_feedback_weight: float = 0.20
     editorial_feedback_min_samples: int = 10
@@ -195,7 +195,10 @@ class SiteSuggestionModeUpdate(BaseModel):
 
 
 class EditorialRankingPolicyUpdate(BaseModel):
-    enabled: bool = True
+    #: Required, not defaulted: switching feedback reranking on is a deliberate
+    #: act while it is unproven, so an omitted field must not turn it on as a
+    #: side effect of editing the thresholds beside it.
+    enabled: bool
     min_score_percent: int = Field(ge=0, le=100)
     feedback_weight: float = Field(ge=0.0, le=1.0)
     min_samples: int = Field(ge=1, le=10_000)
