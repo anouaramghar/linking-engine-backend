@@ -47,6 +47,9 @@ storage model are documented in
 Accepted Tavily suggestions join the normal lifecycle audit, while request and
 candidate decisions also have a durable provider audit described in
 [`docs/design/suggestion-traceability.md`](docs/design/suggestion-traceability.md).
+The one-shot `pool-scheduler-init` Compose service automatically registers the
+unique daily content-pool ingestion coordinator during deployment; repeated
+deployments reuse the existing schedule.
 
 ## Running the tests
 Create `.env` from `.env.example`, then start the services:

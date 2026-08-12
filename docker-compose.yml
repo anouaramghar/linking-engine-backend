@@ -43,6 +43,20 @@ services:
         condition: service_healthy
     restart: "no"
 
+  pool-scheduler-init:
+    <<: *app-service
+    # Register the unique repeating coordinator on every deployment. The
+    # script is idempotent, so an existing schedule is reused, not duplicated.
+    command: ["python", "scripts/schedule_pool_ingestion.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   api:
     <<: *app-service
     build:
@@ -79,6 +93,8 @@ services:
       redis:
         condition: service_healthy
       migrate:
+        condition: service_completed_successfully
+      pool-scheduler-init:
         condition: service_completed_successfully
     volumes:
       - hf_cache:/home/linkmesh/.cache/huggingface
