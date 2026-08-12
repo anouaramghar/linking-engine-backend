@@ -17,17 +17,26 @@ from rq.job import Callback, Job
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db import SessionLocal, engine
-from app.models import IngestionRun, JobRun
+from app.models import IngestionRun, JobRun, Site
 from app.services.alerts import send_alert
 from app.services.publication_progress import mark_publication_failure
-from app.tasks.queues import analysis_queue, ingestion_queue, publication_queue, redis_conn
+from app.tasks.queues import (
+    analysis_queue,
+    ingestion_queue,
+    publication_preparation_queue,
+    publication_queue,
+    redis_conn,
+)
 
 _ENQUEUE_LOCK_NAMESPACE = 0x4C4A  # "LJ" — serializes enqueues per site
+_TENANT_ENQUEUE_LOCK_NAMESPACE = 0x4C54  # "LT" — serializes tenant quota checks
 
 _QUEUES = {
     "ingestion": ingestion_queue,
     "analysis": analysis_queue,
+    "publication_preparation": publication_preparation_queue,
     "publication": publication_queue,
 }
 _RQ_ACTIVE_STATUSES = {"queued", "started", "deferred", "scheduled"}
@@ -56,15 +65,25 @@ class DuplicateJobError(Exception):
         super().__init__(f"{run.kind} job already {run.status} for site {run.site_id}")
 
 
+class JobCapacityError(DuplicateJobError):
+    def __init__(self, tenant_id: int, limit: int):
+        self.tenant_id = tenant_id
+        self.limit = limit
+        Exception.__init__(self, f"tenant {tenant_id} already has {limit} active jobs")
+
+
 class NonRetryableTaskError(RuntimeError):
     """A terminal task failure that RQ must not schedule again."""
 
 
 @contextmanager
-def _site_enqueue_lock(site_id: int) -> Iterator[None]:
+def _enqueue_locks(site_id: int, tenant_id: int) -> Iterator[None]:
     # The work session commits the durable row before enqueueing. A dedicated
     # transaction keeps the per-site advisory lock across both work commits.
     with engine.begin() as lock_connection:
+        lock_connection.execute(
+            select(func.pg_advisory_xact_lock(_TENANT_ENQUEUE_LOCK_NAMESPACE, tenant_id))
+        ).scalar_one()
         lock_connection.execute(
             select(func.pg_advisory_xact_lock(_ENQUEUE_LOCK_NAMESPACE, site_id))
         ).scalar_one()
@@ -148,10 +167,12 @@ def reconcile_active_job_runs(db: Session, runs: list[JobRun]) -> list[JobRun]:
 def _enqueue_job_locked(
     db: Session,
     site_id: int,
+    tenant_id: int,
     kind: str,
     fn,
     job_timeout: int,
     task_kwargs: dict | None = None,
+    requested_by: str | None = None,
 ) -> JobRun:
     """Create the durable run row, then enqueue. Raises DuplicateJobError while an
     active run of this kind exists for the site."""
@@ -172,7 +193,19 @@ def _enqueue_job_locked(
         db.commit()  # keep the reconciliations
         raise DuplicateJobError(still_active[0])
 
-    run = JobRun(site_id=site_id, kind=kind)
+    tenant_active = db.scalars(
+        select(JobRun)
+        .join(Site, Site.id == JobRun.site_id)
+        .where(
+            Site.tenant_id == tenant_id,
+            JobRun.status.in_(["queued", "running"]),
+        )
+    ).all()
+    tenant_active = reconcile_active_job_runs(db, list(tenant_active))
+    if len(tenant_active) >= settings.max_active_jobs_per_tenant:
+        raise JobCapacityError(tenant_id, settings.max_active_jobs_per_tenant)
+
+    run = JobRun(site_id=site_id, kind=kind, requested_by=requested_by)
     db.add(run)
     db.commit()
     job = _QUEUES[kind].enqueue(
@@ -197,15 +230,21 @@ def enqueue_job(
     fn,
     job_timeout: int,
     task_kwargs: dict | None = None,
+    requested_by: str | None = None,
 ) -> JobRun:
-    with _site_enqueue_lock(site_id):
+    tenant_id = db.scalar(select(Site.tenant_id).where(Site.id == site_id))
+    if tenant_id is None:
+        raise ValueError(f"site {site_id} not found")
+    with _enqueue_locks(site_id, tenant_id):
         return _enqueue_job_locked(
             db,
             site_id,
+            tenant_id,
             kind,
             fn,
             job_timeout,
             task_kwargs=task_kwargs,
+            requested_by=requested_by,
         )
 
 
@@ -257,9 +296,7 @@ def record_progress_durably(
             db.close()
 
 
-def _mark_job_failure_progress(
-    run: JobRun, *, terminal: bool, progress_at: datetime
-) -> None:
+def _mark_job_failure_progress(run: JobRun, *, terminal: bool, progress_at: datetime) -> None:
     if run.kind != "publication":
         return
     updated = mark_publication_failure(run.progress, terminal=terminal)
@@ -269,17 +306,18 @@ def _mark_job_failure_progress(
     run.progress_at = progress_at
 
 
-def _run_task_body(fn, site_id: int, job_run_id: int | None) -> dict:
+def _run_task_body(fn, site_id: int, job_run_id: int | None, task_kwargs: dict) -> dict:
     parameters = signature(fn).parameters.values()
+    kwargs = dict(task_kwargs)
     if any(
         parameter.name == "job_run_id" or parameter.kind == Parameter.VAR_KEYWORD
         for parameter in parameters
     ):
-        return fn(site_id, job_run_id=job_run_id)
-    return fn(site_id)
+        kwargs["job_run_id"] = job_run_id
+    return fn(site_id, **kwargs)
 
 
-def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
+def run_durably(job_run_id: int | None, fn, site_id: int, **task_kwargs) -> dict:
     """Task-body wrapper: records start, attempt count, result or error. Re-raises so
     RQ can retry; the final attempt's failure stays recorded. Tolerates a missing row
     (job enqueued before this table existed, or site deleted meanwhile)."""
@@ -294,7 +332,7 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
             run.result = None
             db.commit()
         try:
-            result = _run_task_body(fn, site_id, job_run_id)
+            result = _run_task_body(fn, site_id, job_run_id, task_kwargs)
         except Exception as e:
             error = str(e)[:2000]
             current_job = get_current_job()
@@ -304,10 +342,7 @@ def run_durably(job_run_id: int | None, fn, site_id: int) -> dict:
                 # RQ checks this same in-memory Job after the function raises.
                 current_job.retries_left = 0
             final_attempt = (
-                non_retryable
-                or current_job is None
-                or retries_left is None
-                or retries_left <= 0
+                non_retryable or current_job is None or retries_left is None or retries_left <= 0
             )
             if run is not None:
                 now = datetime.now(timezone.utc)
@@ -378,9 +413,7 @@ def _reconcile_interrupted_job(
     try:
         db = SessionLocal()
         run = db.scalars(
-            select(JobRun)
-            .where(JobRun.queue_job_id == job_id)
-            .with_for_update()
+            select(JobRun).where(JobRun.queue_job_id == job_id).with_for_update()
         ).first()
         if run is None:
             # A fast worker can dequeue before enqueue_job has committed the RQ id

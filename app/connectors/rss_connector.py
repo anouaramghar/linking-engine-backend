@@ -13,7 +13,7 @@ from app.config import settings
 from app.connectors.base import (
     ArticleData,
     ContentConnector,
-    LinkOutcome,
+    PlannedEditOutcome,
     SiteMetadata,
     TaxonomyData,
 )
@@ -25,7 +25,6 @@ from app.connectors.url_guard import (
     validate_url,
 )
 from app.models.site import Site
-from app.models.suggestion import Suggestion
 from app.services.pool_source_policy import pool_request_guard
 
 _RSS_ATOM_MEDIA_TYPES = {
@@ -166,9 +165,9 @@ class RSSConnector(ContentConnector):
             return None
         content_html = _entry_html(entry)[: settings.pool_max_article_chars]
         title = (_text(entry.get("title")) or url)[: settings.pool_max_title_chars]
-        content_text = (
-            _text(content_html) or _text(entry.get("summary")) or title
-        )[: settings.pool_max_article_chars]
+        content_text = (_text(content_html) or _text(entry.get("summary")) or title)[
+            : settings.pool_max_article_chars
+        ]
         tags: list[TaxonomyData] = []
         seen_tags: set[str] = set()
         for tag in entry.get("tags") or []:
@@ -211,7 +210,7 @@ class RSSConnector(ContentConnector):
     def supports_incremental_sync(self) -> bool:
         return True
 
-    def apply_links(
-        self, suggestions: list[Suggestion], *, dry_run: bool = False
-    ) -> list[LinkOutcome]:
+    def apply_planned_edit(
+        self, source, *, original_html: str, updated_html: str
+    ) -> PlannedEditOutcome:
         raise NotImplementedError("content-pool sources are read-only")

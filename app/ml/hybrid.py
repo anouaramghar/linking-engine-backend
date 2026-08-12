@@ -131,9 +131,7 @@ def normalized_title(title: str) -> str:
 def structured_terms(article: CorpusArticle) -> list[str]:
     """Reproduce the frozen BM25-512 recipe selected by the offline evaluation."""
     if len(article.content_text) > settings.crawl_max_article_chars:
-        raise ValueError(
-            f"article content exceeded {settings.crawl_max_article_chars} characters"
-        )
+        raise ValueError(f"article content exceeded {settings.crawl_max_article_chars} characters")
     title_terms = tokenize(article.title)
     taxonomy_terms = [
         term for taxonomy_name in article.taxonomy_names for term in tokenize(taxonomy_name)

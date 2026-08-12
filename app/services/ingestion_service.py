@@ -318,9 +318,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                 )
             total_outbound_links += len(art.outbound_internal_links)
             if total_outbound_links > settings.crawl_max_total_links:
-                raise ValueError(
-                    f"crawl link count exceeded {settings.crawl_max_total_links}"
-                )
+                raise ValueError(f"crawl link count exceeded {settings.crawl_max_total_links}")
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id

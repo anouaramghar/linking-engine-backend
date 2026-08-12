@@ -16,9 +16,7 @@ ACTIVE_SITE_STATUSES = {
 
 def refresh_pipeline_batch_status(db: Session, batch_id: int) -> PipelineBatch:
     """Recompute aggregate status while locking the batch against concurrent workers."""
-    batch = db.scalar(
-        select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update()
-    )
+    batch = db.scalar(select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update())
     if batch is None:
         raise ValueError(f"pipeline batch {batch_id} not found")
     # Cancellation is terminal and operator-owned. A worker finishing a stage
@@ -63,9 +61,7 @@ def update_pipeline_site(
     error: str | None = None,
 ) -> PipelineSiteRun:
     item = db.scalar(
-        select(PipelineSiteRun)
-        .where(PipelineSiteRun.id == pipeline_site_run_id)
-        .with_for_update()
+        select(PipelineSiteRun).where(PipelineSiteRun.id == pipeline_site_run_id).with_for_update()
     )
     if item is None:
         raise ValueError(f"pipeline site run {pipeline_site_run_id} not found")

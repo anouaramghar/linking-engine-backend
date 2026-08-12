@@ -18,8 +18,8 @@ from app.config import settings
 from app.connectors.base import (
     ArticleData,
     ContentConnector,
-    LinkOutcome,
     OutboundLink,
+    PlannedEditOutcome,
     SiteMetadata,
 )
 from app.connectors.http_limits import check_crawl_deadline, get_limited_http_response
@@ -29,7 +29,6 @@ from app.connectors.url_guard import (
     request_guard,
     validate_url,
 )
-from app.models.suggestion import Suggestion
 
 #: Anchors are phrases; a link wrapping a whole section is stored truncated.
 _MAX_ANCHOR_TEXT_CHARS = 300
@@ -78,9 +77,7 @@ class HTMLConnector(ContentConnector):
                 max_items=settings.crawl_max_sitemap_urls,
             )
             if len(urls) > settings.crawl_max_sitemap_urls:
-                raise ValueError(
-                    f"sitemap URL count exceeded {settings.crawl_max_sitemap_urls}"
-                )
+                raise ValueError(f"sitemap URL count exceeded {settings.crawl_max_sitemap_urls}")
         return urls
 
     def _parse_sitemap(self, url: str, xpath: str, *, max_items: int | None = None) -> list[str]:
@@ -89,6 +86,7 @@ class HTMLConnector(ContentConnector):
             self.client,
             url,
             max_bytes=settings.crawl_max_response_bytes,
+            crawl_started_at=self._crawl_started_at,
         )
         resp.raise_for_status()
         tree = etree.fromstring(resp.content, parser=_XML_PARSER)
@@ -121,6 +119,7 @@ class HTMLConnector(ContentConnector):
             self.client,
             url,
             max_bytes=settings.crawl_max_response_bytes,
+            crawl_started_at=self._crawl_started_at,
         )
         if resp.status_code != 200:
             return None
@@ -142,9 +141,7 @@ class HTMLConnector(ContentConnector):
             if urlparse(absolute := urljoin(url, anchor.get("href"))).netloc == self._host
         ]
         if len(internal) > settings.crawl_max_links_per_article:
-            raise ValueError(
-                f"article link count exceeded {settings.crawl_max_links_per_article}"
-            )
+            raise ValueError(f"article link count exceeded {settings.crawl_max_links_per_article}")
         return ArticleData(
             url=url,
             title=doc.title or url,
@@ -167,9 +164,9 @@ class HTMLConnector(ContentConnector):
     def supports_incremental_sync(self) -> bool:
         return False
 
-    def apply_links(
-        self, suggestions: list[Suggestion], *, dry_run: bool = False
-    ) -> list[LinkOutcome]:
+    def apply_planned_edit(
+        self, source, *, original_html: str, updated_html: str
+    ) -> PlannedEditOutcome:
         # A3 resolved: design ready (FTP hypothesis documented), no implementation —
         # HTML sites are secondary, WordPress is the v1 priority.
         raise NotImplementedError("writing to static HTML sites is not supported in v1 (A3)")

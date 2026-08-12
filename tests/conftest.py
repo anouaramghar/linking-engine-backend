@@ -118,12 +118,37 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 # Only now is importing the application safe: app.db reads settings.database_url at
 # import time, and the assignment above is what that read resolves to.
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import event, select  # noqa: E402
 
 from app.api.deps import require_api_key  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.db import SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Site  # noqa: E402
+from app.models import Site, Tenant  # noqa: E402
+from app.services import telegram  # noqa: E402
+from app.services.authorization import Principal, ensure_default_tenant  # noqa: E402
+
+
+@event.listens_for(Site, "before_insert")
+def _assign_default_tenant(mapper, connection, target: Site) -> None:
+    """Own tenant-less test sites under the default tenant.
+
+    This lives in the suite, not in the model, on purpose. Dozens of tests
+    predate tenancy and construct ``Site`` without an owner; backfilling them
+    here keeps those tests readable. Registering it on the model instead would
+    apply the same silent backfill to production inserts, turning "a code path
+    forgot to set tenant_id" from a NOT NULL failure into a live site quietly
+    filed under the tenant every admin can see.
+    """
+    if getattr(target, "tenant_id", None) is not None:
+        return
+    tenant_id = connection.scalar(select(Tenant.id).where(Tenant.slug == "default").limit(1))
+    if tenant_id is None:
+        result = connection.execute(
+            Tenant.__table__.insert().values(slug="default", name="Default").returning(Tenant.id)
+        )
+        tenant_id = result.scalar_one()
+    target.tenant_id = tenant_id
 
 
 def pytest_report_header() -> str:
@@ -166,7 +191,10 @@ def disable_api_key(monkeypatch):
     )
     monkeypatch.setattr(settings, "credential_decryption_keys", None)
     monkeypatch.setattr(settings, "suggestion_min_score", 0.0)
-    app.dependency_overrides[require_api_key] = lambda: None
+    # Admin principal so route-level site ownership checks pass without a key.
+    app.dependency_overrides[require_api_key] = lambda: Principal(
+        is_admin=True, source="legacy_env"
+    )
     yield
     app.dependency_overrides.pop(require_api_key, None)
 
@@ -187,6 +215,22 @@ def offline_publication_defaults(monkeypatch):
     monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
 
 
+@pytest.fixture(autouse=True)
+def offline_telegram(monkeypatch):
+    """Nothing in the suite may message Telegram for real.
+
+    `.env` carries a live bot token and the login tests set a fake one, so an
+    unpatched `notify` would either spam a real chat or post a bad token at
+    api.telegram.org. Tests that care what was sent take this fixture by name
+    and assert on the list.
+    """
+    sent: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        telegram, "notify", lambda telegram_id, text: sent.append((telegram_id, text))
+    )
+    return sent
+
+
 @pytest.fixture
 def client():
     return TestClient(app)
@@ -201,11 +245,21 @@ def db():
 
 @pytest.fixture
 def site(db):
-    """A throwaway site, cascade-deleted after the test."""
+    """A throwaway site, cascade-deleted after the test.
+
+    It carries a WordPress account, because a site without one cannot be
+    prepared for publication at all and most callers here are exercising what
+    happens *after* that gate. Only the username is set: the password is an
+    encrypted column whose key is installed by an autouse fixture, and
+    `has_wordpress_credentials` — the thing the gate reads — tests the username.
+    """
+    tenant = ensure_default_tenant(db)
     site = Site(
         name="test-site",
         base_url=f"https://test-{uuid.uuid4().hex[:8]}.example.com",
         platform="wordpress",
+        wp_username="editor",
+        tenant_id=tenant.id,
     )
     db.add(site)
     db.commit()

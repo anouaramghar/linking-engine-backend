@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.connectors.http_limits import ResponseTooLargeError, request_limited_http_response
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,15 @@ def complete_json(
     owned = client is None
     http = client or httpx.Client(timeout=settings.placement_timeout_seconds)
     try:
-        response = http.post(url, json=payload, headers=headers)
-    except httpx.HTTPError as exc:
+        response = request_limited_http_response(
+            http,
+            "POST",
+            url,
+            max_bytes=1_000_000,
+            json=payload,
+            headers=headers,
+        )
+    except (httpx.HTTPError, ResponseTooLargeError) as exc:
         raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc
     finally:
         if owned:
@@ -95,9 +103,7 @@ def complete_json(
     if response.status_code >= 400:
         # The body carries OpenRouter's own error message (bad model slug, no
         # credit, rate limit); truncated because it is going into a log line.
-        raise OpenRouterError(
-            f"OpenRouter returned {response.status_code}: {response.text[:500]}"
-        )
+        raise OpenRouterError(f"OpenRouter returned {response.status_code}: {response.text[:500]}")
 
     try:
         body = response.json()

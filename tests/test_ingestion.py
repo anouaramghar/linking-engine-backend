@@ -60,7 +60,7 @@ class StubConnector(ContentConnector):
     def supports_incremental_sync(self):
         return False
 
-    def apply_links(self, suggestions, *, dry_run=False):
+    def apply_planned_edit(self, source, *, original_html, updated_html):
         pass
 
 
@@ -185,14 +185,10 @@ def test_ingestion_stores_the_anchor_text_of_each_link(db, site, monkeypatch):
     monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
-    urls = dict(
-        db.execute(select(Article.id, Article.url).where(Article.site_id == site.id)).all()
-    )
+    urls = dict(db.execute(select(Article.id, Article.url).where(Article.site_id == site.id)).all())
     anchors = {
         (urls[link.source_article_id], urls[link.target_article_id]): link.anchor_text
-        for link in db.scalars(
-            select(InternalLink).where(InternalLink.source_article_id.in_(urls))
-        )
+        for link in db.scalars(select(InternalLink).where(InternalLink.source_article_id.in_(urls)))
     }
     assert anchors == {
         (f"{site.base_url}/a", f"{site.base_url}/b/"): "to B",
@@ -211,9 +207,7 @@ def test_durable_ingestion_records_final_progress(db, site, monkeypatch):
     assert result == {"articles": 2, "links": 2}
     db.expire_all()
     job_run = db.get(JobRun, job_run.id)
-    ingestion_run = db.scalar(
-        select(IngestionRun).where(IngestionRun.site_id == site.id)
-    )
+    ingestion_run = db.scalar(select(IngestionRun).where(IngestionRun.site_id == site.id))
     assert job_run.status == "succeeded"
     assert job_run.progress == {
         "stage": "reconciling",
@@ -245,9 +239,7 @@ def test_progress_write_failure_does_not_fail_ingestion(db, site, monkeypatch):
     job_run = db.get(JobRun, job_run.id)
     assert job_run.status == "succeeded"
     assert job_run.progress is None
-    ingestion_run = db.scalar(
-        select(IngestionRun).where(IngestionRun.site_id == site.id)
-    )
+    ingestion_run = db.scalar(select(IngestionRun).where(IngestionRun.site_id == site.id))
     assert ingestion_run.job_run_id == job_run.id
 
 
@@ -255,9 +247,7 @@ def test_successful_recrawl_deactivates_article_not_seen(db, site, monkeypatch):
     monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
-    monkeypatch.setattr(
-        ingestion_service, "get_connector", lambda s: ReducedStubConnector(s)
-    )
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: ReducedStubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
     db.expire_all()
@@ -266,9 +256,7 @@ def test_successful_recrawl_deactivates_article_not_seen(db, site, monkeypatch):
         for article in db.scalars(select(Article).where(Article.site_id == site.id)).all()
     }
     runs = db.scalars(
-        select(IngestionRun)
-        .where(IngestionRun.site_id == site.id)
-        .order_by(IngestionRun.id)
+        select(IngestionRun).where(IngestionRun.site_id == site.id).order_by(IngestionRun.id)
     ).all()
 
     assert articles["1"].is_active is True
@@ -296,14 +284,10 @@ def test_empty_recrawl_fails_without_reconciling_snapshot(db, site, monkeypatch)
 
 
 def test_truncated_recrawl_fails_below_previous_success_floor(db, site, monkeypatch):
-    monkeypatch.setattr(
-        ingestion_service, "get_connector", lambda s: FourArticleStubConnector(s)
-    )
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: FourArticleStubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
-    monkeypatch.setattr(
-        ingestion_service, "get_connector", lambda s: ReducedStubConnector(s)
-    )
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: ReducedStubConnector(s))
     with pytest.raises(ValueError, match=r"1 articles.*50%.*previous.*\(4\)"):
         ingestion_service.run_ingestion(site.id)
 
@@ -319,9 +303,7 @@ def test_truncated_recrawl_fails_below_previous_success_floor(db, site, monkeypa
 
 
 def test_duplicate_records_do_not_bypass_snapshot_completeness(db, site, monkeypatch):
-    monkeypatch.setattr(
-        ingestion_service, "get_connector", lambda s: FourArticleStubConnector(s)
-    )
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: FourArticleStubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
     monkeypatch.setattr(
@@ -412,9 +394,7 @@ def test_successful_recrawl_expires_links_and_preserves_transient_empty_taxonomi
     monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
-    monkeypatch.setattr(
-        ingestion_service, "get_connector", lambda s: ReducedStubConnector(s)
-    )
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: ReducedStubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
     db.expire_all()
@@ -529,13 +509,13 @@ def test_recrawl_expires_inactive_article_suggestions(db, site, client, monkeypa
     db.add_all(suggestions)
     db.commit()
 
-    monkeypatch.setattr(
-        ingestion_service, "get_connector", lambda s: ReducedStubConnector(s)
-    )
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: ReducedStubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
     db.expire_all()
-    statuses = {suggestion.id: db.get(Suggestion, suggestion.id).status for suggestion in suggestions}
+    statuses = {
+        suggestion.id: db.get(Suggestion, suggestion.id).status for suggestion in suggestions
+    }
     assert [statuses[suggestion.id] for suggestion in suggestions] == [
         "expired",
         "expired",
@@ -543,18 +523,15 @@ def test_recrawl_expires_inactive_article_suggestions(db, site, client, monkeypa
         "applied",
     ]
 
-    listed_ids = {
-        item["id"] for item in client.get(f"/api/v1/suggestions/{site.id}").json()
-    }
+    listed_ids = {item["id"] for item in client.get(f"/api/v1/suggestions/{site.id}").json()}
     assert suggestions[0].id not in listed_ids
     assert suggestions[1].id not in listed_ids
-    review = client.put(
-        f"/api/v1/suggestions/{suggestions[0].id}", json={"status": "approved"}
-    )
+    review = client.put(f"/api/v1/suggestions/{suggestions[0].id}", json={"status": "approved"})
     assert review.status_code == 409
     assert client.get(f"/api/v1/publish/{site.id}/status").json() == {
         "applied": 1,
-        "awaiting_publication": 0,
+        "selected_suggestions": 0,
+        "approved_plans": 0,
     }
 
 
@@ -562,9 +539,7 @@ def test_failed_recrawl_preserves_previous_snapshot(db, site, monkeypatch):
     monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
     ingestion_service.run_ingestion(site.id)
 
-    monkeypatch.setattr(
-        ingestion_service, "get_connector", lambda s: FailingStubConnector(s)
-    )
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: FailingStubConnector(s))
     with pytest.raises(RuntimeError, match="crawl interrupted"):
         ingestion_service.run_ingestion(site.id)
 
@@ -582,9 +557,7 @@ def test_failed_recrawl_preserves_previous_snapshot(db, site, monkeypatch):
         .where(Article.site_id == site.id)
     ).all()
     runs = db.scalars(
-        select(IngestionRun)
-        .where(IngestionRun.site_id == site.id)
-        .order_by(IngestionRun.id)
+        select(IngestionRun).where(IngestionRun.site_id == site.id).order_by(IngestionRun.id)
     ).all()
     previous_articles = [article for article in articles if article.external_id in {"1", "2"}]
     partial_articles = [article for article in articles if article.external_id not in {"1", "2"}]
@@ -602,8 +575,12 @@ def test_failed_recrawl_preserves_previous_snapshot(db, site, monkeypatch):
 
 def test_permalink_change_updates_in_place(db, site):
     """Same WP post id under a new URL must update the row, not violate (site_id, external_id)."""
-    old = ArticleData(url=f"{site.base_url}/old-slug", title="T", content_text="x", external_id="99")
-    new = ArticleData(url=f"{site.base_url}/new-slug", title="T", content_text="x", external_id="99")
+    old = ArticleData(
+        url=f"{site.base_url}/old-slug", title="T", content_text="x", external_id="99"
+    )
+    new = ArticleData(
+        url=f"{site.base_url}/new-slug", title="T", content_text="x", external_id="99"
+    )
 
     first_id = ingestion_service._upsert_article(db, site.id, old)
     db.commit()
@@ -616,7 +593,9 @@ def test_permalink_change_updates_in_place(db, site):
 
 def test_reassigned_permalink_updates_existing_url_row(db, site):
     """A new WP post id at an existing permalink must replace the stale identity."""
-    old = ArticleData(url=f"{site.base_url}/same-slug", title="Old", content_text="old", external_id="1")
+    old = ArticleData(
+        url=f"{site.base_url}/same-slug", title="Old", content_text="old", external_id="1"
+    )
     replacement = ArticleData(
         url=f"{site.base_url}/same-slug",
         title="Replacement",
@@ -697,7 +676,10 @@ def test_url_only_ingestion_preserves_wordpress_external_id(db, site):
 
 def test_concurrent_article_insert_resolves_to_one_row(site):
     article = ArticleData(
-        url=f"{site.base_url}/concurrent", title="Concurrent", content_text="content", external_id="7"
+        url=f"{site.base_url}/concurrent",
+        title="Concurrent",
+        content_text="content",
+        external_id="7",
     )
     lookups = Barrier(2, timeout=1)
 

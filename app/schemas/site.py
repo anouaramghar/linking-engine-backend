@@ -67,6 +67,29 @@ class SiteCreate(BaseModel):
         return self
 
 
+class SiteCredentials(BaseModel):
+    """A WordPress account for a site that already exists.
+
+    Separate from `SiteCreate` because rotation is not creation: the base URL,
+    the platform, and the tenant are settled, and only the account may move. An
+    application password that is revoked, or one that was never given, otherwise
+    leaves the site unpublishable with no way back but deleting it.
+    """
+
+    wp_username: str = Field(min_length=1, max_length=255)
+    wp_app_password: str = Field(min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def encryption_configured(self) -> "SiteCredentials":
+        try:
+            # Fail before the request reaches the database, exactly as creation
+            # does: the value is encrypted by the model's database type on write.
+            validate_credential_encryption_key()
+        except CredentialEncryptionError as error:
+            raise ValueError(str(error)) from error
+        return self
+
+
 class SiteBulkRow(BaseModel):
     """One inbound row of a bulk import.
 
@@ -124,6 +147,7 @@ class SiteOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    tenant_id: int
     name: str
     base_url: str
     platform: str
@@ -143,10 +167,12 @@ class SiteOut(BaseModel):
     editorial_feedback_weight: float = 0.20
     editorial_feedback_min_samples: int = 10
     suggestion_method: Literal["hybrid_bm25"] = "hybrid_bm25"
-    suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool = True
-    suggestion_comparison_enabled: bool = False
     suggestion_slots_available: int = 0
+    #: Whether an account exists that could edit this site's posts. Read from
+    #: the model's property, which tests the username alone — the password is an
+    #: encrypted column, and decrypting every row of a list page to learn a
+    #: boolean would be work for nothing. The two are always written together.
+    has_wordpress_credentials: bool = False
     created_at: datetime
     last_ingestion_status: str | None = None
     # Last *finished* analysis, so a crawled site reads differently from an

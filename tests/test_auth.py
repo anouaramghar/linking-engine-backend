@@ -46,9 +46,7 @@ def test_operator_key_can_access_protected_routes(monkeypatch):
     client = _real_auth_client()
 
     assert client.get("/api/v1/sites").status_code == 401
-    assert (
-        client.get("/api/v1/sites", headers={"X-API-Key": "alice-key"}).status_code == 200
-    )
+    assert client.get("/api/v1/sites", headers={"X-API-Key": "alice-key"}).status_code == 200
 
 
 def test_credential_encryption_key_required_outside_development():
@@ -65,9 +63,7 @@ def test_production_accepts_both_required_keys():
     configured = Settings(
         environment="production",
         api_key="sekret",
-        credential_encryption_key=SecretStr(
-            "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
-        ),
+        credential_encryption_key=SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
         _env_file=None,
     )
     assert configured.credential_encryption_key is not None

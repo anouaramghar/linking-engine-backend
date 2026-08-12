@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import exists, func, insert, literal, or_, select, text, tuple_, update
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from app.api.deps import get_audit_actor, get_db
+from app.api.deps import get_audit_actor, get_db, require_api_key, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
 from app.ml.llm import openrouter
 from app.ml.llm.openrouter import OpenRouterError, OpenRouterNotConfigured
@@ -22,6 +22,7 @@ from app.models import (
     Suggestion,
     SuggestionEvent,
 )
+from app.models import PublicationPlan
 from app.schemas.job import JobAccepted
 from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
@@ -44,6 +45,12 @@ from app.schemas.suggestion import (
     TraceEventPage,
 )
 from app.services import placement_service
+from app.services.authorization import (
+    Principal,
+    authorize_site,
+    check_site_access,
+    require_admin_principal,
+)
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.tasks.analysis import analyze_site, compare_site
 
@@ -121,6 +128,22 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
     return outputs
 
 
+def _bound_to_an_approved_plan():
+    """Whether a named human is already bound to an exact edit containing this row.
+
+    That approval is a signed statement about specific bytes. Letting the row be
+    undone or rejected afterwards would leave the approved artifact describing a
+    link nobody wants any more, and the worker sends artifacts, not statuses.
+    Invalidating the plan is the way back — not editing one of its inputs.
+    """
+    return exists(
+        select(1).where(
+            PublicationPlan.id == Suggestion.publication_plan_id,
+            PublicationPlan.status == "approved",
+        )
+    )
+
+
 def _review_values(status: str) -> dict:
     """What a review writes, whichever path issued it.
 
@@ -131,12 +154,18 @@ def _review_values(status: str) -> dict:
     ever revived by an editor deciding on it again, and leaving the count at the
     limit re-quarantines it on its very next attempt — which makes re-approval
     look like it worked and change nothing.
+
+    Any surviving plan link goes with it. The only rows that reach here still
+    carrying one are those whose plan failed, and deciding on such a row again is
+    exactly the explicit reselection that recovery calls for. The plan row itself
+    is untouched, so the artifact that failed remains readable.
     """
     return {
         "status": status,
         "reviewed_at": None if status == "pending" else datetime.now(timezone.utc),
         "publish_attempts": 0,
         "publish_error": None,
+        "publication_plan_id": None,
     }
 
 
@@ -156,7 +185,11 @@ def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]
     return set(
         db.scalars(
             update(Suggestion)
-            .where(*conditions, Suggestion.status.notin_(UNREVIEWABLE))
+            .where(
+                *conditions,
+                Suggestion.status.notin_(UNREVIEWABLE),
+                ~_bound_to_an_approved_plan(),
+            )
             .values(**_review_values(status))
             .returning(Suggestion.id)
             .execution_options(synchronize_session=False)
@@ -204,6 +237,10 @@ def _review_matching_counts(
         .where(
             Suggestion.id == candidates.c.id,
             *conditions,
+            # Guarded here rather than in `candidates`, so a row an operator has
+            # already approved as part of an exact edit is reported as skipped
+            # instead of vanishing from the rule's own count.
+            ~_bound_to_an_approved_plan(),
         )
         .values(**_review_values(status))
         .returning(Suggestion.id)
@@ -339,6 +376,7 @@ def _percent_boundary(percent: int) -> float:
 def _queue_conditions(
     *,
     site_id: int | None = None,
+    tenant_id: int | None = None,
     status: str | None = None,
     method: str | None = None,
     min_percent: int | None = None,
@@ -362,6 +400,15 @@ def _queue_conditions(
     conditions = []
     if site_id is not None:
         conditions.append(Suggestion.site_id == site_id)
+    if tenant_id is not None:
+        conditions.append(
+            exists(
+                select(1).where(
+                    Site.id == Suggestion.site_id,
+                    Site.tenant_id == tenant_id,
+                )
+            )
+        )
     if status is not None:
         conditions.append(Suggestion.status == status)
     if method is not None:
@@ -394,6 +441,7 @@ def _trace_event_query(
     event_type: str | None = None,
     status: str | None = None,
     site_id: int | None = None,
+    tenant_id: int | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
 ):
@@ -433,6 +481,8 @@ def _trace_event_query(
         statement = statement.where(Suggestion.status == status.strip())
     if site_id is not None:
         statement = statement.where(Suggestion.site_id == site_id)
+    if tenant_id is not None:
+        statement = statement.where(Site.tenant_id == tenant_id)
     if date_from is not None:
         statement = statement.where(SuggestionEvent.created_at >= date_from)
     if date_to is not None:
@@ -470,16 +520,20 @@ def list_trace_events(
     date_to: datetime | None = None,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> TraceEventPage:
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from must be before date_to")
+    if site_id is not None:
+        authorize_site(db, principal, site_id)
     statement = _trace_event_query(
         trace_id=trace_id,
         actor=actor,
         event_type=event_type,
         status=status,
         site_id=site_id,
+        tenant_id=_tenant_scope(principal),
         date_from=date_from,
         date_to=date_to,
     )
@@ -511,10 +565,13 @@ def export_trace_events_csv(
     site_id: int | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> Response:
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from must be before date_to")
+    if site_id is not None:
+        authorize_site(db, principal, site_id)
     rows = db.execute(
         _trace_event_query(
             trace_id=trace_id,
@@ -522,6 +579,7 @@ def export_trace_events_csv(
             event_type=event_type,
             status=status,
             site_id=site_id,
+            tenant_id=_tenant_scope(principal),
             date_from=date_from,
             date_to=date_to,
         ).order_by(SuggestionEvent.created_at.desc(), SuggestionEvent.id.desc())
@@ -567,14 +625,21 @@ def export_trace_events_csv(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="linkmesh-traceability.csv"'},
     )
+def _tenant_scope(principal: Principal) -> int | None:
+    if principal.is_admin:
+        return None
+    if principal.tenant_id is None:
+        raise HTTPException(403, "tenant credentials required")
+    return principal.tenant_id
 
 
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
 @router.post("/suggestions/bulk-review")
 def bulk_review(
     payload: BulkReview,
-    db: Session = Depends(get_db),
     actor: str = Depends(get_audit_actor),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
 ) -> dict:
     # Partial success, not all-or-nothing: a batch is a set of independent
     # decisions, and one row the publication worker has already claimed must not
@@ -584,11 +649,24 @@ def bulk_review(
     #
     # Read the ids that exist first, so "skipped" means the worker got there
     # first rather than lumping in ids that were never rows at all.
-    existing = set(
-        db.scalars(select(Suggestion.id).where(Suggestion.id.in_(payload.suggestion_ids)))
+    # Authorize every referenced site before mutating any row. The owning
+    # tenant rides along in the same statement so a batch of any size stays
+    # exactly one SELECT plus the review UPDATE.
+    rows = list(
+        db.execute(
+            select(Suggestion.id, Site.tenant_id)
+            .join(Site, Site.id == Suggestion.site_id)
+            .where(Suggestion.id.in_(payload.suggestion_ids))
+        ).all()
     )
+    existing = {suggestion_id for suggestion_id, _tenant_id in rows}
+    for _suggestion_id, tenant_id in rows:
+        check_site_access(principal, tenant_id)
     _set_audit_actor(db, actor)
-    reviewed = _review_ids(db, payload.suggestion_ids, payload.status)
+    # Review the ids this join actually authorized, not the raw request. A
+    # suggestion whose site row is missing cannot be ownership-checked, so it
+    # must not be swept along by an `IN` over the caller's list.
+    reviewed = _review_ids(db, sorted(existing), payload.status)
     db.commit()
     logger.info(
         "suggestion review actor=%s mode=explicit status=%s reviewed=%s skipped=%s",
@@ -608,8 +686,9 @@ def bulk_review(
 @router.post("/suggestions/bulk-review-by-filter", response_model=BulkReviewFilterResult)
 def bulk_review_by_filter(
     payload: BulkReviewFilter,
-    db: Session = Depends(get_db),
     actor: str = Depends(get_audit_actor),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
 ) -> BulkReviewFilterResult:
     """Apply a bulk rule to every row it matches, however many that is.
 
@@ -618,8 +697,13 @@ def bulk_review_by_filter(
     but can no longer name its targets, and a fleet-wide rule matches far more
     rows than PostgreSQL will accept as bound parameters.
     """
+    if payload.all_sites:
+        require_admin_principal(principal)
+    elif payload.site_id is not None:
+        authorize_site(db, principal, payload.site_id)
     conditions = _queue_conditions(
         site_id=payload.site_id,
+        tenant_id=_tenant_scope(principal),
         status=payload.match_status,
         method=payload.method,
         min_percent=payload.threshold_percent if payload.status == "approved" else None,
@@ -674,6 +758,7 @@ def undo_filtered_bulk_review(
     operation_id: str,
     db: Session = Depends(get_db),
     actor: str = Depends(get_audit_actor),
+    principal: Principal = Depends(require_api_key),
 ) -> BulkReviewUndoResult:
     """Restore exactly the rows changed by one filtered bulk operation.
 
@@ -688,6 +773,18 @@ def undo_filtered_bulk_review(
     )
     if operation is None:
         raise HTTPException(status_code=404, detail="bulk review operation not found")
+    tenant_ids = db.scalars(
+        select(Site.tenant_id)
+        .join(Suggestion, Suggestion.site_id == Site.id)
+        .join(
+            BulkReviewOperationItem,
+            BulkReviewOperationItem.suggestion_id == Suggestion.id,
+        )
+        .where(BulkReviewOperationItem.operation_id == operation.id)
+        .distinct()
+    ).all()
+    for tenant_id in tenant_ids:
+        check_site_access(principal, tenant_id)
     if operation.undone_at is not None:
         return BulkReviewUndoResult(
             restored=operation.undone_count or 0,
@@ -737,10 +834,14 @@ def count_suggestions(
     q: str | None = Query(None, max_length=MAX_SEARCH_TERM),
     target_origin: TargetOrigin | None = None,
     exclude_reciprocal: bool = False,
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> SuggestionCounts:
+    if site_id is not None:
+        authorize_site(db, principal, site_id)
     conditions = _queue_conditions(
         site_id=site_id,
+        tenant_id=_tenant_scope(principal),
         method=method,
         min_percent=min_percent,
         max_percent=max_percent,
@@ -773,11 +874,15 @@ def list_suggestion_page(
     include_total: bool = False,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int | None = Query(None, ge=0, deprecated=True),
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> SuggestionPage:
     """The queue across every site, or one of them, a cursor page at a time."""
+    if site_id is not None:
+        authorize_site(db, principal, site_id)
     conditions = _queue_conditions(
         site_id=site_id,
+        tenant_id=_tenant_scope(principal),
         status=status,
         method=method,
         min_percent=min_percent,
@@ -834,28 +939,28 @@ def list_suggestion_page(
 
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)
-def trigger_analysis(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    site = db.get(Site, site_id)
-    if site is None:
-        raise HTTPException(404, f"site {site_id} not found")
+def trigger_analysis(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
     try:
-        run = enqueue_job(db, site_id, "analysis", analyze_site, job_timeout=7200)
+        run = enqueue_job(db, site.id, "analysis", analyze_site, job_timeout=7200)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
 @router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)
-def trigger_analysis_comparison(site_id: int, db: Session = Depends(get_db)) -> JobAccepted:
-    site = db.get(Site, site_id)
-    if site is None:
-        raise HTTPException(404, f"site {site_id} not found")
+def trigger_analysis_comparison(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
     try:
-        run = enqueue_job(db, site_id, "analysis", compare_site, job_timeout=7200)
+        run = enqueue_job(db, site.id, "analysis", compare_site, job_timeout=7200)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
@@ -863,7 +968,7 @@ def trigger_analysis_comparison(site_id: int, db: Session = Depends(get_db)) -> 
 
 @router.get("/suggestions/{site_id}", response_model=list[SuggestionOut])
 def list_suggestions(
-    site_id: int,
+    site: Site = Depends(require_site_access),
     status: str | None = None,
     method: str | None = None,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
@@ -872,7 +977,7 @@ def list_suggestions(
 ) -> list[SuggestionOut]:
     query = (
         select(Suggestion)
-        .where(Suggestion.site_id == site_id)
+        .where(Suggestion.site_id == site.id)
         .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
         .order_by(Suggestion.score.desc())
     )
@@ -886,7 +991,11 @@ def list_suggestions(
 
 
 @router.get("/suggestions/{suggestion_id}/placement", response_model=PlacementOut)
-def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) -> PlacementOut:
+def get_suggestion_placement(
+    suggestion_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> PlacementOut:
     """Where in the source article this link belongs, generating it on first ask.
 
     Lazy rather than part of analysis: a run produces far more suggestions than
@@ -912,6 +1021,7 @@ def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) 
     )
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
+    authorize_site(db, principal, suggestion.site_id)
 
     placement = placement_service.stored(suggestion)
     if placement is None:
@@ -966,10 +1076,13 @@ def get_suggestion_placement(suggestion_id: int, db: Session = Depends(get_db)) 
 def list_suggestion_events(
     suggestion_id: int,
     limit: int = Query(50, ge=1, le=200),
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> list[SuggestionEvent]:
-    if db.get(Suggestion, suggestion_id) is None:
+    suggestion = db.get(Suggestion, suggestion_id)
+    if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
+    authorize_site(db, principal, suggestion.site_id)
     return list(
         db.scalars(
             select(SuggestionEvent)
@@ -984,8 +1097,9 @@ def list_suggestion_events(
 def review_suggestion(
     suggestion_id: int,
     payload: SuggestionReview,
-    db: Session = Depends(get_db),
     actor: str = Depends(get_audit_actor),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
 ) -> SuggestionOut:
     suggestion = db.get(
         Suggestion,
@@ -994,6 +1108,7 @@ def review_suggestion(
     )
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
+    authorize_site(db, principal, suggestion.site_id)
     _set_audit_actor(db, actor)
     if not _review_ids(db, [suggestion_id], payload.status):
         raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")

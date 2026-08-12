@@ -12,7 +12,7 @@ from app.config import settings
 from app.connectors.base import (
     ArticleData,
     ContentConnector,
-    LinkOutcome,
+    PlannedEditOutcome,
     SiteMetadata,
     TaxonomyData,
 )
@@ -24,7 +24,6 @@ from app.connectors.url_guard import (
     validate_url,
 )
 from app.models.site import Site
-from app.models.suggestion import Suggestion
 from app.services.pool_source_policy import pool_request_guard
 
 
@@ -118,8 +117,7 @@ class WikipediaConnector(ContentConnector):
             media_type = (response.content_type or "").split(";", 1)[0].strip().lower()
             if media_type != "application/json" and not media_type.endswith("+json"):
                 raise ValueError(
-                    "Wikipedia API returned unsupported Content-Type "
-                    f"{media_type or 'missing'}"
+                    f"Wikipedia API returned unsupported Content-Type {media_type or 'missing'}"
                 )
             try:
                 payload = json.loads(response.content)
@@ -130,9 +128,7 @@ class WikipediaConnector(ContentConnector):
             api_error = payload.get("error")
             if api_error is not None:
                 info = (
-                    api_error.get("info", "unknown")
-                    if isinstance(api_error, dict)
-                    else api_error
+                    api_error.get("info", "unknown") if isinstance(api_error, dict) else api_error
                 )
                 raise ValueError(f"Wikipedia API error: {info}")
             pages.extend(payload.get("query", {}).get("pages", []))
@@ -210,7 +206,7 @@ class WikipediaConnector(ContentConnector):
     def supports_incremental_sync(self) -> bool:
         return True
 
-    def apply_links(
-        self, suggestions: list[Suggestion], *, dry_run: bool = False
-    ) -> list[LinkOutcome]:
+    def apply_planned_edit(
+        self, source, *, original_html: str, updated_html: str
+    ) -> PlannedEditOutcome:
         raise NotImplementedError("content-pool sources are read-only")

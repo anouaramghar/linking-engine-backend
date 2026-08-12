@@ -10,7 +10,7 @@ import pytest
 
 from app.config import settings
 from app.connectors import wordpress as wordpress_module
-from app.connectors.base import TaxonomyData
+from app.connectors.base import StalePlanError, TaxonomyData
 from app.connectors.wordpress import WordPressConnector
 
 IN_TEXT = 'data-linkmesh="in-text" href="https://example.com/t?a=1&amp;b=2"'
@@ -54,9 +54,7 @@ def test_internal_hrefs_skips_and_logs_malformed_links(monkeypatch):
         SimpleNamespace(warning=lambda *args: warnings.append(args)),
     )
 
-    assert c._internal_hrefs(content, "https://example.com/post/") == [
-        "https://example.com/valid/"
-    ]
+    assert c._internal_hrefs(content, "https://example.com/post/") == ["https://example.com/valid/"]
     assert warnings and "Skipping malformed WordPress href" in warnings[0][0]
 
 
@@ -116,6 +114,24 @@ def test_to_article_keeps_category_and_tag_with_same_wordpress_id():
     )
 
     assert article.taxonomies == [category, tag]
+
+
+def test_to_article_rejects_a_non_http_link_returned_by_wordpress():
+    c = make_connector()
+
+    with pytest.raises(ValueError, match="unsafe post link"):
+        c._to_article(
+            {
+                "id": 10,
+                "link": "javascript:alert(1)",
+                "title": {"rendered": "Post"},
+                "content": {"rendered": "<p>body</p>"},
+                "categories": [],
+                "tags": [],
+                "date_gmt": None,
+            },
+            {},
+        )
 
 
 def test_paginate_continues_when_total_pages_header_is_missing():
@@ -316,9 +332,7 @@ def test_wordpress_credentials_are_only_sent_to_configured_origin():
             )
         return httpx.Response(200, json=[])
 
-    connector.client = httpx.Client(
-        transport=httpx.MockTransport(handler), follow_redirects=True
-    )
+    connector.client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
     connector._api_candidates = ["https://example.com/wp-json/wp/v2/"]
 
     assert list(connector._paginate("categories")) == []
@@ -345,9 +359,10 @@ def test_query_based_api_root_is_used_for_publication():
         return httpx.Response(200, json={})
 
     connector.client = httpx.Client(transport=httpx.MockTransport(handler))
-    connector.apply_links([_suggestion()])
+    _publish(connector, [_suggestion()])
 
     assert [request.url.params["rest_route"] for request in requests] == [
+        "/wp/v2/posts/10",
         "/wp/v2/posts/10",
         "/wp/v2/posts/10",
     ]
@@ -370,6 +385,25 @@ def _mock_publish(connector, raw_content):
     return captured
 
 
+def _publish(connector, suggestions):
+    """Render, then send exactly what was rendered — the two real steps, composed.
+
+    Publication no longer has a method that decides and writes in one breath.
+    Preparation calls `preview_links` and freezes its answer; publication calls
+    `apply_planned_edit` with those frozen strings and nothing else. Driving both
+    halves here is what keeps these rendering tests honest about the bytes that
+    actually reach WordPress.
+
+    Returns (outcomes, planned-edit outcome).
+    """
+    preview = connector.preview_links(suggestions)
+    return preview.outcomes, connector.apply_planned_edit(
+        suggestions[0].source_article,
+        original_html=preview.original_content,
+        updated_html=preview.updated_content,
+    )
+
+
 def _suggestion(anchor_text=None):
     return SimpleNamespace(
         source_article=SimpleNamespace(id=1, external_id="10", url="https://example.com/src"),
@@ -383,7 +417,7 @@ def _suggestion(anchor_text=None):
 def test_apply_link_escapes_html():
     c = make_connector()
     captured = _mock_publish(c, "<p>body</p>")
-    c.apply_links([_suggestion()])
+    _publish(c, [_suggestion()])
     assert "Tips &amp; &lt;Tricks&gt;" in captured["content"]
     assert 'href="https://example.com/t?a=1&amp;b=2"' in captured["content"]
 
@@ -392,7 +426,7 @@ def test_apply_link_handles_comment_only_content():
     c = make_connector()
     captured = _mock_publish(c, "<!-- wp:latest-posts /-->")
 
-    c.apply_links([_suggestion()])
+    _publish(c, [_suggestion()])
 
     assert captured["content"].startswith("<!-- wp:latest-posts /-->")
     assert "Read also" in captured["content"]
@@ -402,13 +436,13 @@ def test_apply_link_skips_only_on_exact_href():
     # exact target href present -> idempotent no-op
     c = make_connector()
     captured = _mock_publish(c, '<p><a href="https://example.com/t?a=1&b=2">already</a></p>')
-    c.apply_links([_suggestion()])
+    _publish(c, [_suggestion()])
     assert captured == {}
 
     # a *prefix-sharing* href must not suppress the insert (old substring-check bug)
     c = make_connector()
     captured = _mock_publish(c, '<p><a href="https://example.com/t?a=1&b=25">other post</a></p>')
-    c.apply_links([_suggestion()])
+    _publish(c, [_suggestion()])
     assert "Read also" in captured["content"]
 
 
@@ -417,7 +451,7 @@ def test_apply_link_inserts_in_text_when_the_anchor_is_locatable():
     c = make_connector()
     captured = _mock_publish(c, "<!-- wp:paragraph --><p>solar&nbsp;panel costs fell</p>")
 
-    c.apply_links([_suggestion(anchor_text="solar panel")])
+    _publish(c, [_suggestion(anchor_text="solar panel")])
 
     # Byte-for-byte outside the two insertion points, `&nbsp;` included.
     assert captured["content"] == (
@@ -450,7 +484,7 @@ def test_apply_link_inserts_in_text_across_prose_contexts(raw, expected):
     c = make_connector()
     captured = _mock_publish(c, raw)
 
-    c.apply_links([_suggestion(anchor_text="solar panel")])
+    _publish(c, [_suggestion(anchor_text="solar panel")])
 
     assert captured["content"] == expected
 
@@ -495,7 +529,7 @@ def test_apply_link_falls_back_to_the_block_when_in_text_is_unsafe(raw):
     c = make_connector()
     captured = _mock_publish(c, raw)
 
-    c.apply_links([_suggestion(anchor_text="solar panel")])
+    _publish(c, [_suggestion(anchor_text="solar panel")])
 
     assert captured["content"] == raw + (
         '\n<!-- wp:paragraph -->\n<p>Read also: <a href="https://example.com/t?a=1&amp;b=2">solar panel</a></p>\n<!-- /wp:paragraph -->'
@@ -512,7 +546,7 @@ def _republish(connector_content, suggestion):
     """
     c = make_connector()
     captured = _mock_publish(c, connector_content)
-    c.apply_links([suggestion])
+    _publish(c, [suggestion])
     return captured.get("content", connector_content)
 
 
@@ -541,7 +575,7 @@ def test_two_suggestions_competing_for_one_anchor():
 
 
 def test_an_anchor_overlapping_one_already_linked_is_not_split():
-    """"panel costs" straddles the first link's boundary, so it is no longer text."""
+    """ "panel costs" straddles the first link's boundary, so it is no longer text."""
     after_first = _republish(
         "<p>solar panel costs fell</p>", _suggestion(anchor_text="solar panel")
     )
@@ -553,9 +587,10 @@ def test_an_anchor_overlapping_one_already_linked_is_not_split():
 
 def test_a_plural_elsewhere_does_not_make_the_anchor_ambiguous():
     """Word boundaries earn this placement: "panels" would otherwise be a rival."""
-    assert _republish(
-        "<p>one panel here, many panels there</p>", _suggestion(anchor_text="panel")
-    ) == f"<p>one <a {IN_TEXT}>panel</a> here, many panels there</p>"
+    assert (
+        _republish("<p>one panel here, many panels there</p>", _suggestion(anchor_text="panel"))
+        == f"<p>one <a {IN_TEXT}>panel</a> here, many panels there</p>"
+    )
 
 
 #: Long enough that the two anchors are not crowding each other; the gap guard
@@ -638,7 +673,7 @@ def test_publication_is_not_bounded_by_the_crawl_budget(monkeypatch):
     c = make_connector()
     captured = _mock_publish(c, "<p>solar panel costs fell</p>")
 
-    c.apply_links([_suggestion(anchor_text="solar panel")])
+    _publish(c, [_suggestion(anchor_text="solar panel")])
 
     assert captured["content"] == f"<p><a {IN_TEXT}>solar panel</a> costs fell</p>"
 
@@ -684,7 +719,7 @@ def test_apply_link_is_idempotent_for_external_pool_targets():
     c = make_connector()
     captured = _mock_publish(c, published)
 
-    c.apply_links([_pool_suggestion()])
+    _publish(c, [_pool_suggestion()])
 
     assert captured == {}
 
@@ -693,7 +728,7 @@ def test_apply_link_is_idempotent_for_external_pool_targets():
     captured = _mock_publish(c, published)
     other = _pool_suggestion()
     other.target_article.url = "https://en.wikipedia.org/wiki/Photosystem"
-    c.apply_links([other])
+    _publish(c, [other])
     assert captured["content"].count("Read also") == 2
 
 
@@ -726,18 +761,17 @@ def test_a_batch_reads_and_writes_the_post_once():
             return httpx.Response(200, json={"content": {"raw": raw}})
         return httpx.Response(200, json={})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
-    outcomes = c.apply_links(
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
+    outcomes, _written = _publish(
+        c,
         [
             _suggestion(anchor_text="solar panel"),
             _second_target(anchor_text="demand rose"),
             _pool_suggestion(),
-        ]
+        ],
     )
 
-    assert methods == ["GET", "POST"]
+    assert methods == ["GET", "GET", "POST"]
     assert outcomes == ["inserted", "inserted", "block"]
 
 
@@ -747,9 +781,38 @@ def test_a_batch_reports_one_outcome_per_suggestion_in_order():
     already = _second_target()
     _mock_publish(c, f'<p>solar panel costs</p><p><a href="{already.target_article.url}">x</a></p>')
 
-    assert c.apply_links(
-        [_suggestion(anchor_text="solar panel"), already, _pool_suggestion()]
-    ) == ["inserted", "already_present", "block"]
+    outcomes, _written = _publish(
+        c, [_suggestion(anchor_text="solar panel"), already, _pool_suggestion()]
+    )
+
+    assert outcomes == ["inserted", "already_present", "block"]
+
+
+def test_publication_refuses_to_overwrite_an_edit_made_after_approval():
+    """An article that moved is a stale plan, not a retry.
+
+    Typed rather than a bare RuntimeError, because the worker has to tell this
+    apart from a transient failure: retrying would only re-read the same changed
+    article, and the recovery is a new preparation and a new human approval.
+    """
+    c = make_connector()
+    c._api_candidates = []
+    c._api_base_url = "https://example.com/wp-json/wp/v2/"
+    reads = iter(["<p>original</p>", "<p>human edit</p>"])
+    methods = []
+
+    def handler(request):
+        methods.append(request.method)
+        if request.method == "GET":
+            return httpx.Response(200, json={"content": {"raw": next(reads)}})
+        pytest.fail("a conflicting edit must prevent the WordPress POST")
+
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
+
+    with pytest.raises(StalePlanError, match="no longer matches the approved plan"):
+        _publish(c, [_suggestion()])
+
+    assert methods == ["GET", "GET"]
 
 
 def test_a_batch_that_changes_nothing_does_not_write():
@@ -761,24 +824,24 @@ def test_a_batch_that_changes_nothing_does_not_write():
         '<a href="https://example.com/other">b</a></p>',
     )
 
-    assert c.apply_links([_suggestion(), _second_target()]) == [
-        "already_present",
-        "already_present",
-    ]
+    outcomes, written = _publish(c, [_suggestion(), _second_target()])
+
+    assert outcomes == ["already_present", "already_present"]
+    assert written == "already_applied"
     assert captured == {}
 
 
-def test_dry_run_computes_the_outcomes_without_saving():
+def test_preparation_renders_the_edit_without_saving_it():
+    """Preparation reads and decides; it never writes. That is what makes it safe
+    to run in front of an operator before anything is approved."""
     c = make_connector()
     captured = _mock_publish(c, "<p>solar panel costs fell</p>")
 
     preview = c.preview_links([_suggestion(anchor_text="solar panel")])
+
     assert preview.original_content == "<p>solar panel costs fell</p>"
     assert f"<a {IN_TEXT}>solar panel</a>" in preview.updated_content
     assert preview.outcomes == ["inserted"]
-    assert c.apply_links([_suggestion(anchor_text="solar panel")], dry_run=True) == [
-        "inserted"
-    ]
     assert captured == {}
 
 
@@ -799,10 +862,8 @@ def test_a_save_throttled_by_the_host_waits_the_requested_time(monkeypatch):
         headers = {"Retry-After": "12"} if status == 429 else {}
         return httpx.Response(status, json={}, headers=headers)
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
-    c.apply_links([_suggestion()])
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
+    _publish(c, [_suggestion()])
 
     assert waited == [12.0]
 
@@ -827,14 +888,10 @@ def test_a_throttled_save_without_a_usable_delay_still_waits_sensibly(
         if request.method == "GET":
             return httpx.Response(200, json={"content": {"raw": "<p>body</p>"}})
         status = next(statuses)
-        return httpx.Response(
-            status, json={}, headers={"Retry-After": header} if header else {}
-        )
+        return httpx.Response(status, json={}, headers={"Retry-After": header} if header else {})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
-    c.apply_links([_suggestion()])
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
+    _publish(c, [_suggestion()])
 
     assert waited == [expected]
 
@@ -859,11 +916,9 @@ def test_a_host_that_keeps_throttling_eventually_fails(monkeypatch):
         posts.append(request)
         return httpx.Response(429, json={})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     with pytest.raises(httpx.HTTPStatusError):
-        c.apply_links([_suggestion()])
+        _publish(c, [_suggestion()])
 
     assert len(posts) == 3  # the first attempt plus two retries
 
@@ -885,7 +940,7 @@ def test_a_read_the_account_may_not_make_names_the_account(status):
     )
 
     with pytest.raises(ValueError, match=r"editor-bot needs permission to edit posts"):
-        c.apply_links([_suggestion()])
+        _publish(c, [_suggestion()])
 
 
 def test_a_marker_stripped_by_the_host_is_reported(caplog):
@@ -901,12 +956,11 @@ def test_a_marker_stripped_by_the_host_is_reported(caplog):
             return httpx.Response(200, json={"content": {"raw": "<p>solar panel costs</p>"}})
         return httpx.Response(200, json={"content": {"raw": "<p>solar panel costs</p>"}})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     with caplog.at_level("WARNING"):
-        assert c.apply_links([_suggestion(anchor_text="solar panel")]) == ["inserted"]
+        outcomes, _written = _publish(c, [_suggestion(anchor_text="solar panel")])
 
+    assert outcomes == ["inserted"]
     assert "0 of 1 in-text markers" in caplog.text
 
 
@@ -919,11 +973,9 @@ def test_a_marker_that_survives_is_not_reported(caplog):
             raw = json.loads(request.content)["content"]
         return httpx.Response(200, json={"content": {"raw": raw}})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     with caplog.at_level("WARNING"):
-        c.apply_links([_suggestion(anchor_text="solar panel")])
+        _publish(c, [_suggestion(anchor_text="solar panel")])
 
     assert "in-text markers" not in caplog.text
 
@@ -936,11 +988,9 @@ def test_a_successful_save_without_returned_raw_content_warns(caplog):
             return httpx.Response(200, json={"content": {"raw": "<p>solar panel costs</p>"}})
         return httpx.Response(200, json={})
 
-    c.client = httpx.Client(
-        base_url="https://example.com", transport=httpx.MockTransport(handler)
-    )
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
     with caplog.at_level("WARNING"):
-        c.apply_links([_suggestion(anchor_text="solar panel")])
+        _publish(c, [_suggestion(anchor_text="solar panel")])
 
     assert "in-text marker could not be verified" in caplog.text
 
@@ -957,7 +1007,7 @@ def test_a_read_throttled_by_the_host_waits_and_retries(monkeypatch):
     c = make_connector()
     c._api_candidates = []  # REST discovery is its own GET; this test is about the read
     c._api_base_url = "https://example.com/wp-json/wp/v2/"
-    reads = iter([429, 200])
+    reads = iter([429, 200, 200])
 
     def handler(request):
         if request.method != "GET":
@@ -966,9 +1016,129 @@ def test_a_read_throttled_by_the_host_waits_and_retries(monkeypatch):
             return httpx.Response(429, json={}, headers={"Retry-After": "7"})
         return httpx.Response(200, json={"content": {"raw": "<p>solar panel costs</p>"}})
 
-    c.client = httpx.Client(
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
+
+    outcomes, _written = _publish(c, [_suggestion(anchor_text="solar panel")])
+
+    assert outcomes == ["inserted"]
+    assert waited == [7.0]
+
+
+# -- the approved-plan write path (immutable publication plans) --------------
+#
+# `apply_planned_edit` receives two strings and nothing else. It cannot see a
+# suggestion, a target URL, an anchor, or a placement, so there is nothing it
+# could re-decide even if it wanted to. These tests hold that boundary.
+
+
+_SOURCE = SimpleNamespace(id=1, external_id="10", url="https://example.com/src")
+
+_APPROVED_BEFORE = "<p>solar panel costs fell</p>"
+_APPROVED_AFTER = f"<p><a {IN_TEXT}>solar panel</a> costs fell</p>"
+
+
+def _mock_article(connector, raw_content):
+    """Serve `raw_content` on GET and capture the POST body, if one is made."""
+    captured = {}
+
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"content": {"raw": raw_content}})
+        captured["content"] = json.loads(request.content)["content"]
+        return httpx.Response(200, json={})
+
+    connector.client = httpx.Client(
         base_url="https://example.com", transport=httpx.MockTransport(handler)
     )
+    return captured
 
-    assert c.apply_links([_suggestion(anchor_text="solar panel")]) == ["inserted"]
-    assert waited == [7.0]
+
+def test_a_plan_whose_article_is_unchanged_sends_the_approved_bytes_exactly():
+    """Byte-for-byte. Not "equivalent", not "re-rendered from the same inputs"."""
+    c = make_connector()
+    captured = _mock_article(c, _APPROVED_BEFORE)
+
+    outcome = c.apply_planned_edit(
+        _SOURCE, original_html=_APPROVED_BEFORE, updated_html=_APPROVED_AFTER
+    )
+
+    assert outcome == "written"
+    assert captured["content"] == _APPROVED_AFTER
+
+
+def test_a_plan_already_written_is_recognised_and_not_written_again():
+    """The crash-between-POST-and-commit case, which is why retries are safe.
+
+    Without this the retry would see content that is neither snapshot and either
+    refuse for ever or append the same links a second time.
+    """
+    c = make_connector()
+    captured = _mock_article(c, _APPROVED_AFTER)
+
+    outcome = c.apply_planned_edit(
+        _SOURCE, original_html=_APPROVED_BEFORE, updated_html=_APPROVED_AFTER
+    )
+
+    assert outcome == "already_applied"
+    assert captured == {}
+
+
+def test_an_article_that_matches_neither_snapshot_is_refused_without_writing():
+    c = make_connector()
+    captured = _mock_article(c, "<p>an editor rewrote this paragraph</p>")
+
+    with pytest.raises(StalePlanError, match="no longer matches the approved plan"):
+        c.apply_planned_edit(_SOURCE, original_html=_APPROVED_BEFORE, updated_html=_APPROVED_AFTER)
+
+    assert captured == {}
+
+
+def test_a_plan_that_changes_nothing_still_checks_for_drift_without_posting():
+    """Every link was present, but the article can still change after approval."""
+    c = make_connector()
+    requests = []
+
+    def handler(request):
+        requests.append(request.method)
+        return httpx.Response(200, json={"content": {"raw": _APPROVED_BEFORE}})
+
+    c.client = httpx.Client(base_url="https://example.com", transport=httpx.MockTransport(handler))
+
+    outcome = c.apply_planned_edit(
+        _SOURCE, original_html=_APPROVED_BEFORE, updated_html=_APPROVED_BEFORE
+    )
+
+    assert outcome == "already_applied"
+    assert requests and set(requests) == {"GET"}
+
+
+def test_a_no_op_plan_becomes_stale_when_the_live_article_changed():
+    c = make_connector()
+    captured = _mock_article(c, "<p>An editor removed the approved links</p>")
+
+    with pytest.raises(StalePlanError, match="no longer matches the approved plan"):
+        c.apply_planned_edit(
+            _SOURCE,
+            original_html=_APPROVED_BEFORE,
+            updated_html=_APPROVED_BEFORE,
+        )
+
+    assert captured == {}
+
+
+def test_nothing_decided_after_approval_can_change_the_submitted_html(monkeypatch):
+    """The settings and inputs that shaped the plan are re-read by nobody.
+
+    A target URL edited, an anchor regenerated, the in-text cap lowered to zero,
+    the crowding gap widened, the placement model swapped — every one of these
+    changed what publication wrote, because publication re-rendered. It no longer
+    has the inputs, so the bytes are the bytes.
+    """
+    monkeypatch.setattr(settings, "publish_max_in_text_links_per_article", 0)
+    monkeypatch.setattr(settings, "publish_min_in_text_gap_chars", 100_000)
+    c = make_connector()
+    captured = _mock_article(c, _APPROVED_BEFORE)
+
+    c.apply_planned_edit(_SOURCE, original_html=_APPROVED_BEFORE, updated_html=_APPROVED_AFTER)
+
+    assert captured["content"] == _APPROVED_AFTER

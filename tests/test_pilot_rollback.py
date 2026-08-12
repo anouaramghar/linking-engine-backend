@@ -75,14 +75,50 @@ def migrated(scratch_database, monkeypatch):
 def _seed(url: str, *, hybrid_statuses=(), cosine_statuses=(), site_mode="standard") -> None:
     engine = create_engine(url)
     with engine.begin() as connection:
-        site_id = connection.execute(
-            text(
+        has_tenant_column = bool(
+            connection.execute(
+                text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'sites' AND column_name = 'tenant_id'"
+                )
+            ).scalar()
+        )
+        has_site_mode_column = bool(
+            connection.execute(
+                text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'sites' AND column_name = 'suggestion_mode'"
+                )
+            ).scalar()
+        )
+        if has_tenant_column and has_site_mode_column:
+            # Seeded against the tenants-bearing head, sites must name an owner.
+            site_stmt = text(
+                "INSERT INTO sites (name, base_url, platform, suggestion_mode, tenant_id) "
+                "SELECT 'rollback', 'https://rollback.example.com', 'wordpress', :mode, id "
+                "FROM tenants WHERE slug = 'default' "
+                "RETURNING id"
+            )
+        elif has_tenant_column:
+            site_stmt = text(
+                "INSERT INTO sites (name, base_url, platform, tenant_id) "
+                "SELECT 'rollback', 'https://rollback.example.com', 'wordpress', id "
+                "FROM tenants WHERE slug = 'default' "
+                "RETURNING id"
+            )
+        elif has_site_mode_column:
+            site_stmt = text(
                 "INSERT INTO sites (name, base_url, platform, suggestion_mode) "
                 "VALUES ('rollback', 'https://rollback.example.com', 'wordpress', :mode) "
                 "RETURNING id"
-            ),
-            {"mode": site_mode},
-        ).scalar_one()
+            )
+        else:
+            site_stmt = text(
+                "INSERT INTO sites (name, base_url, platform) "
+                "VALUES ('rollback', 'https://rollback.example.com', 'wordpress') "
+                "RETURNING id"
+            )
+        site_id = connection.execute(site_stmt, {"mode": site_mode}).scalar_one()
         article_ids = [
             connection.execute(
                 text(

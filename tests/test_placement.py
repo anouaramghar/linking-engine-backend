@@ -83,9 +83,9 @@ def _stub_completion(monkeypatch, answer: dict | Exception, calls: list | None =
 
 
 def _client_returning(payload, status: int = 200) -> httpx.Client:
-    body = payload if isinstance(payload, dict) else {
-        "choices": [{"message": {"content": payload}}]
-    }
+    body = (
+        payload if isinstance(payload, dict) else {"choices": [{"message": {"content": payload}}]}
+    )
     return httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(status, json=body)))
 
 
@@ -132,6 +132,17 @@ def test_client_raises_on_an_error_status(enable_openrouter):
     with _client_returning({"error": {"message": "no credit"}}, status=402) as client:
         with pytest.raises(OpenRouterError, match="402"):
             _complete(client)
+
+
+def test_client_rejects_an_unbounded_response(enable_openrouter):
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"x" * 1_000_001, request=request)
+        )
+    )
+
+    with client, pytest.raises(OpenRouterError, match="decoded-body limit|declares"):
+        _complete(client)
 
 
 def test_client_raises_on_prose_instead_of_json(enable_openrouter):
@@ -228,9 +239,7 @@ def test_the_model_only_sees_the_configured_slice(monkeypatch, enable_openrouter
     assert not placement.found  # the passage is past the cut
 
 
-def test_an_anchor_a_sibling_already_took_is_rejected(
-    monkeypatch, enable_openrouter, suggestion
-):
+def test_an_anchor_a_sibling_already_took_is_rejected(monkeypatch, enable_openrouter, suggestion):
     """Two suggestions on one source cannot both link the same words.
 
     Publication gives the phrase to the first and the loser publishes as the

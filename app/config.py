@@ -10,15 +10,38 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://linkmesh:linkmesh@localhost:5432/linkmesh"
     redis_url: str = "redis://localhost:6379/0"
 
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
     environment: str = "development"
 
     # Static API key for all non-health endpoints; empty fails closed at the API boundary.
+    # When set, this key is a legacy admin principal (all tenants) with a deprecation warning.
     api_key: str = ""
     # Human operator identities mapped to their individual API keys. These keys
-    # may call every protected route and provide trusted approval audit identity.
+    # may call every protected route as admin and provide trusted approval audit identity.
     operator_api_keys: dict[str, SecretStr] = Field(default_factory=dict)
+    # HMAC pepper for database API key hashes. A database leak alone must not let
+    # an attacker verify candidate secrets offline. Set a long random value in
+    # every non-dev environment before minting tenant keys.
+    api_key_pepper: str = ""
+
+    # Dashboard login via Telegram; see docs/design/dashboard-authentication.md.
+    # The Login Widget is deliberately not used: it needs a publicly routable
+    # registered domain, and this deployment sits behind an IP restriction. The
+    # bot deep-link flow needs only outbound access to api.telegram.org.
+    # An empty token disables dashboard login; the proxy then has no gate to
+    # consult, so it must not be deployed with auth_request enabled.
+    telegram_bot_token: SecretStr | None = None
+    # Used to build the static t.me deep link the browser shows. No leading '@'.
+    telegram_bot_username: str = ""
+    # Pre-approved Telegram user ID allowed to approve everyone else. Without it
+    # the first login has nobody to admit it and the dashboard is unreachable.
+    dashboard_bootstrap_admin_id: int | None = None
+    # Sliding: a request within the window extends it. 12 hours covers a working
+    # day without forcing a re-login over lunch.
+    dashboard_session_ttl_minutes: int = Field(default=720, gt=0, le=43_200)
+    # Long enough to switch to Telegram and press Start, short enough that an
+    # abandoned one-time code is not a standing invitation. The environment
+    # name stays stable for deployment compatibility.
+    dashboard_login_nonce_ttl_seconds: int = Field(default=300, gt=0, le=3_600)
 
     # Fernet key used to encrypt WordPress application passwords at rest.
     credential_encryption_key: SecretStr | None = None
@@ -89,18 +112,43 @@ class Settings(BaseSettings):
     # segment. Emptying either list disables that half of the rule.
     low_value_target_titles: list[str] = Field(
         default=[
-            "login", "log in", "sign in", "sign up", "register", "registration",
-            "dashboard", "my account", "cart", "shopping cart", "checkout",
-            "privacy policy", "terms of service", "terms of use", "cookie policy",
+            "login",
+            "log in",
+            "sign in",
+            "sign up",
+            "register",
+            "registration",
+            "dashboard",
+            "my account",
+            "cart",
+            "shopping cart",
+            "checkout",
+            "privacy policy",
+            "terms of service",
+            "terms of use",
+            "cookie policy",
             "support portal",
         ]
     )
     low_value_target_url_slugs: list[str] = Field(
         default=[
-            "login", "log-in", "sign-in", "sign-up", "signup", "register",
-            "registration", "dashboard", "my-account", "cart", "shopping-cart",
-            "checkout", "privacy-policy", "terms-of-service", "terms-of-use",
-            "cookie-policy", "support-portal",
+            "login",
+            "log-in",
+            "sign-in",
+            "sign-up",
+            "signup",
+            "register",
+            "registration",
+            "dashboard",
+            "my-account",
+            "cart",
+            "shopping-cart",
+            "checkout",
+            "privacy-policy",
+            "terms-of-service",
+            "terms-of-use",
+            "cookie-policy",
+            "support-portal",
         ]
     )
 
@@ -120,13 +168,16 @@ class Settings(BaseSettings):
     # write traffic LinkMesh ever sends a customer site, and shared hosting
     # answers that with a WAF block rather than a Retry-After we could honour.
     publish_request_delay_seconds: float = Field(default=0.5, ge=0.0, le=60.0)
-    # Placements missing at publication time are generated in a preflight pass,
-    # because the review queue is worked in bulk and a bulk-approved row never
-    # had its drawer opened. Each is a model call of a few seconds, so the pass
-    # is capped: past this many the rest publish as the appended block, exactly
-    # as they do today. 0 disables preflight and restores lazy-only generation.
+    # Placements missing when publication plans are *prepared* are generated in
+    # one pass, because the review queue is worked in bulk and a selected row
+    # never had its drawer opened. This is the last moment a model may be asked:
+    # a placement generated after approval cannot change the approved edit, so
+    # the appended block an operator saw stays the block that is published. Each
+    # call is a few seconds, so the pass is capped: past this many the rest are
+    # prepared as the appended block. 0 disables it and restores lazy-only
+    # generation.
     publish_max_placement_calls_per_run: int = Field(default=200, ge=0, le=5_000)
-    # How many preflight placement calls run at once. The pass is latency-bound
+    # How many preparation placement calls run at once. The pass is latency-bound
     # on an external API, not CPU-bound; the ceiling is the provider's rate
     # limit, not ours.
     publish_placement_concurrency: int = Field(default=4, ge=1, le=16)
@@ -176,6 +227,9 @@ class Settings(BaseSettings):
     # records them prospectively instead of inventing a pre-deployment trend.
     evaluation_snapshot_interval_seconds: int = Field(default=86400, ge=60)
     evaluation_snapshot_repeat_count: int = Field(default=3650, ge=1)
+
+    # One tenant cannot fill every stage queue while other tenants wait.
+    max_active_jobs_per_tenant: int = Field(default=100, ge=1, le=10_000)
 
     # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/
     # metadata destinations and require HTTPS when WP credentials are used.

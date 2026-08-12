@@ -169,9 +169,7 @@ def test_generation_rejects_pairs_below_the_minimum_score(db, site, monkeypatch)
 
     targets = set(
         db.scalars(
-            select(Suggestion.target_article_id).where(
-                Suggestion.source_article_id == source.id
-            )
+            select(Suggestion.target_article_id).where(Suggestion.source_article_id == source.id)
         )
     )
     assert strong.id in targets
@@ -252,9 +250,7 @@ def test_reanalysis_respects_total_suggestion_cap(db, site):
     assert max(counts.values()) <= settings.hybrid_max_suggestions_per_article
 
 
-def test_rejected_and_applied_suggestions_free_active_quota(
-    db, site, source_with_pool_targets
-):
+def test_rejected_and_applied_suggestions_free_active_quota(db, site, source_with_pool_targets):
     source, _pool, _targets = source_with_pool_targets(
         site, settings.hybrid_max_suggestions_per_article + 3
     )
@@ -496,9 +492,9 @@ def test_review_lifecycle(client, db, site):
     listed = client.get(f"/api/v1/suggestions/{site.id}", params={"status": "approved"}).json()
     assert [s["id"] for s in listed] == [first.id]
 
-    # publication status counts
+    # publication status counts — a selected row is not yet a publishable plan
     status = client.get(f"/api/v1/publish/{site.id}/status").json()
-    assert status == {"applied": 0, "awaiting_publication": 1}
+    assert status == {"applied": 0, "selected_suggestions": 1, "approved_plans": 0}
 
 
 def test_review_can_be_undone(client, db, site):

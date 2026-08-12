@@ -361,9 +361,7 @@ def test_connect_backend_honors_allow_private():
 
 class _CannedTLSStream(httpcore.NetworkStream):
     def __init__(self) -> None:
-        self.response = (
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
-        )
+        self.response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
         self.server_hostname = None
 
     def read(self, max_bytes, timeout=None):
@@ -426,9 +424,7 @@ def test_wordpress_connector_requires_https_with_credentials(no_dns):
     ("wp_username", "wp_app_password"),
     [("admin", None), (None, "password")],
 )
-def test_wordpress_connector_rejects_partial_credentials(
-    no_dns, wp_username, wp_app_password
-):
+def test_wordpress_connector_rejects_partial_credentials(no_dns, wp_username, wp_app_password):
     with pytest.raises(ValueError, match="provided together"):
         WordPressConnector(
             _site(

@@ -11,6 +11,7 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import delete, select
 
+from app.api.deps import require_api_key
 from app.config import settings
 from app.connectors.registry import get_connector
 from app.connectors.rss_connector import RSSConnector
@@ -28,6 +29,7 @@ from app.ml.external.cleaning import (
     deduplicate_external_urls,
     normalize_external_url,
 )
+from app.main import app
 from app.schemas.site import SiteCreate
 from app.connectors.url_guard import UnsafeURLError
 from app.services.ingestion_service import _reconcile_snapshot
@@ -72,7 +74,13 @@ def _delete_audit_events(db, site_id: int) -> None:
     db.commit()
 
 
-def test_pool_schema_defaults_to_daily_and_rejects_credentials():
+def test_pool_schema_defaults_to_daily_and_rejects_credentials(monkeypatch):
+    # `SiteCreate` relaxes the HTTPS and private-address rules when this is on,
+    # and settings fall back to the developer's .env, which the suite shares.
+    # Pinned here so this asserts the guard rather than the machine it runs on,
+    # as `test_url_guard` and `test_site_bulk_import` already do.
+    monkeypatch.setattr(settings, "allow_unsafe_crawl_targets", False)
+
     payload = SiteCreate(
         name="Wikipedia",
         base_url="https://en.wikipedia.org/wiki/Search_engine_optimization",
@@ -377,9 +385,7 @@ def test_wikipedia_connector_bounds_empty_continuations(monkeypatch):
         return httpx.Response(
             200,
             headers={"content-type": "application/json"},
-            content=json.dumps(
-                {"query": {"pages": []}, "continue": {"gsroffset": calls}}
-            ).encode(),
+            content=json.dumps({"query": {"pages": []}, "continue": {"gsroffset": calls}}).encode(),
         )
 
     monkeypatch.setattr(settings, "pool_max_articles_per_source", 2)
@@ -613,7 +619,76 @@ def test_pool_source_must_be_approved_before_ingestion_and_can_be_revoked(client
         _delete_audit_events(db, site_id)
 
 
+def test_a_managed_domain_can_never_become_a_pool_target(client, db, monkeypatch):
+    """PBN rule: a domain we run for a client must not be a link target for other
+    clients, whichever order the two sites are created in."""
+    monkeypatch.setattr(settings, "pool_allowed_domains", "wikipedia.org,client.example")
+    created: list[int] = []
+    try:
+        managed = client.post(
+            "/api/v1/sites",
+            json={
+                "name": "Client blog",
+                "base_url": "https://blog.client.example",
+                "platform": "wordpress",
+            },
+        )
+        assert managed.status_code == 201, managed.text
+        created.append(managed.json()["id"])
+
+        pool = client.post(
+            "/api/v1/sites",
+            json={
+                "name": "Same property, as a pool source",
+                "base_url": "https://client.example/feed.xml",
+                "platform": "pool",
+            },
+        )
+        assert pool.status_code == 201, pool.text
+        pool_id = pool.json()["id"]
+        created.append(pool_id)
+
+        refused = client.post(f"/api/v1/sites/{pool_id}/pool-source/approval")
+        assert refused.status_code == 409, refused.text
+        assert "private blog network" in refused.text
+        db.expire_all()
+        assert db.get(Site, pool_id).pool_source_approved is False
+
+        # Reverse order: the pool source is approved before the client site exists.
+        wiki = client.post(
+            "/api/v1/sites",
+            json={
+                "name": "Wikipedia",
+                "base_url": "https://en.wikipedia.org/wiki/Backlink",
+                "platform": "pool",
+            },
+        )
+        assert wiki.status_code == 201, wiki.text
+        created.append(wiki.json()["id"])
+        approval = client.post(f"/api/v1/sites/{wiki.json()['id']}/pool-source/approval")
+        assert approval.status_code == 200, approval.text
+
+        collision = client.post(
+            "/api/v1/sites",
+            json={
+                "name": "Client on the pool domain",
+                "base_url": "https://wikipedia.org",
+                "platform": "wordpress",
+            },
+        )
+        assert collision.status_code == 409, collision.text
+        assert "private blog network" in collision.text
+    finally:
+        for site_id in created:
+            site = db.get(Site, site_id)
+            if site is not None:
+                db.delete(site)
+                db.commit()
+            _delete_audit_events(db, site_id)
+
+
 def test_pool_approval_identity_comes_from_operator_key(client, db, monkeypatch):
+    app.dependency_overrides.pop(require_api_key, None)
     monkeypatch.setattr(settings, "operator_api_keys", {"alice": SecretStr("alice-key")})
     response = client.post(
         "/api/v1/sites",
@@ -814,7 +889,13 @@ def test_pool_traceability_survives_site_deletion(client, db):
     try:
         approved = client.post(f"/api/v1/sites/{site_id}/pool-source/approval")
         assert approved.status_code == 200, approved.text
-        assert client.delete(f"/api/v1/sites/{site_id}").status_code == 204
+        assert (
+            client.delete(
+                f"/api/v1/sites/{site_id}",
+                params={"confirm_name": "Deleted pool"},
+            ).status_code
+            == 204
+        )
 
         history = client.get(f"/api/v1/sites/{site_id}/pool-source/audit-events")
         assert history.status_code == 200
@@ -1090,9 +1171,7 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
     ("approved", "quarantined"),
     [(False, False), (True, True)],
 )
-def test_hybrid_excludes_disabled_pool_sources(
-    db, site, monkeypatch, approved, quarantined
-):
+def test_hybrid_excludes_disabled_pool_sources(db, site, monkeypatch, approved, quarantined):
     monkeypatch.setattr(
         "app.ml.embeddings.encode",
         lambda texts: [_vector(1.0) for _text in texts],

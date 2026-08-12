@@ -1,6 +1,18 @@
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -8,29 +20,26 @@ from app.db_types import EncryptedCredential
 
 Platform = Enum("wordpress", "html", "pool", name="platform", native_enum=False, length=20)
 RunStatus = Enum("running", "succeeded", "failed", name="run_status", native_enum=False, length=20)
-SuggestionMode = Enum(
-    "standard",
-    "experimental",
-    name="site_suggestion_mode",
-    native_enum=False,
-    length=20,
-)
 
 
 class Site(Base):
     __tablename__ = "sites"
 
+    # Two clients may legitimately own the same URL — an agency and the brand
+    # itself, or the same domain moving between tenants. Global uniqueness would
+    # also let one tenant probe another's inventory through the 409.
+    __table_args__ = (UniqueConstraint("tenant_id", "base_url", name="uq_sites_tenant_base_url"),)
+
     id: Mapped[int] = mapped_column(primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        index=True,
+    )
     name: Mapped[str] = mapped_column(String(255))
-    base_url: Mapped[str] = mapped_column(String(2048), unique=True)
+    base_url: Mapped[str] = mapped_column(String(2048))
     platform: Mapped[str] = mapped_column(Platform)
     crawl_frequency: Mapped[str] = mapped_column(
         String(50), default="manual", server_default="manual"
-    )
-    suggestion_mode: Mapped[str] = mapped_column(
-        SuggestionMode,
-        default="experimental",
-        server_default="experimental",
     )
     # WordPress Application Passwords (A2) — HTTP Basic Auth
     wp_username: Mapped[str | None] = mapped_column(String(255))
@@ -75,6 +84,17 @@ class Site(Base):
         Integer, default=10, server_default="10"
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def has_wordpress_credentials(self) -> bool:
+        """Whether an account exists that could edit this site's posts.
+
+        Publication reads each post with `context=edit` before it writes, and
+        WordPress refuses that anonymously. Tested on the username so that
+        listing sites does not decrypt a password per row; the two are only ever
+        written as a pair.
+        """
+        return self.platform == "wordpress" and bool(self.wp_username)
 
 
 class IngestionRun(Base):

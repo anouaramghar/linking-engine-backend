@@ -102,7 +102,9 @@ def test_ingestion_success_chains_analysis_and_completes_batch(db, monkeypatch):
     db.refresh(item)
     db.refresh(ingestion_run)
 
-    monkeypatch.setattr(pipeline_tasks, "run_ingestion", lambda _site_id, job_run_id=None: {"articles": 4})
+    monkeypatch.setattr(
+        pipeline_tasks, "run_ingestion", lambda _site_id, job_run_id=None: {"articles": 4}
+    )
     monkeypatch.setattr(pipeline_tasks, "enqueue_job", _fake_enqueue)
     result = pipeline_tasks.ingest_pipeline_site(
         site.id,

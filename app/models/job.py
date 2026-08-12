@@ -7,7 +7,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db import Base
 
 JobKind = Enum(
-    "ingestion", "analysis", "publication", name="job_kind", native_enum=False, length=20
+    "ingestion",
+    "analysis",
+    "publication_preparation",
+    "publication",
+    name="job_kind",
+    native_enum=False,
+    length=32,
 )
 # queued -> running -> succeeded | failed; a failed attempt goes back to running on RQ retry.
 # Rows are created at enqueue time, so a job Redis loses is still visible as 'queued'
@@ -26,6 +32,7 @@ class JobRun(Base):
     kind: Mapped[str] = mapped_column(JobKind)
     status: Mapped[str] = mapped_column(JobRunStatus, default="queued", server_default="queued")
     queue_job_id: Mapped[str | None] = mapped_column(String(64), index=True)  # RQ job id
+    requested_by: Mapped[str | None] = mapped_column(String(255))
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     result: Mapped[dict | None] = mapped_column(JSONB)
     progress: Mapped[dict | None] = mapped_column(JSONB)

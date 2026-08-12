@@ -552,9 +552,6 @@ def test_pilot_rows_store_cosine_as_the_score_and_bm25_in_the_components(
     db, site, eligibility_corpus
 ):
     source, targets = eligibility_corpus
-    site.suggestion_mode = "experimental"
-    db.commit()
-
     generate_suggestions(site.id)
 
     row = db.scalars(
@@ -604,8 +601,6 @@ def test_comparison_rows_store_no_components(db, site):
 
 def test_the_api_serves_the_components_for_a_pilot_row(db, site, client, eligibility_corpus):
     source, _targets = eligibility_corpus
-    site.suggestion_mode = "experimental"
-    db.commit()
     generate_suggestions(site.id)
 
     response = client.get(f"/api/v1/suggestions/{site.id}", params={"method": "hybrid_bm25"})
