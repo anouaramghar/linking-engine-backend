@@ -376,6 +376,51 @@ def test_wikipedia_connector_follows_continuation_and_validates_json(monkeypatch
     assert sleeps == [settings.pool_request_delay_seconds]
 
 
+def test_wikipedia_direct_article_lookup_ignores_older_revision_continuation():
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        assert request.url.params["rvlimit"] == "1"
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(
+                {
+                    "query": {
+                        "pages": [
+                            {
+                                "pageid": 1,
+                                "title": "RSS",
+                                "fullurl": "https://en.wikipedia.org/wiki/RSS",
+                                "extract": "RSS is a web feed format.",
+                                "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+                            }
+                        ]
+                    },
+                    "continue": {"rvcontinue": "older-revision", "continue": "-||"},
+                }
+            ).encode(),
+        )
+
+    connector = WikipediaConnector(
+        Site(
+            name="Wiki",
+            base_url="https://en.wikipedia.org/wiki/RSS",
+            platform="pool",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    article = connector.fetch_article_by_url("https://en.wikipedia.org/wiki/RSS")
+
+    connector.client.close()
+    assert article is not None
+    assert article.title == "RSS"
+    assert calls == 1
+
+
 def test_wikipedia_connector_bounds_empty_continuations(monkeypatch):
     calls = 0
 

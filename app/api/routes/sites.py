@@ -43,6 +43,8 @@ from app.schemas.site import (
     ArticleOut,
     EditorialRankingPolicyOut,
     EditorialRankingPolicyUpdate,
+    PoolSourceValidationRequest,
+    PoolSourceValidationResult,
     SiteBulkCreated,
     SiteBulkFailure,
     SiteBulkRequest,
@@ -59,11 +61,13 @@ from app.services.external_link_policy import (
 from app.services.ingestion_service import latest_run
 from app.services.pool_source_audit import record_pool_source_audit_event
 from app.services.pool_source_policy import (
+    PoolSourceFetchError,
     PoolSourcePolicyError,
     expire_pool_target_suggestions,
     require_allowed_pool_domain,
     require_no_pbn_conflict,
 )
+from app.services.pool_source_validation import classify_pool_source, probe_pool_source
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -329,6 +333,61 @@ def bulk_create_sites(
 
     db.commit()
     return SiteBulkResult(created=created, skipped=skipped, rejected=rejected)
+
+
+@router.post("/pool-source/validate", response_model=PoolSourceValidationResult)
+def validate_pool_source(
+    payload: PoolSourceValidationRequest,
+    tenant_id: int | None = Query(None, ge=1),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> PoolSourceValidationResult:
+    """Validate one remote pool source without creating, approving, or crawling it."""
+
+    require_creatable_platform(principal, "pool")
+    owner_tenant_id = resolve_create_tenant_id(db, principal, tenant_id=tenant_id)
+    try:
+        item = SiteCreate.model_validate(
+            {"name": payload.name, "base_url": payload.base_url, "platform": "pool"}
+        )
+    except ValidationError as exc:
+        return PoolSourceValidationResult(
+            base_url=payload.base_url,
+            valid=False,
+            reason=_first_error(exc),
+        )
+
+    source_type = classify_pool_source(item.base_url)
+    if db.scalar(
+        select(Site.id).where(
+            Site.base_url == item.base_url,
+            Site.tenant_id == owner_tenant_id,
+        )
+    ):
+        return PoolSourceValidationResult(
+            base_url=item.base_url,
+            valid=False,
+            source_type=source_type,
+            reason=DUPLICATE_REASON,
+        )
+
+    try:
+        require_allowed_pool_domain(item.base_url)
+        require_no_pbn_conflict(db, item.base_url, as_pool=True)
+        source_type = probe_pool_source(Site(**item.model_dump(), tenant_id=owner_tenant_id))
+    except (PoolSourcePolicyError, PoolSourceFetchError) as error:
+        return PoolSourceValidationResult(
+            base_url=item.base_url,
+            valid=False,
+            source_type=source_type,
+            reason=str(error),
+        )
+
+    return PoolSourceValidationResult(
+        base_url=item.base_url,
+        valid=True,
+        source_type=source_type,
+    )
 
 
 @router.get("", response_model=list[SiteOut])
