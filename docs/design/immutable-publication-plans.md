@@ -57,7 +57,7 @@ POST /publish/{id}                 queue named approved artifacts, nothing else
 **Preparation** is where every decision now happens: reciprocal suppression,
 anchor arbitration, ordering, the last placement generation, one WordPress GET
 per source article, and the rendering. It is allowed to spend money and to read
-the customer's site. It writes nothing back to WordPress, approves nothing, and
+the managed site. It writes nothing back to WordPress, approves nothing, and
 changes no suggestion's review status. An unreachable source yields an error and
 no plan, so a dead post cannot ride along in someone else's approval.
 

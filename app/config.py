@@ -233,7 +233,9 @@ class Settings(BaseSettings):
     evaluation_snapshot_interval_seconds: int = Field(default=86400, ge=60)
     evaluation_snapshot_repeat_count: int = Field(default=3650, ge=1)
 
-    # One tenant cannot fill every stage queue while other tenants wait.
+    # A ceiling on concurrent work per key scope. With one scope in use this is
+    # simply a global cap on active jobs, which is the useful reading today; it
+    # is not fair-share scheduling between competing customers.
     max_active_jobs_per_tenant: int = Field(default=100, ge=1, le=10_000)
 
     # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/

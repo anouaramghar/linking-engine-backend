@@ -25,9 +25,12 @@ RunStatus = Enum("running", "succeeded", "failed", name="run_status", native_enu
 class Site(Base):
     __tablename__ = "sites"
 
-    # Two clients may legitimately own the same URL — an agency and the brand
-    # itself, or the same domain moving between tenants. Global uniqueness would
-    # also let one tenant probe another's inventory through the 409.
+    # Scoped rather than global so a 409 cannot be used to probe what a key
+    # cannot read: under global uniqueness, "this URL already exists" is an
+    # answer about sites outside the caller's scope. There are no clients here
+    # (see app/services/authorization.py), so this is containment, not a claim
+    # that two owners may hold one URL — in practice the scope is always the
+    # same one, and the constraint then behaves exactly like a global one.
     __table_args__ = (UniqueConstraint("tenant_id", "base_url", name="uq_sites_tenant_base_url"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)

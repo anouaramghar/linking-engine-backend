@@ -302,7 +302,7 @@ def _publish_approved_plans(
                     record_progress_durably(job_run_id, session=progress_db, **progress)
                     continue
                 except Exception:
-                    # Only the customer's publication boundary consumes a
+                    # Only the WordPress publication boundary consumes a
                     # suggestion attempt. Database and progress failures are
                     # infrastructure errors, not evidence that this plan is bad.
                     charge_suggestions = True

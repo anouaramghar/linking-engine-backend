@@ -4,7 +4,7 @@
     POST /publish/{id}/plans/approve   a named human binds themselves to hashes
     POST /publish/{id}                 queue the approved artifacts, nothing else
 
-Preparation may spend money and read a customer's site; it writes nothing back.
+Preparation may spend money and read the managed site; it writes nothing back.
 Approval is the only place a human decision is recorded. Queueing makes no
 decision at all, which is what makes it safe to retry after a failure.
 """
@@ -198,7 +198,7 @@ def prepare_publication_plans_async(
 @router.post("/{site_id}/plans/prepare", response_model=PublicationPreparationOut)
 def prepare_publication_plans(
     site: Site = Depends(require_site_access),
-    # Each source article is a live request to the customer's site, so a
+    # Each source article is a live request to the managed site, so a
     # synchronous preparation is bounded rather than covering the whole queue.
     max_articles: int = Query(default=25, ge=1, le=100),
     db: Session = Depends(get_db),

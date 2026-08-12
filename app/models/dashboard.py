@@ -1,8 +1,11 @@
 """Dashboard operator identity: who may open the UI, and as whom.
 
-Separate from ``api_keys`` on purpose. A key is a service credential scoped to a
-tenant; a dashboard user is a person, admitted once by an admin and thereafter
-holding full access. See ``docs/design/dashboard-authentication.md``.
+Separate from ``api_keys`` on purpose, and the two answer different questions. A
+key is a service credential whose scope bounds what one leak can reach; a
+dashboard user is a person, admitted once by an admin and thereafter holding
+full access to everything. People are not scoped here and are not meant to be --
+"everyone's internal and sees everything". See
+``docs/design/dashboard-authentication.md``.
 """
 
 from datetime import datetime

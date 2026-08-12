@@ -52,7 +52,7 @@ def _batch_out(db: Session, batch: PipelineBatch) -> PipelineBatchOut:
 def _authorized_batch(db: Session, principal: Principal, batch_id: int) -> PipelineBatch:
     """Load a batch the caller is allowed to act on, or raise 404/403.
 
-    A batch carries no tenant of its own: the sites it runs are its only
+    A batch carries no scope of its own: the sites it runs are its only
     ownership evidence, so every one of them must be in scope. Reading, streaming
     and cancelling all go through here, because a caller who may not see a batch
     must not be able to stop it either.
@@ -65,7 +65,7 @@ def _authorized_batch(db: Session, principal: Principal, batch_id: int) -> Pipel
     )
     if not site_ids and not principal.is_admin:
         # Deleting a site cascades its runs away, which can empty a batch that
-        # still exists. Hiding it from tenants is right — there is nothing left
+        # still exists. Hiding it from a scoped key is right — there is nothing left
         # to prove ownership with — but an admin should still see the record.
         raise HTTPException(404, f"pipeline batch {batch_id} not found")
     for site_id in site_ids:
@@ -289,7 +289,7 @@ def retry_pipeline_site(
     # The whole batch, not just the site being retried. This route answers with
     # _batch_out, which carries every run in the batch, so authorizing one site
     # would hand a caller the site ids, statuses and error text of the others.
-    # An admin may build a batch that spans tenants, which is exactly when that
+    # An admin may build a batch that spans scopes, which is exactly when that
     # matters.
     batch = _authorized_batch(db, principal, batch_id)
     item = db.scalar(

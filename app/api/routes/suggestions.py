@@ -70,7 +70,7 @@ CLAIMS_AN_ANCHOR = ("pending", "approved", "applying", "applied")
 def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[SuggestionOut]:
     """Serialize suggestions with each target's ownership made explicit.
 
-    A normal customer suggestion targets an article from the same site. Pool
+    An ordinary suggestion targets an article from the same site. Pool
     articles are deliberately allowed as targets, so the target article's
     owning site is the source of truth for the dashboard label.
     """
