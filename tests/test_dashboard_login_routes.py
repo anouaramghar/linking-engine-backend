@@ -342,6 +342,30 @@ def test_dashboard_user_out_includes_photo_url(client, db):
     assert user["photo_url"] == f"/api/v1/auth/users/{user['id']}/avatar"
 
 
+def test_user_avatar_is_cached_privately(client, db, monkeypatch):
+    """A shared cache must never hold this.
+
+    The route is behind a dashboard session and the picture belongs to the
+    account it names, so `public` would let a proxy serve one operator's face to
+    whoever asked next. `private` keeps the browser caching that the long
+    max-age is actually for.
+    """
+    _login_as(client, db, telegram_id=4242)
+    session = client.get("/api/v1/auth/session").json()
+    user = session["user"]
+
+    monkeypatch.setattr("app.services.telegram.client_from_settings", lambda: object())
+    monkeypatch.setattr(
+        "app.services.telegram.get_user_profile_photo_bytes",
+        lambda _client, _tid: (b"\x89PNG\r\n\x1a\n", "image/png"),
+    )
+
+    res = client.get(f"/api/v1/auth/users/{user['id']}/avatar")
+    assert res.status_code == 200
+    assert "public" not in res.headers["cache-control"]
+    assert res.headers["cache-control"] == "private, max-age=86400"
+
+
 def test_user_avatar_endpoint_returns_404_when_user_has_no_photo(client, db, monkeypatch):
     _login_as(client, db, telegram_id=4242)
     session = client.get("/api/v1/auth/session").json()

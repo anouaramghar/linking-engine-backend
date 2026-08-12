@@ -286,10 +286,12 @@ def retry_pipeline_site(
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> PipelineBatchOut:
-    authorize_site(db, principal, site_id)
-    batch = db.get(PipelineBatch, batch_id)
-    if batch is None:
-        raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    # The whole batch, not just the site being retried. This route answers with
+    # _batch_out, which carries every run in the batch, so authorizing one site
+    # would hand a caller the site ids, statuses and error text of the others.
+    # An admin may build a batch that spans tenants, which is exactly when that
+    # matters.
+    batch = _authorized_batch(db, principal, batch_id)
     item = db.scalar(
         select(PipelineSiteRun).where(
             PipelineSiteRun.batch_id == batch_id,

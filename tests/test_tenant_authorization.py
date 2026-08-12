@@ -726,6 +726,45 @@ def test_foreign_pipeline_batch_cannot_be_read_streamed_or_cancelled(real_auth, 
             db.commit()
 
 
+def test_retrying_own_site_in_a_shared_batch_is_refused(real_auth, db):
+    """Owning one site in a batch does not authorize the batch.
+
+    Only an admin can build a batch spanning tenants, and this is the route that
+    made that dangerous: it authorized the single site being retried, then
+    answered with the whole batch — every run in it, with site ids, statuses and
+    error text. The retry itself is the smaller half of the problem.
+    """
+    with _tenant(db, "shares") as (tenant_a, key_a), _tenant(db, "shared-with") as (tenant_b, _):
+        site_a = _site(db, tenant_a)
+        site_b = _site(db, tenant_b)
+        batch = PipelineBatch(status="failed")
+        db.add(batch)
+        db.flush()
+        run_a = PipelineSiteRun(
+            batch_id=batch.id,
+            site_id=site_a.id,
+            status="failed",
+            stage="analysis",
+            error="analysis failed",
+        )
+        db.add_all([run_a, PipelineSiteRun(batch_id=batch.id, site_id=site_b.id, status="queued")])
+        db.commit()
+        batch_id = batch.id
+
+        try:
+            refused = real_auth.post(
+                f"/api/v1/pipelines/batches/{batch_id}/sites/{site_a.id}/retry",
+                headers={"X-API-Key": key_a},
+            )
+            assert refused.status_code == 403, refused.text
+            assert str(site_b.id) not in refused.text
+            db.expire_all()
+            assert db.get(PipelineSiteRun, run_a.id).status == "failed"
+        finally:
+            db.delete(db.get(PipelineBatch, batch_id))
+            db.commit()
+
+
 def test_own_pipeline_batch_stays_cancellable(real_auth, db):
     with _tenant(db, "cancels") as (tenant, key):
         batch_id = _batch(db, _site(db, tenant))

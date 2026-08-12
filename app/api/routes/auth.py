@@ -255,5 +255,9 @@ def get_user_avatar(
     return Response(
         content=avatar_bytes,
         media_type=media_type,
-        headers={"Cache-Control": "public, max-age=86400"},
+        # private, not public: the route is behind a dashboard session, and the
+        # picture belongs to the account it names. A shared cache holding it
+        # would serve one operator's face to whoever asks next. The browser
+        # cache is what the long max-age is for, and private still allows it.
+        headers={"Cache-Control": "private, max-age=86400"},
     )

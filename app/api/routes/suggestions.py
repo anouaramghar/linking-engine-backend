@@ -631,6 +631,8 @@ def export_trace_events_csv(
         (_trace_export_row(_trace_event_out(row)) for row in rows),
         filename="linkmesh-traceability.csv",
     )
+
+
 def _tenant_scope(principal: Principal) -> int | None:
     if principal.is_admin:
         return None
