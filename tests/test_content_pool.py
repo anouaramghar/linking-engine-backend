@@ -13,6 +13,11 @@ from sqlalchemy import delete, select
 
 from app.api.deps import require_api_key
 from app.config import settings
+from app.connectors.feed_discovery import (
+    FeedNotFoundError,
+    FeedPayloadError,
+    validate_feed_payload,
+)
 from app.connectors.registry import get_connector
 from app.connectors.rss_connector import RSSConnector
 from app.connectors.wikipedia_connector import WikipediaConnector
@@ -114,9 +119,12 @@ def test_pool_schema_defaults_to_daily_and_rejects_credentials(monkeypatch):
 
 
 def test_external_urls_have_one_stable_storage_identity():
-    assert normalize_external_url(
-        " HTTPS://B\u00dcCHER.Example:443/report/?utm_source=test&id=7&b=2#section "
-    ) == "https://xn--bcher-kva.example/report/?b=2&id=7"
+    assert (
+        normalize_external_url(
+            " HTTPS://B\u00dcCHER.Example:443/report/?utm_source=test&id=7&b=2#section "
+        )
+        == "https://xn--bcher-kva.example/report/?b=2&id=7"
+    )
     assert normalize_external_url("http://[2001:DB8::1]:80") == "http://[2001:db8::1]/"
 
     assert deduplicate_external_urls(
@@ -209,8 +217,13 @@ def test_rss_rejects_html_and_oversized_responses(monkeypatch):
             content=b"<html>not a feed</html>",
         )
     )
-    with pytest.raises(ValueError, match="HTML page"):
+    # A page where a feed was expected starts a search for the real feed; this
+    # host serves the same page everywhere, so the source still fails. See
+    # tests/test_feed_discovery.py for the search itself.
+    with pytest.raises(FeedNotFoundError, match="no feed was found"):
         RSSConnector(site, transport=html_transport)._feed()
+    with pytest.raises(FeedPayloadError, match="HTML page"):
+        validate_feed_payload(b"<html>not a feed</html>", "application/rss+xml")
 
     monkeypatch.setattr(settings, "pool_max_response_bytes", 8)
     large_transport = httpx.MockTransport(
@@ -260,8 +273,12 @@ def test_rss_rejects_non_feed_content_type():
         ),
     )
     try:
-        with pytest.raises(ValueError, match="unsupported Content-Type 'text/html'"):
+        # An HTML error page is never accepted as content, whether the search for
+        # a real feed runs or not.
+        with pytest.raises(FeedNotFoundError, match="no feed was found"):
             list(connector.fetch_articles())
+        with pytest.raises(FeedPayloadError, match="unsupported Content-Type 'text/html'"):
+            validate_feed_payload(b"<html>temporary error</html>", "text/html")
     finally:
         connector.client.close()
 

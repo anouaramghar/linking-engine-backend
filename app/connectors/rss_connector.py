@@ -17,6 +17,12 @@ from app.connectors.base import (
     SiteMetadata,
     TaxonomyData,
 )
+from app.connectors.feed_discovery import (
+    FeedPayloadError,
+    discover_feed,
+    looks_like_html,
+    validate_feed_payload,
+)
 from app.connectors.http_limits import get_limited_response
 from app.connectors.url_guard import (
     SSRFProtectedTransport,
@@ -26,15 +32,6 @@ from app.connectors.url_guard import (
 )
 from app.models.site import Site
 from app.services.pool_source_policy import pool_request_guard
-
-_RSS_ATOM_MEDIA_TYPES = {
-    "application/atom+xml",
-    "application/rdf+xml",
-    "application/rss+xml",
-    "application/x-rss+xml",
-    "application/xml",
-    "text/xml",
-}
 
 
 class _TextParser(HTMLParser):
@@ -78,29 +75,6 @@ def _external_id(value: str) -> str:
     return value if len(value) <= 255 else f"rss:{sha256(value.encode()).hexdigest()}"
 
 
-def _media_type(content_type: str | None) -> str | None:
-    if content_type is None:
-        return None
-    return content_type.split(";", 1)[0].strip().lower()
-
-
-def _decoded_prefix(content: bytes) -> str:
-    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return content[:1024].decode("utf-16", errors="ignore").lstrip().lower()
-    return content[:1024].decode("utf-8-sig", errors="ignore").lstrip().lower()
-
-
-def _validate_feed_payload(content: bytes, content_type: str | None) -> None:
-    media_type = _media_type(content_type)
-    if media_type is not None and media_type not in _RSS_ATOM_MEDIA_TYPES:
-        raise ValueError(f"RSS/Atom source returned unsupported Content-Type {media_type!r}")
-    prefix = _decoded_prefix(content)
-    if not prefix.startswith("<"):
-        raise ValueError("RSS/Atom source returned a non-XML or binary response")
-    if prefix.startswith(("<!doctype html", "<html")):
-        raise ValueError("RSS/Atom source returned an HTML page instead of a feed")
-
-
 class RSSConnector(ContentConnector):
     def __init__(
         self,
@@ -109,6 +83,8 @@ class RSSConnector(ContentConnector):
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         super().__init__(site)
+        #: Set once the site's address turns out to be a page rather than a feed.
+        self.feed_url: str | None = None
         allow_private = settings.allow_unsafe_crawl_targets
         validate_url(
             site.base_url,
@@ -134,14 +110,38 @@ class RSSConnector(ContentConnector):
             },
         )
 
-    def _feed(self):
+    def _feed_payload(self) -> bytes:
+        """The feed bytes, resolving the feed URL once if the source is a web page.
+
+        An operator normally has the site's address, not its feed's. When the
+        address serves a page, `discover_feed` finds the feed the page advertises
+        or one at a conventional path, and the answer is kept for the life of this
+        connector so the search runs once per ingestion rather than once per call.
+
+        A source whose address already serves a feed — every pool source today —
+        takes the first branch and makes exactly the one request it always made.
+        """
+        url = self.feed_url or self.site.base_url
         response = get_limited_response(
             self.client,
-            self.site.base_url,
+            url,
             max_bytes=settings.pool_max_response_bytes,
         )
-        _validate_feed_payload(response.content, response.content_type)
-        parsed = feedparser.parse(response.content)
+        try:
+            validate_feed_payload(response.content, response.content_type)
+        except FeedPayloadError:
+            # Only a web page starts a search. A malformed, binary or oversized
+            # response at a known feed URL is a broken feed, and reporting that
+            # is more useful than probing five more paths on the same host.
+            if self.feed_url is not None or not looks_like_html(response.content):
+                raise
+            found = discover_feed(self.client, self.site.base_url, html=response.content)
+            self.feed_url = found.url
+            return found.content
+        return response.content
+
+    def _feed(self):
+        parsed = feedparser.parse(self._feed_payload())
         if parsed.bozo:
             raise ValueError(f"invalid RSS/Atom feed: {parsed.bozo_exception}")
         if not str(parsed.version or "").lower().startswith(("rss", "atom")):
