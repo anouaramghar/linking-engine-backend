@@ -330,10 +330,13 @@ def test_drilldown_and_csv_export_respect_filters_and_escape_formulas(client, db
     assert page["total"] == 1
     assert page["items"][0]["id"] == suggestion.id
     assert page["items"][0]["source_title"] == "=DANGEROUS()"
-    assert client.get(
-        "/api/v1/evaluation/suggestions",
-        params={**params, "metric": "rejected"},
-    ).json()["total"] == 0
+    assert (
+        client.get(
+            "/api/v1/evaluation/suggestions",
+            params={**params, "metric": "rejected"},
+        ).json()["total"]
+        == 0
+    )
 
     exported = client.get("/api/v1/evaluation/export.csv", params=params)
     assert exported.status_code == 200
@@ -432,9 +435,9 @@ def test_metrics_declare_what_the_dashboard_is_and_is_not(client, db, site):
     )
     db.commit()
 
-    provenance = client.get(
-        "/api/v1/evaluation/metrics", params={"site_id": site.id}
-    ).json()["provenance"]
+    provenance = client.get("/api/v1/evaluation/metrics", params={"site_id": site.id}).json()[
+        "provenance"
+    ]
 
     assert provenance["surface"] == "operational_telemetry"
     assert provenance["supports_ranking_decisions"] is False

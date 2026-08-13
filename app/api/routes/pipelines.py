@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from datetime import UTC, datetime
-from time import monotonic, sleep
+from time import monotonic
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -9,6 +10,7 @@ from rq.exceptions import NoSuchJobError
 from rq.job import Job
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_audit_actor, get_db, require_api_key
 from app.db import SessionLocal
@@ -47,6 +49,18 @@ def _batch_out(db: Session, batch: PipelineBatch) -> PipelineBatchOut:
         finished_at=batch.finished_at,
         sites=[PipelineSiteRunOut.model_validate(item) for item in items],
     )
+
+
+def _pipeline_snapshot(batch_id: int) -> tuple[str | None, bool]:
+    """Read one stream snapshot in a short-lived worker-thread session."""
+    with SessionLocal() as stream_db:
+        batch = stream_db.get(PipelineBatch, batch_id)
+        if batch is None:
+            return None, True
+        return (
+            _batch_out(stream_db, batch).model_dump_json(),
+            batch.status in TERMINAL_BATCH_STATUSES,
+        )
 
 
 def _authorized_batch(db: Session, principal: Principal, batch_id: int) -> PipelineBatch:
@@ -178,17 +192,14 @@ def stream_pipeline_batch(
     # read-only session instead.
     db.close()
 
-    def events():
+    async def events():
         previous = None
         last_sent = monotonic()
         while True:
-            with SessionLocal() as stream_db:
-                batch = stream_db.get(PipelineBatch, batch_id)
-                if batch is None:
-                    yield 'event: error\ndata: {"detail":"batch deleted"}\n\n'
-                    return
-                payload = _batch_out(stream_db, batch).model_dump_json()
-                terminal = batch.status in TERMINAL_BATCH_STATUSES
+            payload, terminal = await run_in_threadpool(_pipeline_snapshot, batch_id)
+            if payload is None:
+                yield 'event: error\ndata: {"detail":"batch deleted"}\n\n'
+                return
             now = monotonic()
             if payload != previous:
                 yield f"event: batch\ndata: {payload}\n\n"
@@ -200,7 +211,7 @@ def stream_pipeline_batch(
             if terminal:
                 yield "event: done\ndata: {}\n\n"
                 return
-            sleep(1)
+            await asyncio.sleep(1)
 
     return StreamingResponse(
         events(),
@@ -240,9 +251,7 @@ def cancel_pipeline_batch(
     actor: str = Depends(get_audit_actor),
 ) -> PipelineBatchOut:
     _authorized_batch(db, principal, batch_id)
-    batch = db.scalar(
-        select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update()
-    )
+    batch = db.scalar(select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update())
     if batch is None:
         raise HTTPException(404, f"pipeline batch {batch_id} not found")
     if batch.status in {"succeeded", "failed", "partial_failed"}:
@@ -253,9 +262,7 @@ def cancel_pipeline_batch(
     reason = f"Cancelled by {actor}"
     items = list(
         db.scalars(
-            select(PipelineSiteRun)
-            .where(PipelineSiteRun.batch_id == batch_id)
-            .with_for_update()
+            select(PipelineSiteRun).where(PipelineSiteRun.batch_id == batch_id).with_for_update()
         )
     )
     now = datetime.now(UTC)

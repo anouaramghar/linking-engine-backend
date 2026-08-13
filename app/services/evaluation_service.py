@@ -70,8 +70,7 @@ EVALUATION_LIMITATIONS = (
     "crawl or analysis volume moves these rates without anything about link "
     "quality changing.",
     "Semantic score is a ranking score. It is not confidence, accuracy or quality.",
-    "No site selection is frozen, so comparing two ranges compares two different "
-    "mixes of sites.",
+    "No site selection is frozen, so comparing two ranges compares two different mixes of sites.",
 )
 
 
@@ -152,20 +151,26 @@ def _placement_metrics(
     date_to: datetime | None,
 ) -> PlacementMetrics:
     conditions = _suggestion_conditions(site_id, date_from, date_to)
-    generated = db.scalar(
-        select(func.count(Suggestion.id)).where(
-            *conditions,
-            Suggestion.placement_generated_at.is_not(None),
+    generated = (
+        db.scalar(
+            select(func.count(Suggestion.id)).where(
+                *conditions,
+                Suggestion.placement_generated_at.is_not(None),
+            )
         )
-    ) or 0
-    successful = db.scalar(
-        select(func.count(Suggestion.id)).where(
-            *conditions,
-            Suggestion.placement_generated_at.is_not(None),
-            Suggestion.placement_context.is_not(None),
-            Suggestion.anchor_text.is_not(None),
+        or 0
+    )
+    successful = (
+        db.scalar(
+            select(func.count(Suggestion.id)).where(
+                *conditions,
+                Suggestion.placement_generated_at.is_not(None),
+                Suggestion.placement_context.is_not(None),
+                Suggestion.anchor_text.is_not(None),
+            )
         )
-    ) or 0
+        or 0
+    )
     return PlacementMetrics(
         generated=generated,
         successful=successful,
@@ -203,36 +208,39 @@ def _current_orphan_counts(db: Session, site_id: int | None) -> tuple[int, int]:
     article_conditions = [Article.is_active.is_(True), Site.platform != "pool"]
     if site_id is not None:
         article_conditions.append(Article.site_id == site_id)
-    active_articles = db.scalar(
-        select(func.count(Article.id))
-        .join(Site, Site.id == Article.site_id)
-        .where(*article_conditions)
-    ) or 0
+    active_articles = (
+        db.scalar(
+            select(func.count(Article.id))
+            .join(Site, Site.id == Article.site_id)
+            .where(*article_conditions)
+        )
+        or 0
+    )
     has_active_inbound = exists(
         select(InternalLink.id).where(
             InternalLink.target_article_id == Article.id,
             InternalLink.is_active.is_(True),
         )
     )
-    remaining = db.scalar(
-        select(func.count(Article.id))
-        .join(Site, Site.id == Article.site_id)
-        .where(*article_conditions, ~has_active_inbound)
-    ) or 0
+    remaining = (
+        db.scalar(
+            select(func.count(Article.id))
+            .join(Site, Site.id == Article.site_id)
+            .where(*article_conditions, ~has_active_inbound)
+        )
+        or 0
+    )
     return active_articles, remaining
 
 
 def _orphan_help_condition(target) -> list:
     earlier_link = aliased(InternalLink)
-    had_inbound_before_application = (
-        exists(
-            select(earlier_link.id).where(
-                earlier_link.target_article_id == Suggestion.target_article_id,
-                earlier_link.first_seen_at < Suggestion.applied_at,
-            )
+    had_inbound_before_application = exists(
+        select(earlier_link.id).where(
+            earlier_link.target_article_id == Suggestion.target_article_id,
+            earlier_link.first_seen_at < Suggestion.applied_at,
         )
-        .correlate(Suggestion)
-    )
+    ).correlate(Suggestion)
     return [
         Suggestion.status == "applied",
         Suggestion.applied_at.is_not(None),
@@ -254,11 +262,14 @@ def _orphan_metrics(
         *_suggestion_conditions(site_id, date_from, date_to),
         *_orphan_help_condition(target),
     ]
-    reduced = db.scalar(
-        select(func.count(func.distinct(Suggestion.target_article_id)))
-        .join(target, target.id == Suggestion.target_article_id)
-        .where(*reduction_conditions)
-    ) or 0
+    reduced = (
+        db.scalar(
+            select(func.count(func.distinct(Suggestion.target_article_id)))
+            .join(target, target.id == Suggestion.target_article_id)
+            .where(*reduction_conditions)
+        )
+        or 0
+    )
     return OrphanMetrics(
         active_articles=active_articles,
         remaining=remaining,
@@ -368,9 +379,7 @@ def _score_range_metrics(
     for score, status in rows:
         percent = max(0, min(100, floor(float(score) * 100 + 0.5)))
         bucket = next(
-            definition
-            for definition in definitions
-            if definition[0] <= percent <= definition[1]
+            definition for definition in definitions if definition[0] <= percent <= definition[1]
         )
         grouped[bucket]["suggestions"] += 1
         if status == "pending":
@@ -390,8 +399,7 @@ def _score_range_metrics(
             rejected=grouped[(minimum, maximum)]["rejected"],
             acceptance_rate=_rate(
                 grouped[(minimum, maximum)]["accepted"],
-                grouped[(minimum, maximum)]["accepted"]
-                + grouped[(minimum, maximum)]["rejected"],
+                grouped[(minimum, maximum)]["accepted"] + grouped[(minimum, maximum)]["rejected"],
             ),
         )
         for minimum, maximum in definitions

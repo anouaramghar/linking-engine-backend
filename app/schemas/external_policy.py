@@ -30,9 +30,7 @@ class ExternalLinkPolicyUpdate(BaseModel):
         blocked = set(self.blocklist_domains) | set(self.competitor_domains)
         conflicts = sorted(set(self.allowlist_domains) & blocked)
         if conflicts:
-            raise ValueError(
-                "domains cannot be both allowed and blocked: " + ", ".join(conflicts)
-            )
+            raise ValueError("domains cannot be both allowed and blocked: " + ", ".join(conflicts))
         return self
 
 

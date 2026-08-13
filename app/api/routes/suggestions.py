@@ -552,7 +552,9 @@ def list_trace_events(
 
 
 def _csv_safe(value: object) -> str:
-    rendered = json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else str(value or "")
+    rendered = (
+        json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else str(value or "")
+    )
     return f"'{rendered}" if rendered.startswith(("=", "+", "-", "@")) else rendered
 
 
@@ -775,9 +777,7 @@ def undo_filtered_bulk_review(
     the counts recorded by the first undo.
     """
     operation = db.scalar(
-        select(BulkReviewOperation)
-        .where(BulkReviewOperation.id == operation_id)
-        .with_for_update()
+        select(BulkReviewOperation).where(BulkReviewOperation.id == operation_id).with_for_update()
     )
     if operation is None:
         raise HTTPException(status_code=404, detail="bulk review operation not found")

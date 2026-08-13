@@ -101,6 +101,8 @@ def _external_policy_out(
         updated_at=stored.updated_at if stored is not None else None,
         expired_suggestions=expired_suggestions,
     )
+
+
 def _first_error(exc: ValidationError) -> str:
     """Flatten a row's validation failure into one reviewer-readable line."""
     error = exc.errors()[0]

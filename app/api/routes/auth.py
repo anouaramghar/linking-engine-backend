@@ -8,10 +8,12 @@ Everything here is gated on a dashboard session instead.
 See ``docs/design/dashboard-authentication.md``.
 """
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -28,6 +30,7 @@ from app.services import dashboard_auth, telegram
 from app.services.dashboard_auth import SESSION_COOKIE
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 #: Closes the loop the pending screen opens. Without it the only way to discover
 #: an approval is to keep trying the login until one works.
@@ -85,10 +88,6 @@ def start_login(db: Session = Depends(get_db)) -> LoginStartOut:
             status_code=503,
             detail="dashboard login is not configured; set TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME",
         )
-    # Housekeeping rides along with the operation that creates the garbage.
-    # Logins are rare and expired codes are worthless, so a handful of deleted
-    # rows here is cheaper than owning a scheduler for it.
-    dashboard_auth.purge_expired_login_codes(db)
     deep_link = dashboard_auth.login_deep_link()
     assert deep_link is not None  # configured check above guarantees a username
     return LoginStartOut(
@@ -105,6 +104,17 @@ def complete_login(
 ) -> LoginCompleteOut:
     """Redeem the one-time code Telegram delivered to this operator."""
     outcome = dashboard_auth.redeem_login_code(db, payload.code)
+    # A valid Telegram-issued code is the proof-of-possession boundary. Do not
+    # let arbitrary anonymous start requests perform database housekeeping.
+    if outcome.state != "invalid":
+        try:
+            dashboard_auth.purge_expired_login_codes(db)
+        except SQLAlchemyError:
+            # Redemption already committed the session. Cleanup is housekeeping,
+            # so a transient database failure must not turn a valid login into a
+            # failed one.
+            db.rollback()
+            logger.warning("dashboard_login_cleanup_failed", exc_info=True)
     if outcome.state == "approved" and outcome.token:
         _set_session_cookie(response, outcome.token)
     user = DashboardUserOut.model_validate(outcome.user) if outcome.user is not None else None

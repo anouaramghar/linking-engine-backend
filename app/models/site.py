@@ -85,9 +85,7 @@ class Site(Base):
     editorial_feedback_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false"
     )
-    editorial_min_score_percent: Mapped[int] = mapped_column(
-        Integer, default=0, server_default="0"
-    )
+    editorial_min_score_percent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     editorial_feedback_weight: Mapped[float] = mapped_column(
         Float, default=0.20, server_default="0.20"
     )

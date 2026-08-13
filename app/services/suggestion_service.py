@@ -396,9 +396,7 @@ def generate_suggestions(
                     )
                 else:
                     try:
-                        ranking_limit = (
-                            suggestion_cap if shadow_selected else candidate_pool_limit
-                        )
+                        ranking_limit = suggestion_cap if shadow_selected else candidate_pool_limit
                         ranking = hybrid_ranker.rank(
                             db,
                             source_id=article_id,

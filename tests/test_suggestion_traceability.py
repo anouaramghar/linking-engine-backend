@@ -116,9 +116,10 @@ def test_suggestion_event_history_is_immutable_and_scoped(client, db, site):
 
     first_events = client.get(f"/api/v1/suggestions/{first.id}/events").json()
     assert {event["suggestion_id"] for event in first_events} == {first.id}
-    assert db.scalar(
-        select(SuggestionEvent).where(SuggestionEvent.suggestion_id == second.id)
-    ) is not None
+    assert (
+        db.scalar(select(SuggestionEvent).where(SuggestionEvent.suggestion_id == second.id))
+        is not None
+    )
 
     missing = client.get("/api/v1/suggestions/999999999/events")
     assert missing.status_code == 404

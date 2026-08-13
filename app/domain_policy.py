@@ -8,8 +8,11 @@ def normalize_domain(value: str) -> str:
     candidate = value.strip().lower().removeprefix("*.").rstrip(".")
     if "://" in candidate:
         candidate = urlsplit(candidate).hostname or ""
-    if not candidate or "/" in candidate or ":" in candidate or any(
-        character.isspace() for character in candidate
+    if (
+        not candidate
+        or "/" in candidate
+        or ":" in candidate
+        or any(character.isspace() for character in candidate)
     ):
         raise ValueError(f"invalid domain: {value!r}")
     try:
@@ -29,9 +32,7 @@ def domain_matches(domain: str, rule: str) -> bool:
     """Match a domain rule against the domain itself and all its subdomains."""
     normalized_domain = normalize_domain(domain)
     normalized_rule = normalize_domain(rule)
-    return normalized_domain == normalized_rule or normalized_domain.endswith(
-        f".{normalized_rule}"
-    )
+    return normalized_domain == normalized_rule or normalized_domain.endswith(f".{normalized_rule}")
 
 
 def normalized_unique_domains(values: list[str]) -> list[str]:

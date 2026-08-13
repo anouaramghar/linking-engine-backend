@@ -24,7 +24,9 @@ def upgrade() -> None:
         sa.Column("reviewed_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("undone_count", sa.Integer(), nullable=True),
         sa.Column("skipped_count", sa.Integer(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.Column("undone_at", sa.DateTime(timezone=True), nullable=True),
         sa.PrimaryKeyConstraint("id"),
     )

@@ -335,12 +335,16 @@ def fill_external_suggestion_gap(
             )
         )
 
-    scores = _semantic_scores(
-        db,
-        article=article,
-        model=model,
-        candidates=scorable,
-    ) if scorable else []
+    scores = (
+        _semantic_scores(
+            db,
+            article=article,
+            model=model,
+            candidates=scorable,
+        )
+        if scorable
+        else []
+    )
     ranked = sorted(
         zip(scorable, scores, strict=True),
         key=lambda item: (-item[1], item[0].provider_rank),

@@ -44,9 +44,13 @@ def downgrade() -> None:
     """
     connection = op.get_bind()
     if connection.dialect.has_table(connection, "sites"):
-        enrolled = connection.execute(
-            sa.text("SELECT id FROM sites WHERE suggestion_mode = 'experimental' ORDER BY id")
-        ).scalars().all()
+        enrolled = (
+            connection.execute(
+                sa.text("SELECT id FROM sites WHERE suggestion_mode = 'experimental' ORDER BY id")
+            )
+            .scalars()
+            .all()
+        )
         if enrolled:
             raise RuntimeError(
                 "Refusing to downgrade: site(s) "

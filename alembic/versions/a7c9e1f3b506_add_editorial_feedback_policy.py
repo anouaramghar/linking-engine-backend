@@ -30,7 +30,9 @@ def upgrade() -> None:
     )
     op.add_column(
         "sites",
-        sa.Column("editorial_feedback_enabled", sa.Boolean(), nullable=False, server_default=sa.true()),
+        sa.Column(
+            "editorial_feedback_enabled", sa.Boolean(), nullable=False, server_default=sa.true()
+        ),
     )
     op.add_column(
         "sites",
@@ -42,7 +44,9 @@ def upgrade() -> None:
     )
     op.add_column(
         "sites",
-        sa.Column("editorial_feedback_min_samples", sa.Integer(), nullable=False, server_default="10"),
+        sa.Column(
+            "editorial_feedback_min_samples", sa.Integer(), nullable=False, server_default="10"
+        ),
     )
     op.create_check_constraint(
         "ck_sites_editorial_min_score_percent",

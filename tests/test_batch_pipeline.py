@@ -254,9 +254,9 @@ def test_cancel_batch_marks_unfinished_sites_terminal_and_workers_stop(client, d
     assert response.json()["status"] == "cancelled"
     assert response.json()["cancelled"] == 1
     assert response.json()["sites"][0]["status"] == "cancelled"
-    assert pipeline_tasks.analyze_pipeline_site(
-        site.id, batch_site_run_id=item.id
-    ) == {"cancelled": True}
+    assert pipeline_tasks.analyze_pipeline_site(site.id, batch_site_run_id=item.id) == {
+        "cancelled": True
+    }
     _cleanup(db, batch.id, [site.id])
 
 

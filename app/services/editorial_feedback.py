@@ -137,7 +137,9 @@ def rerank_with_editorial_feedback(
 
     components: dict[int, dict] = {}
     ordered: list[RankedCandidate] = []
-    for feedback_index, (candidate, original_index, combined, acceptance, bucket) in enumerate(scored):
+    for feedback_index, (candidate, original_index, combined, acceptance, bucket) in enumerate(
+        scored
+    ):
         ordered.append(candidate)
         components[candidate.target_id] = {
             "version": "editorial_feedback_v1",

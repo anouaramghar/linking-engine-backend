@@ -50,8 +50,5 @@ def downgrade() -> None:
         server_default="standard",
     )
     op.execute(
-        sa.text(
-            "UPDATE sites SET suggestion_mode = 'standard' "
-            "WHERE suggestion_mode <> 'standard'"
-        )
+        sa.text("UPDATE sites SET suggestion_mode = 'standard' WHERE suggestion_mode <> 'standard'")
     )

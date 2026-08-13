@@ -599,6 +599,9 @@ def get_job_status(job_id: str) -> dict | None:
         progress = run.progress if run is not None else None
         progress_at = run.progress_at if run is not None else None
         durable_error = run.error if run is not None else None
+        durable_result = (
+            run.result if run is not None and run.status == "succeeded" else None
+        )
         if (
             run is not None
             and run.status == "succeeded"
@@ -620,10 +623,15 @@ def get_job_status(job_id: str) -> dict | None:
         if latest_result is not None and latest_result.exc_string
         else durable_error
     )
+    result = None
+    if status == "succeeded":
+        result = job.return_value()
+        if result is None:
+            result = durable_result
     return {
         "job_id": job_id,
         "status": status,
-        "result": job.return_value() if status == "succeeded" else None,
+        "result": result,
         "progress": progress,
         "progress_at": progress_at,
         "error": error,

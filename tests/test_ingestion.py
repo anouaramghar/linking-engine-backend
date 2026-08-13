@@ -318,9 +318,7 @@ def test_duplicate_records_do_not_bypass_snapshot_completeness(db, site, monkeyp
     assert all(article.is_active is True for article in articles)
 
 
-def test_pool_ingestion_normalizes_and_deduplicates_external_article_urls(
-    db, monkeypatch
-):
+def test_pool_ingestion_normalizes_and_deduplicates_external_article_urls(db, monkeypatch):
     pool = Site(
         name="External pool",
         base_url="https://en.wikipedia.org/wiki/Link_analysis",
@@ -340,9 +338,7 @@ def test_pool_ingestion_normalizes_and_deduplicates_external_article_urls(
         result = ingestion_service.run_ingestion(pool.id)
         db.expire_all()
         articles = db.scalars(select(Article).where(Article.site_id == pool.id)).all()
-        stored = [
-            (article.url, article.external_id, article.content_text) for article in articles
-        ]
+        stored = [(article.url, article.external_id, article.content_text) for article in articles]
     finally:
         # Pool articles participate in every site's candidate corpus. This test
         # creates its own source rather than using the per-test `site` fixture,
@@ -352,9 +348,7 @@ def test_pool_ingestion_normalizes_and_deduplicates_external_article_urls(
         db.commit()
 
     assert result == {"articles": 1, "links": 0}
-    assert stored == [
-        ("https://example.com/report?id=7", "canonical", "first copy wins")
-    ]
+    assert stored == [("https://example.com/report?id=7", "canonical", "first copy wins")]
 
 
 def test_overlapping_ingestion_fails_fast_and_records_failed_run(db, site, monkeypatch):

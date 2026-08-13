@@ -444,9 +444,7 @@ def test_queue_hides_foreign_suggestions(real_auth, db):
 
 
 def test_traceability_and_single_event_history_hide_foreign_tenants(real_auth, db):
-    with _tenant(db, "trace-a") as (tenant_a, key_a), _tenant(
-        db, "trace-b"
-    ) as (tenant_b, _):
+    with _tenant(db, "trace-a") as (tenant_a, key_a), _tenant(db, "trace-b") as (tenant_b, _):
         mine = _suggestion(db, _site(db, tenant_a))
         theirs = _suggestion(db, _site(db, tenant_b))
         db.add_all(
@@ -479,16 +477,12 @@ def test_traceability_and_single_event_history_hide_foreign_tenants(real_auth, d
         assert mine.trace_id in exported.text
         assert theirs.trace_id not in exported.text
 
-        foreign_history = real_auth.get(
-            f"/api/v1/suggestions/{theirs.id}/events", headers=headers
-        )
+        foreign_history = real_auth.get(f"/api/v1/suggestions/{theirs.id}/events", headers=headers)
         assert foreign_history.status_code == 403
 
 
 def test_filtered_bulk_undo_rejects_a_foreign_tenant(real_auth, db):
-    with _tenant(db, "undo-a") as (tenant_a, key_a), _tenant(
-        db, "undo-b"
-    ) as (_tenant_b, key_b):
+    with _tenant(db, "undo-a") as (tenant_a, key_a), _tenant(db, "undo-b") as (_tenant_b, key_b):
         mine = _suggestion(db, _site(db, tenant_a))
         created = real_auth.post(
             "/api/v1/suggestions/bulk-review-by-filter",
@@ -716,9 +710,22 @@ def test_foreign_pipeline_batch_cannot_be_read_streamed_or_cancelled(real_auth, 
         batch_id = _batch(db, _site(db, tenant_r))
         headers = {"X-API-Key": key_w}
         try:
-            assert real_auth.get(f"/api/v1/pipelines/batches/{batch_id}", headers=headers).status_code == 403
-            assert real_auth.get(f"/api/v1/pipelines/batches/{batch_id}/events", headers=headers).status_code == 403
-            assert real_auth.post(f"/api/v1/pipelines/batches/{batch_id}/cancel", headers=headers).status_code == 403
+            assert (
+                real_auth.get(f"/api/v1/pipelines/batches/{batch_id}", headers=headers).status_code
+                == 403
+            )
+            assert (
+                real_auth.get(
+                    f"/api/v1/pipelines/batches/{batch_id}/events", headers=headers
+                ).status_code
+                == 403
+            )
+            assert (
+                real_auth.post(
+                    f"/api/v1/pipelines/batches/{batch_id}/cancel", headers=headers
+                ).status_code
+                == 403
+            )
             db.expire_all()
             assert db.get(PipelineBatch, batch_id).status == "running"
         finally:
@@ -795,10 +802,16 @@ def test_evaluation_api_is_admin_only(real_auth, db):
         site = _site(db, tenant)
         headers = {"X-API-Key": key}
         assert real_auth.get("/api/v1/evaluation/metrics", headers=headers).status_code == 403
-        assert real_auth.get(
-            "/api/v1/evaluation/metrics", headers=headers, params={"site_id": site.id}
-        ).status_code == 403
-        assert real_auth.get(
-            "/api/v1/evaluation/suggestions", headers=headers, params={"metric": "decided"}
-        ).status_code == 403
+        assert (
+            real_auth.get(
+                "/api/v1/evaluation/metrics", headers=headers, params={"site_id": site.id}
+            ).status_code
+            == 403
+        )
+        assert (
+            real_auth.get(
+                "/api/v1/evaluation/suggestions", headers=headers, params={"metric": "decided"}
+            ).status_code
+            == 403
+        )
         assert real_auth.get("/api/v1/evaluation/export.csv", headers=headers).status_code == 403

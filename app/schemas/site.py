@@ -190,10 +190,6 @@ class SiteOut(BaseModel):
     last_crawl_at: datetime | None = None
 
 
-class SiteSuggestionModeUpdate(BaseModel):
-    suggestion_mode: Literal["standard", "experimental"]
-
-
 class EditorialRankingPolicyUpdate(BaseModel):
     #: Required, not defaulted: switching feedback reranking on is a deliberate
     #: act while it is unproven, so an omitted field must not turn it on as a
@@ -206,12 +202,6 @@ class EditorialRankingPolicyUpdate(BaseModel):
 
 class EditorialRankingPolicyOut(EditorialRankingPolicyUpdate):
     site_id: int
-
-
-class SiteSuggestionModeState(BaseModel):
-    suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool
-    suggestion_comparison_enabled: bool
 
 
 class ArticleBrief(BaseModel):

@@ -21,7 +21,9 @@ def upgrade() -> None:
         "pipeline_batches",
         sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("status", sa.String(length=30), server_default="queued", nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
@@ -41,7 +43,9 @@ def upgrade() -> None:
         sa.Column("analysis_job_run_id", sa.Integer(), nullable=True),
         sa.Column("retry_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("error", sa.Text(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint(
@@ -49,7 +53,9 @@ def upgrade() -> None:
             "'analysis_running', 'succeeded', 'failed')",
             name="ck_pipeline_site_status",
         ),
-        sa.CheckConstraint("stage IN ('ingestion', 'analysis', 'completed')", name="ck_pipeline_site_stage"),
+        sa.CheckConstraint(
+            "stage IN ('ingestion', 'analysis', 'completed')", name="ck_pipeline_site_stage"
+        ),
         sa.ForeignKeyConstraint(["analysis_job_run_id"], ["job_runs.id"], ondelete="SET NULL"),
         sa.ForeignKeyConstraint(["batch_id"], ["pipeline_batches.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["ingestion_job_run_id"], ["job_runs.id"], ondelete="SET NULL"),

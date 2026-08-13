@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import require_api_key
 from app.api.routes import auth as auth_routes
@@ -70,8 +71,8 @@ def test_start_login_returns_a_deep_link_and_code_lifetime(client, monkeypatch):
     assert body["expires_in_seconds"] == 300
 
 
-def test_start_login_clears_out_expired_codes(client, db):
-    """Housekeeping rides along here because nothing else schedules it."""
+def test_start_login_does_not_write_housekeeping_rows(client, db):
+    """An anonymous start request only returns the static Telegram deep link."""
     user = _request_user(db, 4242)
     dashboard_auth.approve_user(db, user, approved_by="bootstrap")
     db.commit()
@@ -82,7 +83,42 @@ def test_start_login_clears_out_expired_codes(client, db):
 
     client.post("/api/v1/auth/login/start")
 
+    assert db.query(LoginNonce).count() == 1
+
+
+def test_valid_login_code_clears_expired_codes(client, db):
+    user = _request_user(db, 4242)
+    dashboard_auth.approve_user(db, user, approved_by="bootstrap")
+    db.commit()
+    _user, _stale_code = dashboard_auth.create_login_code(db, 4242)
+    stale = db.query(LoginNonce).one()
+    stale.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.commit()
+    _user, live_code = dashboard_auth.create_login_code(db, 4242)
+    db.commit()
+
+    response = client.post("/api/v1/auth/login/complete", json={"code": live_code})
+
+    assert response.json()["state"] == "approved"
     assert db.query(LoginNonce).count() == 0
+
+
+def test_valid_login_succeeds_when_cleanup_fails(client, db, monkeypatch):
+    user = _request_user(db, 4242)
+    dashboard_auth.approve_user(db, user, approved_by="bootstrap")
+    db.commit()
+    _user, code = dashboard_auth.create_login_code(db, 4242)
+    db.commit()
+
+    def fail_cleanup(_db):
+        raise SQLAlchemyError("database unavailable")
+
+    monkeypatch.setattr(auth_routes.dashboard_auth, "purge_expired_login_codes", fail_cleanup)
+
+    response = client.post("/api/v1/auth/login/complete", json={"code": code})
+
+    assert response.json()["state"] == "approved"
+    assert SESSION_COOKIE in response.cookies
 
 
 def test_start_login_fails_closed_when_unconfigured(client, monkeypatch):
