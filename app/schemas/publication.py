@@ -53,24 +53,6 @@ class PlanLink(BaseModel):
     outcome: LinkOutcome
 
 
-class PublicationPlanOut(BaseModel):
-    """One persisted, immutable edit an operator may approve.
-
-    The HTML is the whole point: `updated_html` is byte-for-byte what will be
-    sent to WordPress if this plan is approved and the live post still equals
-    `original_html`. Nothing renders it again.
-    """
-
-    id: int
-    status: str
-    plan_hash: str
-    source_article_id: int
-    source_url: str
-    original_html: str
-    updated_html: str
-    links: list[PlanLink]
-
-
 class PublicationPreparationError(BaseModel):
     """A source article deliberately left out of this batch.
 
@@ -80,20 +62,6 @@ class PublicationPreparationError(BaseModel):
     source_article_id: int
     source_url: str
     message: str
-
-
-class PublicationPreparationOut(BaseModel):
-    """What preparation produced, and what it could not.
-
-    `has_more` says more source articles remain unshown. It never means they
-    will be included in the approval the operator is about to give.
-    """
-
-    site_id: int
-    selected_suggestions: int
-    plans: list[PublicationPlanOut]
-    errors: list[PublicationPreparationError]
-    has_more: bool
 
 
 class PublicationPlanHtml(BaseModel):

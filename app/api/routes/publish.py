@@ -1,12 +1,16 @@
 """Publication is three explicit steps, and only the middle one is an approval.
 
-    POST /publish/{id}/plans/prepare   read the live posts, render, store, show
-    POST /publish/{id}/plans/approve   a named human binds themselves to hashes
-    POST /publish/{id}                 queue the approved artifacts, nothing else
+    POST /publish/{id}/plans/prepare-async  queue the live read, render and store
+    POST /publish/{id}/plans/approve        a named human binds themselves to hashes
+    POST /publish/{id}                      queue the approved artifacts, nothing else
 
 Preparation may spend money and read the managed site; it writes nothing back.
-Approval is the only place a human decision is recorded. Queueing makes no
-decision at all, which is what makes it safe to retry after a failure.
+It is only ever queued: the work is one live WordPress request per source
+article plus a placement model call, which is far too slow and too expensive to
+hold an API worker, and its owner has to be a named operator rather than
+whichever key opened the connection. Approval is the only place a human decision
+is recorded. Queueing makes no decision at all, which is what makes it safe to
+retry after a failure.
 """
 
 import logging
@@ -23,12 +27,8 @@ from app.schemas.publication import (
     PendingPublicationSite,
     PlanApprovalRequest,
     PlanApprovalResult,
-    PlanLink,
     PublicationQueueRequest,
-    PublicationPlanOut,
     PublicationPlanHtml,
-    PublicationPreparationError,
-    PublicationPreparationOut,
 )
 from app.services import publication_plan_service
 from app.services.authorization import Principal, tenant_site_filter
@@ -42,19 +42,6 @@ from app.tasks.publication import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/publish", tags=["publish"])
-
-
-def _plan_out(plan: PublicationPlan) -> PublicationPlanOut:
-    return PublicationPlanOut(
-        id=plan.id,
-        status=plan.status,
-        plan_hash=plan.plan_hash,
-        source_article_id=plan.source_article_id,
-        source_url=plan.source_url,
-        original_html=plan.original_html,
-        updated_html=plan.updated_html,
-        links=[PlanLink(**item) for item in (plan.items or [])],
-    )
 
 
 def _pending_publication_query(principal: Principal, search: str | None = None):
@@ -170,11 +157,26 @@ def prepare_publication_plans_async(
     max_articles: int = Query(default=10, ge=1, le=100),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
-    """Queue live preparation so slow WordPress reads never occupy an API worker."""
+    """Queue live preparation so slow WordPress reads never occupy an API worker.
+
+    This is the only way to prepare. Every decision publication used to make on
+    its own — cohort, order, anchor arbitration, in-text or appended block, the
+    rendered HTML — is made by the worker and stored. What the job returns is
+    not a preview of a future decision; it *is* the decision, and approving its
+    hash is what allows it to be sent.
+    """
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources are read-only")
+    # Checked once here rather than discovered per article. Preparation reads
+    # every source post with `context=edit`, which WordPress refuses without an
+    # account, so an unauthenticated site produced one live request and one
+    # identical 401 per article before showing the operator an empty batch.
     if not site.has_wordpress_credentials:
-        raise HTTPException(409, "this site has no WordPress account connected")
+        raise HTTPException(
+            409,
+            "this site has no WordPress account, so its posts cannot be read for editing "
+            "or written to; add an application password for a user who can edit posts",
+        )
     try:
         run = enqueue_job(
             db,
@@ -193,51 +195,6 @@ def prepare_publication_plans_async(
                 409, "this site is already being prepared by another operator"
             ) from error
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
-
-
-@router.post("/{site_id}/plans/prepare", response_model=PublicationPreparationOut)
-def prepare_publication_plans(
-    site: Site = Depends(require_site_access),
-    # Each source article is a live request to the managed site, so a
-    # synchronous preparation is bounded rather than covering the whole queue.
-    max_articles: int = Query(default=25, ge=1, le=100),
-    db: Session = Depends(get_db),
-) -> PublicationPreparationOut:
-    """Freeze what publication would write, decided against the live posts.
-
-    Every decision publication used to make on its own — cohort, order, anchor
-    arbitration, in-text or appended block, the rendered HTML — is made here and
-    stored. What comes back is not a preview of a future decision; it *is* the
-    decision, and approving its hash is what allows it to be sent.
-    """
-    if site.platform == "pool":
-        raise HTTPException(409, "content-pool sources are read-only")
-    # Checked once here rather than discovered per article. Preparation reads
-    # every source post with `context=edit`, which WordPress refuses without an
-    # account, so an unauthenticated site produced one live request and one
-    # identical 401 per article before showing the operator an empty batch.
-    if not site.has_wordpress_credentials:
-        raise HTTPException(
-            409,
-            "this site has no WordPress account, so its posts cannot be read for editing "
-            "or written to; add an application password for a user who can edit posts",
-        )
-
-    preparation = publication_plan_service.prepare_site(db, site, max_articles=max_articles)
-    return PublicationPreparationOut(
-        site_id=preparation.site_id,
-        selected_suggestions=preparation.selected_suggestions,
-        plans=[_plan_out(plan) for plan in preparation.plans],
-        errors=[
-            PublicationPreparationError(
-                source_article_id=error.source_article_id,
-                source_url=error.source_url,
-                message=error.message,
-            )
-            for error in preparation.errors
-        ],
-        has_more=preparation.has_more,
-    )
 
 
 @router.get(

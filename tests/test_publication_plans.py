@@ -385,11 +385,21 @@ def _approve(client, site, plans, expect=200):
     return response
 
 
+def _prepare(site, **kwargs):
+    """Prepare the way the worker does, because that is the only way it happens.
+
+    There is no synchronous route to call here: preparation reads the live site
+    and calls the placement model, so it is always queued and always owned by a
+    named operator. The task body is what these tests exercise.
+    """
+    return _prepare_publication_plans(site.id, **kwargs)
+
+
 def _prepared(client, db, site, articles, monkeypatch, **kwargs):
     """One selected suggestion, prepared into a plan the operator can approve."""
     suggestion = _suggestion(db, site, *articles)
     _stub_preview(monkeypatch, **kwargs)
-    plan = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()["plans"][0]
+    plan = _prepare(site)["plans"][0]
     return suggestion, plan
 
 
@@ -399,7 +409,7 @@ def test_preparation_stores_an_approvable_plan_and_writes_no_wordpress_content(
     suggestion = _suggestion(db, site, *articles)
     seen = _stub_preview(monkeypatch)
 
-    body = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()
+    body = _prepare(site)
 
     assert seen == [[suggestion.id]]
     assert body["selected_suggestions"] == 1
@@ -408,7 +418,6 @@ def test_preparation_stores_an_approvable_plan_and_writes_no_wordpress_content(
     (plan,) = body["plans"]
     assert plan["status"] == "prepared"
     assert len(plan["plan_hash"]) == 64
-    assert plan["original_html"] == "<p>Before</p>"
     assert plan["links"] == [
         {
             "position": 0,
@@ -416,8 +425,12 @@ def test_preparation_stores_an_approvable_plan_and_writes_no_wordpress_content(
             "target_url": articles[1].url,
             "anchor_text": None,
             "outcome": "inserted",
+            "placement_context": None,
         }
     ]
+    # The exact bytes are stored, not returned: the result an operator reviews
+    # carries the decision, and the HTML is loaded on demand beside it.
+    assert db.get(PublicationPlan, plan["id"]).original_html == "<p>Before</p>"
     # Nothing about the review decision moved, and nothing is bound yet.
     db.expire_all()
     stored = db.get(Suggestion, suggestion.id)
@@ -435,8 +448,8 @@ def test_preparing_an_unchanged_article_twice_returns_the_same_plan(
     _suggestion(db, site, *articles)
     _stub_preview(monkeypatch)
 
-    first = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()["plans"][0]
-    second = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()["plans"][0]
+    first = _prepare(site)["plans"][0]
+    second = _prepare(site)["plans"][0]
 
     assert (first["id"], first["plan_hash"]) == (second["id"], second["plan_hash"])
 
@@ -446,10 +459,10 @@ def test_a_changed_article_supersedes_the_previous_prepared_plan(
 ):
     _suggestion(db, site, *articles)
     _stub_preview(monkeypatch)
-    first = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()["plans"][0]
+    first = _prepare(site)["plans"][0]
 
     _stub_preview(monkeypatch, updated="<p>Before, rewritten</p>")
-    second = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()["plans"][0]
+    second = _prepare(site)["plans"][0]
 
     assert second["id"] != first["id"]
     db.expire_all()
@@ -469,7 +482,7 @@ def test_an_approved_row_is_not_offered_for_preparation_again(
     _approve(client, site, [plan])
 
     _stub_preview(monkeypatch, updated="<p>Before, rewritten</p>")
-    body = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()
+    body = _prepare(site)
 
     assert body["plans"] == []
     db.expire_all()
@@ -491,7 +504,7 @@ def test_an_approved_plan_is_never_superseded_by_a_new_preparation(
     latecomer = _suggestion(db, site, articles[0], late)
 
     _stub_preview(monkeypatch, updated="<p>Before, rewritten</p>")
-    body = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()
+    body = _prepare(site)
 
     assert body["plans"] == []
     assert "already covers this article" in body["errors"][0]["message"]
@@ -558,7 +571,7 @@ def test_an_unreachable_source_produces_an_error_and_no_plan(
     _suggestion(db, site, *articles)
     _stub_preview(monkeypatch, fail=RuntimeError("post is gone"))
 
-    body = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()
+    body = _prepare(site)
 
     assert body["plans"] == []
     assert body["errors"][0]["message"] == "post is gone"
@@ -581,9 +594,7 @@ def test_preparation_is_bounded_and_says_so(client, db, site, articles, monkeypa
         _suggestion(db, site, source, target)
     seen = _stub_preview(monkeypatch)
 
-    body = client.post(
-        f"/api/v1/publish/{site.id}/plans/prepare", params={"max_articles": 2}
-    ).json()
+    body = _prepare(site, max_articles=2)
 
     assert len(seen) == 2
     assert len(body["plans"]) == 2
@@ -606,9 +617,9 @@ def test_a_block_fallback_is_frozen_exactly_as_it_was_shown(
     )
     _stub_preview(monkeypatch, updated=block_html, outcomes=["block"])
 
-    plan = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()["plans"][0]
+    plan = _prepare(site)["plans"][0]
 
-    assert plan["updated_html"] == block_html
+    assert db.get(PublicationPlan, plan["id"]).updated_html == block_html
     assert plan["links"][0]["outcome"] == "block"
 
 
@@ -616,7 +627,7 @@ def test_preparation_refuses_a_content_pool_source(client, db, site):
     site.platform = "pool"
     db.commit()
 
-    assert client.post(f"/api/v1/publish/{site.id}/plans/prepare").status_code == 409
+    assert client.post(f"/api/v1/publish/{site.id}/plans/prepare-async").status_code == 409
 
 
 def test_preparation_refuses_a_site_with_no_wordpress_account(
@@ -635,7 +646,7 @@ def test_preparation_refuses_a_site_with_no_wordpress_account(
     site.wp_app_password = None
     db.commit()
 
-    response = client.post(f"/api/v1/publish/{site.id}/plans/prepare")
+    response = client.post(f"/api/v1/publish/{site.id}/plans/prepare-async")
 
     assert response.status_code == 409
     assert "application password" in response.json()["detail"]
@@ -718,7 +729,7 @@ def test_a_plan_belonging_to_another_site_cannot_be_approved(
 def test_a_superseded_plan_cannot_be_approved(client, db, site, articles, monkeypatch):
     _, plan = _prepared(client, db, site, articles, monkeypatch)
     _stub_preview(monkeypatch, updated="<p>Before, rewritten</p>")
-    client.post(f"/api/v1/publish/{site.id}/plans/prepare")
+    _prepare(site)
 
     response = _approve(client, site, [plan], expect=409)
 
@@ -760,7 +771,7 @@ def test_one_bad_plan_in_a_batch_approves_none_of_them(client, db, site, article
         db.commit()
         _suggestion(db, site, source, target)
     _stub_preview(monkeypatch)
-    plans = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()["plans"]
+    plans = _prepare(site)["plans"]
     assert len(plans) == 2
 
     _approve(client, site, [plans[0], {**plans[1], "plan_hash": "0" * 64}], expect=409)
@@ -1200,6 +1211,7 @@ def test_the_worker_stores_a_validated_result(db, site, articles, monkeypatch):
 
 def test_exact_html_is_loaded_separately(client, db, site, articles, monkeypatch):
     _, plan = _prepared(client, db, site, articles, monkeypatch)
+    stored = db.get(PublicationPlan, plan["id"])
 
     response = client.get(f"/api/v1/publish/{site.id}/plans/{plan['id']}/html")
 
@@ -1207,6 +1219,6 @@ def test_exact_html_is_loaded_separately(client, db, site, articles, monkeypatch
     assert response.json() == {
         "id": plan["id"],
         "plan_hash": plan["plan_hash"],
-        "original_html": plan["original_html"],
-        "updated_html": plan["updated_html"],
+        "original_html": stored.original_html,
+        "updated_html": stored.updated_html,
     }

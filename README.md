@@ -104,10 +104,14 @@ Reviewing a suggestion **selects** it; it does not schedule anything. Publicatio
 three separate calls, and only the middle one is a decision:
 
 ```http
-POST /api/v1/publish/{site_id}/plans/prepare?max_articles=10
+POST /api/v1/publish/{site_id}/plans/prepare-async?max_articles=10   -> 202 {job_id}
 POST /api/v1/publish/{site_id}/plans/approve   {"plans": [{"id": 55, "plan_hash": "..."}]}
 POST /api/v1/publish/{site_id}   {"plan_ids": [55]}
 ```
+
+Preparation is always queued and always owned by a named operator: it makes one live
+WordPress request per source article plus a placement model call, which is too slow and
+too expensive to hold an API worker. Poll `GET /api/v1/jobs/{job_id}` for its result.
 
 Preparation reads the live WordPress posts, makes every decision publication used to
 make on its own — cohort, ordering, anchor arbitration, in-text or appended block, the

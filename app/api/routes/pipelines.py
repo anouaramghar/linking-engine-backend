@@ -30,6 +30,24 @@ from app.tasks.queues import redis_conn
 router = APIRouter(prefix="/pipelines", tags=["pipelines"])
 logger = logging.getLogger(__name__)
 TERMINAL_BATCH_STATUSES = {"succeeded", "failed", "partial_failed", "cancelled"}
+#: How long a stream waits before it reads the batch again. It starts fast so a
+#: click feels answered, and slows down while nothing changes.
+MIN_STREAM_INTERVAL = 1.0
+MAX_STREAM_INTERVAL = 5.0
+
+
+def _next_stream_interval(interval: float, changed: bool) -> float:
+    """Poll fast while a batch is moving, slowly while it is not.
+
+    Every snapshot is a database round trip and a worker thread, and both are
+    shared with every other request in the process — so a batch that ingests for
+    twenty minutes must not cost one query per second per open tab for all of
+    them. Any change resets the stream to its fastest interval, which is what
+    keeps a run that suddenly starts moving from being reported late.
+    """
+    if changed:
+        return MIN_STREAM_INTERVAL
+    return min(interval * 2, MAX_STREAM_INTERVAL)
 
 
 def _batch_out(db: Session, batch: PipelineBatch) -> PipelineBatchOut:
@@ -195,13 +213,15 @@ def stream_pipeline_batch(
     async def events():
         previous = None
         last_sent = monotonic()
+        interval = MIN_STREAM_INTERVAL
         while True:
             payload, terminal = await run_in_threadpool(_pipeline_snapshot, batch_id)
             if payload is None:
                 yield 'event: error\ndata: {"detail":"batch deleted"}\n\n'
                 return
             now = monotonic()
-            if payload != previous:
+            changed = payload != previous
+            if changed:
                 yield f"event: batch\ndata: {payload}\n\n"
                 previous = payload
                 last_sent = now
@@ -211,7 +231,8 @@ def stream_pipeline_batch(
             if terminal:
                 yield "event: done\ndata: {}\n\n"
                 return
-            await asyncio.sleep(1)
+            interval = _next_stream_interval(interval, changed)
+            await asyncio.sleep(interval)
 
     return StreamingResponse(
         events(),
