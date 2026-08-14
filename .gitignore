@@ -10,7 +10,15 @@ htmlcov/
 
 # Environment
 .env
+.env.staging
 !.env.example
+!.env.staging.example
+
+# Machine-local Compose overrides. These may contain literal development
+# credentials and must never be committed.
+docker-compose.local.yml
+docker-compose.runtime.yml
+Dockerfile.staging.local
 
 # ML artifacts
 *.pt
