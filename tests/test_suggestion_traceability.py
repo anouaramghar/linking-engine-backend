@@ -88,10 +88,12 @@ def test_review_and_undo_append_actor_attributed_events(client, db, site):
         "to_status": "pending",
     }
     assert history[1]["actor"] == "local-development"
-    assert history[1]["details"] == {
-        "from_status": "pending",
-        "to_status": "approved",
-    }
+    assert history[1]["details"]["from_status"] == "pending"
+    assert history[1]["details"]["to_status"] == "approved"
+    assert history[1]["details"]["reviewer_id"] == "local-development"
+    assert history[1]["details"]["review_kind"] == "individual"
+    assert history[1]["details"]["exposed"] is False
+    assert history[1]["details"]["review_duration_ms"] >= 0
 
 
 def test_worker_owned_transition_is_attributed_and_explained(client, db, site):

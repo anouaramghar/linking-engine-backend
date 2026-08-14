@@ -26,12 +26,15 @@ from app.schemas.evaluation import (
     EvaluationProvenance,
     EvaluationSuggestionOut,
     EvaluationSuggestionPage,
+    ExposureMetrics,
+    GraphImpactMetrics,
     EvaluationTrendPoint,
     MethodMetrics,
     OrphanMetrics,
     OrphanTrendPoint,
     PlacementMetrics,
     PublicationMetrics,
+    RejectionReasonMetric,
     ScoreRangeMetrics,
     SiteEvaluationMetrics,
 )
@@ -49,7 +52,7 @@ _EXPORT_FETCH_BATCH = 1_000
 #: Bumped whenever a field on ``EvaluationMetricsOut`` changes meaning, so a
 #: stored or exported answer can never be compared against a differently defined
 #: one without the difference being visible.
-EVALUATION_SCHEMA_VERSION = "evaluation_metrics_v1"
+EVALUATION_SCHEMA_VERSION = "evaluation_metrics_v2"
 
 #: Thresholds from docs/superpowers/plans/2026-08-11-evidence-driven-operations.md,
 #: Workstream 5: three operator-selected representative sites, at least 100
@@ -175,6 +178,138 @@ def _placement_metrics(
         generated=generated,
         successful=successful,
         success_rate=_rate(successful, generated),
+    )
+
+
+def _exposure_metrics(
+    db: Session,
+    site_id: int | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+) -> ExposureMetrics:
+    conditions = _suggestion_conditions(site_id, date_from, date_to)
+    suggestions = db.scalar(select(func.count(Suggestion.id)).where(*conditions)) or 0
+    exposed = (
+        db.scalar(
+            select(func.count(Suggestion.id)).where(
+                *conditions,
+                Suggestion.shown_at.is_not(None),
+            )
+        )
+        or 0
+    )
+    exposed_decisions = (
+        db.scalar(
+            select(func.count(Suggestion.id)).where(
+                *conditions,
+                Suggestion.shown_at.is_not(None),
+                Suggestion.status.in_(DECIDED_STATUSES),
+            )
+        )
+        or 0
+    )
+    unseen_decisions = (
+        db.scalar(
+            select(func.count(Suggestion.id)).where(
+                *conditions,
+                Suggestion.shown_at.is_(None),
+                Suggestion.status.in_(DECIDED_STATUSES),
+            )
+        )
+        or 0
+    )
+    exposed_accepted = (
+        db.scalar(
+            select(func.count(Suggestion.id)).where(
+                *conditions,
+                Suggestion.shown_at.is_not(None),
+                Suggestion.status.in_(ACCEPTED_STATUSES),
+            )
+        )
+        or 0
+    )
+    exposed_rejected = (
+        db.scalar(
+            select(func.count(Suggestion.id)).where(
+                *conditions,
+                Suggestion.shown_at.is_not(None),
+                Suggestion.status == "rejected",
+            )
+        )
+        or 0
+    )
+    return ExposureMetrics(
+        suggestions=suggestions,
+        exposed=exposed,
+        unseen=max(0, suggestions - exposed),
+        exposure_rate=_rate(exposed, suggestions),
+        exposed_decisions=exposed_decisions,
+        unseen_decisions=unseen_decisions,
+        exposed_acceptance_rate=_rate(
+            exposed_accepted,
+            exposed_accepted + exposed_rejected,
+        ),
+    )
+
+
+def _rejection_reason_metrics(
+    db: Session,
+    site_id: int | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+) -> list[RejectionReasonMetric]:
+    conditions = _suggestion_conditions(site_id, date_from, date_to)
+    counts: defaultdict[str, int] = defaultdict(int)
+    rows = db.execute(
+        select(SuggestionEvent.details)
+        .join(Suggestion, Suggestion.id == SuggestionEvent.suggestion_id)
+        .where(*conditions, SuggestionEvent.event_type == "reviewed")
+    )
+    for (details,) in rows:
+        if not isinstance(details, dict) or details.get("to_status") != "rejected":
+            continue
+        counts[str(details.get("rejection_reason") or "unspecified")] += 1
+    return [
+        RejectionReasonMetric(reason=reason, count=count)
+        for reason, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def _graph_impact_metrics(
+    db: Session,
+    site_id: int | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+) -> GraphImpactMetrics:
+    conditions = _suggestion_conditions(site_id, date_from, date_to)
+    rows = db.execute(
+        select(
+            Suggestion.score_components,
+            Suggestion.status,
+            Suggestion.shown_at,
+        ).where(*conditions)
+    )
+    with_context = adjusted = exposed = accepted = orphan_accepted = underlinked_accepted = 0
+    for components, status, shown_at in rows:
+        graph = components.get("graph") if isinstance(components, dict) else None
+        if not isinstance(graph, dict):
+            continue
+        with_context += 1
+        adjusted += int(bool(graph.get("applied") or graph.get("adjustment", 0) > 0))
+        exposed += int(shown_at is not None)
+        accepted_status = status in ACCEPTED_STATUSES
+        accepted += int(accepted_status)
+        orphan_accepted += int(accepted_status and graph.get("target_orphan", False))
+        underlinked_accepted += int(
+            accepted_status and graph.get("target_underlinked", False)
+        )
+    return GraphImpactMetrics(
+        suggestions_with_graph_context=with_context,
+        graph_adjusted_suggestions=adjusted,
+        exposed_graph_suggestions=exposed,
+        accepted_or_published_graph_suggestions=accepted,
+        orphan_targets_accepted=orphan_accepted,
+        underlinked_targets_accepted=underlinked_accepted,
     )
 
 
@@ -590,6 +725,11 @@ def _provenance(
     )
     individual = db.scalar(select(func.count()).select_from(Suggestion).where(*decided, ~from_bulk))
     bulk = db.scalar(select(func.count()).select_from(Suggestion).where(*decided, from_bulk))
+    exposed_individual = db.scalar(
+        select(func.count())
+        .select_from(Suggestion)
+        .where(*decided, Suggestion.shown_at.is_not(None), ~from_bulk)
+    )
     cutoff = db.scalar(select(func.max(Suggestion.created_at)).where(*conditions))
 
     per_site = db.execute(
@@ -612,8 +752,10 @@ def _provenance(
         evidence_cutoff=cutoff,
         individual_labels=individual or 0,
         bulk_labels=bulk or 0,
+        exposed_individual_labels=exposed_individual or 0,
         label_provenance=(
             f"{individual or 0} decisions made row by row, {bulk or 0} made by a bulk rule. "
+            f"{exposed_individual or 0} individual decisions were exposed before review. "
             "Both are counted in the rates on this page; only the first are individual labels."
         ),
         sample_state=state,
@@ -631,6 +773,7 @@ def evaluation_metrics(
     date_to: datetime | None = None,
 ) -> EvaluationMetricsOut:
     editorial = _editorial_metrics(db, site_id, date_from, date_to)
+    exposure = _exposure_metrics(db, site_id, date_from, date_to)
     placement = _placement_metrics(db, site_id, date_from, date_to)
     publication = _publication_metrics(db, site_id, date_from, date_to)
     return EvaluationMetricsOut(
@@ -641,6 +784,9 @@ def evaluation_metrics(
         cohort_definition=COHORT_DEFINITION,
         provenance=_provenance(db, site_id, date_from, date_to),
         editorial=editorial,
+        exposure=exposure,
+        rejection_reasons=_rejection_reason_metrics(db, site_id, date_from, date_to),
+        graph_impact=_graph_impact_metrics(db, site_id, date_from, date_to),
         placement=placement,
         publication=publication,
         orphans=_orphan_metrics(db, site_id, date_from, date_to),
@@ -846,9 +992,18 @@ def evaluation_export_rows(
                 ),
                 Suggestion.method,
                 Suggestion.score,
+                Suggestion.shown_at,
+                Suggestion.last_shown_at,
+                Suggestion.exposure_count,
                 Suggestion.status,
                 Suggestion.created_at,
                 Suggestion.reviewed_at,
+                Suggestion.reviewer_id,
+                Suggestion.rejection_reason,
+                Suggestion.retrieval_version,
+                Suggestion.ranking_version,
+                Suggestion.final_rank,
+                Suggestion.feature_snapshot,
                 Suggestion.placement_generated_at,
                 Suggestion.applied_at,
                 Suggestion.publish_outcome,

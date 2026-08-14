@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -84,6 +85,8 @@ def get_evaluation_suggestions(
 def _csv_safe(value: object) -> str:
     if value is None:
         return ""
+    if isinstance(value, (dict, list)):
+        return csv_escape_formula(json.dumps(value, sort_keys=True, separators=(",", ":")))
     rendered = value.isoformat() if isinstance(value, datetime) else str(value)
     return csv_escape_formula(rendered)
 
@@ -96,9 +99,18 @@ EXPORT_HEADER = (
     "target_title",
     "method",
     "semantic_score",
+    "shown_at",
+    "last_shown_at",
+    "exposure_count",
     "status",
     "created_at",
     "reviewed_at",
+    "reviewer_id",
+    "rejection_reason",
+    "retrieval_version",
+    "ranking_version",
+    "final_rank",
+    "feature_snapshot",
     "placement_generated_at",
     "applied_at",
     "publish_outcome",

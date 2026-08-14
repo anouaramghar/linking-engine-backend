@@ -36,6 +36,8 @@ from app.schemas.suggestion import (
     SuggestionCounts,
     SuggestionCursor,
     SuggestionEventOut,
+    SuggestionExposure,
+    SuggestionExposureResult,
     SuggestionOut,
     SuggestionPage,
     SuggestionReview,
@@ -177,6 +179,14 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
                 publish_outcome=suggestion.publish_outcome,
                 publish_attempts=suggestion.publish_attempts,
                 publish_error=suggestion.publish_error,
+                shown_at=suggestion.shown_at,
+                last_shown_at=suggestion.last_shown_at,
+                exposure_count=suggestion.exposure_count,
+                reviewer_id=suggestion.reviewer_id,
+                rejection_reason=suggestion.rejection_reason,
+                retrieval_version=suggestion.retrieval_version,
+                ranking_version=suggestion.ranking_version,
+                final_rank=suggestion.final_rank,
                 created_at=suggestion.created_at,
             )
         )
@@ -199,7 +209,12 @@ def _bound_to_an_approved_plan():
     )
 
 
-def _review_values(status: str) -> dict:
+def _review_values(
+    status: str,
+    *,
+    actor: str | None = None,
+    rejection_reason: str | None = None,
+) -> dict:
     """What a review writes, whichever path issued it.
 
     Undoing a decision returns the suggestion to the unreviewed state, so the
@@ -221,10 +236,19 @@ def _review_values(status: str) -> dict:
         "publish_attempts": 0,
         "publish_error": None,
         "publication_plan_id": None,
+        "reviewer_id": actor[:255] if actor and status != "pending" else None,
+        "rejection_reason": rejection_reason if status == "rejected" else None,
     }
 
 
-def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]:
+def _review_matching(
+    db: Session,
+    conditions: Sequence,
+    status: str,
+    *,
+    actor: str | None = None,
+    rejection_reason: str | None = None,
+) -> set[int]:
     """Move every reviewable row matching ``conditions`` to ``status``; returns the
     ids that actually moved.
 
@@ -245,15 +269,34 @@ def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]
                 Suggestion.status.notin_(UNREVIEWABLE),
                 ~_bound_to_an_approved_plan(),
             )
-            .values(**_review_values(status))
+            .values(
+                **_review_values(
+                    status,
+                    actor=actor,
+                    rejection_reason=rejection_reason,
+                )
+            )
             .returning(Suggestion.id)
             .execution_options(synchronize_session=False)
         )
     )
 
 
-def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[int]:
-    return _review_matching(db, [Suggestion.id.in_(suggestion_ids)], status)
+def _review_ids(
+    db: Session,
+    suggestion_ids: Sequence[int],
+    status: str,
+    *,
+    actor: str | None = None,
+    rejection_reason: str | None = None,
+) -> set[int]:
+    return _review_matching(
+        db,
+        [Suggestion.id.in_(suggestion_ids)],
+        status,
+        actor=actor,
+        rejection_reason=rejection_reason,
+    )
 
 
 def _set_audit_actor(db: Session, actor: str) -> None:
@@ -264,11 +307,49 @@ def _set_audit_actor(db: Session, actor: str) -> None:
     )
 
 
+def _set_review_context(
+    db: Session,
+    actor: str,
+    *,
+    review_kind: str,
+    rejection_reason: str | None = None,
+) -> None:
+    """Pass decision metadata to the lifecycle trigger for this transaction."""
+    context = {
+        "review_kind": review_kind,
+        "rejection_reason": rejection_reason,
+    }
+    db.execute(
+        text(
+            """
+            SELECT
+                set_config('linkmesh.audit_actor', :actor, true),
+                set_config('linkmesh.review_context', :context, true)
+            """
+        ),
+        {
+            "actor": actor[:255],
+            "context": json.dumps(
+                {key: value for key, value in context.items() if value is not None}
+            ),
+        },
+    )
+
+
+def _set_exposure_context(db: Session, surface: str) -> None:
+    db.execute(
+        text("SELECT set_config('linkmesh.exposure_context', :context, true)"),
+        {"context": json.dumps({"surface": surface})},
+    )
+
+
 def _review_matching_counts(
     db: Session,
     conditions: Sequence,
     status: str,
     operation_id: str | None = None,
+    actor: str | None = None,
+    rejection_reason: str | None = None,
 ) -> tuple[int, int, list[int] | None]:
     """Summarize one stable candidate cohort and update its reviewable rows.
 
@@ -297,7 +378,13 @@ def _review_matching_counts(
             # instead of vanishing from the rule's own count.
             ~_bound_to_an_approved_plan(),
         )
-        .values(**_review_values(status))
+        .values(
+            **_review_values(
+                status,
+                actor=actor,
+                rejection_reason=rejection_reason,
+            )
+        )
         .returning(Suggestion.id)
         .execution_options(synchronize_session=False)
         .cte("reviewed_rows")
@@ -698,6 +785,50 @@ def _tenant_scope(principal: Principal) -> int | None:
     return principal.tenant_id
 
 
+# declared before /suggestions/{site_id} so "exposure" is not parsed as a site id
+@router.post("/suggestions/exposure", response_model=SuggestionExposureResult)
+def mark_suggestions_exposed(
+    payload: SuggestionExposure,
+    actor: str = Depends(get_audit_actor),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> SuggestionExposureResult:
+    """Record that the dashboard rendered a bounded set of suggestions.
+
+    Exposure is idempotent at the audit level: the first render writes
+    ``shown_at`` and emits one lifecycle event, while later renders refresh the
+    last-seen timestamp and count without manufacturing more training labels.
+    """
+    rows = list(
+        db.execute(
+            select(Suggestion.id, Site.tenant_id)
+            .join(Site, Site.id == Suggestion.site_id)
+            .where(Suggestion.id.in_(payload.suggestion_ids))
+        ).all()
+    )
+    for _suggestion_id, tenant_id in rows:
+        check_site_access(principal, tenant_id)
+    existing_ids = {suggestion_id for suggestion_id, _tenant_id in rows}
+    if not existing_ids:
+        return SuggestionExposureResult(exposed=0)
+
+    now = datetime.now(timezone.utc)
+    _set_audit_actor(db, actor)
+    _set_exposure_context(db, payload.surface)
+    db.execute(
+        update(Suggestion)
+        .where(Suggestion.id.in_(existing_ids))
+        .values(
+            shown_at=func.coalesce(Suggestion.shown_at, now),
+            last_shown_at=now,
+            exposure_count=Suggestion.exposure_count + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return SuggestionExposureResult(exposed=len(existing_ids))
+
+
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
 @router.post("/suggestions/bulk-review")
 def bulk_review(
@@ -727,11 +858,22 @@ def bulk_review(
     existing = {suggestion_id for suggestion_id, _tenant_id in rows}
     for _suggestion_id, tenant_id in rows:
         check_site_access(principal, tenant_id)
-    _set_audit_actor(db, actor)
+    _set_review_context(
+        db,
+        actor,
+        review_kind="bulk",
+        rejection_reason=payload.rejection_reason,
+    )
     # Review the ids this join actually authorized, not the raw request. A
     # suggestion whose site row is missing cannot be ownership-checked, so it
     # must not be swept along by an `IN` over the caller's list.
-    reviewed = _review_ids(db, sorted(existing), payload.status)
+    reviewed = _review_ids(
+        db,
+        sorted(existing),
+        payload.status,
+        actor=actor,
+        rejection_reason=payload.rejection_reason,
+    )
     db.commit()
     logger.info(
         "suggestion review actor=%s mode=explicit status=%s reviewed=%s skipped=%s",
@@ -785,12 +927,19 @@ def bulk_review_by_filter(
     )
     db.add(operation)
     db.flush()
-    _set_audit_actor(db, actor)
+    _set_review_context(
+        db,
+        actor,
+        review_kind="bulk",
+        rejection_reason=payload.rejection_reason,
+    )
     matched, reviewed, reviewed_ids = _review_matching_counts(
         db,
         conditions,
         payload.status,
         operation_id=operation.id,
+        actor=actor,
+        rejection_reason=payload.rejection_reason,
     )
     undo_operation_id: str | None = operation.id
     if reviewed:
@@ -859,14 +1008,14 @@ def undo_filtered_bulk_review(
     cohort = select(BulkReviewOperationItem.suggestion_id).where(
         BulkReviewOperationItem.operation_id == operation.id
     )
-    _set_audit_actor(db, actor)
+    _set_review_context(db, actor, review_kind="undo")
     restored = db.execute(
         update(Suggestion)
         .where(
             Suggestion.id.in_(cohort),
             Suggestion.status == operation.to_status,
         )
-        .values(**_review_values(operation.from_status))
+        .values(**_review_values(operation.from_status, actor=actor))
         .execution_options(synchronize_session=False)
     ).rowcount
     skipped = operation.reviewed_count - restored
@@ -1174,8 +1323,19 @@ def review_suggestion(
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
     authorize_site(db, principal, suggestion.site_id)
-    _set_audit_actor(db, actor)
-    if not _review_ids(db, [suggestion_id], payload.status):
+    _set_review_context(
+        db,
+        actor,
+        review_kind="individual",
+        rejection_reason=payload.rejection_reason,
+    )
+    if not _review_ids(
+        db,
+        [suggestion_id],
+        payload.status,
+        actor=actor,
+        rejection_reason=payload.rejection_reason,
+    ):
         raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
     db.commit()
     logger.info(

@@ -396,6 +396,12 @@ def fill_external_suggestion_gap(
             )
             continue
 
+        feature_snapshot = {
+            "semantic": semantic_score,
+            "semantic_model": model,
+            "provider_rank": candidate.provider_rank,
+            "external_safety": candidate.safety.as_score_component(),
+        }
         suggestion = Suggestion(
             site_id=site.id,
             source_article_id=article.id,
@@ -409,12 +415,11 @@ def fill_external_suggestion_gap(
             search_query=response.query,
             method="external_search",
             score=semantic_score,
-            score_components={
-                "semantic": semantic_score,
-                "semantic_model": model,
-                "provider_rank": candidate.provider_rank,
-                "external_safety": candidate.safety.as_score_component(),
-            },
+            score_components=feature_snapshot,
+            retrieval_version="external_search_v1",
+            ranking_version="external_search_provider_v1",
+            final_rank=candidate.provider_rank,
+            feature_snapshot=feature_snapshot,
             status="pending",
         )
         db.add(suggestion)

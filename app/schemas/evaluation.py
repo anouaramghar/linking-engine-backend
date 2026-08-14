@@ -28,6 +28,34 @@ class EditorialMetrics(BaseModel):
     decision_time_sample: int
 
 
+class ExposureMetrics(BaseModel):
+    """Whether a suggestion was actually rendered before its decision."""
+
+    suggestions: int
+    exposed: int
+    unseen: int
+    exposure_rate: float | None
+    exposed_decisions: int
+    unseen_decisions: int
+    exposed_acceptance_rate: float | None
+
+
+class RejectionReasonMetric(BaseModel):
+    reason: str
+    count: int
+
+
+class GraphImpactMetrics(BaseModel):
+    """Observed graph context and outcomes attached to generated suggestions."""
+
+    suggestions_with_graph_context: int
+    graph_adjusted_suggestions: int
+    exposed_graph_suggestions: int
+    accepted_or_published_graph_suggestions: int
+    orphan_targets_accepted: int
+    underlinked_targets_accepted: int
+
+
 class PlacementMetrics(BaseModel):
     generated: int
     successful: int
@@ -139,6 +167,7 @@ class EvaluationProvenance(BaseModel):
     #: How the decisions were made, not how many there are.
     individual_labels: int
     bulk_labels: int
+    exposed_individual_labels: int
     label_provenance: str
     sample_state: EvidenceSampleState
     #: Sites holding at least ``individual_label_target`` individual labels, and
@@ -160,6 +189,9 @@ class EvaluationMetricsOut(BaseModel):
     cohort_definition: str
     provenance: EvaluationProvenance
     editorial: EditorialMetrics
+    exposure: ExposureMetrics
+    rejection_reasons: list[RejectionReasonMetric]
+    graph_impact: GraphImpactMetrics
     placement: PlacementMetrics
     publication: PublicationMetrics
     orphans: OrphanMetrics

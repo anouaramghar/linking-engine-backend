@@ -42,6 +42,27 @@ _DIMENSION_PROBE_INPUT = "LinkMesh dimension probe"
 logger = logging.getLogger(__name__)
 
 
+def _ranking_versions(
+    method: str,
+    components: dict,
+    *,
+    graph_mode: str,
+    feedback_enabled: bool,
+) -> tuple[str, str]:
+    """Return the immutable retrieval/ranking labels stored with one row."""
+    retrieval_version = str(
+        components.get("version")
+        or {
+            "baseline_cosine": "cosine_v1",
+            "external_search": "external_search_v1",
+        }.get(method, f"{method}_v1")
+    )
+    ranking_version = (
+        f"{method}:graph={graph_mode}:feedback={'on' if feedback_enabled else 'off'}"
+    )
+    return retrieval_version, ranking_version
+
+
 @contextmanager
 def _site_analysis_lock(site_id: int) -> Iterator[None]:
     # Batch commits use a separate work session. This dedicated transaction therefore holds
@@ -506,7 +527,7 @@ def generate_suggestions(
                     graph_metadata = {}
                 if comparison_only:
                     candidate_rows = []
-                for candidate in candidate_rows:
+                for final_rank, candidate in enumerate(candidate_rows, start=1):
                     graph = None
                     metadata = graph_metadata.get(candidate.target_id)
                     target_feature = graph_features.get(candidate.target_id)
@@ -538,6 +559,41 @@ def generate_suggestions(
                             "applied": metadata.applied,
                             "mode": settings.graph_reranking_mode,
                         }
+                    feature_snapshot = (
+                        {
+                            **(
+                                candidate.score_components()
+                                if method == "hybrid_bm25"
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "external_trust": external_trust[
+                                        candidate.target_id
+                                    ].as_score_component()
+                                }
+                                if candidate.target_id in external_trust
+                                else {}
+                            ),
+                            **({"graph": graph} if graph is not None else {}),
+                            **(
+                                {
+                                    "editorial_feedback": feedback_components[
+                                        candidate.target_id
+                                    ]
+                                }
+                                if candidate.target_id in feedback_components
+                                else {}
+                            ),
+                        }
+                        or None
+                    )
+                    retrieval_version, ranking_version = _ranking_versions(
+                        method,
+                        feature_snapshot or {},
+                        graph_mode=settings.graph_reranking_mode,
+                        feedback_enabled=feedback_profile is not None,
+                    )
                     db.add(
                         Suggestion(
                             site_id=site_id,
@@ -547,35 +603,11 @@ def generate_suggestions(
                             # Cosine similarity for both methods, so one number keeps
                             # one meaning across the mixed queue.
                             score=candidate.semantic_score,
-                            score_components=(
-                                {
-                                    **(
-                                        candidate.score_components()
-                                        if method == "hybrid_bm25"
-                                        else {}
-                                    ),
-                                    **(
-                                        {
-                                            "external_trust": external_trust[
-                                                candidate.target_id
-                                            ].as_score_component()
-                                        }
-                                        if candidate.target_id in external_trust
-                                        else {}
-                                    ),
-                                    **({"graph": graph} if graph is not None else {}),
-                                    **(
-                                        {
-                                            "editorial_feedback": feedback_components[
-                                                candidate.target_id
-                                            ]
-                                        }
-                                        if candidate.target_id in feedback_components
-                                        else {}
-                                    ),
-                                }
-                                or None
-                            ),
+                            score_components=feature_snapshot,
+                            retrieval_version=retrieval_version,
+                            ranking_version=ranking_version,
+                            final_rank=final_rank,
+                            feature_snapshot=feature_snapshot,
                             status="pending",
                         )
                     )
