@@ -89,6 +89,27 @@ def test_a_refusal_from_telegram_raises_with_its_reason():
         _client(handler).get_me()
 
 
+def test_a_download_stops_at_the_size_limit():
+    """An avatar is the only thing downloaded, and Telegram keeps those small.
+
+    Without a ceiling the reply length decides how much memory the bot process
+    spends, and the reply is not ours.
+    """
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 4096)
+
+    with pytest.raises(TelegramError, match="larger than"):
+        _client(handler).download_file("photos/big.jpg", max_bytes=1024)
+
+
+def test_a_download_within_the_limit_returns_every_byte():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"avatar-bytes")
+
+    assert _client(handler).download_file("photos/ok.jpg") == b"avatar-bytes"
+
+
 def test_the_bot_silences_httpx_request_logging():
     """The token is in the URL path, and httpx logs the request line at INFO.
 

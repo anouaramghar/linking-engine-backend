@@ -38,6 +38,7 @@ from app.ml.hybrid import (
     HYBRID_POOL_SIZE,
     LEXICAL_POOL_SIZE,
     CorpusArticle,
+    RankedCandidate,
     normalized_title,
     structured_terms,
     weighted_rrf_scores,
@@ -230,6 +231,26 @@ class EvaluationRanker:
     ) -> list[int]:
         """Target article ids for one source under one method, best first."""
         return self.rank_all(db, source_id=source_id, limit=limit, methods=(method,))[method]
+
+    def ranked_candidates(
+        self,
+        db: Session,
+        *,
+        source_id: int,
+        limit: int = HYBRID_POOL_SIZE,
+        method: RankingMethod = "hybrid",
+    ) -> tuple[RankedCandidate, ...]:
+        """Return an ordering with semantic scores for post-ranking evaluation."""
+        if source_id not in self.sources:
+            return ()
+        ranked_ids = self.rank(db, source_id=source_id, limit=limit, method=method)
+        if not ranked_ids:
+            return ()
+        semantic_scores = self._eligible_scores(db, source_id)
+        return tuple(
+            RankedCandidate(target_id=target_id, semantic_score=semantic_scores[target_id])
+            for target_id in ranked_ids
+        )
 
     def rank_all(
         self,

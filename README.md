@@ -38,7 +38,9 @@ job id is unique, and each site/date snapshot is updated rather than duplicated.
 Managed sites have independent outgoing-link policies covering HTTPS, trusted
 TLDs, domain age, allowlists, blocklists, and competitor domains. Owned domains
 are always protected. The same policy is enforced before ranking and again
-before publication. Approved content-pool sources provide reusable external
+before publication. External suggestions are disabled by default for new managed
+sites and missing policies; an operator must explicitly enable this separate
+capability. Approved content-pool sources provide reusable external
 articles; when the normal internal/content-pool pipeline leaves open slots, a
 configured Tavily provider can supply bounded direct-URL candidates as a paid
 fallback. The separate safety rules, provider limits, ranking contract, and

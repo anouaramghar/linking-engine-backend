@@ -89,7 +89,14 @@ def start_login(db: Session = Depends(get_db)) -> LoginStartOut:
             detail="dashboard login is not configured; set TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME",
         )
     deep_link = dashboard_auth.login_deep_link()
-    assert deep_link is not None  # configured check above guarantees a username
+    if deep_link is None:
+        # Unreachable while the configured check above holds. It is a raise
+        # rather than an assertion because `python -O` strips assertions, and a
+        # stripped one here would hand Pydantic a None it declares as a str.
+        raise HTTPException(
+            status_code=503,
+            detail="dashboard login is not configured; set TELEGRAM_BOT_USERNAME",
+        )
     return LoginStartOut(
         deep_link=deep_link,
         expires_in_seconds=settings.dashboard_login_nonce_ttl_seconds,

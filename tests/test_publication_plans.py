@@ -601,6 +601,83 @@ def test_preparation_is_bounded_and_says_so(client, db, site, articles, monkeypa
     assert body["has_more"] is True
 
 
+def _three_links_from_one_article(db, site, source, first_target):
+    """Three selected links leaving one source article, worst-ranked last.
+
+    The shape behind "3 selected links" on one queue card: one article, one
+    plan, one hash covering all three.
+    """
+    siblings = []
+    for index in range(2):
+        target = Article(
+            site_id=site.id,
+            url=f"{site.base_url}/t{index}",
+            title=f"t{index}",
+            content_text="b",
+        )
+        db.add(target)
+        db.commit()
+        siblings.append(_suggestion(db, site, source, target, score=0.95))
+    return siblings, _suggestion(db, site, source, first_target, score=0.5)
+
+
+def test_preparing_one_named_link_renders_that_link_alone(client, db, site, articles, monkeypatch):
+    """One named link is one artifact holding one link.
+
+    Narrowing in the dashboard could not do this. The artifact would still be
+    one article carrying all three links under one hash, so approving it would
+    publish all three — including the two the operator never opened.
+
+    The named link is the lowest-ranked of the three here, so it also takes the
+    phrase its higher-ranked sibling would have won in a full batch. That is the
+    documented consequence of publishing one link on its own, not an accident.
+    """
+    source, first_target = articles
+    _siblings, wanted = _three_links_from_one_article(db, site, source, first_target)
+    seen = _stub_preview(monkeypatch)
+
+    body = _prepare(site, suggestion_ids=[wanted.id])
+
+    # One named link is one live request, not ten.
+    assert seen == [[wanted.id]]
+    (plan,) = body["plans"]
+    assert [link["suggestion_id"] for link in plan["links"]] == [wanted.id]
+    # The siblings are untouched editorial intent, still waiting and still counted.
+    assert body["selected_suggestions"] == 3
+
+
+def test_the_unnamed_siblings_still_prepare_as_one_article(client, db, site, articles, monkeypatch):
+    """A filter is per request. It must not become the site's new behaviour."""
+    source, first_target = articles
+    siblings, wanted = _three_links_from_one_article(db, site, source, first_target)
+    _stub_preview(monkeypatch)
+
+    (plan,) = _prepare(site)["plans"]
+
+    assert {link["suggestion_id"] for link in plan["links"]} == {
+        wanted.id,
+        *(row.id for row in siblings),
+    }
+
+
+def test_naming_a_link_that_is_not_selected_prepares_nothing_and_reads_nothing(
+    client, db, site, articles, monkeypatch
+):
+    """An id from another site, or one already spoken for, is simply absent.
+
+    It is the same "not in this batch" answer as an article that could not be
+    read, and it costs no live request to give.
+    """
+    _suggestion(db, site, *articles)
+    seen = _stub_preview(monkeypatch)
+
+    body = _prepare(site, suggestion_ids=[999_999])
+
+    assert body["plans"] == []
+    assert seen == []
+    assert body["selected_suggestions"] == 1
+
+
 def test_a_block_fallback_is_frozen_exactly_as_it_was_shown(
     client, db, site, articles, monkeypatch
 ):
@@ -1054,7 +1131,27 @@ def test_async_preparation_is_owned_and_queued(client, site, monkeypatch):
     assert response.json() == {"job_id": "prepare-job", "job_run_id": 42}
     assert captured["args"][2] == "publication_preparation"
     assert captured["requested_by"]
-    assert captured["task_kwargs"] == {"max_articles": 10}
+    assert captured["task_kwargs"] == {"max_articles": 10, "suggestion_ids": None}
+
+
+def test_a_named_link_reaches_the_worker_as_the_scope_of_the_job(client, site, monkeypatch):
+    """The scope of an approval is decided here, so it must survive the queue."""
+    captured = {}
+
+    def enqueue(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            id=42, queue_job_id="prepare-job", requested_by=kwargs["requested_by"]
+        )
+
+    monkeypatch.setattr("app.api.routes.publish.enqueue_job", enqueue)
+
+    response = client.post(
+        f"/api/v1/publish/{site.id}/plans/prepare-async?suggestion_ids=7&suggestion_ids=9"
+    )
+
+    assert response.status_code == 202
+    assert captured["task_kwargs"] == {"max_articles": 10, "suggestion_ids": [7, 9]}
 
 
 # -- the asynchronous result is a contract, not a loose dictionary -----------
@@ -1168,7 +1265,7 @@ def test_the_worker_stores_a_validated_result(db, site, articles, monkeypatch):
     """End to end: what `_prepare_publication_plans` returns is the model's JSON."""
     suggestion = _suggestion(db, site, *articles)
 
-    def fake_prepare(_db, _site, *, max_articles, job_run_id=None):
+    def fake_prepare(_db, _site, *, max_articles, suggestion_ids=None, job_run_id=None):
         plan = _plan(db, site, articles[0])
         plan.items = [
             {

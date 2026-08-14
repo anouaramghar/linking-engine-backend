@@ -66,6 +66,10 @@ class FakeProvider:
 
 def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> None:
     source = _source(db, site)
+    # External discovery is a separately enabled capability. The normal v2
+    # default is off, so this test opts into the provider path explicitly.
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
+    db.commit()
     provider = FakeProvider(
         ExternalSearchResponse(
             provider="tavily",

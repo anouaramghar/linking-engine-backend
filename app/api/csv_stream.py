@@ -21,6 +21,18 @@ from fastapi.responses import StreamingResponse
 #: stays a rounding error next to the response.
 CSV_FETCH_BATCH = 1_000
 
+#: Leading characters a spreadsheet reads as the start of a formula. The tab and
+#: the carriage return are here because a spreadsheet discards them before it
+#: parses the cell, so ``"\t=cmd"`` is still a formula when the file is opened.
+#: The rule lives in this module, not beside each export, so that the two
+#: exports cannot drift apart.
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_escape_formula(rendered: str) -> str:
+    """Neutralize a cell a spreadsheet would otherwise evaluate (CWE-1236)."""
+    return f"'{rendered}" if rendered.startswith(CSV_FORMULA_PREFIXES) else rendered
+
 
 def csv_chunks(
     header: Sequence[str],

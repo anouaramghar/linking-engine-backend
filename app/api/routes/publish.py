@@ -155,6 +155,7 @@ def prepare_publication_plans_async(
     site: Site = Depends(require_site_access),
     operator_id: str = Depends(require_operator_identity),
     max_articles: int = Query(default=10, ge=1, le=100),
+    suggestion_ids: list[int] | None = Query(default=None, max_length=50),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
     """Queue live preparation so slow WordPress reads never occupy an API worker.
@@ -164,6 +165,19 @@ def prepare_publication_plans_async(
     rendered HTML — is made by the worker and stored. What the job returns is
     not a preview of a future decision; it *is* the decision, and approving its
     hash is what allows it to be sent.
+
+    `suggestion_ids` prepares only those links. A plan's hash covers a whole
+    source article, so approving one link out of an article holding several is
+    possible only if the artifact was rendered for that link alone — which is a
+    decision, and therefore has to be made here rather than by hiding rows in a
+    dashboard. Ids belonging to another site match nothing and yield an empty
+    preparation; the cohort query is scoped to this site and says nothing about
+    them either way.
+
+    An id that names a link on this site which is *not* selected, is already
+    bound to a plan, or lost a reciprocal pair, is likewise absent from the
+    result rather than rejected: it is the same "not in this batch" answer the
+    operator gets when the article could not be read.
     """
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources are read-only")
@@ -184,11 +198,16 @@ def prepare_publication_plans_async(
             "publication_preparation",
             prepare_publication_plans_job,
             job_timeout=900,
-            task_kwargs={"max_articles": max_articles},
+            task_kwargs={"max_articles": max_articles, "suggestion_ids": suggestion_ids},
             requested_by=operator_id,
         )
     except DuplicateJobError as error:
         if error.run.requested_by == operator_id and error.run.queue_job_id:
+            # One preparation per site at a time, so this operator joins the one
+            # already running rather than reading the same posts twice. It may
+            # have a different scope from the one just asked for — the dashboard
+            # shows the named link out of whatever batch comes back, and a wider
+            # result is never approved by a narrower review.
             run = error.run
         else:
             raise HTTPException(

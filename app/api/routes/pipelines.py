@@ -42,8 +42,10 @@ def _next_stream_interval(interval: float, changed: bool) -> float:
     Every snapshot is a database round trip and a worker thread, and both are
     shared with every other request in the process — so a batch that ingests for
     twenty minutes must not cost one query per second per open tab for all of
-    them. Any change resets the stream to its fastest interval, which is what
-    keeps a run that suddenly starts moving from being reported late.
+    them. The cost of the backoff is bounded and paid once: the first change
+    after a quiet spell is seen up to `MAX_STREAM_INTERVAL` late, and because any
+    change resets the stream to its fastest interval, a stage that is actually
+    moving is then reported within a second.
     """
     if changed:
         return MIN_STREAM_INTERVAL

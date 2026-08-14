@@ -14,7 +14,7 @@ from app.models import Article, ExternalLinkPolicy, Site, Suggestion, Suggestion
 @dataclass(frozen=True)
 class PolicyState:
     site_id: int
-    external_links_enabled: bool = True
+    external_links_enabled: bool = False
     require_https: bool = True
     min_trust_score: int = 60
     min_domain_age_days: int = 0

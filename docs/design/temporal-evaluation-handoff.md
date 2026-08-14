@@ -73,3 +73,30 @@ have not been separated by this test set, whatever their means say.
 A new method is added in `app/ml/evaluation/ranking.py`: name it in
 `RankingMethod`, add it to `RANKING_METHODS`, and produce its order inside
 `EvaluationRanker.rank_all`. Nothing else in the measurement changes.
+
+## Graph-aware multi-objective evaluation
+
+Slice 3 keeps those relevance metrics as guardrails and adds a separate structural
+report. Run it against the same frozen split used for ranking quality:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_graph_evaluation.py `
+  --split docs\data\evaluation-split-observed-2026-01-01.json `
+  --k 5 `
+  --output docs\data\evaluation-graph-<date>.json
+```
+
+The runner builds each site's graph from the split's training edges only, adds the
+measured post-cutoff source articles, and refuses to write a report when the split
+does not match the current database. For Hybrid, shadow, and active variants it
+reports:
+
+- Recall@K, NDCG@K, and MRR as relevance guardrails;
+- paired reorder and relevant-hit changes against Hybrid;
+- simulated orphan, underlinked, and saturation deltas;
+- newly connected pages, target concentration, and simulation warnings.
+
+Structural deltas are simulations of the top-K recommendation batch, not claims
+that an editor approved or published those links. A promotion decision must state
+the acceptable relevance loss and the required structural improvement explicitly;
+the report does not collapse both objectives into an arbitrary single score.

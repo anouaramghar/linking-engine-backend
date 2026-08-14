@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.csv_stream import csv_response
+from app.api.csv_stream import csv_escape_formula, csv_response
 from app.api.deps import get_db, require_admin
 from app.models import Site
 from app.schemas.evaluation import (
@@ -85,9 +85,7 @@ def _csv_safe(value: object) -> str:
     if value is None:
         return ""
     rendered = value.isoformat() if isinstance(value, datetime) else str(value)
-    if rendered.startswith(("=", "+", "-", "@")):
-        return f"'{rendered}"
-    return rendered
+    return csv_escape_formula(rendered)
 
 
 EXPORT_HEADER = (

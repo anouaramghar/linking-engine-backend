@@ -175,8 +175,13 @@ class TavilySearchProvider:
                     )
 
                 if attempt > len(self.retry_delays_seconds):
-                    assert transient_error is not None
-                    raise transient_error
+                    # `or` rather than an assertion: `python -O` strips
+                    # assertions, and a stripped one here would leave
+                    # `raise None`, reporting the exhausted retry as an
+                    # unrelated TypeError.
+                    raise transient_error or ExternalSearchTransientError(
+                        "Tavily request failed without a recorded error"
+                    )
                 sleep(self.retry_delays_seconds[attempt - 1])
         finally:
             if owned:

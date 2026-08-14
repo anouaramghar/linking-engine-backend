@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import exists, func, insert, literal, or_, select, text, tuple_, update
 from sqlalchemy.orm import Session, aliased, joinedload
 
-from app.api.csv_stream import CSV_FETCH_BATCH, csv_response
+from app.api.csv_stream import CSV_FETCH_BATCH, csv_escape_formula, csv_response
 from app.api.deps import get_audit_actor, get_db, require_api_key, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
 from app.ml.llm import openrouter
@@ -52,6 +52,7 @@ from app.services.authorization import (
     require_admin_principal,
 )
 from app.services.job_service import DuplicateJobError, enqueue_job
+from app.services.graph_service import current_feature_map
 from app.tasks.analysis import analyze_site, compare_site
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,21 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
             select(Site.id, Site.name, Site.platform).where(Site.id.in_(target_site_ids))
         )
     }
+    graph_features_by_site: dict[int, dict[int, object]] = {}
+    graph_snapshots_by_site = {}
+    article_ids_by_site: dict[int, set[int]] = {}
+    for suggestion in suggestions:
+        ids = article_ids_by_site.setdefault(suggestion.site_id, set())
+        ids.add(suggestion.source_article_id)
+        if (
+            suggestion.target_article is not None
+            and suggestion.target_article.site_id == suggestion.site_id
+        ):
+            ids.add(suggestion.target_article.id)
+    for site_id, article_ids in article_ids_by_site.items():
+        snapshot, features = current_feature_map(db, site_id, article_ids)
+        graph_snapshots_by_site[site_id] = snapshot
+        graph_features_by_site[site_id] = features
     outputs = []
     for suggestion in suggestions:
         if suggestion.target_article is None:
@@ -100,6 +116,45 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
             target_site_name, target_platform = target_sites[suggestion.target_article.site_id]
             target = SuggestionTargetBrief.model_validate(suggestion.target_article)
             target_origin = "content_pool" if target_platform == "pool" else "internal"
+        score_components = (
+            dict(suggestion.score_components)
+            if isinstance(suggestion.score_components, dict)
+            else {}
+        )
+        source_feature = graph_features_by_site.get(suggestion.site_id, {}).get(
+            suggestion.source_article_id
+        )
+        target_feature = (
+            graph_features_by_site.get(suggestion.site_id, {}).get(suggestion.target_article.id)
+            if suggestion.target_article is not None
+            and suggestion.target_article.site_id == suggestion.site_id
+            else None
+        )
+        if (
+            source_feature is not None
+            and target_feature is not None
+            and "graph" not in score_components
+        ):
+            snapshot = graph_snapshots_by_site.get(suggestion.site_id)
+            score_components["graph"] = {
+                "algorithm_version": snapshot.algorithm_version if snapshot else None,
+                "snapshot_id": snapshot.id if snapshot else None,
+                "graph_version": snapshot.graph_version if snapshot else None,
+                "source_out_degree": source_feature.out_degree,
+                "source_hub": source_feature.hub,
+                "source_saturated": source_feature.saturated,
+                "target_in_degree": target_feature.in_degree,
+                "target_orphan": target_feature.orphan,
+                "target_underlinked": target_feature.underlinked,
+                "target_hub": target_feature.hub,
+                "target_saturated": target_feature.saturated,
+                "target_hub_score": target_feature.hub_score,
+                "target_saturation_score": target_feature.saturation_score,
+                "opportunity": 0.0,
+                "adjustment": 0.0,
+                "applied": False,
+                "mode": "context_only",
+            }
         outputs.append(
             SuggestionOut(
                 id=suggestion.id,
@@ -111,7 +166,7 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
                 target_site_name=target_site_name,
                 method=suggestion.method,
                 score=suggestion.score,
-                score_components=suggestion.score_components,
+                score_components=score_components or None,
                 provider=suggestion.provider,
                 provider_request_id=suggestion.provider_request_id,
                 provider_score=suggestion.provider_score,
@@ -555,7 +610,7 @@ def _csv_safe(value: object) -> str:
     rendered = (
         json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else str(value or "")
     )
-    return f"'{rendered}" if rendered.startswith(("=", "+", "-", "@")) else rendered
+    return csv_escape_formula(rendered)
 
 
 TRACE_EXPORT_HEADER = (

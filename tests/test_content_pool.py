@@ -24,6 +24,7 @@ from app.connectors.wikipedia_connector import WikipediaConnector
 from app.models import (
     Article,
     Embedding,
+    ExternalLinkPolicy,
     IngestionRun,
     PoolSourceAuditEvent,
     Site,
@@ -1086,6 +1087,7 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
         content_text="tomato canning jars boiling water safety",
     )
     db.add_all([source, target])
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
     db.flush()
     db.add_all(
         [
@@ -1195,6 +1197,7 @@ def test_hybrid_excludes_disabled_pool_sources(db, site, monkeypatch, approved, 
     )
     pool = _pool(db, approved=approved)
     pool.pool_source_quarantined = quarantined
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
     source = Article(
         site_id=site.id,
         url=f"{site.base_url}/{uuid.uuid4().hex}",

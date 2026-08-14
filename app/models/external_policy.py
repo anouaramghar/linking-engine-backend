@@ -16,7 +16,7 @@ class ExternalLinkPolicy(Base):
         ForeignKey("sites.id", ondelete="CASCADE"), primary_key=True
     )
     external_links_enabled: Mapped[bool] = mapped_column(
-        Boolean, default=True, server_default="true"
+        Boolean, default=False, server_default="false"
     )
     require_https: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     min_trust_score: Mapped[int] = mapped_column(Integer, default=60, server_default="60")

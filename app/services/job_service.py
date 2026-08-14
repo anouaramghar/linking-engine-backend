@@ -599,9 +599,7 @@ def get_job_status(job_id: str) -> dict | None:
         progress = run.progress if run is not None else None
         progress_at = run.progress_at if run is not None else None
         durable_error = run.error if run is not None else None
-        durable_result = (
-            run.result if run is not None and run.status == "succeeded" else None
-        )
+        durable_result = run.result if run is not None and run.status == "succeeded" else None
         if (
             run is not None
             and run.status == "succeeded"

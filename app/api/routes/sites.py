@@ -411,7 +411,10 @@ def update_external_link_policy(
     if policy is None:
         policy = ExternalLinkPolicy(site_id=site.id)
         db.add(policy)
-    for field, value in payload.model_dump().items():
+    # The policy surface accepts partial updates in practice.  Do not turn an
+    # omitted field into its schema default: an existing explicitly enabled
+    # policy must remain enabled when an operator changes only a domain rule.
+    for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(policy, field, value)
     policy.updated_by = operator_id
     db.flush()

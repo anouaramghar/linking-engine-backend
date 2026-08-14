@@ -6,7 +6,7 @@ from app.domain_policy import normalized_unique_domains, normalized_unique_tlds
 
 
 class ExternalLinkPolicyUpdate(BaseModel):
-    external_links_enabled: bool = True
+    external_links_enabled: bool = False
     require_https: bool = True
     min_trust_score: int = Field(default=60, ge=0, le=100)
     min_domain_age_days: int = Field(default=0, ge=0, le=36_500)

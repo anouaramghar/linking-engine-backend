@@ -6,6 +6,7 @@ from app.api.routes import (
     alerts,
     auth,
     evaluation,
+    graph,
     health,
     ingestion,
     jobs,
@@ -31,6 +32,7 @@ for router in [
     alerts.router,
     pipelines.router,
     evaluation.router,
+    graph.router,
     admin_keys.router,
 ]:
     app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])

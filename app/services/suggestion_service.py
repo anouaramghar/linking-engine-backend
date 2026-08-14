@@ -24,6 +24,11 @@ from app.services.editorial_feedback import (
     rerank_with_editorial_feedback,
     score_percent,
 )
+from app.services.graph_service import (
+    deterministic_rerank,
+    ensure_graph_snapshot,
+    snapshot_features,
+)
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
@@ -240,6 +245,16 @@ def generate_suggestions(
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
+            graph_snapshot, graph_created = ensure_graph_snapshot(db, site_id)
+            # The snapshot is a derived observation of the accepted article/link
+            # state. Persist it before candidate generation so every suggestion
+            # can carry the exact graph version it was ranked against.
+            if graph_created:
+                db.commit()
+                db.refresh(graph_snapshot)
+            else:
+                db.commit()
+            graph_features = snapshot_features(db, graph_snapshot.id)
             pool_site_ids = db.scalars(
                 select(Article.site_id)
                 .where(
@@ -346,6 +361,7 @@ def generate_suggestions(
             external_created = 0
             external_credits_used = 0
             external_filtered: dict[str, int] = {}
+            graph_reordered_sources = 0
             for article_id in article_ids:
                 if ranking_mode == "hybrid" and site_capacity <= 0:
                     break
@@ -465,6 +481,20 @@ def generate_suggestions(
                         if score_percent(candidate.semantic_score)
                         >= site.editorial_min_score_percent
                     ]
+                    graph_metadata = {}
+                    if method == "hybrid_bm25" and graph_features:
+                        candidate_rows, graph_metadata = deterministic_rerank(
+                            candidate_rows,
+                            graph_features,
+                            source_article_id=article_id,
+                            mode=settings.graph_reranking_mode,
+                            minimum_relevance=settings.suggestion_min_score,
+                        )
+                        if any(
+                            metadata.final_rank != metadata.baseline_rank
+                            for metadata in graph_metadata.values()
+                        ):
+                            graph_reordered_sources += 1
                     if feedback_profile is not None:
                         candidate_rows, feedback_components = rerank_with_editorial_feedback(
                             candidate_rows,
@@ -472,9 +502,42 @@ def generate_suggestions(
                             weight=site.editorial_feedback_weight,
                         )
                     candidate_rows = candidate_rows[:remaining]
+                else:
+                    graph_metadata = {}
                 if comparison_only:
                     candidate_rows = []
                 for candidate in candidate_rows:
+                    graph = None
+                    metadata = graph_metadata.get(candidate.target_id)
+                    target_feature = graph_features.get(candidate.target_id)
+                    if metadata is not None and target_feature is not None:
+                        graph = {
+                            "algorithm_version": graph_snapshot.algorithm_version,
+                            "snapshot_id": graph_snapshot.id,
+                            "graph_version": graph_snapshot.graph_version,
+                            "source_out_degree": metadata.source_out_degree,
+                            "source_hub": metadata.source_hub,
+                            "source_saturated": metadata.source_saturated,
+                            "target_in_degree": metadata.target_in_degree,
+                            "target_orphan": metadata.target_orphan,
+                            "target_underlinked": metadata.target_underlinked,
+                            "target_hub": target_feature.hub if target_feature else False,
+                            "target_saturated": target_feature.saturated
+                            if target_feature
+                            else False,
+                            "target_hub_score": target_feature.hub_score
+                            if target_feature
+                            else None,
+                            "target_saturation_score": (
+                                target_feature.saturation_score if target_feature else None
+                            ),
+                            "opportunity": metadata.opportunity,
+                            "adjustment": metadata.adjustment,
+                            "baseline_rank": metadata.baseline_rank,
+                            "final_rank": metadata.final_rank,
+                            "applied": metadata.applied,
+                            "mode": settings.graph_reranking_mode,
+                        }
                     db.add(
                         Suggestion(
                             site_id=site_id,
@@ -500,6 +563,7 @@ def generate_suggestions(
                                         if candidate.target_id in external_trust
                                         else {}
                                     ),
+                                    **({"graph": graph} if graph is not None else {}),
                                     **(
                                         {
                                             "editorial_feedback": feedback_components[
@@ -570,6 +634,10 @@ def generate_suggestions(
                     feedback_profile.samples if feedback_profile is not None else 0
                 ),
                 "editorial_min_score_percent": site.editorial_min_score_percent,
+                "graph_snapshot_id": graph_snapshot.id,
+                "graph_version": graph_snapshot.graph_version,
+                "graph_reranking_mode": settings.graph_reranking_mode,
+                "graph_reordered_sources": graph_reordered_sources,
             }
             if ranking_mode != "baseline":
                 result.update(

@@ -1,4 +1,4 @@
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -209,6 +209,19 @@ class Settings(BaseSettings):
     # Analysis bounds are checked before embedding or corpus construction.
     analysis_max_articles_per_site: int = Field(default=10_000, ge=1, le=100_000)
     analysis_max_corpus_articles: int = Field(default=20_000, ge=1, le=200_000)
+
+    # Deterministic graph intelligence. Shadow is the safe default: it records
+    # the proposed graph-aware order beside the frozen BM25-512 order until a
+    # representative evaluation set proves that promotion is worthwhile.
+    graph_algorithm_version: str = Field(default="deterministic_v1", min_length=1, max_length=40)
+    graph_underlinked_max_in_degree: int = Field(default=1, ge=0, le=1_000)
+    graph_hub_min_out_degree: int = Field(default=10, ge=1, le=100_000)
+    graph_saturation_min_in_degree: int = Field(default=10, ge=1, le=100_000)
+    graph_reranking_mode: Literal["off", "shadow", "active"] = "shadow"
+    # A structural opportunity may only move a candidate inside this bounded
+    # relevance margin. It can never compensate for a large topical gap.
+    graph_max_relevance_boost: float = Field(default=0.03, ge=0.0, le=0.10)
+    graph_simulation_target_share_warning: float = Field(default=0.50, gt=0.0, le=1.0)
 
     # External content pool (RSS/Atom and Wikipedia).
     pool_max_articles_per_source: int = Field(default=50, ge=1, le=50)

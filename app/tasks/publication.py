@@ -82,13 +82,20 @@ def prepare_publication_plans(
     site_id: int,
     job_run_id: int | None = None,
     max_articles: int = 10,
+    suggestion_ids: list[int] | None = None,
 ) -> dict:
-    """Durably prepare one bounded, compact review batch for an operator."""
+    """Durably prepare one bounded, compact review batch for an operator.
+
+    `suggestion_ids` is a plain list rather than a set because this signature is
+    what RQ serialises into Redis and what the durable `job_runs` payload
+    records.
+    """
     return run_durably(
         job_run_id,
         _prepare_publication_plans,
         site_id,
         max_articles=max_articles,
+        suggestion_ids=suggestion_ids,
     )
 
 
@@ -96,6 +103,7 @@ def _prepare_publication_plans(
     site_id: int,
     job_run_id: int | None = None,
     max_articles: int = 10,
+    suggestion_ids: list[int] | None = None,
 ) -> dict:
     with SessionLocal() as db:
         site = db.get(Site, site_id)
@@ -105,6 +113,7 @@ def _prepare_publication_plans(
             db,
             site,
             max_articles=max_articles,
+            suggestion_ids=set(suggestion_ids) if suggestion_ids else None,
             job_run_id=job_run_id,
         )
         suggestion_ids = [

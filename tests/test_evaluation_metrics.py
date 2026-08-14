@@ -2,6 +2,7 @@ import pytest
 
 from app.ml.evaluation.metrics import (
     QueryScore,
+    compare_rankings,
     evaluate_rankings,
     ndcg_at_k,
     recall_at_k,
@@ -134,3 +135,24 @@ def test_empty_summary_is_reportable_rather_than_an_error():
     assert summary.ndcg_at_k == 0.0
     assert summary.skipped_without_relevant == 3
     assert summary.to_dict()["k"] == 5
+
+
+def test_compare_rankings_reports_paired_relevance_tradeoffs():
+    comparison = compare_rankings(
+        candidate_rankings={10: [1, 57], 11: [57, 3], 12: [7]},
+        baseline_rankings={10: [57, 1], 11: [3, 57], 12: [7]},
+        relevant_by_source={10: {57}, 11: {57}, 12: {99}},
+        k=1,
+    )
+
+    assert comparison.queries == 3
+    assert comparison.reordered_queries == 2
+    assert comparison.top_k_changed_queries == 2
+    assert comparison.baseline_relevant_hits_at_k == 1
+    assert comparison.candidate_relevant_hits_at_k == 1
+    assert comparison.relevant_hit_gain_queries == 1
+    assert comparison.relevant_hit_loss_queries == 1
+    assert comparison.relevant_hit_unchanged_queries == 1
+    assert comparison.ndcg_improved_queries == 1
+    assert comparison.ndcg_worsened_queries == 1
+    assert comparison.ndcg_unchanged_queries == 1

@@ -41,18 +41,6 @@ class PendingPublicationPage(BaseModel):
     total_approved_plans: int | None = None
 
 
-class PlanLink(BaseModel):
-    """One link inside a prepared plan, exactly as it was rendered."""
-
-    position: int
-    suggestion_id: int
-    target_url: str
-    #: The phrase the link was written on. Displayed when the outcome is
-    #: "inserted"; retained either way because it is part of the hashed artifact.
-    anchor_text: str | None = None
-    outcome: LinkOutcome
-
-
 class PublicationPreparationError(BaseModel):
     """A source article deliberately left out of this batch.
 
@@ -106,16 +94,13 @@ class PlanApprovalResult(BaseModel):
 
 
 class PublicationPreparationJobLink(BaseModel):
-    """One link as the asynchronous worker reports it.
-
-    `PlanLink` plus the sentence the link lands in. The passage is not part of
-    the hashed artifact — it is read from the suggestion at preparation time —
-    so it is carried here rather than added to `PlanLink`.
-    """
+    """One link inside a prepared plan, exactly as it was rendered."""
 
     position: int
     suggestion_id: int
     target_url: str
+    #: The phrase the link was written on. Displayed when the outcome is
+    #: "inserted"; retained either way because it is part of the hashed artifact.
     anchor_text: str | None = None
     outcome: LinkOutcome
     #: The passage the operator reads instead of raw HTML. Absent when the
