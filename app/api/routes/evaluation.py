@@ -13,6 +13,12 @@ from app.schemas.evaluation import (
     EvaluationMetricsOut,
     EvaluationSuggestionPage,
 )
+from app.schemas.reviewer_labels import LabelReadinessOut, ReviewerLabelDatasetOut
+from app.ml.evaluation.reviewer_labels import (
+    ReviewerLabelDataset,
+    build_reviewer_label_dataset,
+    inspect_label_readiness,
+)
 from app.services.evaluation_service import (
     evaluation_export_rows,
     evaluation_metrics,
@@ -116,6 +122,152 @@ EXPORT_HEADER = (
     "publish_outcome",
     "last_failure_at",
 )
+
+REVIEWER_LABEL_EXPORT_HEADER = (
+    "review_event_id",
+    "suggestion_id",
+    "trace_id",
+    "site_id",
+    "source_article_id",
+    "target_article_id",
+    "label",
+    "reviewed_at",
+    "reviewer_id",
+    "shown_at",
+    "exposure_count",
+    "method",
+    "score",
+    "retrieval_version",
+    "ranking_version",
+    "final_rank",
+    "feature_snapshot",
+)
+
+
+def _validate_cutoff(cutoff_at: datetime) -> None:
+    if cutoff_at.tzinfo is None or cutoff_at.utcoffset() is None:
+        raise HTTPException(422, "cutoff_at must include a timezone")
+
+
+def _reviewer_label_dataset(
+    db: Session,
+    *,
+    site_id: int | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+    cutoff_at: datetime,
+    holdout_site_id: int | None,
+) -> ReviewerLabelDataset:
+    _validate_filters(db, site_id, date_from, date_to)
+    _validate_cutoff(cutoff_at)
+    if holdout_site_id is not None and db.get(Site, holdout_site_id) is None:
+        raise HTTPException(404, f"site {holdout_site_id} not found")
+    try:
+        return build_reviewer_label_dataset(
+            db,
+            cutoff_at=cutoff_at,
+            site_ids=(site_id,) if site_id is not None else None,
+            date_from=date_from,
+            date_to=date_to,
+            holdout_site_id=holdout_site_id,
+            # This endpoint is an auditable evidence export. It returns the
+            # eligible rows and embeds the false readiness state, while the
+            # offline freeze script remains fail-closed for training artifacts.
+            require_ready=False,
+        )
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@router.get("/label-readiness", response_model=LabelReadinessOut)
+def get_label_readiness(
+    site_id: int | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    db: Session = Depends(get_db),
+) -> LabelReadinessOut:
+    """Report whether reviewer evidence is ready for a frozen benchmark."""
+    _validate_filters(db, site_id, date_from, date_to)
+    return inspect_label_readiness(
+        db,
+        site_ids=(site_id,) if site_id is not None else None,
+        date_from=date_from,
+        date_to=date_to,
+    ).to_dict()
+
+
+@router.get("/reviewer-labels.json", response_model=ReviewerLabelDatasetOut)
+def export_reviewer_labels_json(
+    cutoff_at: datetime,
+    site_id: int | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    holdout_site_id: int | None = Query(None, ge=1),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Export only exposed individual labels plus frozen split metadata.
+
+    The response is an evidence export, not permission to train or promote a
+    model. ``readiness.ready`` must be true before a file is frozen for those
+    purposes.
+    """
+    return _reviewer_label_dataset(
+        db,
+        site_id=site_id,
+        date_from=date_from,
+        date_to=date_to,
+        cutoff_at=cutoff_at,
+        holdout_site_id=holdout_site_id,
+    ).to_dict()
+
+
+@router.get("/reviewer-labels.csv")
+def export_reviewer_labels_csv(
+    cutoff_at: datetime,
+    site_id: int | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    holdout_site_id: int | None = Query(None, ge=1),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Stream the same eligible labels for spreadsheet/offline inspection."""
+    dataset = _reviewer_label_dataset(
+        db,
+        site_id=site_id,
+        date_from=date_from,
+        date_to=date_to,
+        cutoff_at=cutoff_at,
+        holdout_site_id=holdout_site_id,
+    )
+    return csv_response(
+        REVIEWER_LABEL_EXPORT_HEADER,
+        (
+            [
+                _csv_safe(value)
+                for value in (
+                    row.review_event_id,
+                    row.suggestion_id,
+                    row.trace_id,
+                    row.site_id,
+                    row.source_article_id,
+                    row.target_article_id,
+                    row.label,
+                    row.reviewed_at,
+                    row.reviewer_id,
+                    row.shown_at,
+                    row.exposure_count,
+                    row.method,
+                    row.score,
+                    row.retrieval_version,
+                    row.ranking_version,
+                    row.final_rank,
+                    row.feature_snapshot,
+                )
+            ]
+            for row in dataset.labels
+        ),
+        filename="linkmesh-reviewer-labels.csv",
+    )
 
 
 @router.get("/export.csv")
