@@ -12,6 +12,7 @@ from app.ml.evaluation.reviewer_labels import (
     eligible_reviewer_labels,
     inspect_label_readiness,
 )
+from app.ml.evaluation.reviewer_benchmark_runner import run_reviewer_benchmark
 from app.models import Article, Suggestion, SuggestionEvent
 
 
@@ -195,6 +196,21 @@ def test_frozen_dataset_gate_is_fail_closed_until_three_sites_are_ready(db, site
 
     assert error.value.readiness.ready is False
     assert "three representative sites" in " ".join(error.value.readiness.blocked_reasons)
+
+
+def test_benchmark_runner_refuses_an_unready_evidence_export(db, site):
+    source = _article(db, site, "source-runner-gate")
+    target = _article(db, site, "target-runner-gate")
+    _label(db, site, source, target, reviewed_at=datetime(2026, 8, 5, tzinfo=UTC))
+    dataset = build_reviewer_label_dataset(
+        db,
+        cutoff_at=CUTOFF,
+        site_ids=(site.id,),
+        require_ready=False,
+    )
+
+    with pytest.raises(LabelReadinessError):
+        run_reviewer_benchmark(db, dataset)
 
 
 def _example(*, site_id: int, suggestion_id: int, reviewed_at: datetime) -> ReviewerLabelExample:
