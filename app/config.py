@@ -205,6 +205,12 @@ class Settings(BaseSettings):
     crawl_max_article_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
     crawl_max_links_per_article: int = Field(default=1_000, ge=1, le=100_000)
     crawl_max_total_links: int = Field(default=100_000, ge=1, le=1_000_000)
+    # HTML discovery falls back to a small same-origin frontier when a site has
+    # no usable sitemap. The frontier is bounded independently of article and
+    # response-size limits so navigation cannot turn into an unbounded crawl.
+    crawl_bfs_fallback_enabled: bool = True
+    crawl_max_depth: int = Field(default=2, ge=0, le=10)
+    crawl_max_discovered_urls: int = Field(default=20_000, ge=1, le=100_000)
 
     # Analysis bounds are checked before embedding or corpus construction.
     analysis_max_articles_per_site: int = Field(default=10_000, ge=1, le=100_000)

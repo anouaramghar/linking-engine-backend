@@ -106,6 +106,9 @@ class Suggestion(Base):
         server_default=text("gen_random_uuid()::text"),
     )
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    generation_job_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_runs.id", ondelete="SET NULL"), index=True
+    )
     source_article_id: Mapped[int] = mapped_column(
         ForeignKey("articles.id", ondelete="CASCADE"), index=True
     )

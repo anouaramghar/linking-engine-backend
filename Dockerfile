@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.12-slim-bookworm
 
+ARG BUILD_COMMIT=unknown
+
 COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /uvx /bin/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -9,7 +11,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:$PATH" \
-    HF_HOME=/home/linkmesh/.cache/huggingface
+    HF_HOME=/home/linkmesh/.cache/huggingface \
+    BUILD_COMMIT=${BUILD_COMMIT}
 
 WORKDIR /app
 

@@ -3,23 +3,27 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from collections import Counter
 from time import monotonic
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
+from lxml import html as lxml_html
 
 from app.config import settings
-from app.connectors.base import ArticleData, TaxonomyData
+from app.connectors.base import ArticleData, DiscoveryObservation, TaxonomyData
 from app.connectors.http_limits import check_crawl_deadline
 from app.connectors.registry import get_connector
+from app.connectors.url_guard import UnsafeURLError, validate_url
 from app.db import SessionLocal, engine
 from app.ml.external.cleaning import normalize_external_url
 from app.models import (
     Article,
     ArticleTaxonomy,
     IngestionRun,
+    IngestionDiagnostic,
     InternalLink,
     Site,
     Suggestion,
@@ -83,6 +87,294 @@ def normalize_url(url: str) -> str:
     """Comparison key: scheme-insensitive, no fragment/query, no trailing slash."""
     p = urlparse(url)
     return f"{p.netloc.lower()}{p.path.rstrip('/')}"
+
+
+def _persist_diagnostics(
+    db: Session,
+    run: IngestionRun,
+    observations: list[DiscoveryObservation],
+) -> None:
+    """Attach connector decisions after the snapshot transaction succeeds or rolls back."""
+    summary = Counter(observation.reason_code for observation in observations)
+    unique_urls = {normalize_url(observation.url) for observation in observations}
+    accepted_urls = {
+        normalize_url(observation.url)
+        for observation in observations
+        if observation.state == "accepted"
+    }
+    skipped_urls = {
+        normalize_url(observation.url)
+        for observation in observations
+        if observation.state in ("skipped", "failed")
+    }
+    run.discovered_urls = len(unique_urls)
+    run.accepted_urls = len(accepted_urls)
+    run.skipped_urls = len(skipped_urls)
+    run.diagnostic_summary = dict(sorted(summary.items()))
+    db.add_all(
+        IngestionDiagnostic(
+            site_id=run.site_id,
+            ingestion_run_id=run.id,
+            url=observation.url,
+            state=observation.state,
+            reason_code=observation.reason_code,
+            reason_detail=(observation.reason_detail or "")[:2000] or None,
+            discovered_from=observation.discovered_from,
+            depth=observation.depth,
+            http_status=observation.http_status,
+            content_type=observation.content_type,
+            final_url=observation.final_url,
+            canonical_url=observation.canonical_url,
+        )
+        for observation in observations
+    )
+
+
+def _complete_accepted_observations(
+    connector, accepted: list[DiscoveryObservation]
+) -> list[DiscoveryObservation]:
+    observations = connector.drain_discovery_observations()
+    accepted_keys = {
+        (normalize_url(observation.url), observation.state)
+        for observation in observations
+    }
+    for observation in accepted:
+        key = (normalize_url(observation.url), observation.state)
+        if key not in accepted_keys:
+            observations.append(observation)
+            accepted_keys.add(key)
+    return observations
+
+
+def _import_canonical_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
+
+
+def _text_from_import_html(content_html: str | None) -> str:
+    if not content_html:
+        return ""
+    try:
+        return " ".join(lxml_html.fromstring(content_html).text_content().split())
+    except (ValueError, TypeError):
+        return ""
+
+
+def import_articles(
+    db: Session,
+    site: Site,
+    rows,
+    *,
+    replace_snapshot: bool = False,
+) -> dict:
+    """Import normalized or Screaming Frog article rows into the article graph.
+
+    The import is a source snapshot only when ``replace_snapshot`` is explicit.
+    The default enriches/updates the supplied URLs without deactivating pages
+    absent from a partial CSV export.
+    """
+    skipped: list[dict] = []
+    rejected: list[dict] = []
+    observations: list[DiscoveryObservation] = []
+    imported = 0
+    updated = 0
+    article_ids: set[int] = set()
+    url_to_id: dict[str, int] = {}
+    outbound: list[tuple[int, list]] = []
+    seen_urls: set[str] = set()
+    with _site_ingestion_lock(site.id):
+        run = IngestionRun(site_id=site.id, status="running")
+        db.add(run)
+        db.commit()
+        try:
+            for row_number, row in enumerate(rows, start=1):
+                values = row.model_dump() if hasattr(row, "model_dump") else dict(row)
+                raw_url = (values.get("url") or "").strip()
+                if not raw_url:
+                    reason = "url is required"
+                    rejected.append({"row": row_number, "url": None, "reason": reason})
+                    observations.append(
+                        DiscoveryObservation(
+                            url=f"import-row:{row_number}",
+                            state="skipped",
+                            reason_code="missing_url",
+                            reason_detail=reason,
+                        )
+                    )
+                    continue
+                try:
+                    validate_url(
+                        raw_url,
+                        allow_private=settings.allow_unsafe_crawl_targets,
+                        same_host_as=site.base_url,
+                        resolve_dns=False,
+                    )
+                except UnsafeURLError as error:
+                    reason = str(error)
+                    rejected.append({"row": row_number, "url": raw_url, "reason": reason})
+                    observations.append(
+                        DiscoveryObservation(
+                            url=raw_url,
+                            state="skipped",
+                            reason_code="unsafe_url",
+                            reason_detail=reason,
+                        )
+                    )
+                    continue
+                url = _import_canonical_url(values.get("canonical_url") or raw_url)
+                try:
+                    validate_url(
+                        url,
+                        allow_private=settings.allow_unsafe_crawl_targets,
+                        same_host_as=site.base_url,
+                        resolve_dns=False,
+                    )
+                except UnsafeURLError as error:
+                    reason = f"canonical URL is unsafe: {error}"
+                    rejected.append({"row": row_number, "url": raw_url, "reason": reason})
+                    observations.append(
+                        DiscoveryObservation(
+                            url=raw_url,
+                            state="skipped",
+                            reason_code="unsafe_canonical",
+                            reason_detail=reason,
+                        )
+                    )
+                    continue
+                key = normalize_url(url)
+                if key in seen_urls:
+                    reason = "duplicate URL in this import"
+                    skipped.append({"row": row_number, "url": raw_url, "reason": reason})
+                    observations.append(
+                        DiscoveryObservation(
+                            url=url,
+                            state="skipped",
+                            reason_code="duplicate_import_url",
+                            reason_detail=reason,
+                        )
+                    )
+                    continue
+                seen_urls.add(key)
+                status_code = values.get("status_code")
+                if status_code is not None and status_code != 200:
+                    reason = f"HTTP status is {status_code}"
+                    skipped.append({"row": row_number, "url": raw_url, "reason": reason})
+                    observations.append(
+                        DiscoveryObservation(
+                            url=url,
+                            state="skipped",
+                            reason_code="http_error",
+                            reason_detail=reason,
+                            http_status=status_code,
+                        )
+                    )
+                    continue
+                indexability = (values.get("indexability") or "").strip().lower()
+                if indexability and indexability not in {"indexable", "index"}:
+                    reason = f"indexability is {values['indexability']}"
+                    skipped.append({"row": row_number, "url": raw_url, "reason": reason})
+                    observations.append(
+                        DiscoveryObservation(
+                            url=url,
+                            state="skipped",
+                            reason_code="noindex",
+                            reason_detail=reason,
+                        )
+                    )
+                    continue
+                content_html = values.get("content_html")
+                title = (values.get("title") or "").strip() or url
+                content_text = (values.get("content_text") or "").strip()
+                if not content_text:
+                    content_text = _text_from_import_html(content_html) or title
+                if len(content_text) > settings.crawl_max_article_chars:
+                    reason = (
+                        f"content exceeded {settings.crawl_max_article_chars} characters"
+                    )
+                    rejected.append({"row": row_number, "url": raw_url, "reason": reason})
+                    observations.append(
+                        DiscoveryObservation(
+                            url=url,
+                            state="skipped",
+                            reason_code="article_too_large",
+                            reason_detail=reason,
+                        )
+                    )
+                    continue
+                existing_id = db.scalar(
+                    select(Article.id).where(Article.site_id == site.id, Article.url == url)
+                )
+                article = ArticleData(
+                    url=url,
+                    title=title,
+                    content_text=content_text,
+                    content_html=content_html,
+                    discovered_from=values.get("discovered_from"),
+                    discovery_depth=values.get("discovery_depth") or 0,
+                    canonical_url=values.get("canonical_url"),
+                    outbound_internal_links=values.get("outbound_internal_links") or [],
+                )
+                article_id = _upsert_article(db, site.id, article, run.id)
+                stored = db.get(Article, article_id)
+                if stored is not None and not replace_snapshot:
+                    stored.is_active = True
+                article_ids.add(article_id)
+                url_to_id[key] = article_id
+                outbound.append((article_id, article.outbound_internal_links))
+                if existing_id is None:
+                    imported += 1
+                else:
+                    updated += 1
+                observations.append(
+                    DiscoveryObservation(
+                        url=url,
+                        state="accepted",
+                        reason_code="accepted",
+                        discovered_from=article.discovered_from,
+                        depth=article.discovery_depth,
+                        canonical_url=article.canonical_url,
+                    )
+                )
+
+            if replace_snapshot:
+                _validate_snapshot_completeness(db, site.id, run.id, len(article_ids))
+            links = 0
+            seen_links: set[tuple[int, int]] = set()
+            for source_id, outbound_links in outbound:
+                for link in outbound_links:
+                    target_id = url_to_id.get(normalize_url(link.url))
+                    if target_id and target_id != source_id and (source_id, target_id) not in seen_links:
+                        _upsert_link(db, source_id, target_id, run.id, link.anchor_text)
+                        seen_links.add((source_id, target_id))
+                        links += 1
+            if replace_snapshot:
+                _reconcile_snapshot(db, site.id, run.id)
+            run.status = "succeeded"
+            run.articles_upserted = len(article_ids)
+            run.links_found = links
+            _persist_diagnostics(db, run, observations)
+            run.finished_at = datetime.now(timezone.utc)
+            db.commit()
+            return {
+                "ingestion_run_id": run.id,
+                "imported": imported,
+                "updated": updated,
+                "links_found": links,
+                "skipped": skipped,
+                "rejected": rejected,
+                "diagnostic_summary": run.diagnostic_summary,
+            }
+        except Exception as error:
+            db.rollback()
+            run.status = "failed"
+            run.error = str(error)[:2000]
+            _persist_diagnostics(db, run, observations)
+            run.finished_at = datetime.now(timezone.utc)
+            db.commit()
+            raise
 
 
 def _upsert_article(db: Session, site_id: int, art: ArticleData, run_id: int | None = None) -> int:
@@ -260,6 +552,8 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
     run = IngestionRun(site_id=site_id, job_run_id=job_run_id)
     db.add(run)
     db.commit()
+    connector = None
+    accepted_observations: list[DiscoveryObservation] = []
     try:
         site = db.get(Site, site_id)
         if site is None:
@@ -319,6 +613,16 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             total_outbound_links += len(art.outbound_internal_links)
             if total_outbound_links > settings.crawl_max_total_links:
                 raise ValueError(f"crawl link count exceeded {settings.crawl_max_total_links}")
+            accepted_observations.append(
+                DiscoveryObservation(
+                    url=art.url,
+                    state="accepted",
+                    reason_code="accepted",
+                    discovered_from=art.discovered_from,
+                    depth=art.discovery_depth,
+                    canonical_url=art.canonical_url,
+                )
+            )
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             url_to_id[normalize_url(art.url)] = article_id
@@ -371,6 +675,11 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         run.status = "succeeded"
         run.articles_upserted = articles
         run.links_found = links
+        _persist_diagnostics(
+            db,
+            run,
+            _complete_accepted_observations(connector, accepted_observations),
+        )
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
         return {"articles": articles, "links": links}
@@ -378,6 +687,12 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         db.rollback()
         run.status = "failed"
         run.error = str(e)[:2000]
+        if connector is not None:
+            _persist_diagnostics(
+                db,
+                run,
+                _complete_accepted_observations(connector, accepted_observations),
+            )
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
         raise

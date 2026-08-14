@@ -231,6 +231,29 @@ class IngestionRunOut(BaseModel):
     status: str
     articles_upserted: int
     links_found: int
+    discovered_urls: int
+    accepted_urls: int
+    skipped_urls: int
+    diagnostic_summary: dict
     error: str | None
     started_at: datetime
     finished_at: datetime | None
+
+
+class IngestionDiagnosticOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    site_id: int
+    ingestion_run_id: int
+    url: str
+    state: str
+    reason_code: str
+    reason_detail: str | None
+    discovered_from: str | None
+    depth: int
+    http_status: int | None
+    content_type: str | None
+    final_url: str | None
+    canonical_url: str | None
+    created_at: datetime

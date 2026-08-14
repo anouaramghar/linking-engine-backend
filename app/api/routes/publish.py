@@ -13,12 +13,15 @@ is recorded. Queueing makes no decision at all, which is what makes it safe to
 retry after a failure.
 """
 
+import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
+from app.api.csv_stream import csv_escape_formula, csv_response
 from app.api.deps import get_db, require_api_key, require_operator_identity, require_site_access
 from app.models import PublicationPlan, Site, Suggestion
 from app.schemas.job import JobAccepted
@@ -34,6 +37,7 @@ from app.services import publication_plan_service
 from app.services.authorization import Principal, tenant_site_filter
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.services.publication_plan_service import PlanApprovalError
+from app.services.publication_plan_service import PlanIntegrityError, verify_integrity
 from app.tasks.publication import (
     prepare_publication_plans as prepare_publication_plans_job,
     publish_approved_plans,
@@ -42,6 +46,35 @@ from app.tasks.publication import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/publish", tags=["publish"])
+
+
+PUBLICATION_EXPORT_HEADER = (
+    "plan_id",
+    "plan_hash",
+    "site_id",
+    "source_article_id",
+    "source_url",
+    "source_title",
+    "target_url",
+    "anchor_text",
+    "placement_context",
+    "outcome",
+    "original_html",
+    "updated_html",
+    "plan_status",
+    "approved_by",
+    "approved_at",
+)
+
+
+def _export_cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict | list):
+        rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    else:
+        rendered = value.isoformat() if hasattr(value, "isoformat") else str(value)
+    return csv_escape_formula(rendered)
 
 
 def _pending_publication_query(principal: Principal, search: str | None = None):
@@ -74,6 +107,7 @@ def _pending_publication_query(principal: Principal, search: str | None = None):
                 Site.wp_username.is_not(None),
                 Site.wp_username != "",
             ).label("can_publish"),
+            (Site.platform == "html").label("can_export"),
         )
         .outerjoin(selected, selected.c.site_id == Site.id)
         .outerjoin(approved, approved.c.site_id == Site.id)
@@ -185,7 +219,7 @@ def prepare_publication_plans_async(
     # every source post with `context=edit`, which WordPress refuses without an
     # account, so an unauthenticated site produced one live request and one
     # identical 401 per article before showing the operator an empty batch.
-    if not site.has_wordpress_credentials:
+    if site.platform == "wordpress" and not site.has_wordpress_credentials:
         raise HTTPException(
             409,
             "this site has no WordPress account, so its posts cannot be read for editing "
@@ -241,6 +275,93 @@ def publication_plan_html(
     )
 
 
+@router.get("/{site_id}/export.csv", response_class=StreamingResponse)
+def export_non_wordpress_publication(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Export approved, exact artifacts for a non-WordPress operator workflow.
+
+    This is deliberately after preparation and named approval. It exports the
+    stored bytes and metadata; it never renders a new edit and never queues a
+    publication job.
+    """
+    if site.platform == "wordpress":
+        raise HTTPException(
+            409,
+            "WordPress sites use the protected publication queue; export is for non-WordPress sites",
+        )
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources are read-only")
+    plans = list(
+        db.scalars(
+            select(PublicationPlan)
+            .where(
+                PublicationPlan.site_id == site.id,
+                PublicationPlan.status == "approved",
+            )
+            .order_by(PublicationPlan.id)
+        )
+    )
+    try:
+        for plan in plans:
+            if plan.approved_hash is None:
+                raise PlanIntegrityError(f"publication plan {plan.id} has no approval hash")
+            verify_integrity(plan)
+    except PlanIntegrityError as error:
+        raise HTTPException(409, str(error)) from error
+
+    def rows():
+        for plan in plans:
+            items = list(plan.items or [])
+            suggestion_ids = [
+                item.get("suggestion_id")
+                for item in items
+                if item.get("suggestion_id") is not None
+            ]
+            suggestions = (
+                db.scalars(
+                    select(Suggestion)
+                    .where(Suggestion.id.in_(suggestion_ids))
+                    .options(joinedload(Suggestion.source_article))
+                ).all()
+                if suggestion_ids
+                else []
+            )
+            by_id = {suggestion.id: suggestion for suggestion in suggestions}
+            if not items:
+                items = [{}]
+            for item in items:
+                suggestion = by_id.get(item.get("suggestion_id"))
+                yield [
+                    _export_cell(plan.id),
+                    _export_cell(plan.plan_hash),
+                    _export_cell(plan.site_id),
+                    _export_cell(plan.source_article_id),
+                    _export_cell(plan.source_url),
+                    _export_cell(
+                        suggestion.source_article.title if suggestion is not None else None
+                    ),
+                    _export_cell(item.get("target_url")),
+                    _export_cell(item.get("anchor_text")),
+                    _export_cell(
+                        suggestion.placement_context if suggestion is not None else None
+                    ),
+                    _export_cell(item.get("outcome")),
+                    _export_cell(plan.original_html),
+                    _export_cell(plan.updated_html),
+                    _export_cell(plan.status),
+                    _export_cell(plan.approved_by),
+                    _export_cell(plan.approved_at),
+                ]
+
+    return csv_response(
+        PUBLICATION_EXPORT_HEADER,
+        rows(),
+        filename=f"linkmesh-site-{site.id}-publication.csv",
+    )
+
+
 @router.post("/{site_id}/plans/approve", response_model=PlanApprovalResult)
 def approve_publication_plans(
     payload: PlanApprovalRequest,
@@ -288,6 +409,11 @@ def trigger_publication(
     """
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources are read-only")
+    if site.platform == "html":
+        raise HTTPException(
+            409,
+            "static HTML sites are read-only; export the approved publication CSV instead",
+        )
     approved_query = select(PublicationPlan.id).where(
         PublicationPlan.site_id == site.id,
         PublicationPlan.status == "approved",

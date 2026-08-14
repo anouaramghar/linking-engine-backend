@@ -5,6 +5,7 @@ x-app-service: &app-service
   environment:
     DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh
     REDIS_URL: redis://redis:6379/0
+    BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
 
 services:
   db:
@@ -48,6 +49,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

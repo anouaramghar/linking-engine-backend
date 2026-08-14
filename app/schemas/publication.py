@@ -29,6 +29,9 @@ class PendingPublicationSite(BaseModel):
     #: request and return the same 401. Said here, before the operator spends
     #: that, rather than discovered inside an empty review.
     can_publish: bool = True
+    #: Static HTML sites can export approved artifacts, but never accept a
+    #: LinkMesh write request.
+    can_export: bool = False
 
 
 class PendingPublicationPage(BaseModel):

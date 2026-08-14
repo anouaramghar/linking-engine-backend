@@ -405,6 +405,7 @@ def fill_external_suggestion_gap(
         suggestion = Suggestion(
             site_id=site.id,
             source_article_id=article.id,
+            generation_job_run_id=job_run_id,
             target_article_id=None,
             external_url=candidate.normalized_url,
             external_title=candidate.title,

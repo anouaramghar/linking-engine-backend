@@ -118,11 +118,11 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 # Only now is importing the application safe: app.db reads settings.database_url at
 # import time, and the assignment above is what that read resolves to.
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import event, select  # noqa: E402
+from sqlalchemy import event, select, text  # noqa: E402
 
 from app.api.deps import require_api_key  # noqa: E402
 from app.config import settings  # noqa: E402
-from app.db import SessionLocal, engine  # noqa: E402
+from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Site, Tenant  # noqa: E402
 from app.services import telegram  # noqa: E402
@@ -172,6 +172,25 @@ def engine_is_bound_to_the_test_database():
         f"the SQLAlchemy engine is bound to {bound!r}, not the configured test "
         f"database {_database_name(TEST_DATABASE_URL)!r}"
     )
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def reset_test_database(engine_is_bound_to_the_test_database):
+    """Start every suite against a clean schema-owned disposable database.
+
+    The database name guard above makes this bounded destructive setup safe. A
+    previous run can leave pool sites, jobs, or suggestions that are not owned
+    by a function fixture; those rows change pagination and quota outcomes even
+    though the current test is correct. Reset only mapped application tables,
+    preserving Alembic's version table so the fixture never becomes a migration
+    substitute.
+    """
+    table_names = [table.name for table in Base.metadata.sorted_tables]
+    if table_names:
+        quoted = ", ".join(f'"{name}"' for name in table_names)
+        with engine.begin() as connection:
+            connection.execute(text(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE"))
     yield
 
 

@@ -55,7 +55,7 @@ from app.services.authorization import (
 )
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.services.graph_service import current_feature_map
-from app.tasks.analysis import analyze_site, compare_site
+from app.tasks.analysis import analyze_article, analyze_site, compare_site
 
 logger = logging.getLogger(__name__)
 
@@ -1161,6 +1161,33 @@ def trigger_analysis(
         run = enqueue_job(db, site.id, "analysis", analyze_site, job_timeout=7200)
     except DuplicateJobError as e:
         raise HTTPException(409, str(e)) from e
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
+
+
+@router.post("/articles/{article_id}/suggestions", status_code=202, response_model=JobAccepted)
+def trigger_article_analysis(
+    article_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> JobAccepted:
+    """Generate the normal suggestion set for one source article only."""
+    article = db.get(Article, article_id)
+    if article is None:
+        raise HTTPException(404, f"article {article_id} not found")
+    site = authorize_site(db, principal, article.site_id)
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    try:
+        run = enqueue_job(
+            db,
+            site.id,
+            "analysis",
+            analyze_article,
+            job_timeout=7200,
+            task_kwargs={"article_id": article.id},
+        )
+    except DuplicateJobError as error:
+        raise HTTPException(409, str(error)) from error
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 

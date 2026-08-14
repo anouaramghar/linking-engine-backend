@@ -249,6 +249,7 @@ def generate_suggestions(
     site_id: int,
     job_run_id: int | None = None,
     *,
+    article_id: int | None = None,
     ranking_mode_override: str | None = None,
     comparison_only: bool = False,
     external_provider: ExternalSearchProvider | None = None,
@@ -328,14 +329,13 @@ def generate_suggestions(
                         site_id,
                     )
 
-            article_ids = db.scalars(
-                select(Article.id)
-                .where(
-                    Article.site_id == site_id,
-                    Article.is_active.is_(True),
-                )
-                .order_by(Article.id)
-            ).all()
+            article_query = select(Article.id).where(
+                Article.site_id == site_id,
+                Article.is_active.is_(True),
+            )
+            if article_id is not None:
+                article_query = article_query.where(Article.id == article_id)
+            article_ids = db.scalars(article_query.order_by(Article.id)).all()
             shadow_source_ids = (
                 _evenly_spaced_ids(article_ids, settings.hybrid_max_sources_per_run)
                 if ranking_mode == "shadow"
@@ -598,6 +598,7 @@ def generate_suggestions(
                         Suggestion(
                             site_id=site_id,
                             source_article_id=article_id,
+                            generation_job_run_id=job_run_id,
                             target_article_id=candidate.target_id,
                             method=method,
                             # Cosine similarity for both methods, so one number keeps
@@ -670,6 +671,7 @@ def generate_suggestions(
                 "graph_version": graph_snapshot.graph_version,
                 "graph_reranking_mode": settings.graph_reranking_mode,
                 "graph_reordered_sources": graph_reordered_sources,
+                "source_article_id": article_id,
             }
             if ranking_mode != "baseline":
                 result.update(

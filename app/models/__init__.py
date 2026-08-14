@@ -6,6 +6,7 @@ from app.models.evaluation import EvaluationSnapshot
 from app.models.external_policy import ExternalLinkPolicy
 from app.models.external_search_audit import ExternalSearchAuditEvent
 from app.models.graph import GraphFeature, GraphSnapshot
+from app.models.ingestion import IngestionDiagnostic
 from app.models.job import JobRun
 from app.models.link import InternalLink
 from app.models.pool_audit import PoolSourceAuditEvent
@@ -36,6 +37,7 @@ __all__ = [
     "ExternalSearchAuditEvent",
     "GraphFeature",
     "GraphSnapshot",
+    "IngestionDiagnostic",
     "IngestionRun",
     "InternalLink",
     "JobRun",
