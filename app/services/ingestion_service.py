@@ -3,11 +3,10 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from collections import Counter
 from time import monotonic
 from urllib.parse import urlparse, urlunparse
 
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 from lxml import html as lxml_html
@@ -23,11 +22,16 @@ from app.models import (
     Article,
     ArticleTaxonomy,
     IngestionRun,
-    IngestionDiagnostic,
-    InternalLink,
     Site,
-    Suggestion,
     Taxonomy,
+)
+from app.services.crawl_snapshot import (
+    CrawlSnapshot,
+    _persist_diagnostics,
+    _reconcile_snapshot,
+    _upsert_link,
+    _validate_snapshot_completeness,
+    normalize_url,
 )
 from app.services.job_service import record_progress_durably
 from app.services.pool_source_policy import PoolSourceFetchError
@@ -54,96 +58,6 @@ def _site_ingestion_lock(site_id: int) -> Iterator[None]:
             lock_connection.execute(
                 select(func.pg_advisory_unlock(_INGESTION_LOCK_NAMESPACE, site_id))
             ).scalar_one()
-
-
-def _validate_snapshot_completeness(
-    db: Session, site_id: int, run_id: int, article_count: int
-) -> None:
-    if article_count == 0:
-        raise ValueError(
-            f"crawl returned zero articles for site {site_id}; snapshot not reconciled"
-        )
-
-    previous_count = db.scalar(
-        select(IngestionRun.articles_upserted)
-        .where(
-            IngestionRun.site_id == site_id,
-            IngestionRun.status == "succeeded",
-            IngestionRun.id != run_id,
-        )
-        .order_by(IngestionRun.id.desc())
-        .limit(1)
-    )
-    minimum_ratio = settings.ingestion_min_previous_ratio
-    if previous_count and article_count < previous_count * minimum_ratio:
-        raise ValueError(
-            f"crawl returned {article_count} articles for site {site_id}, below "
-            f"{minimum_ratio:.0%} of the previous successful crawl ({previous_count}); "
-            "snapshot not reconciled"
-        )
-
-
-def normalize_url(url: str) -> str:
-    """Comparison key: scheme-insensitive, no fragment/query, no trailing slash."""
-    p = urlparse(url)
-    return f"{p.netloc.lower()}{p.path.rstrip('/')}"
-
-
-def _persist_diagnostics(
-    db: Session,
-    run: IngestionRun,
-    observations: list[DiscoveryObservation],
-) -> None:
-    """Attach connector decisions after the snapshot transaction succeeds or rolls back."""
-    summary = Counter(observation.reason_code for observation in observations)
-    unique_urls = {normalize_url(observation.url) for observation in observations}
-    accepted_urls = {
-        normalize_url(observation.url)
-        for observation in observations
-        if observation.state == "accepted"
-    }
-    skipped_urls = {
-        normalize_url(observation.url)
-        for observation in observations
-        if observation.state in ("skipped", "failed")
-    }
-    run.discovered_urls = len(unique_urls)
-    run.accepted_urls = len(accepted_urls)
-    run.skipped_urls = len(skipped_urls)
-    run.diagnostic_summary = dict(sorted(summary.items()))
-    db.add_all(
-        IngestionDiagnostic(
-            site_id=run.site_id,
-            ingestion_run_id=run.id,
-            url=observation.url,
-            state=observation.state,
-            reason_code=observation.reason_code,
-            reason_detail=(observation.reason_detail or "")[:2000] or None,
-            discovered_from=observation.discovered_from,
-            depth=observation.depth,
-            http_status=observation.http_status,
-            content_type=observation.content_type,
-            final_url=observation.final_url,
-            canonical_url=observation.canonical_url,
-        )
-        for observation in observations
-    )
-
-
-def _complete_accepted_observations(
-    connector, accepted: list[DiscoveryObservation]
-) -> list[DiscoveryObservation]:
-    observations = connector.drain_discovery_observations()
-    accepted_keys = {
-        (normalize_url(observation.url), observation.state)
-        for observation in observations
-    }
-    for observation in accepted:
-        key = (normalize_url(observation.url), observation.state)
-        if key not in accepted_keys:
-            observations.append(observation)
-            accepted_keys.add(key)
-    return observations
 
 
 def _import_canonical_url(url: str) -> str:
@@ -456,96 +370,6 @@ def _upsert_taxonomies(
         )
 
 
-def _upsert_link(
-    db: Session,
-    source_id: int,
-    target_id: int,
-    run_id: int,
-    anchor_text: str | None = None,
-) -> None:
-    db.execute(
-        pg_insert(InternalLink)
-        .values(
-            source_article_id=source_id,
-            target_article_id=target_id,
-            anchor_text=anchor_text,
-            is_active=True,
-            last_seen_run_id=run_id,
-        )
-        .on_conflict_do_update(
-            index_elements=["source_article_id", "target_article_id"],
-            # first_seen_at stays immutable for history (Phase 0, finding 3).
-            # anchor_text is refreshed: an editor rewording a link is exactly
-            # the change an anchor-distribution report needs to see.
-            set_={
-                "anchor_text": anchor_text,
-                "is_active": True,
-                "last_seen_at": func.now(),
-                "last_seen_run_id": run_id,
-            },
-        )
-    )
-
-
-def _reconcile_snapshot(db: Session, site_id: int, run_id: int) -> None:
-    site_article_ids = select(Article.id).where(Article.site_id == site_id)
-    inactive_article_ids = select(Article.id).where(
-        Article.site_id == site_id,
-        Article.last_seen_run_id.is_distinct_from(run_id),
-    )
-    taxonomy_reporter_ids = select(ArticleTaxonomy.article_id).where(
-        ArticleTaxonomy.last_seen_run_id == run_id
-    )
-    db.execute(
-        update(Article)
-        .where(
-            Article.site_id == site_id,
-            Article.last_seen_run_id == run_id,
-            Article.is_active.is_(False),
-        )
-        .values(is_active=True)
-    )
-    db.execute(
-        update(Article)
-        .where(
-            Article.site_id == site_id,
-            Article.last_seen_run_id.is_distinct_from(run_id),
-            Article.is_active.is_(True),
-        )
-        .values(is_active=False)
-    )
-    db.execute(
-        update(Suggestion)
-        .where(
-            Suggestion.status.in_(("pending", "approved")),
-            or_(
-                Suggestion.source_article_id.in_(inactive_article_ids),
-                Suggestion.target_article_id.in_(inactive_article_ids),
-            ),
-        )
-        .values(status="expired")
-    )
-    db.execute(
-        update(InternalLink)
-        .where(
-            InternalLink.source_article_id.in_(site_article_ids),
-            InternalLink.last_seen_run_id.is_distinct_from(run_id),
-            InternalLink.is_active.is_(True),
-        )
-        .values(is_active=False)
-    )
-    db.execute(
-        delete(ArticleTaxonomy).where(
-            ArticleTaxonomy.article_id.in_(site_article_ids),
-            ArticleTaxonomy.last_seen_run_id.is_distinct_from(run_id),
-            or_(
-                ArticleTaxonomy.article_id.in_(inactive_article_ids),
-                ArticleTaxonomy.article_id.in_(taxonomy_reporter_ids),
-            ),
-        )
-    )
-
-
 def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
     """RQ task body. A run never stays 'running' (sequence 4.1 alt success/failure)."""
     db = SessionLocal()
@@ -553,7 +377,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
     db.add(run)
     db.commit()
     connector = None
-    accepted_observations: list[DiscoveryObservation] = []
+    snapshot = CrawlSnapshot(site_id=site_id, run_id=run.id)
     try:
         site = db.get(Site, site_id)
         if site is None:
@@ -564,10 +388,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         # live content. This deliberately trades bounded, resumable batch commits
         # for atomicity; use staging and promotion before scaling to very large crawls.
         crawl_started_at = monotonic()
-        url_to_id: dict[str, int] = {}
         external_urls_seen: set[str] = set()
-        outbound: list[tuple[int, list[str]]] = []
-        article_ids: set[int] = set()
         articles_seen = 0
         total_outbound_links = 0
         last_progress_count = 0
@@ -613,22 +434,10 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             total_outbound_links += len(art.outbound_internal_links)
             if total_outbound_links > settings.crawl_max_total_links:
                 raise ValueError(f"crawl link count exceeded {settings.crawl_max_total_links}")
-            accepted_observations.append(
-                DiscoveryObservation(
-                    url=art.url,
-                    state="accepted",
-                    reason_code="accepted",
-                    discovered_from=art.discovered_from,
-                    depth=art.discovery_depth,
-                    canonical_url=art.canonical_url,
-                )
-            )
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
-            url_to_id[normalize_url(art.url)] = article_id
-            outbound.append((article_id, art.outbound_internal_links))
-            article_ids.add(article_id)
-            articles = len(article_ids)
+            snapshot.stage_article(art, article_id)
+            articles = snapshot.article_count
             if articles % 50 == 0 and articles != last_progress_count:
                 # Keep progress visible without committing any live snapshot data.
                 record_progress_durably(
@@ -638,10 +447,10 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                 )
                 last_progress_count = articles
 
-        articles = len(article_ids)
+        articles = snapshot.article_count
 
         try:
-            _validate_snapshot_completeness(db, site_id, run.id, articles)
+            snapshot.validate_completeness(db)
         except ValueError as error:
             if site.platform == "pool":
                 raise PoolSourceFetchError(str(error)) from error
@@ -649,20 +458,12 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
 
         # Resolve links once all articles are known (forward references)
         record_progress_durably(job_run_id, stage="resolving_links")
-        links = 0
-        seen: set[tuple[int, int]] = set()
         resolve_internal_url = getattr(connector, "resolve_internal_url", None)
-        for source_id, outbound_links in outbound:
-            check_crawl_deadline(crawl_started_at)
-            for link in outbound_links:
-                check_crawl_deadline(crawl_started_at)
-                target_id = url_to_id.get(normalize_url(link.url))
-                if target_id is None and resolve_internal_url is not None:
-                    target_id = url_to_id.get(normalize_url(resolve_internal_url(link.url)))
-                if target_id and target_id != source_id and (source_id, target_id) not in seen:
-                    _upsert_link(db, source_id, target_id, run.id, link.anchor_text)
-                    seen.add((source_id, target_id))
-                    links += 1
+        links = snapshot.resolve_links(
+            db,
+            resolve_internal_url=resolve_internal_url,
+            check_deadline=lambda: check_crawl_deadline(crawl_started_at),
+        )
 
         # Reconciliation is success-gated after link resolution (Phase 0, finding 3).
         record_progress_durably(
@@ -671,15 +472,11 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             articles=articles,
             links=links,
         )
-        _reconcile_snapshot(db, site_id, run.id)
+        snapshot.promote(db)
         run.status = "succeeded"
         run.articles_upserted = articles
         run.links_found = links
-        _persist_diagnostics(
-            db,
-            run,
-            _complete_accepted_observations(connector, accepted_observations),
-        )
+        snapshot.persist_diagnostics(db, run, connector)
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
         return {"articles": articles, "links": links}
@@ -688,11 +485,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         run.status = "failed"
         run.error = str(e)[:2000]
         if connector is not None:
-            _persist_diagnostics(
-                db,
-                run,
-                _complete_accepted_observations(connector, accepted_observations),
-            )
+            snapshot.persist_diagnostics(db, run, connector)
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
         raise
