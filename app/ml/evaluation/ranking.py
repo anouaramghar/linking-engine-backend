@@ -34,14 +34,12 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.ml.baseline import low_value_target_params, semantic_scores_for_targets
 from app.ml.hybrid import (
-    DENSE_POOL_SIZE,
     HYBRID_POOL_SIZE,
-    LEXICAL_POOL_SIZE,
     CorpusArticle,
     RankedCandidate,
+    rank_hybrid_candidates,
     normalized_title,
     structured_terms,
-    weighted_rrf_scores,
 )
 from app.ml.lexical import BM25Index, rank_scores
 from app.models import Article, ArticleTaxonomy, Embedding, Taxonomy
@@ -66,6 +64,14 @@ class PoolStats:
     pool_articles: int
     source_articles: int
     excluded_low_value: int
+
+
+@dataclass(frozen=True)
+class _CandidateOrders:
+    eligible_scores: dict[int, float]
+    dense_order: tuple[int, ...]
+    lexical_order: tuple[int, ...]
+    bm25_scores: dict[int, float]
 
 
 def _low_value_filter():
@@ -232,6 +238,23 @@ class EvaluationRanker:
         """Target article ids for one source under one method, best first."""
         return self.rank_all(db, source_id=source_id, limit=limit, methods=(method,))[method]
 
+    def _candidate_orders(self, db: Session, source_id: int) -> _CandidateOrders | None:
+        if source_id not in self.sources or self.index is None:
+            return None
+        eligible = self._eligible_scores(db, source_id)
+        if not eligible:
+            return _CandidateOrders({}, (), (), {})
+        dense_order = tuple(
+            target_id
+            for target_id, _score in sorted(eligible.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        bm25_scores = self.index.score_documents(
+            self.terms_by_source[source_id],
+            excluded_ids=set(self.pool) - set(eligible),
+        )
+        lexical_order = tuple(target_id for target_id, _score in rank_scores(bm25_scores))
+        return _CandidateOrders(eligible, dense_order, lexical_order, bm25_scores)
+
     def ranked_candidates(
         self,
         db: Session,
@@ -241,14 +264,24 @@ class EvaluationRanker:
         method: RankingMethod = "hybrid",
     ) -> tuple[RankedCandidate, ...]:
         """Return an ordering with semantic scores for post-ranking evaluation."""
-        if source_id not in self.sources:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if method not in RANKING_METHODS:
+            raise ValueError(f"unsupported ranking methods: {[method]}")
+        orders = self._candidate_orders(db, source_id)
+        if orders is None or not orders.eligible_scores:
             return ()
-        ranked_ids = self.rank(db, source_id=source_id, limit=limit, method=method)
-        if not ranked_ids:
-            return ()
-        semantic_scores = self._eligible_scores(db, source_id)
+        if method == "hybrid":
+            return rank_hybrid_candidates(
+                orders.dense_order,
+                orders.lexical_order,
+                orders.bm25_scores,
+                orders.eligible_scores,
+                limit=limit,
+            )
+        ranked_ids = (orders.dense_order if method == "dense" else orders.lexical_order)[:limit]
         return tuple(
-            RankedCandidate(target_id=target_id, semantic_score=semantic_scores[target_id])
+            RankedCandidate(target_id=target_id, semantic_score=orders.eligible_scores[target_id])
             for target_id in ranked_ids
         )
 
@@ -273,53 +306,27 @@ class EvaluationRanker:
             raise ValueError(f"unsupported ranking methods: {unknown}")
 
         empty: dict[RankingMethod, list[int]] = {method: [] for method in methods}
-        if source_id not in self.sources or self.index is None:
+        orders = self._candidate_orders(db, source_id)
+        if orders is None:
             return empty
-        eligible = self._eligible_scores(db, source_id)
-        if not eligible:
+        if not orders.eligible_scores:
             return empty
-
-        dense_order = [
-            target_id
-            for target_id, _score in sorted(eligible.items(), key=lambda kv: (-kv[1], kv[0]))
-        ]
-        bm25_scores = self.index.score_documents(
-            self.terms_by_source[source_id],
-            excluded_ids=set(self.pool) - set(eligible),
-        )
-        lexical_order = [target_id for target_id, _score in rank_scores(bm25_scores)]
 
         ranked: dict[RankingMethod, list[int]] = {}
         for method in methods:
             if method == "dense":
-                ranked[method] = dense_order[:limit]
+                ranked[method] = list(orders.dense_order[:limit])
             elif method == "lexical":
-                ranked[method] = lexical_order[:limit]
+                ranked[method] = list(orders.lexical_order[:limit])
             else:
-                ranked[method] = self._hybrid_order(
-                    dense_order, lexical_order, bm25_scores, limit=limit
-                )
+                ranked[method] = [
+                    candidate.target_id
+                    for candidate in rank_hybrid_candidates(
+                        orders.dense_order,
+                        orders.lexical_order,
+                        orders.bm25_scores,
+                        orders.eligible_scores,
+                        limit=limit,
+                    )
+                ]
         return ranked
-
-    def _hybrid_order(
-        self,
-        dense_order: Sequence[int],
-        lexical_order: Sequence[int],
-        bm25_scores: dict[int, float],
-        *,
-        limit: int,
-    ) -> list[int]:
-        fused = weighted_rrf_scores(
-            dense_order[:DENSE_POOL_SIZE], lexical_order[:LEXICAL_POOL_SIZE]
-        )
-        fusion_ranks = {target_id: rank for rank, (target_id, _score) in enumerate(fused, start=1)}
-        # BM25-512 decides the order and the fused rank breaks ties, exactly as
-        # `HybridRanker.rank` does. See the module docstring in app/ml/hybrid.py.
-        return sorted(
-            fusion_ranks,
-            key=lambda target_id: (
-                -bm25_scores.get(target_id, 0.0),
-                fusion_ranks[target_id],
-                target_id,
-            ),
-        )[:limit]
