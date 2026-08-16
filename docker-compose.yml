@@ -88,7 +88,11 @@ services:
 
   worker-analysis:
     <<: *app-service
-    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "analysis"]
+    # --with-scheduler is required: RQ parks delayed retries in
+    # rq:scheduled:analysis, and only a worker running a scheduler promotes them
+    # back onto the ready queue. Without it a retried job stays "scheduled"
+    # forever, which the API reports to the dashboard as "analysis queued".
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "analysis"]
     depends_on:
       db:
         condition: service_healthy
@@ -101,7 +105,8 @@ services:
 
   worker-publication:
     <<: *app-service
-    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "publication"]
+    # See worker-analysis: a queue with no scheduler never drains its retries.
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "publication"]
     depends_on:
       db:
         condition: service_healthy
@@ -114,7 +119,8 @@ services:
     <<: *app-service
     # Live reads and placement generation cannot occupy API or publication
     # capacity. Scale this service across sites; per-site duplicate guards remain.
-    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "publication-preparation"]
+    # See worker-analysis: a queue with no scheduler never drains its retries.
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "publication-preparation"]
     depends_on:
       db:
         condition: service_healthy
