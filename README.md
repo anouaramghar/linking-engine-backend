@@ -185,6 +185,16 @@ passwords. To rotate it, move the current key to `CREDENTIAL_DECRYPTION_KEYS`, d
 new primary key, run `alembic upgrade head`, verify ingestion and publication, then remove
 the previous key. Multiple previous keys may be comma-separated. Never commit real keys.
 
+Stored credentials must use the `fernet:v1:` format. The application rejects non-empty
+plaintext values instead of passing them to WordPress. The credential migration encrypts
+legacy rows with the configured primary key; run `alembic upgrade head` before starting a
+deployment that has not yet applied it. A missing primary key causes the migration to fail
+closed rather than storing another unprotected value.
+
+`API_KEY_PEPPER` is also required outside development. It is the HMAC secret for
+database-backed API-key hashes and dashboard session/login-code hashes; use a long random
+value and keep it separate from `API_KEY`.
+
 ## Operator-specific API keys
 
 Automation that needs a named operator identity can use:

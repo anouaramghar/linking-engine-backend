@@ -77,7 +77,11 @@ class Principal:
 
 
 def _pepper() -> bytes:
-    value = settings.api_key_pepper or _UNCONFIGURED_PEPPER
+    value = settings.api_key_pepper.strip()
+    if not value:
+        if settings.environment != "development":
+            raise RuntimeError("API_KEY_PEPPER must be set outside development")
+        value = _UNCONFIGURED_PEPPER
     return value.encode("utf-8")
 
 
@@ -89,7 +93,7 @@ def require_configured_pepper() -> None:
     setting a real pepper later invalidates every existing key at once, with a
     401 and no explanation. Fail at mint time, where the operator can still act.
     """
-    if settings.api_key_pepper:
+    if settings.api_key_pepper.strip():
         return
     if settings.environment == "development":
         logger.warning(

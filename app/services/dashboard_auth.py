@@ -46,7 +46,12 @@ _UNCONFIGURED_PEPPER = "linkmesh-unconfigured-pepper"
 
 
 def _pepper() -> bytes:
-    return (settings.api_key_pepper or _UNCONFIGURED_PEPPER).encode("utf-8")
+    value = settings.api_key_pepper.strip()
+    if not value:
+        if settings.environment != "development":
+            raise RuntimeError("API_KEY_PEPPER must be set outside development")
+        value = _UNCONFIGURED_PEPPER
+    return value.encode("utf-8")
 
 
 def hash_session_token(raw_token: str) -> str:

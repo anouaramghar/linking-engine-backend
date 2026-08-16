@@ -276,6 +276,12 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def require_api_key_pepper_outside_development(self) -> Self:
+        if self.environment != "development" and not self.api_key_pepper.strip():
+            raise ValueError("API_KEY_PEPPER must be set outside development")
+        return self
+
+    @model_validator(mode="after")
     def forbid_unsafe_crawl_targets_outside_development(self) -> Self:
         if self.environment != "development" and self.allow_unsafe_crawl_targets:
             raise ValueError("ALLOW_UNSAFE_CRAWL_TARGETS is development-only")
