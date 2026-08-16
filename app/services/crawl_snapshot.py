@@ -108,12 +108,16 @@ def _persist_diagnostics(
 
 
 def _complete_accepted_observations(
-    connector, accepted: Sequence[DiscoveryObservation]
+    connector,
+    accepted: Sequence[DiscoveryObservation],
+    *,
+    existing: Sequence[DiscoveryObservation] = (),
 ) -> list[DiscoveryObservation]:
-    observations = connector.drain_discovery_observations()
+    observations = list(existing)
+    if connector is not None:
+        observations = [*connector.drain_discovery_observations(), *observations]
     accepted_keys = {
-        (normalize_url(observation.url), observation.state)
-        for observation in observations
+        (normalize_url(observation.url), observation.state) for observation in observations
     }
     for observation in accepted:
         key = (normalize_url(observation.url), observation.state)
@@ -218,6 +222,10 @@ class CrawlSnapshot:
     Article rows can be written inside the caller's transaction before this
     object promotes anything. If the crawl fails or is incomplete, the caller
     rolls back and this snapshot never becomes the active site view.
+
+    Callers record acceptance before persisting an article, then stage its
+    database identity after persistence. Promotion requires completeness
+    validation and link resolution to have succeeded first.
     """
 
     site_id: int
@@ -226,6 +234,9 @@ class CrawlSnapshot:
     _url_to_id: dict[str, int] = field(default_factory=dict)
     _outbound: list[tuple[int, list[OutboundLink]]] = field(default_factory=list)
     _accepted_observations: list[DiscoveryObservation] = field(default_factory=list)
+    _validated: bool = field(default=False, init=False, repr=False)
+    _links_resolved: bool = field(default=False, init=False, repr=False)
+    _promoted: bool = field(default=False, init=False, repr=False)
 
     @property
     def article_count(self) -> int:
@@ -235,11 +246,15 @@ class CrawlSnapshot:
     def accepted_observations(self) -> tuple[DiscoveryObservation, ...]:
         return tuple(self._accepted_observations)
 
-    def stage_article(self, article: ArticleData, article_id: int) -> None:
-        """Add one persisted article to this run's staged snapshot."""
-        self._article_ids.add(article_id)
-        self._url_to_id[normalize_url(article.url)] = article_id
-        self._outbound.append((article_id, list(article.outbound_internal_links)))
+    def _mark_dirty(self) -> None:
+        if self._promoted:
+            raise RuntimeError("a promoted snapshot cannot accept more articles")
+        self._validated = False
+        self._links_resolved = False
+
+    def record_accepted_article(self, article: ArticleData) -> None:
+        """Record acceptance before persistence so failures retain the evidence."""
+        self._mark_dirty()
         self._accepted_observations.append(
             DiscoveryObservation(
                 url=article.url,
@@ -251,9 +266,19 @@ class CrawlSnapshot:
             )
         )
 
+    def stage_article(self, article: ArticleData, article_id: int) -> None:
+        """Add one persisted article to this run's staged snapshot."""
+        self._mark_dirty()
+        self._article_ids.add(article_id)
+        self._url_to_id[normalize_url(article.url)] = article_id
+        self._outbound.append((article_id, list(article.outbound_internal_links)))
+
     def validate_completeness(self, db: Session) -> None:
         """Refuse to replace the active view with an empty or truncated crawl."""
+        if self._promoted:
+            raise RuntimeError("a promoted snapshot cannot be validated again")
         _validate_snapshot_completeness(db, self.site_id, self.run_id, self.article_count)
+        self._validated = True
 
     def resolve_links(
         self,
@@ -263,6 +288,8 @@ class CrawlSnapshot:
         check_deadline: Callable[[], None] | None = None,
     ) -> int:
         """Resolve forward references after all staged article identities exist."""
+        if self._promoted:
+            raise RuntimeError("a promoted snapshot cannot resolve links again")
         check = check_deadline or (lambda: None)
         links = 0
         seen: set[tuple[int, int]] = set()
@@ -279,18 +306,35 @@ class CrawlSnapshot:
                     _upsert_link(db, source_id, target_id, self.run_id, link.anchor_text)
                     seen.add((source_id, target_id))
                     links += 1
+        self._links_resolved = True
         return links
 
     def promote(self, db: Session) -> None:
         """Make this complete snapshot the active site view."""
+        if not self._validated:
+            raise RuntimeError("snapshot completeness must be validated before promotion")
+        if not self._links_resolved:
+            raise RuntimeError("snapshot links must be resolved before promotion")
+        if self._promoted:
+            raise RuntimeError("snapshot has already been promoted")
         _reconcile_snapshot(db, self.site_id, self.run_id)
+        self._promoted = True
 
-    def persist_diagnostics(self, db: Session, run: IngestionRun, connector) -> None:
+    def persist_diagnostics(
+        self,
+        db: Session,
+        run: IngestionRun,
+        connector=None,
+        *,
+        observations: Sequence[DiscoveryObservation] = (),
+    ) -> None:
         """Persist connector evidence plus accepted article observations."""
-        observations = _complete_accepted_observations(
-            connector, self._accepted_observations
+        completed_observations = _complete_accepted_observations(
+            connector,
+            self._accepted_observations,
+            existing=observations,
         )
-        _persist_diagnostics(db, run, observations)
+        _persist_diagnostics(db, run, completed_observations)
 
 
 __all__ = [

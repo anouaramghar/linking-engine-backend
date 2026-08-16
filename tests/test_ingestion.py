@@ -25,6 +25,7 @@ from app.models import (
     Suggestion,
     Taxonomy,
 )
+from app.services.crawl_snapshot import _reconcile_snapshot
 from app.services.job_service import run_durably
 
 
@@ -473,7 +474,7 @@ def test_reconcile_skips_stable_article_and_link_updates(db, site):
 
     event.listen(engine, "after_cursor_execute", record_update_rowcounts)
     try:
-        ingestion_service._reconcile_snapshot(db, site.id, run.id)
+        _reconcile_snapshot(db, site.id, run.id)
         db.commit()
     finally:
         event.remove(engine, "after_cursor_execute", record_update_rowcounts)

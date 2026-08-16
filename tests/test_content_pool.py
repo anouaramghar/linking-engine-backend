@@ -38,7 +38,7 @@ from app.ml.external.cleaning import (
 from app.main import app
 from app.schemas.site import SiteCreate
 from app.connectors.url_guard import UnsafeURLError
-from app.services.ingestion_service import _reconcile_snapshot
+from app.services.crawl_snapshot import _reconcile_snapshot
 from app.services.pool_source_policy import (
     PoolSourceFetchError,
     PoolSourcePolicyError,

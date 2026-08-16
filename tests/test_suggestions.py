@@ -24,7 +24,7 @@ from app.models import (
     Suggestion,
 )
 from app.models.article import EMBEDDING_DIM
-from app.services.ingestion_service import _reconcile_snapshot
+from app.services.crawl_snapshot import _reconcile_snapshot
 from app.services.suggestion_service import generate_suggestions
 
 

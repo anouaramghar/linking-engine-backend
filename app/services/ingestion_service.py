@@ -25,14 +25,7 @@ from app.models import (
     Site,
     Taxonomy,
 )
-from app.services.crawl_snapshot import (
-    CrawlSnapshot,
-    _persist_diagnostics,
-    _reconcile_snapshot,
-    _upsert_link,
-    _validate_snapshot_completeness,
-    normalize_url,
-)
+from app.services.crawl_snapshot import CrawlSnapshot, normalize_url
 from app.services.job_service import record_progress_durably
 from app.services.pool_source_policy import PoolSourceFetchError
 
@@ -95,14 +88,12 @@ def import_articles(
     observations: list[DiscoveryObservation] = []
     imported = 0
     updated = 0
-    article_ids: set[int] = set()
-    url_to_id: dict[str, int] = {}
-    outbound: list[tuple[int, list]] = []
     seen_urls: set[str] = set()
     with _site_ingestion_lock(site.id):
         run = IngestionRun(site_id=site.id, status="running")
         db.add(run)
         db.commit()
+        snapshot = CrawlSnapshot(site_id=site.id, run_id=run.id)
         try:
             for row_number, row in enumerate(rows, start=1):
                 values = row.model_dump() if hasattr(row, "model_dump") else dict(row)
@@ -205,9 +196,7 @@ def import_articles(
                 if not content_text:
                     content_text = _text_from_import_html(content_html) or title
                 if len(content_text) > settings.crawl_max_article_chars:
-                    reason = (
-                        f"content exceeded {settings.crawl_max_article_chars} characters"
-                    )
+                    reason = f"content exceeded {settings.crawl_max_article_chars} characters"
                     rejected.append({"row": row_number, "url": raw_url, "reason": reason})
                     observations.append(
                         DiscoveryObservation(
@@ -231,45 +220,26 @@ def import_articles(
                     canonical_url=values.get("canonical_url"),
                     outbound_internal_links=values.get("outbound_internal_links") or [],
                 )
+                snapshot.record_accepted_article(article)
                 article_id = _upsert_article(db, site.id, article, run.id)
                 stored = db.get(Article, article_id)
                 if stored is not None and not replace_snapshot:
                     stored.is_active = True
-                article_ids.add(article_id)
-                url_to_id[key] = article_id
-                outbound.append((article_id, article.outbound_internal_links))
+                snapshot.stage_article(article, article_id)
                 if existing_id is None:
                     imported += 1
                 else:
                     updated += 1
-                observations.append(
-                    DiscoveryObservation(
-                        url=url,
-                        state="accepted",
-                        reason_code="accepted",
-                        discovered_from=article.discovered_from,
-                        depth=article.discovery_depth,
-                        canonical_url=article.canonical_url,
-                    )
-                )
 
             if replace_snapshot:
-                _validate_snapshot_completeness(db, site.id, run.id, len(article_ids))
-            links = 0
-            seen_links: set[tuple[int, int]] = set()
-            for source_id, outbound_links in outbound:
-                for link in outbound_links:
-                    target_id = url_to_id.get(normalize_url(link.url))
-                    if target_id and target_id != source_id and (source_id, target_id) not in seen_links:
-                        _upsert_link(db, source_id, target_id, run.id, link.anchor_text)
-                        seen_links.add((source_id, target_id))
-                        links += 1
+                snapshot.validate_completeness(db)
+            links = snapshot.resolve_links(db)
             if replace_snapshot:
-                _reconcile_snapshot(db, site.id, run.id)
+                snapshot.promote(db)
             run.status = "succeeded"
-            run.articles_upserted = len(article_ids)
+            run.articles_upserted = snapshot.article_count
             run.links_found = links
-            _persist_diagnostics(db, run, observations)
+            snapshot.persist_diagnostics(db, run, observations=observations)
             run.finished_at = datetime.now(timezone.utc)
             db.commit()
             return {
@@ -285,7 +255,7 @@ def import_articles(
             db.rollback()
             run.status = "failed"
             run.error = str(error)[:2000]
-            _persist_diagnostics(db, run, observations)
+            snapshot.persist_diagnostics(db, run, observations=observations)
             run.finished_at = datetime.now(timezone.utc)
             db.commit()
             raise
@@ -434,6 +404,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             total_outbound_links += len(art.outbound_internal_links)
             if total_outbound_links > settings.crawl_max_total_links:
                 raise ValueError(f"crawl link count exceeded {settings.crawl_max_total_links}")
+            snapshot.record_accepted_article(art)
             article_id = _upsert_article(db, site_id, art, run.id)
             _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
             snapshot.stage_article(art, article_id)
