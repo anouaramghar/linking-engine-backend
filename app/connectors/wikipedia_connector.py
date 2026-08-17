@@ -135,7 +135,10 @@ class WikipediaConnector(ContentConnector):
             if result_limit is not None and len(pages) >= result_limit:
                 return pages[:result_limit]
             continuation = payload.get("continue") or {}
-            if not continuation:
+            # A direct-title lookup pins revisions to one item (`rvlimit=1`).
+            # MediaWiki still advertises older revisions through `rvcontinue`,
+            # but they cannot change the current article we are validating.
+            if not continuation or result_limit is None:
                 return pages
             if request_number + 1 >= max_requests:
                 raise ValueError("Wikipedia API pagination exceeded request limit")

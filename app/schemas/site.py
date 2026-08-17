@@ -143,6 +143,20 @@ class SiteBulkResult(BaseModel):
     rejected: list[SiteBulkFailure]  # failed validation, including the SSRF guard
 
 
+class PoolSourceValidationRequest(BaseModel):
+    """One pool source to probe without creating or approving it."""
+
+    name: str | None = None
+    base_url: str | None = None
+
+
+class PoolSourceValidationResult(BaseModel):
+    base_url: str | None
+    valid: bool
+    source_type: Literal["wikipedia", "rss_atom"] | None = None
+    reason: str | None = None
+
+
 class SiteOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

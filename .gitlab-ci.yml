@@ -31,6 +31,8 @@ test:
     DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh_test
     TEST_DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh_test
     REDIS_URL: redis://redis:6379/0
+    # Tests must never inherit a live external-search credential.
+    TAVILY_API_KEY: ""
   script:
     - |
       uv run python - <<'PY'
