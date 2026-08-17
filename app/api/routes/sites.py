@@ -73,6 +73,20 @@ router = APIRouter(prefix="/sites", tags=["sites"])
 
 DUPLICATE_REASON = "a site with this base_url already exists"
 
+#: How much of a failure message travels on a list row. Long enough for the
+#: sentence that names the cause, short enough that 250 failed sites do not
+#: turn one page into a megabyte of tracebacks.
+MAX_ROW_ERROR_CHARS = 300
+
+
+def _row_error(message: str | None) -> str | None:
+    if not message:
+        return None
+    trimmed = " ".join(message.split())
+    if len(trimmed) <= MAX_ROW_ERROR_CHARS:
+        return trimmed
+    return trimmed[: MAX_ROW_ERROR_CHARS - 1].rstrip() + "…"
+
 
 def _managed_site_or_409(site: Site) -> Site:
     if site.platform == "pool":
@@ -91,6 +105,8 @@ def _external_policy_out(
         updated_at=stored.updated_at if stored is not None else None,
         expired_suggestions=expired_suggestions,
     )
+
+
 def _first_error(exc: ValidationError) -> str:
     """Flatten a row's validation failure into one reviewer-readable line."""
     error = exc.errors()[0]
@@ -214,9 +230,15 @@ def _site_out(
     if run is not None:
         item.last_ingestion_status = run.status
         item.last_crawl_at = run.finished_at or run.started_at
+        # Only for a failure: a message left on a succeeded run would read as a
+        # problem the site does not have.
+        if run.status == "failed":
+            item.last_ingestion_error = _row_error(run.error)
     if analysis is not None:
         item.last_analysis_status = analysis.status
         item.last_analysis_at = analysis.finished_at or analysis.enqueued_at
+        if analysis.status == "failed":
+            item.last_analysis_error = _row_error(analysis.error)
     return item
 
 
@@ -448,7 +470,10 @@ def update_external_link_policy(
     if policy is None:
         policy = ExternalLinkPolicy(site_id=site.id)
         db.add(policy)
-    for field, value in payload.model_dump().items():
+    # The policy surface accepts partial updates in practice.  Do not turn an
+    # omitted field into its schema default: an existing explicitly enabled
+    # policy must remain enabled when an operator changes only a domain rule.
+    for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(policy, field, value)
     policy.updated_by = operator_id
     db.flush()

@@ -50,7 +50,7 @@ def test_policy_api_returns_defaults_and_normalizes_rules(client, db, site):
     assert default.status_code == 200
     assert default.json() == {
         "site_id": site.id,
-        "external_links_enabled": True,
+        "external_links_enabled": False,
         "require_https": True,
         "min_trust_score": 60,
         "min_domain_age_days": 0,
@@ -77,11 +77,27 @@ def test_policy_api_returns_defaults_and_normalizes_rules(client, db, site):
     )
     assert updated.status_code == 200
     body = updated.json()
+    assert body["external_links_enabled"] is False
     assert body["trusted_tlds"] == ["org"]
     assert body["allowlist_domains"] == ["trusted.example"]
     assert body["competitor_domains"] == ["competitor.example"]
     assert body["updated_by"] == "local-development"
     assert db.get(ExternalLinkPolicy, site.id).min_trust_score == 75
+
+
+def test_existing_explicit_policy_value_is_not_rewritten_by_partial_update(client, db, site):
+    policy = ExternalLinkPolicy(site_id=site.id, external_links_enabled=True)
+    db.add(policy)
+    db.commit()
+
+    response = client.put(
+        f"/api/v1/sites/{site.id}/external-link-policy",
+        json={"competitor_domains": ["competitor.example"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["external_links_enabled"] is True
+    assert db.get(ExternalLinkPolicy, site.id).external_links_enabled is True
 
 
 def test_policy_rejects_conflicting_domain_lists(client, site):
@@ -100,6 +116,7 @@ def test_trust_score_uses_https_tld_age_allowlist_and_approval(db, site):
     pool = _pool(db, registered_days_ago=400)
     policy = PolicyState(
         site_id=site.id,
+        external_links_enabled=True,
         min_trust_score=80,
         trusted_tlds=("org",),
         allowlist_domains=("wikipedia.org",),
@@ -223,6 +240,7 @@ def test_external_target_context_only_admits_safe_pool_articles(db, site):
     db.add(
         ExternalLinkPolicy(
             site_id=site.id,
+            external_links_enabled=True,
             min_trust_score=0,
             competitor_domains=["competitor.example"],
         )
@@ -246,7 +264,11 @@ def test_policy_source_preview_reports_eligible_and_blocked_article_counts(clien
     _article(db, pool, url="https://competitor.example/report", title="Blocked")
     client.put(
         f"/api/v1/sites/{site.id}/external-link-policy",
-        json={"min_trust_score": 0, "competitor_domains": ["competitor.example"]},
+        json={
+            "external_links_enabled": True,
+            "min_trust_score": 0,
+            "competitor_domains": ["competitor.example"],
+        },
     )
 
     response = client.get(f"/api/v1/sites/{site.id}/external-link-policy/sources")

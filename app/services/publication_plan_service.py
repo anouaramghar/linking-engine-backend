@@ -123,7 +123,9 @@ def _direction_rank(row) -> tuple[float, int]:
     return (-row.score, row.id)
 
 
-def grouped_batch(db: Session, site_id: int) -> tuple[list[tuple[int, list[int]]], list[int]]:
+def grouped_batch(
+    db: Session, site_id: int, only: set[int] | None = None
+) -> tuple[list[tuple[int, list[int]]], list[int]]:
     """Selected suggestions as (source_article_id, suggestion_ids), best first,
     plus the ids whose reverse direction is already a published link.
 
@@ -131,6 +133,21 @@ def grouped_batch(db: Session, site_id: int) -> tuple[list[tuple[int, list[int]]
     render takes the phrase and the rest fall back to the appended block.
     Articles themselves stay in best-cosine-first order so a partial preparation
     still shows the strongest work.
+
+    `only` narrows the batch to named suggestions, which is what a review opened
+    from one queue row asks for. Two properties make the narrowing safe:
+
+    * It is applied **last**. Reciprocal suppression and anchor arbitration run
+      over the whole site first, so naming one link can never smuggle it past a
+      rule the full batch would have applied to it.
+    * The superseded list is narrowed with it. A request about one link is no
+      licence to retire selections nobody asked about.
+
+    A named link does take a phrase that a higher-ranked sibling would have won
+    in a full batch, because it is now the only suggestion rendering into that
+    article. That is the honest consequence of publishing one link on its own:
+    the sibling is prepared later, against an article that already carries this
+    link, and falls back exactly as any losing suggestion does.
 
     Near-duplicate template pages propose A->B and B->A together and a bulk
     selection takes both, which would write a mutual link neither page needs. The
@@ -167,6 +184,8 @@ def grouped_batch(db: Session, site_id: int) -> tuple[list[tuple[int, list[int]]
         )
     ).all()
     superseded = [row.id for row in rows if row.reverse_applied]
+    if only is not None:
+        superseded = [row_id for row_id in superseded if row_id in only]
     rows = [row for row in rows if not row.reverse_applied]
 
     # The reverse may also be sitting in this very batch, where no database
@@ -186,7 +205,9 @@ def grouped_batch(db: Session, site_id: int) -> tuple[list[tuple[int, list[int]]
 
     by_source: dict[int, list] = defaultdict(list)
     for row in rows:
-        if row.id in kept:
+        # `kept` first, `only` second: the narrowing may drop a link the site's
+        # own rules kept, never keep one they dropped.
+        if row.id in kept and (only is None or row.id in only):
             by_source[row.source_article_id].append(row)
     groups = []
     for source_article_id, source_rows in by_source.items():
@@ -287,8 +308,11 @@ def generate_missing_placements(
         generated = 0
         for source_results in results:
             for suggestion_id, placement in source_results:
-                placement_service.store(db, suggestion_id, placement)
-                generated += bool(placement.anchor_text)
+                # Counts what the row ends up holding, not what this pass
+                # generated: a concurrently stored placement keeps its own
+                # answer, and reporting ours would overstate the pass.
+                stored_placement = placement_service.store(db, suggestion_id, placement)
+                generated += bool(stored_placement.anchor_text)
         db.commit()
         if spent >= budget:
             logger.warning(
@@ -439,6 +463,7 @@ def prepare_site(
     site,
     *,
     max_articles: int,
+    suggestion_ids: set[int] | None = None,
     job_run_id: int | None = None,
 ) -> PublicationPreparation:
     """Render and persist the exact edits an operator may now approve.
@@ -450,8 +475,18 @@ def prepare_site(
 
     An unreachable source yields an error and no plan, so a dead post cannot
     quietly ride along in someone else's approval.
+
+    `suggestion_ids` prepares only the named links. A plan's hash covers a whole
+    article, so this is the *only* way to approve one link out of an article
+    that holds several: narrowing at the point of rendering produces an artifact
+    that contains that link and nothing else. Filtering afterwards could not —
+    it would still be one hash over one article carrying every link in it. The
+    cost falls with the scope: one named link is one live read, not ten.
+
+    `selected_suggestions` stays the site-wide count either way. It answers "how
+    much intent is waiting here", which a narrowed request does not change.
     """
-    groups, superseded = grouped_batch(db, site.id)
+    groups, superseded = grouped_batch(db, site.id, suggestion_ids)
     if superseded and expire_superseded(db, superseded):
         db.commit()
         logger.info(
@@ -765,11 +800,7 @@ def load_approved_plans(
     )
     if plan_ids is not None:
         query = query.where(PublicationPlan.id.in_(plan_ids))
-    return list(
-        db.scalars(
-            query.order_by(PublicationPlan.id)
-        ).all()
-    )
+    return list(db.scalars(query.order_by(PublicationPlan.id)).all())
 
 
 def mark_stale(db: Session, plan: PublicationPlan, reason: str) -> None:

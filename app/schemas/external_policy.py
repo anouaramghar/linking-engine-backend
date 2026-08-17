@@ -6,7 +6,7 @@ from app.domain_policy import normalized_unique_domains, normalized_unique_tlds
 
 
 class ExternalLinkPolicyUpdate(BaseModel):
-    external_links_enabled: bool = True
+    external_links_enabled: bool = False
     require_https: bool = True
     min_trust_score: int = Field(default=60, ge=0, le=100)
     min_domain_age_days: int = Field(default=0, ge=0, le=36_500)
@@ -30,9 +30,7 @@ class ExternalLinkPolicyUpdate(BaseModel):
         blocked = set(self.blocklist_domains) | set(self.competitor_domains)
         conflicts = sorted(set(self.allowlist_domains) & blocked)
         if conflicts:
-            raise ValueError(
-                "domains cannot be both allowed and blocked: " + ", ".join(conflicts)
-            )
+            raise ValueError("domains cannot be both allowed and blocked: " + ", ".join(conflicts))
         return self
 
 

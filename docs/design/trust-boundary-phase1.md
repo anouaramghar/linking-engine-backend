@@ -1,7 +1,9 @@
 # Trust boundary — phase 1
 
-Status: implemented on `feat/trust-boundary`. Full multi-tenant keys remain
-proposal-only in [per-site-authorization.md](per-site-authorization.md).
+Status: implemented on `feat/trust-boundary`. Scoped database keys shipped in
+[phase 2](trust-boundary-phase2.md); [per-site-authorization.md](per-site-authorization.md)
+is the original proposal and is partly superseded — a scope is blast-radius
+containment for a leaked key, not client isolation.
 
 ## What shipped
 

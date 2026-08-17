@@ -1,15 +1,17 @@
-# syntax=docker/dockerfile:1.7
 FROM python:3.12-slim-bookworm
+
+ARG BUILD_COMMIT=unknown
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /uvx /bin/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    UV_COMPILE_BYTECODE=1 \
+    UV_COMPILE_BYTECODE=0 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
     PATH="/opt/venv/bin:$PATH" \
-    HF_HOME=/home/linkmesh/.cache/huggingface
+    HF_HOME=/home/linkmesh/.cache/huggingface \
+    BUILD_COMMIT=${BUILD_COMMIT}
 
 WORKDIR /app
 
@@ -27,7 +29,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN groupadd --system linkmesh \
     && useradd --system --gid linkmesh --home-dir /home/linkmesh --create-home linkmesh \
     && mkdir -p /home/linkmesh/.cache/huggingface \
-    && chown -R linkmesh:linkmesh /app /opt/venv /home/linkmesh
+    && chown -R linkmesh:linkmesh /app /home/linkmesh
 
 USER linkmesh
 

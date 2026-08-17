@@ -83,6 +83,7 @@ def test_direct_external_suggestion_is_exposed_as_web_search(client, db, site) -
 def test_web_search_safety_applies_only_approved_hard_guards(site) -> None:
     policy = PolicyState(
         site_id=site.id,
+        external_links_enabled=True,
         blocklist_domains=("blocked.example",),
         competitor_domains=("competitor.example",),
     )

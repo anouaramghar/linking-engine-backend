@@ -43,8 +43,7 @@ def test_compose_registers_content_pool_schedule_before_worker():
     assert "migrate:" in registrar
     assert 'restart: "no"' in registrar
     assert (
-        "      pool-scheduler-init:\n"
-        "        condition: service_completed_successfully"
+        "      pool-scheduler-init:\n        condition: service_completed_successfully"
     ) in worker
 
 

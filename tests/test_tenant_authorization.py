@@ -19,7 +19,17 @@ from sqlalchemy import select
 from app.api.deps import require_api_key
 from app.config import settings
 from app.main import app
-from app.models import Alert, ApiKey, Article, Site, Suggestion, SuggestionEvent, Tenant
+from app.models import (
+    Alert,
+    ApiKey,
+    Article,
+    PipelineBatch,
+    PipelineSiteRun,
+    Site,
+    Suggestion,
+    SuggestionEvent,
+    Tenant,
+)
 from app.services.authorization import (
     LAST_USED_REFRESH,
     Principal,
@@ -434,9 +444,7 @@ def test_queue_hides_foreign_suggestions(real_auth, db):
 
 
 def test_traceability_and_single_event_history_hide_foreign_tenants(real_auth, db):
-    with _tenant(db, "trace-a") as (tenant_a, key_a), _tenant(
-        db, "trace-b"
-    ) as (tenant_b, _):
+    with _tenant(db, "trace-a") as (tenant_a, key_a), _tenant(db, "trace-b") as (tenant_b, _):
         mine = _suggestion(db, _site(db, tenant_a))
         theirs = _suggestion(db, _site(db, tenant_b))
         db.add_all(
@@ -469,16 +477,12 @@ def test_traceability_and_single_event_history_hide_foreign_tenants(real_auth, d
         assert mine.trace_id in exported.text
         assert theirs.trace_id not in exported.text
 
-        foreign_history = real_auth.get(
-            f"/api/v1/suggestions/{theirs.id}/events", headers=headers
-        )
+        foreign_history = real_auth.get(f"/api/v1/suggestions/{theirs.id}/events", headers=headers)
         assert foreign_history.status_code == 403
 
 
 def test_filtered_bulk_undo_rejects_a_foreign_tenant(real_auth, db):
-    with _tenant(db, "undo-a") as (tenant_a, key_a), _tenant(
-        db, "undo-b"
-    ) as (_tenant_b, key_b):
+    with _tenant(db, "undo-a") as (tenant_a, key_a), _tenant(db, "undo-b") as (_tenant_b, key_b):
         mine = _suggestion(db, _site(db, tenant_a))
         created = real_auth.post(
             "/api/v1/suggestions/bulk-review-by-filter",
@@ -677,3 +681,137 @@ def test_tenant_delete_refuses_while_sites_remain(monkeypatch, db):
         app.dependency_overrides[require_api_key] = lambda: Principal(
             is_admin=True, source="legacy_env"
         )
+
+
+# --------------------------------------------------------------------------
+# Pipeline batches
+# --------------------------------------------------------------------------
+
+
+def _batch(db, *sites) -> int:
+    batch = PipelineBatch(status="running")
+    db.add(batch)
+    db.flush()
+    db.add_all(
+        PipelineSiteRun(batch_id=batch.id, site_id=site.id, status="queued") for site in sites
+    )
+    db.commit()
+    return batch.id
+
+
+def test_foreign_pipeline_batch_cannot_be_read_streamed_or_cancelled(real_auth, db):
+    """Cancelling is a mutation of another scope's work, not a read of it.
+
+    Read was authorized site by site from the start; cancel and the live stream
+    were not, so any valid key could stop another scope's batch and watch its
+    site ids, job state and errors go by.
+    """
+    with _tenant(db, "runner") as (tenant_r, _), _tenant(db, "watcher") as (_w, key_w):
+        batch_id = _batch(db, _site(db, tenant_r))
+        headers = {"X-API-Key": key_w}
+        try:
+            assert (
+                real_auth.get(f"/api/v1/pipelines/batches/{batch_id}", headers=headers).status_code
+                == 403
+            )
+            assert (
+                real_auth.get(
+                    f"/api/v1/pipelines/batches/{batch_id}/events", headers=headers
+                ).status_code
+                == 403
+            )
+            assert (
+                real_auth.post(
+                    f"/api/v1/pipelines/batches/{batch_id}/cancel", headers=headers
+                ).status_code
+                == 403
+            )
+            db.expire_all()
+            assert db.get(PipelineBatch, batch_id).status == "running"
+        finally:
+            db.delete(db.get(PipelineBatch, batch_id))
+            db.commit()
+
+
+def test_retrying_own_site_in_a_shared_batch_is_refused(real_auth, db):
+    """Owning one site in a batch does not authorize the batch.
+
+    Only an admin can build a batch spanning tenants, and this is the route that
+    made that dangerous: it authorized the single site being retried, then
+    answered with the whole batch — every run in it, with site ids, statuses and
+    error text. The retry itself is the smaller half of the problem.
+    """
+    with _tenant(db, "shares") as (tenant_a, key_a), _tenant(db, "shared-with") as (tenant_b, _):
+        site_a = _site(db, tenant_a)
+        site_b = _site(db, tenant_b)
+        batch = PipelineBatch(status="failed")
+        db.add(batch)
+        db.flush()
+        run_a = PipelineSiteRun(
+            batch_id=batch.id,
+            site_id=site_a.id,
+            status="failed",
+            stage="analysis",
+            error="analysis failed",
+        )
+        db.add_all([run_a, PipelineSiteRun(batch_id=batch.id, site_id=site_b.id, status="queued")])
+        db.commit()
+        batch_id = batch.id
+
+        try:
+            refused = real_auth.post(
+                f"/api/v1/pipelines/batches/{batch_id}/sites/{site_a.id}/retry",
+                headers={"X-API-Key": key_a},
+            )
+            assert refused.status_code == 403, refused.text
+            assert str(site_b.id) not in refused.text
+            db.expire_all()
+            assert db.get(PipelineSiteRun, run_a.id).status == "failed"
+        finally:
+            db.delete(db.get(PipelineBatch, batch_id))
+            db.commit()
+
+
+def test_own_pipeline_batch_stays_cancellable(real_auth, db):
+    with _tenant(db, "cancels") as (tenant, key):
+        batch_id = _batch(db, _site(db, tenant))
+        try:
+            cancelled = real_auth.post(
+                f"/api/v1/pipelines/batches/{batch_id}/cancel", headers={"X-API-Key": key}
+            )
+            assert cancelled.status_code == 200, cancelled.text
+            assert cancelled.json()["status"] == "cancelled"
+        finally:
+            db.delete(db.get(PipelineBatch, batch_id))
+            db.commit()
+
+
+# --------------------------------------------------------------------------
+# Evaluation
+# --------------------------------------------------------------------------
+
+
+def test_evaluation_api_is_admin_only(real_auth, db):
+    """`site_id` is a filter, not a scope.
+
+    Omitting it reports on every site at once, so a scoped key that could reach
+    these routes would read fleet titles and export them as CSV — exactly the
+    blast radius scoped keys exist to bound.
+    """
+    with _tenant(db, "evaluator") as (tenant, key):
+        site = _site(db, tenant)
+        headers = {"X-API-Key": key}
+        assert real_auth.get("/api/v1/evaluation/metrics", headers=headers).status_code == 403
+        assert (
+            real_auth.get(
+                "/api/v1/evaluation/metrics", headers=headers, params={"site_id": site.id}
+            ).status_code
+            == 403
+        )
+        assert (
+            real_auth.get(
+                "/api/v1/evaluation/suggestions", headers=headers, params={"metric": "decided"}
+            ).status_code
+            == 403
+        )
+        assert real_auth.get("/api/v1/evaluation/export.csv", headers=headers).status_code == 403

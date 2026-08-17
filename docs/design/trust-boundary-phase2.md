@@ -2,11 +2,19 @@
 
 Status: implemented on `feat/trust-boundary`.
 
+> **What a scope means was settled on 2026-08-06, after this document was
+> written.** A scope is blast-radius containment for a leaked key, not client
+> isolation: *"keep the scoped keys, they're for limiting blast radius if one
+> ever leaks, not client isolation, since we don't have clients."* The mechanism
+> described below is correct and stays. The framing of rows 1 and 9 below, and of
+> "`base_url` uniqueness" and "Frontend" further down, has been corrected in
+> place. `app/services/authorization.py` holds the authoritative statement.
+
 ## Defaults for open questions
 
 | # | Decision |
 |---|----------|
-| 1 | One tenant = one client company. Agencies get multiple tenants later if needed. |
+| 1 | ~~One tenant = one client company.~~ There are no client companies. A scope bounds what one key can reach; one scope (`default`) is in use and every site belongs to it. |
 | 2 | Site ownership is strictly singular (`sites.tenant_id` NOT NULL). |
 | 3 | Only admin principals mint/rotate/revoke keys (`POST /admin/api-keys`). |
 | 4 | Tenant keys are full read/write for that tenant; no finer scopes yet. |
@@ -65,26 +73,30 @@ explanation. Failing at mint time puts that where an operator can act on it.
 
 ## `base_url` uniqueness
 
-Unique per `(tenant_id, base_url)`, not globally (`d4f2a8c61b93`). Two clients
-may legitimately hold the same URL — an agency and the brand itself, or a domain
-moving between tenants — and a global constraint also let one tenant probe
-another's inventory through the 409 alone. The downgrade refuses while any URL
-is held by more than one tenant, since global uniqueness is no longer satisfiable
+Unique per `(tenant_id, base_url)`, not globally (`d4f2a8c61b93`). The reason is
+containment, not shared ownership: under a global constraint the 409 answers
+"does this URL exist anywhere?" for a caller who may not read anywhere, which
+turns site creation into an inventory oracle. With one scope in use the
+constraint behaves exactly like a global one. The downgrade refuses while any URL
+is held by more than one scope, since global uniqueness is no longer satisfiable
 at that point.
 
 ## Compatibility
 
-The production dashboard still injects one shared service key. That key must stay
-an admin credential (legacy `API_KEY` or a DB admin key) until the UI learns
-per-tenant keys. Tenant isolation is enforced for any non-admin key issued via
-`/admin/api-keys`.
+The production dashboard injects one shared admin service key downstream of a
+verified session, and that is the intended end state rather than a stopgap:
+operators are internal and see everything, so the dashboard has no reason to hold
+a narrower credential. Scope enforcement therefore applies to keys issued via
+`/admin/api-keys` — machine callers and integrations — not to dashboard traffic.
 
 ## Frontend
 
-No SPA change is required for phase 2 while the proxy continues to use an admin
-key. Phase 3 (optional): multi-tenant operator UX and per-tenant proxy keys.
+No SPA change is required, and none is planned. The earlier "phase 3: multi-tenant
+operator UX and per-tenant proxy keys" is **dropped** — it was premised on
+clients, and there are none.
 
-When that lands, the SPA has to stop assuming every site it can see is one it
-can act on: `GET /sites` now returns shared pool sources alongside owned sites,
-and mutating them 403s for a tenant key. `SiteOut.tenant_id` is the field to
-branch on.
+The one scenario the SPA would have to handle, if a scoped key ever reached it,
+is that a visible site is not always an actionable one: `GET /sites` returns
+shared pool sources alongside owned sites, and mutating them 403s for a scoped
+key. `SiteOut.tenant_id` is the field to branch on. Under the shared admin key
+this cannot arise.

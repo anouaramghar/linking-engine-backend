@@ -36,9 +36,7 @@ def probe_pool_source(site: Site) -> PoolSourceType:
     except httpx.TimeoutException as error:
         raise PoolSourceFetchError("source validation timed out") from error
     except httpx.HTTPStatusError as error:
-        raise PoolSourceFetchError(
-            f"source returned HTTP {error.response.status_code}"
-        ) from error
+        raise PoolSourceFetchError(f"source returned HTTP {error.response.status_code}") from error
     except httpx.HTTPError as error:
         raise PoolSourceFetchError(f"source request failed: {error}") from error
     except (TypeError, ValueError) as error:

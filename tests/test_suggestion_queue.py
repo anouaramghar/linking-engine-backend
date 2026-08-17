@@ -499,9 +499,7 @@ def test_small_filtered_review_can_be_undone_by_returned_ids(client, db, site):
 
 def test_large_filtered_review_has_exact_idempotent_server_side_undo(client, db, site):
     pair = _pair(db, site)
-    suggestions = [
-        _suggest(db, site, pair, 0.90) for _ in range(MAX_BULK_REVIEW + 1)
-    ]
+    suggestions = [_suggest(db, site, pair, 0.90) for _ in range(MAX_BULK_REVIEW + 1)]
     db.commit()
 
     body = _rule(
@@ -523,9 +521,7 @@ def test_large_filtered_review_has_exact_idempotent_server_side_undo(client, db,
     # A row that has moved on since the review must not be overwritten by Undo.
     suggestions[0].status = "applied"
     db.commit()
-    undone = client.post(
-        f"/api/v1/suggestions/bulk-review-operations/{operation_id}/undo"
-    )
+    undone = client.post(f"/api/v1/suggestions/bulk-review-operations/{operation_id}/undo")
     assert undone.status_code == 200
     assert undone.json() == {
         "restored": MAX_BULK_REVIEW,
@@ -536,9 +532,7 @@ def test_large_filtered_review_has_exact_idempotent_server_side_undo(client, db,
     assert _status(db, suggestions[0].id) == "applied"
     assert _status(db, suggestions[-1].id) == "pending"
 
-    repeated = client.post(
-        f"/api/v1/suggestions/bulk-review-operations/{operation_id}/undo"
-    )
+    repeated = client.post(f"/api/v1/suggestions/bulk-review-operations/{operation_id}/undo")
     assert repeated.json() == {
         "restored": MAX_BULK_REVIEW,
         "skipped": 1,

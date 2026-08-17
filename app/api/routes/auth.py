@@ -8,10 +8,12 @@ Everything here is gated on a dashboard session instead.
 See ``docs/design/dashboard-authentication.md``.
 """
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -28,6 +30,7 @@ from app.services import dashboard_auth, telegram
 from app.services.dashboard_auth import SESSION_COOKIE
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 #: Closes the loop the pending screen opens. Without it the only way to discover
 #: an approval is to keep trying the login until one works.
@@ -65,6 +68,19 @@ def require_dashboard_session(
     return user
 
 
+def require_dashboard_admin(
+    user: DashboardUser = Depends(require_dashboard_session),
+) -> DashboardUser:
+    """A dashboard user who is also in the admin group, or 403.
+
+    The gate lives here rather than in the browser. Hiding the buttons from a
+    non-admin is a courtesy; this is the part that decides.
+    """
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="dashboard admin required")
+    return user
+
+
 @router.post("/login/start", response_model=LoginStartOut)
 def start_login(db: Session = Depends(get_db)) -> LoginStartOut:
     if not dashboard_auth.dashboard_login_configured():
@@ -72,12 +88,15 @@ def start_login(db: Session = Depends(get_db)) -> LoginStartOut:
             status_code=503,
             detail="dashboard login is not configured; set TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME",
         )
-    # Housekeeping rides along with the operation that creates the garbage.
-    # Logins are rare and expired codes are worthless, so a handful of deleted
-    # rows here is cheaper than owning a scheduler for it.
-    dashboard_auth.purge_expired_login_codes(db)
     deep_link = dashboard_auth.login_deep_link()
-    assert deep_link is not None  # configured check above guarantees a username
+    if deep_link is None:
+        # Unreachable while the configured check above holds. It is a raise
+        # rather than an assertion because `python -O` strips assertions, and a
+        # stripped one here would hand Pydantic a None it declares as a str.
+        raise HTTPException(
+            status_code=503,
+            detail="dashboard login is not configured; set TELEGRAM_BOT_USERNAME",
+        )
     return LoginStartOut(
         deep_link=deep_link,
         expires_in_seconds=settings.dashboard_login_nonce_ttl_seconds,
@@ -92,6 +111,17 @@ def complete_login(
 ) -> LoginCompleteOut:
     """Redeem the one-time code Telegram delivered to this operator."""
     outcome = dashboard_auth.redeem_login_code(db, payload.code)
+    # A valid Telegram-issued code is the proof-of-possession boundary. Do not
+    # let arbitrary anonymous start requests perform database housekeeping.
+    if outcome.state != "invalid":
+        try:
+            dashboard_auth.purge_expired_login_codes(db)
+        except SQLAlchemyError:
+            # Redemption already committed the session. Cleanup is housekeeping,
+            # so a transient database failure must not turn a valid login into a
+            # failed one.
+            db.rollback()
+            logger.warning("dashboard_login_cleanup_failed", exc_info=True)
     if outcome.state == "approved" and outcome.token:
         _set_session_cookie(response, outcome.token)
     user = DashboardUserOut.model_validate(outcome.user) if outcome.user is not None else None
@@ -118,9 +148,10 @@ def logout(
 
 
 # --------------------------------------------------------------------------
-# Admission. Every approved user may admit others: the team lead specified
-# "full access once approved, no per-person scoping needed", so there is no
-# narrower role to check against.
+# Admission. Approval still grants the whole dashboard — there is no per-page
+# scoping — but admitting and removing people belongs to the admin group alone.
+# Listing stays open to any approved user so the roster is readable; only the
+# controls that change it are privileged.
 # --------------------------------------------------------------------------
 
 
@@ -150,7 +181,7 @@ def _target_user(db: Session, user_id: int) -> DashboardUser:
 @router.post("/users/{user_id}/approve", response_model=DashboardUserOut)
 def approve_dashboard_user(
     user_id: int,
-    approver: DashboardUser = Depends(require_dashboard_session),
+    approver: DashboardUser = Depends(require_dashboard_admin),
     db: Session = Depends(get_db),
 ) -> DashboardUser:
     user = _target_user(db, user_id)
@@ -169,15 +200,54 @@ def approve_dashboard_user(
 @router.post("/users/{user_id}/revoke", response_model=DashboardUserOut)
 def revoke_dashboard_user(
     user_id: int,
-    approver: DashboardUser = Depends(require_dashboard_session),
+    approver: DashboardUser = Depends(require_dashboard_admin),
     db: Session = Depends(get_db),
 ) -> DashboardUser:
     user = _target_user(db, user_id)
     if user.id == approver.id:
-        # Locking yourself out is recoverable only by another approved user, and
+        # Locking yourself out is recoverable only by another admin, and
         # possibly by nobody at all if you were the last one.
         raise HTTPException(status_code=409, detail="cannot revoke your own access")
     dashboard_auth.revoke_user(db, user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.post("/users/{user_id}/admin", response_model=DashboardUserOut)
+def grant_dashboard_admin(
+    user_id: int,
+    _: DashboardUser = Depends(require_dashboard_admin),
+    db: Session = Depends(get_db),
+) -> DashboardUser:
+    """Add somebody to the admin group. Only an admin may.
+
+    An account has to be inside before it can hold the keys, so this refuses a
+    pending or revoked user rather than silently arming a flag that takes effect
+    at some later approval nobody connects to this action.
+    """
+    user = _target_user(db, user_id)
+    if user.status != "approved":
+        raise HTTPException(status_code=409, detail="approve this account before making it admin")
+    dashboard_auth.set_admin(db, user, True)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.delete("/users/{user_id}/admin", response_model=DashboardUserOut)
+def revoke_dashboard_admin(
+    user_id: int,
+    approver: DashboardUser = Depends(require_dashboard_admin),
+    db: Session = Depends(get_db),
+) -> DashboardUser:
+    """Remove somebody from the admin group, leaving their access untouched."""
+    user = _target_user(db, user_id)
+    if user.id == approver.id:
+        # Same rule as revoking yourself, and for the same reason: the last
+        # admin demoting themselves leaves a dashboard nobody can admit into.
+        raise HTTPException(status_code=409, detail="cannot remove your own admin rights")
+    dashboard_auth.set_admin(db, user, False)
     db.commit()
     db.refresh(user)
     return user
@@ -202,5 +272,9 @@ def get_user_avatar(
     return Response(
         content=avatar_bytes,
         media_type=media_type,
-        headers={"Cache-Control": "public, max-age=86400"},
+        # private, not public: the route is behind a dashboard session, and the
+        # picture belongs to the account it names. A shared cache holding it
+        # would serve one operator's face to whoever asks next. The browser
+        # cache is what the long max-age is for, and private still allows it.
+        headers={"Cache-Control": "private, max-age=86400"},
     )

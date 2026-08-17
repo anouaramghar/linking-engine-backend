@@ -106,9 +106,7 @@ def test_transport_failure_is_wrapped() -> None:
         raise httpx.ConnectError("connection refused")
 
     with _client(handler) as client:
-        provider = TavilySearchProvider(
-            api_key="test-key", retry_delays_seconds=(), client=client
-        )
+        provider = TavilySearchProvider(api_key="test-key", retry_delays_seconds=(), client=client)
         with pytest.raises(ExternalSearchError, match="Tavily transport failed"):
             provider.search("internal linking", max_results=3)
 
@@ -124,9 +122,7 @@ def test_transport_failure_is_wrapped() -> None:
 )
 def test_provider_errors_are_classified(status_code: int, error_type: type[Exception]) -> None:
     with _client(lambda _request: httpx.Response(status_code, text="provider error")) as client:
-        provider = TavilySearchProvider(
-            api_key="test-key", retry_delays_seconds=(), client=client
-        )
+        provider = TavilySearchProvider(api_key="test-key", retry_delays_seconds=(), client=client)
         with pytest.raises(error_type):
             provider.search("internal linking", max_results=3)
 

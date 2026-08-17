@@ -254,9 +254,9 @@ def test_cancel_batch_marks_unfinished_sites_terminal_and_workers_stop(client, d
     assert response.json()["status"] == "cancelled"
     assert response.json()["cancelled"] == 1
     assert response.json()["sites"][0]["status"] == "cancelled"
-    assert pipeline_tasks.analyze_pipeline_site(
-        site.id, batch_site_run_id=item.id
-    ) == {"cancelled": True}
+    assert pipeline_tasks.analyze_pipeline_site(site.id, batch_site_run_id=item.id) == {
+        "cancelled": True
+    }
     _cleanup(db, batch.id, [site.id])
 
 
@@ -282,3 +282,19 @@ def test_terminal_batch_stream_emits_snapshot_and_done(client, db):
     assert '"status":"succeeded"' in response.text
     assert "event: done" in response.text
     _cleanup(db, batch.id, [site.id])
+
+
+def test_a_quiet_stream_backs_off_and_a_change_speeds_it_up_again():
+    """Each snapshot costs a query and a worker thread shared with every request.
+
+    A batch that ingests for twenty minutes must not cost one of each per second
+    per open tab, and a batch that starts moving must not be reported late.
+    """
+    interval = pipeline_routes.MIN_STREAM_INTERVAL
+    quiet = []
+    for _ in range(5):
+        interval = pipeline_routes._next_stream_interval(interval, changed=False)
+        quiet.append(interval)
+
+    assert quiet == [2.0, 4.0, 5.0, 5.0, 5.0]
+    assert pipeline_routes._next_stream_interval(interval, changed=True) == 1.0

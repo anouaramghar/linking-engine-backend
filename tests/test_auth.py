@@ -7,6 +7,8 @@ from pydantic import SecretStr
 from app.api.deps import require_api_key
 from app.config import Settings, settings
 from app.main import app
+from app.services.authorization import hash_api_key
+from app.services.dashboard_auth import hash_session_token
 
 
 def _real_auth_client() -> TestClient:
@@ -59,10 +61,31 @@ def test_credential_encryption_key_required_outside_development():
         )
 
 
+def test_api_key_pepper_required_outside_development():
+    with pytest.raises(ValueError, match="API_KEY_PEPPER must be set"):
+        Settings(
+            environment="production",
+            api_key="sekret",
+            api_key_pepper="",
+            credential_encryption_key=SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
+            _env_file=None,
+        )
+
+
+@pytest.mark.parametrize("hash_function", [hash_api_key, hash_session_token])
+def test_production_hashes_refuse_the_development_pepper(monkeypatch, hash_function):
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "api_key_pepper", "")
+
+    with pytest.raises(RuntimeError, match="API_KEY_PEPPER must be set"):
+        hash_function("secret")
+
+
 def test_production_accepts_both_required_keys():
     configured = Settings(
         environment="production",
         api_key="sekret",
+        api_key_pepper="test-pepper",
         credential_encryption_key=SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
         _env_file=None,
     )

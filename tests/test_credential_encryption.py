@@ -24,8 +24,9 @@ def test_credential_round_trip_is_authenticated_and_not_plaintext():
     assert decrypt_credential(encrypted) == "wordpress-app-password"
 
 
-def test_plaintext_read_compatibility_during_migration():
-    assert decrypt_credential("legacy-plaintext") == "legacy-plaintext"
+def test_plaintext_credentials_are_rejected_until_migrated():
+    with pytest.raises(CredentialEncryptionError, match="not encrypted"):
+        decrypt_credential("legacy-plaintext")
 
 
 def test_wrong_key_cannot_decrypt(monkeypatch):

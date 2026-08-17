@@ -11,9 +11,7 @@ from app.services.pool_source_validation import classify_pool_source
 VALIDATE_URL = "/api/v1/sites/pool-source/validate"
 
 
-def test_validation_probes_wikipedia_and_rss_without_creating_sources(
-    client, db, monkeypatch
-):
+def test_validation_probes_wikipedia_and_rss_without_creating_sources(client, db, monkeypatch):
     monkeypatch.setattr(settings, "pool_allowed_domains", "wikipedia.org,example.com")
     probed: list[str] = []
 

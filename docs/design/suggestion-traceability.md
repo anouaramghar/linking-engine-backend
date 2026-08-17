@@ -11,6 +11,36 @@ event in the same transaction as the suggestion insert or status change, so a
 state transition cannot commit without its audit entry and a rolled-back
 transition cannot leave a false event behind.
 
+## Review exposure and generation snapshots
+
+Slice 4 adds an explicit exposure boundary to the same lifecycle contract:
+
+```http
+POST /api/v1/suggestions/exposure
+{"suggestion_ids": [123, 124], "surface": "queue"}
+```
+
+The dashboard calls this when a bounded queue page is rendered. The first call
+sets `shown_at` and emits one `exposed` event; later renders update
+`last_shown_at` and `exposure_count` without creating duplicate exposure labels.
+Review events retain the trusted actor, current decision, optional rejection
+reason, review source (`individual` or `bulk`), whether the row was exposed, and
+a duration measured from first exposure (or generation for an unseen row).
+Undo does not erase the append-only history.
+
+Each newly generated suggestion also stores the retrieval version, ranking
+version, final rank, and a JSON feature snapshot alongside the existing
+`score_components`. These are generation-time facts: a database trigger rejects
+updates to those fields after insert. Older rows remain nullable rather than
+receiving invented model provenance. The evaluation CSV exports the snapshot
+and exposure/decision fields so a frozen offline dataset can be reproduced
+without reconstructing ranking state from the current graph.
+
+`GET /api/v1/evaluation/metrics` reports exposure versus unseen decisions,
+optional rejection-reason counts, and graph-context outcomes separately from
+the existing operational rates. The surface is still operational telemetry;
+it does not by itself authorize a ranking or model promotion.
+
 ## Lifecycle events
 
 | Suggestion change | Event | Default actor |
@@ -106,7 +136,12 @@ GET /api/v1/suggestion-events/export.csv
 ```
 
 Both accept Trace ID, actor, event type, current status, site, and date-range
-filters. The paged dashboard exposes full event JSON, the current publication
-error, and a copyable Trace ID. CSV export applies the same filters to the full
-matching cohort rather than only the visible page. Spreadsheet formula prefixes
-are escaped before export.
+filters. The event-type filter offers every event in the table above,
+`external_discovered` included — it is the one event that explains a paid
+external suggestion, so it cannot be the one an operator is unable to search
+for. The paged dashboard exposes full event JSON, the current publication error,
+and a copyable Trace ID. CSV export applies the same filters to the full matching
+cohort rather than only the visible page, and streams it: the rows are read in
+batches and written straight to the response, so an unfiltered export of the
+largest table in the schema does not have to fit in memory first. Spreadsheet
+formula prefixes are escaped before export.

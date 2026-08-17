@@ -38,7 +38,9 @@ job id is unique, and each site/date snapshot is updated rather than duplicated.
 Managed sites have independent outgoing-link policies covering HTTPS, trusted
 TLDs, domain age, allowlists, blocklists, and competitor domains. Owned domains
 are always protected. The same policy is enforced before ranking and again
-before publication. Approved content-pool sources provide reusable external
+before publication. External suggestions are disabled by default for new managed
+sites and missing policies; an operator must explicitly enable this separate
+capability. Approved content-pool sources provide reusable external
 articles; when the normal internal/content-pool pipeline leaves open slots, a
 configured Tavily provider can supply bounded direct-URL candidates as a paid
 fallback. The separate safety rules, provider limits, ranking contract, and
@@ -81,8 +83,21 @@ DASHBOARD_BOOTSTRAP_ADMIN_ID=123456789
 ```
 
 The bootstrap ID only promotes a pending user; restarting cannot restore a revoked operator.
-Approved dashboard users intentionally have full internal access. Keep the service behind
-the IP-restricted firewall; login is the second layer, not a replacement for the firewall.
+
+One privileged **admin group** owns access management. Only its members may approve or
+revoke an account, or add and remove admin rights, and every one of those routes depends
+on `require_dashboard_admin` — the restriction is enforced by the backend and returns 403,
+not merely hidden in the dashboard. An admin cannot revoke or demote themselves, because
+that leaves a dashboard nobody can admit anyone into.
+
+Approved dashboard users intentionally have full internal access to everything else. That
+is the whole of the difference: the admin group is about who may hand out access, not
+about which sites or data a signed-in operator can reach. Revoking an account suspends its
+access and leaves its admin membership alone, so restoring it restores the same
+membership; removing admin rights is the separate action that changes it.
+
+Keep the service behind the IP-restricted firewall; login is the second layer, not a
+replacement for the firewall.
 
 Per-site API keys remain available for limiting credential blast radius. They are not a
 human login or a client-isolation boundary. Content-pool sites remain admin-only even when
@@ -98,10 +113,14 @@ Reviewing a suggestion **selects** it; it does not schedule anything. Publicatio
 three separate calls, and only the middle one is a decision:
 
 ```http
-POST /api/v1/publish/{site_id}/plans/prepare?max_articles=10
+POST /api/v1/publish/{site_id}/plans/prepare-async?max_articles=10   -> 202 {job_id}
 POST /api/v1/publish/{site_id}/plans/approve   {"plans": [{"id": 55, "plan_hash": "..."}]}
 POST /api/v1/publish/{site_id}   {"plan_ids": [55]}
 ```
+
+Preparation is always queued and always owned by a named operator: it makes one live
+WordPress request per source article plus a placement model call, which is too slow and
+too expensive to hold an API worker. Poll `GET /api/v1/jobs/{job_id}` for its result.
 
 Preparation reads the live WordPress posts, makes every decision publication used to
 make on its own — cohort, ordering, anchor arbitration, in-text or appended block, the
@@ -172,6 +191,16 @@ Full setup and CI notes are in [docs/testing.md](docs/testing.md).
 passwords. To rotate it, move the current key to `CREDENTIAL_DECRYPTION_KEYS`, deploy a
 new primary key, run `alembic upgrade head`, verify ingestion and publication, then remove
 the previous key. Multiple previous keys may be comma-separated. Never commit real keys.
+
+Stored credentials must use the `fernet:v1:` format. The application rejects non-empty
+plaintext values instead of passing them to WordPress. The credential migration encrypts
+legacy rows with the configured primary key; run `alembic upgrade head` before starting a
+deployment that has not yet applied it. A missing primary key causes the migration to fail
+closed rather than storing another unprotected value.
+
+`API_KEY_PEPPER` is also required outside development. It is the HMAC secret for
+database-backed API-key hashes and dashboard session/login-code hashes; use a long random
+value and keep it separate from `API_KEY`.
 
 ## Operator-specific API keys
 

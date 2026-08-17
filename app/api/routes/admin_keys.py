@@ -57,8 +57,8 @@ def delete_tenant(
     """Remove a tenant that owns nothing. Its API keys cascade away with it.
 
     Sites hold the tenant with ON DELETE RESTRICT, so this refuses rather than
-    orphaning or silently reassigning a live customer's inventory. Delete or
-    move the sites first — that has to be a deliberate act, not a side effect.
+    orphaning or silently reassigning live sites. Delete or move them first —
+    that has to be a deliberate act, not a side effect.
     """
     tenant = db.get(Tenant, tenant_id)
     if tenant is None:

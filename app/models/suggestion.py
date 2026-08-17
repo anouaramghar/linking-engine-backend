@@ -106,6 +106,9 @@ class Suggestion(Base):
         server_default=text("gen_random_uuid()::text"),
     )
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
+    generation_job_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_runs.id", ondelete="SET NULL"), index=True
+    )
     source_article_id: Mapped[int] = mapped_column(
         ForeignKey("articles.id", ondelete="CASCADE"), index=True
     )
@@ -170,6 +173,25 @@ class Suggestion(Base):
     publication_plan_id: Mapped[int | None] = mapped_column(
         ForeignKey("publication_plans.id", ondelete="SET NULL"), index=True
     )
+    # First and most recent times this suggestion was rendered in a reviewer
+    # surface.  ``shown_at`` is deliberately separate from ``reviewed_at``:
+    # an unseen row is not a rejection, and the distinction is part of the
+    # training-data contract.
+    shown_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_shown_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exposure_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Current decision metadata is convenient for queue exports and metrics;
+    # the append-only SuggestionEvent rows remain the historical source of
+    # truth when a reviewer undoes and revisits a decision.
+    reviewer_id: Mapped[str | None] = mapped_column(String(255))
+    rejection_reason: Mapped[str | None] = mapped_column(String(40))
+    # These are generation-time facts, never recomputed from the current graph.
+    # The Slice 4 migration also protects them, and score_components, with a
+    # database trigger so an operational update cannot rewrite ranking evidence.
+    retrieval_version: Mapped[str | None] = mapped_column(String(80))
+    ranking_version: Mapped[str | None] = mapped_column(String(120))
+    final_rank: Mapped[int | None] = mapped_column(Integer)
+    feature_snapshot: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -234,9 +256,7 @@ class BulkReviewOperation(Base):
     """Durable identity for one server-side bulk rule and its exact undo cohort."""
 
     __tablename__ = "bulk_review_operations"
-    __table_args__ = (
-        Index("ix_bulk_review_operations_created_at", "created_at"),
-    )
+    __table_args__ = (Index("ix_bulk_review_operations_created_at", "created_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     actor: Mapped[str] = mapped_column(String(255))
@@ -253,9 +273,7 @@ class BulkReviewOperationItem(Base):
     """One suggestion changed by a bulk rule, stored without sending huge ID lists."""
 
     __tablename__ = "bulk_review_operation_items"
-    __table_args__ = (
-        Index("ix_bulk_review_operation_items_suggestion_id", "suggestion_id"),
-    )
+    __table_args__ = (Index("ix_bulk_review_operation_items_suggestion_id", "suggestion_id"),)
 
     operation_id: Mapped[str] = mapped_column(
         ForeignKey("bulk_review_operations.id", ondelete="CASCADE"), primary_key=True

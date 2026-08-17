@@ -1,4 +1,4 @@
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     environment: str = "development"
+    # Commit this build was made from, set by the image build. Reported with the
+    # evaluation numbers so a figure can be traced back to the code that computed
+    # it. Empty means "this deployment does not record one", which is reported as
+    # unknown rather than guessed.
+    build_commit: str = ""
 
     # Static API key for all non-health endpoints; empty fails closed at the API boundary.
     # When set, this key is a legacy admin principal (all tenants) with a deprecation warning.
@@ -200,10 +205,29 @@ class Settings(BaseSettings):
     crawl_max_article_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
     crawl_max_links_per_article: int = Field(default=1_000, ge=1, le=100_000)
     crawl_max_total_links: int = Field(default=100_000, ge=1, le=1_000_000)
+    # HTML discovery falls back to a small same-origin frontier when a site has
+    # no usable sitemap. The frontier is bounded independently of article and
+    # response-size limits so navigation cannot turn into an unbounded crawl.
+    crawl_bfs_fallback_enabled: bool = True
+    crawl_max_depth: int = Field(default=2, ge=0, le=10)
+    crawl_max_discovered_urls: int = Field(default=20_000, ge=1, le=100_000)
 
     # Analysis bounds are checked before embedding or corpus construction.
     analysis_max_articles_per_site: int = Field(default=10_000, ge=1, le=100_000)
     analysis_max_corpus_articles: int = Field(default=20_000, ge=1, le=200_000)
+
+    # Deterministic graph intelligence. Shadow is the safe default: it records
+    # the proposed graph-aware order beside the frozen BM25-512 order until a
+    # representative evaluation set proves that promotion is worthwhile.
+    graph_algorithm_version: str = Field(default="deterministic_v1", min_length=1, max_length=40)
+    graph_underlinked_max_in_degree: int = Field(default=1, ge=0, le=1_000)
+    graph_hub_min_out_degree: int = Field(default=10, ge=1, le=100_000)
+    graph_saturation_min_in_degree: int = Field(default=10, ge=1, le=100_000)
+    graph_reranking_mode: Literal["off", "shadow", "active"] = "shadow"
+    # A structural opportunity may only move a candidate inside this bounded
+    # relevance margin. It can never compensate for a large topical gap.
+    graph_max_relevance_boost: float = Field(default=0.03, ge=0.0, le=0.10)
+    graph_simulation_target_share_warning: float = Field(default=0.50, gt=0.0, le=1.0)
 
     # External content pool (RSS/Atom and Wikipedia).
     pool_max_articles_per_source: int = Field(default=50, ge=1, le=50)
@@ -228,7 +252,9 @@ class Settings(BaseSettings):
     evaluation_snapshot_interval_seconds: int = Field(default=86400, ge=60)
     evaluation_snapshot_repeat_count: int = Field(default=3650, ge=1)
 
-    # One tenant cannot fill every stage queue while other tenants wait.
+    # A ceiling on concurrent work per key scope. With one scope in use this is
+    # simply a global cap on active jobs, which is the useful reading today; it
+    # is not fair-share scheduling between competing customers.
     max_active_jobs_per_tenant: int = Field(default=100, ge=1, le=10_000)
 
     # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/
@@ -247,6 +273,12 @@ class Settings(BaseSettings):
         key = self.credential_encryption_key
         if self.environment != "development" and (key is None or not key.get_secret_value()):
             raise ValueError("CREDENTIAL_ENCRYPTION_KEY must be set outside development")
+        return self
+
+    @model_validator(mode="after")
+    def require_api_key_pepper_outside_development(self) -> Self:
+        if self.environment != "development" and not self.api_key_pepper.strip():
+            raise ValueError("API_KEY_PEPPER must be set outside development")
         return self
 
     @model_validator(mode="after")

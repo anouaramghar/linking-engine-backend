@@ -62,6 +62,27 @@ class OutboundLink(BaseModel):
     anchor_text: str | None = None
 
 
+@dataclass(frozen=True)
+class DiscoveryObservation:
+    """One bounded discovery decision made by a connector.
+
+    The observation is deliberately connector-neutral. A sitemap, a crawl
+    frontier, and a WordPress page feed can all explain why a URL was accepted
+    or left out without teaching the ingestion service platform-specific rules.
+    """
+
+    url: str
+    state: Literal["accepted", "skipped", "failed"]
+    reason_code: str
+    reason_detail: str | None = None
+    discovered_from: str | None = None
+    depth: int = 0
+    http_status: int | None = None
+    content_type: str | None = None
+    final_url: str | None = None
+    canonical_url: str | None = None
+
+
 class TaxonomyData(BaseModel):
     kind: str  # category | tag
     name: str
@@ -78,6 +99,9 @@ class ArticleData(BaseModel):
     published_at: datetime | None = None
     taxonomies: list[TaxonomyData] = []
     outbound_internal_links: list[OutboundLink] = []  # links to other pages of the same site
+    discovered_from: str | None = None
+    discovery_depth: int = 0
+    canonical_url: str | None = None
 
 
 class SiteMetadata(BaseModel):
@@ -90,6 +114,16 @@ class SiteMetadata(BaseModel):
 class ContentConnector(ABC):
     def __init__(self, site: Site):
         self.site = site
+        self._discovery_observations: list[DiscoveryObservation] = []
+
+    def record_discovery(self, observation: DiscoveryObservation) -> None:
+        """Keep diagnostics until ingestion can attach them to its run."""
+        self._discovery_observations.append(observation)
+
+    def drain_discovery_observations(self) -> list[DiscoveryObservation]:
+        observations = self._discovery_observations
+        self._discovery_observations = []
+        return observations
 
     @abstractmethod
     def fetch_articles(self) -> Iterator[ArticleData]: ...

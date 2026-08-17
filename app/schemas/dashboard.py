@@ -12,6 +12,8 @@ class DashboardUserOut(BaseModel):
     username: str | None
     display_name: str | None
     status: str
+    #: Whether this account may approve, revoke, and promote other accounts.
+    is_admin: bool = False
     requested_at: datetime
     approved_at: datetime | None
     approved_by: str | None

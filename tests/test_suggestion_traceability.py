@@ -88,10 +88,12 @@ def test_review_and_undo_append_actor_attributed_events(client, db, site):
         "to_status": "pending",
     }
     assert history[1]["actor"] == "local-development"
-    assert history[1]["details"] == {
-        "from_status": "pending",
-        "to_status": "approved",
-    }
+    assert history[1]["details"]["from_status"] == "pending"
+    assert history[1]["details"]["to_status"] == "approved"
+    assert history[1]["details"]["reviewer_id"] == "local-development"
+    assert history[1]["details"]["review_kind"] == "individual"
+    assert history[1]["details"]["exposed"] is False
+    assert history[1]["details"]["review_duration_ms"] >= 0
 
 
 def test_worker_owned_transition_is_attributed_and_explained(client, db, site):
@@ -116,9 +118,10 @@ def test_suggestion_event_history_is_immutable_and_scoped(client, db, site):
 
     first_events = client.get(f"/api/v1/suggestions/{first.id}/events").json()
     assert {event["suggestion_id"] for event in first_events} == {first.id}
-    assert db.scalar(
-        select(SuggestionEvent).where(SuggestionEvent.suggestion_id == second.id)
-    ) is not None
+    assert (
+        db.scalar(select(SuggestionEvent).where(SuggestionEvent.suggestion_id == second.id))
+        is not None
+    )
 
     missing = client.get("/api/v1/suggestions/999999999/events")
     assert missing.status_code == 404

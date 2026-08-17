@@ -1,13 +1,16 @@
 """Dashboard operator identity: who may open the UI, and as whom.
 
-Separate from ``api_keys`` on purpose. A key is a service credential scoped to a
-tenant; a dashboard user is a person, admitted once by an admin and thereafter
-holding full access. See ``docs/design/dashboard-authentication.md``.
+Separate from ``api_keys`` on purpose, and the two answer different questions. A
+key is a service credential whose scope bounds what one leak can reach; a
+dashboard user is a person, admitted once by an admin and thereafter holding
+full access to everything. People are not scoped here and are not meant to be --
+"everyone's internal and sees everything". See
+``docs/design/dashboard-authentication.md``.
 """
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -36,6 +39,16 @@ class DashboardUser(Base):
     display_name: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(
         DashboardUserStatus, default="pending", server_default="pending", index=True
+    )
+    #: Whether this person may admit and remove other people.
+    #:
+    #: Approval used to be the only gate, which made every approved account an
+    #: approver. The team lead asked for one privileged group instead: everyone
+    #: approved still sees the whole dashboard, but only an admin may approve,
+    #: revoke, or promote. Deliberately a flag rather than a role table — one
+    #: group is the whole hierarchy that was asked for.
+    is_admin: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
     )
     requested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

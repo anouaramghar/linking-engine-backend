@@ -29,6 +29,9 @@ class PendingPublicationSite(BaseModel):
     #: request and return the same 401. Said here, before the operator spends
     #: that, rather than discovered inside an empty review.
     can_publish: bool = True
+    #: Static HTML sites can export approved artifacts, but never accept a
+    #: LinkMesh write request.
+    can_export: bool = False
 
 
 class PendingPublicationPage(BaseModel):
@@ -41,36 +44,6 @@ class PendingPublicationPage(BaseModel):
     total_approved_plans: int | None = None
 
 
-class PlanLink(BaseModel):
-    """One link inside a prepared plan, exactly as it was rendered."""
-
-    position: int
-    suggestion_id: int
-    target_url: str
-    #: The phrase the link was written on. Displayed when the outcome is
-    #: "inserted"; retained either way because it is part of the hashed artifact.
-    anchor_text: str | None = None
-    outcome: LinkOutcome
-
-
-class PublicationPlanOut(BaseModel):
-    """One persisted, immutable edit an operator may approve.
-
-    The HTML is the whole point: `updated_html` is byte-for-byte what will be
-    sent to WordPress if this plan is approved and the live post still equals
-    `original_html`. Nothing renders it again.
-    """
-
-    id: int
-    status: str
-    plan_hash: str
-    source_article_id: int
-    source_url: str
-    original_html: str
-    updated_html: str
-    links: list[PlanLink]
-
-
 class PublicationPreparationError(BaseModel):
     """A source article deliberately left out of this batch.
 
@@ -80,20 +53,6 @@ class PublicationPreparationError(BaseModel):
     source_article_id: int
     source_url: str
     message: str
-
-
-class PublicationPreparationOut(BaseModel):
-    """What preparation produced, and what it could not.
-
-    `has_more` says more source articles remain unshown. It never means they
-    will be included in the approval the operator is about to give.
-    """
-
-    site_id: int
-    selected_suggestions: int
-    plans: list[PublicationPlanOut]
-    errors: list[PublicationPreparationError]
-    has_more: bool
 
 
 class PublicationPlanHtml(BaseModel):
@@ -135,6 +94,53 @@ class PlanApprovalResult(BaseModel):
     #: Recorded on every approved plan. Echoed back so the dashboard can show
     #: who the engine believes just approved these edits.
     approved_by: str
+
+
+class PublicationPreparationJobLink(BaseModel):
+    """One link inside a prepared plan, exactly as it was rendered."""
+
+    position: int
+    suggestion_id: int
+    target_url: str
+    #: The phrase the link was written on. Displayed when the outcome is
+    #: "inserted"; retained either way because it is part of the hashed artifact.
+    anchor_text: str | None = None
+    outcome: LinkOutcome
+    #: The passage the operator reads instead of raw HTML. Absent when the
+    #: suggestion never carried one.
+    placement_context: str | None = None
+
+
+class PublicationPreparationJobPlan(BaseModel):
+    """One prepared plan, without the two HTML bodies.
+
+    The exact bytes stay behind `GET /publish/{site}/plans/{id}/html`: a batch of
+    ten articles carries megabytes of markup, and a job result is polled every
+    1.5 seconds until it settles.
+    """
+
+    id: int
+    status: str
+    plan_hash: str
+    source_article_id: int
+    source_url: str
+    links: list[PublicationPreparationJobLink]
+
+
+class PublicationPreparationJobResult(BaseModel):
+    """What `prepare_publication_plans` stores in `JobRun.result`.
+
+    The worker used to hand-build anonymous dictionaries here, so a field that
+    drifted from what the dashboard reads was only discovered by an operator
+    looking at a broken review. Constructing this model is the runtime boundary:
+    a malformed result raises in the worker instead of being persisted.
+    """
+
+    site_id: int
+    selected_suggestions: int
+    plans: list[PublicationPreparationJobPlan]
+    errors: list[PublicationPreparationError]
+    has_more: bool
 
 
 class PublicationQueueRequest(BaseModel):

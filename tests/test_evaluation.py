@@ -2,7 +2,13 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from app.models import Article, EvaluationSnapshot, InternalLink, Suggestion
+from app.models import (
+    Article,
+    EvaluationSnapshot,
+    InternalLink,
+    Suggestion,
+    SuggestionEvent,
+)
 from app.services.evaluation_service import capture_daily_evaluation_snapshots
 
 
@@ -324,10 +330,13 @@ def test_drilldown_and_csv_export_respect_filters_and_escape_formulas(client, db
     assert page["total"] == 1
     assert page["items"][0]["id"] == suggestion.id
     assert page["items"][0]["source_title"] == "=DANGEROUS()"
-    assert client.get(
-        "/api/v1/evaluation/suggestions",
-        params={**params, "metric": "rejected"},
-    ).json()["total"] == 0
+    assert (
+        client.get(
+            "/api/v1/evaluation/suggestions",
+            params={**params, "metric": "rejected"},
+        ).json()["total"]
+        == 0
+    )
 
     exported = client.get("/api/v1/evaluation/export.csv", params=params)
     assert exported.status_code == 200
@@ -353,3 +362,91 @@ def test_date_filters_require_timezone_and_chronological_order(client, site):
 
     assert naive.status_code == 422
     assert backwards.status_code == 422
+
+
+def test_failed_publication_drilldown_reports_the_failure_not_the_review(client, db, site):
+    """`reviewed_at` is when an editor approved the row, which is before every
+    attempt that could fail. Reporting it as the failure time puts the failure
+    days ahead of its own cause.
+    """
+    source = _article(db, site, "failure-source")
+    target = _article(db, site, "failure-target")
+    approved_at = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    failed_at = datetime(2026, 8, 5, 17, 30, tzinfo=UTC)
+    suggestion = Suggestion(
+        site_id=site.id,
+        source_article_id=source.id,
+        target_article_id=target.id,
+        method="hybrid_bm25",
+        score=0.8,
+        status="failed",
+        created_at=datetime(2026, 8, 1, tzinfo=UTC),
+        reviewed_at=approved_at,
+    )
+    db.add(suggestion)
+    db.flush()
+    db.add_all(
+        [
+            SuggestionEvent(
+                suggestion_id=suggestion.id,
+                event_type="publish_attempt_failed",
+                actor="system:publication",
+                details={"attempt": 1},
+                created_at=failed_at - timedelta(hours=2),
+            ),
+            SuggestionEvent(
+                suggestion_id=suggestion.id,
+                event_type="failed",
+                actor="publication-worker",
+                details={},
+                created_at=failed_at,
+            ),
+        ]
+    )
+    db.commit()
+
+    page = client.get(
+        "/api/v1/evaluation/suggestions",
+        params={"site_id": site.id, "metric": "publish_failed"},
+    ).json()
+
+    assert page["total"] == 1
+    assert page["items"][0]["occurred_at"].startswith("2026-08-05T17:30")
+
+    exported = client.get("/api/v1/evaluation/export.csv", params={"site_id": site.id})
+    assert "2026-08-05T17:30" in exported.text
+
+
+def test_metrics_declare_what_the_dashboard_is_and_is_not(client, db, site):
+    """Numbers without provenance get quoted as evidence. These say they are not."""
+    source = _article(db, site, "provenance-source")
+    target = _article(db, site, "provenance-target")
+    db.add(
+        Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="hybrid_bm25",
+            score=0.8,
+            status="approved",
+            created_at=datetime(2026, 8, 2, tzinfo=UTC),
+            reviewed_at=datetime(2026, 8, 3, tzinfo=UTC),
+        )
+    )
+    db.commit()
+
+    provenance = client.get("/api/v1/evaluation/metrics", params={"site_id": site.id}).json()[
+        "provenance"
+    ]
+
+    assert provenance["surface"] == "operational_telemetry"
+    assert provenance["supports_ranking_decisions"] is False
+    assert provenance["schema_version"]
+    assert provenance["evidence_cutoff"] is not None
+    assert provenance["sample_state"] == "more_individual_labels_required"
+    assert provenance["individual_labels"] == 1
+    assert provenance["bulk_labels"] == 0
+    assert provenance["individual_label_target"] == 100
+    assert provenance["baseline_site_target"] == 3
+    assert provenance["sites_meeting_label_target"] == 0
+    assert len(provenance["limitations"]) >= 3

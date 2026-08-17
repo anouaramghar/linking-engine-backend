@@ -17,7 +17,7 @@ through a rule that dense retrieval would have applied.
 """
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from sqlalchemy import and_, or_, select, true
@@ -180,6 +180,58 @@ def weighted_reciprocal_rank_fusion(
         article_id
         for article_id, _score in weighted_rrf_scores(dense_ranking, lexical_ranking, limit=limit)
     ]
+
+
+def rank_hybrid_candidates(
+    dense_ids: Sequence[int],
+    lexical_ids: Sequence[int],
+    bm25_scores: Mapping[int, float],
+    semantic_scores: Mapping[int, float],
+    *,
+    limit: int,
+) -> tuple[RankedCandidate, ...]:
+    """Return the production Hybrid order with its complete rank evidence.
+
+    The candidate pools may be larger than the frozen retrieval pools. The
+    bounded slices and the final BM25-first ordering live here so production
+    analysis and offline evaluation cannot silently diverge.
+    """
+
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    dense_pool = list(dense_ids[:DENSE_POOL_SIZE])
+    lexical_pool = list(lexical_ids[:LEXICAL_POOL_SIZE])
+    fused = weighted_rrf_scores(dense_pool, lexical_pool)
+    fusion_scores = dict(fused)
+    fusion_ranks = {target_id: rank for rank, (target_id, _score) in enumerate(fused, start=1)}
+    dense_ranks = {target_id: rank for rank, target_id in enumerate(dense_pool, start=1)}
+    lexical_ranks = {target_id: rank for rank, target_id in enumerate(lexical_pool, start=1)}
+
+    missing_scores = [target_id for target_id in fusion_ranks if target_id not in semantic_scores]
+    if missing_scores:
+        raise ValueError(
+            f"Hybrid ranking is missing semantic scores for target ids {missing_scores[:5]}"
+        )
+    final_ids = sorted(
+        fusion_ranks,
+        key=lambda target_id: (
+            -bm25_scores.get(target_id, 0.0),
+            fusion_ranks[target_id],
+            target_id,
+        ),
+    )[:limit]
+    return tuple(
+        RankedCandidate(
+            target_id=target_id,
+            semantic_score=min(1.0, max(0.0, semantic_scores[target_id])),
+            bm25_score=bm25_scores.get(target_id, 0.0),
+            fusion_rank=fusion_ranks[target_id],
+            fusion_score=fusion_scores[target_id],
+            dense_rank=dense_ranks.get(target_id),
+            lexical_rank=lexical_ranks.get(target_id),
+        )
+        for target_id in final_ids
+    )
 
 
 class HybridRanker:
@@ -390,32 +442,12 @@ class HybridRanker:
             lexical_ids.extend(target_id for target_id in page_ids if target_id in semantic_scores)
         lexical_ids = lexical_ids[:LEXICAL_POOL_SIZE]
 
-        fused = weighted_rrf_scores(dense_ids, lexical_ids)
-        fusion_scores = dict(fused)
-        fusion_ranks = {target_id: rank for rank, (target_id, _score) in enumerate(fused, start=1)}
-        dense_ranks = {target_id: rank for rank, target_id in enumerate(dense_ids, start=1)}
-        lexical_ranks = {target_id: rank for rank, target_id in enumerate(lexical_ids, start=1)}
-
-        # BM25-512 alone decides the final order; the fused rank only breaks ties.
-        final_ids = sorted(
-            fusion_ranks,
-            key=lambda target_id: (
-                -bm25_scores.get(target_id, 0.0),
-                fusion_ranks[target_id],
-                target_id,
-            ),
-        )[:limit]
-        candidates = tuple(
-            RankedCandidate(
-                target_id=target_id,
-                semantic_score=min(1.0, max(0.0, semantic_scores[target_id])),
-                bm25_score=bm25_scores.get(target_id, 0.0),
-                fusion_rank=fusion_ranks[target_id],
-                fusion_score=fusion_scores[target_id],
-                dense_rank=dense_ranks.get(target_id),
-                lexical_rank=lexical_ranks.get(target_id),
-            )
-            for target_id in final_ids
+        candidates = rank_hybrid_candidates(
+            dense_ids,
+            lexical_ids,
+            bm25_scores,
+            semantic_scores,
+            limit=limit,
         )
 
         # The shadow comparison must be against what the baseline path would

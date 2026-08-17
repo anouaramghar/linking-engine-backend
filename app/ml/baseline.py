@@ -95,7 +95,7 @@ WHERE a1.id = :article_id
       WHERE s.source_article_id = a2.id
         AND s.target_article_id = a1.id
         AND s.status IN ('pending', 'approved', 'applying', 'applied'))
-ORDER BY e2.vector <=> e1.vector
+ORDER BY e2.vector <=> e1.vector, a2.id
 LIMIT :k
 """)
 

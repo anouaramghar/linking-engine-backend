@@ -4,15 +4,40 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
-from app.models import IngestionRun, Site
+from app.models import IngestionDiagnostic, IngestionRun, Site
 from app.schemas.job import JobAccepted
-from app.schemas.site import IngestionRunOut
-from app.services.ingestion_service import latest_run
+from app.schemas.ingestion import ArticleImportRequest, ArticleImportResult
+from app.schemas.site import IngestionDiagnosticOut, IngestionRunOut
+from app.services.ingestion_service import import_articles, latest_run
 from app.services.job_service import DuplicateJobError, enqueue_job
 from app.services.pool_source_policy import PoolSourcePolicyError, require_approved_pool_source
 from app.tasks.ingestion import ingest_pool_site, ingest_site
 
 router = APIRouter(prefix="/sites", tags=["ingestion"])
+
+
+@router.post("/{site_id}/articles/import", response_model=ArticleImportResult)
+def import_article_rows(
+    payload: ArticleImportRequest,
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> ArticleImportResult:
+    """Import a bounded normalized/Screaming Frog article export."""
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources use their configured feed connector")
+    try:
+        return ArticleImportResult.model_validate(
+            import_articles(
+                db,
+                site,
+                payload.rows,
+                replace_snapshot=payload.replace_snapshot,
+            )
+        )
+    except RuntimeError as error:
+        if "ingestion already running" in str(error):
+            raise HTTPException(409, str(error)) from error
+        raise
 
 
 @router.post("/{site_id}/ingest", status_code=202, response_model=JobAccepted)
@@ -56,6 +81,31 @@ def list_ingestion_runs(
         select(IngestionRun)
         .where(IngestionRun.site_id == site.id)
         .order_by(IngestionRun.started_at.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+
+@router.get(
+    "/{site_id}/ingestion-runs/{run_id}/diagnostics",
+    response_model=list[IngestionDiagnosticOut],
+)
+def ingestion_diagnostics(
+    run_id: int,
+    site: Site = Depends(require_site_access),
+    limit: int = Query(200, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[IngestionDiagnostic]:
+    run_exists = db.scalar(
+        select(IngestionRun.id).where(IngestionRun.id == run_id, IngestionRun.site_id == site.id)
+    )
+    if run_exists is None:
+        raise HTTPException(404, f"ingestion run {run_id} not found")
+    return db.scalars(
+        select(IngestionDiagnostic)
+        .where(IngestionDiagnostic.ingestion_run_id == run_id)
+        .order_by(IngestionDiagnostic.id)
         .limit(limit)
         .offset(offset)
     ).all()

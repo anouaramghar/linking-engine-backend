@@ -115,6 +115,47 @@ class MetricSummary:
         }
 
 
+@dataclass(frozen=True)
+class RankingComparison:
+    """Paired changes between a candidate ordering and a baseline ordering."""
+
+    k: int
+    queries: int
+    reordered_queries: int
+    top_k_changed_queries: int
+    baseline_relevant_hits_at_k: int
+    candidate_relevant_hits_at_k: int
+    relevant_hit_gain_queries: int
+    relevant_hit_loss_queries: int
+    relevant_hit_unchanged_queries: int
+    ndcg_improved_queries: int
+    ndcg_worsened_queries: int
+    ndcg_unchanged_queries: int
+
+    def to_dict(self) -> dict:
+        return {
+            "k": self.k,
+            "queries": self.queries,
+            "reordered_queries": self.reordered_queries,
+            "reordered_share": self.reordered_queries / self.queries if self.queries else 0.0,
+            "top_k_changed_queries": self.top_k_changed_queries,
+            "top_k_changed_share": (
+                self.top_k_changed_queries / self.queries if self.queries else 0.0
+            ),
+            "baseline_relevant_hits_at_k": self.baseline_relevant_hits_at_k,
+            "candidate_relevant_hits_at_k": self.candidate_relevant_hits_at_k,
+            "relevant_hit_delta": (
+                self.candidate_relevant_hits_at_k - self.baseline_relevant_hits_at_k
+            ),
+            "relevant_hit_gain_queries": self.relevant_hit_gain_queries,
+            "relevant_hit_loss_queries": self.relevant_hit_loss_queries,
+            "relevant_hit_unchanged_queries": self.relevant_hit_unchanged_queries,
+            "ndcg_improved_queries": self.ndcg_improved_queries,
+            "ndcg_worsened_queries": self.ndcg_worsened_queries,
+            "ndcg_unchanged_queries": self.ndcg_unchanged_queries,
+        }
+
+
 def _mean_ci95(values: Sequence[float]) -> tuple[float, float]:
     """Normal-approximation interval for the mean. Deterministic, so runs compare."""
     if len(values) < 2:
@@ -187,3 +228,82 @@ def evaluate_rankings(
         )
     scores.sort(key=lambda score: score.source_article_id)
     return summarize(scores, k=k, skipped_without_relevant=skipped)
+
+
+def compare_rankings(
+    candidate_rankings: Mapping[int, Sequence[int]],
+    baseline_rankings: Mapping[int, Sequence[int]],
+    relevant_by_source: Mapping[int, Collection[int]],
+    *,
+    k: int,
+) -> RankingComparison:
+    """Measure paired ordering and hit changes against one fixed baseline.
+
+    Queries without a relevant target are excluded, matching ``evaluate_rankings``.
+    A missing ranking is still scored as an empty ordering, so a candidate method
+    cannot hide a failed query by omitting it from its output.
+    """
+
+    if k < 1:
+        raise ValueError(f"k must be at least 1, got {k}")
+
+    reordered = 0
+    top_k_changed = 0
+    baseline_hits = 0
+    candidate_hits = 0
+    hit_gains = 0
+    hit_losses = 0
+    hit_unchanged = 0
+    ndcg_improved = 0
+    ndcg_worsened = 0
+    ndcg_unchanged = 0
+    queries = 0
+
+    for source_article_id, relevant in relevant_by_source.items():
+        if not relevant:
+            continue
+        queries += 1
+        baseline = baseline_rankings.get(source_article_id, ())
+        candidate = candidate_rankings.get(source_article_id, ())
+        _validate(baseline, relevant, k)
+        _validate(candidate, relevant, k)
+
+        if list(candidate) != list(baseline):
+            reordered += 1
+        if set(candidate[:k]) != set(baseline[:k]):
+            top_k_changed += 1
+
+        baseline_query_hits = sum(article_id in relevant for article_id in baseline[:k])
+        candidate_query_hits = sum(article_id in relevant for article_id in candidate[:k])
+        baseline_hits += baseline_query_hits
+        candidate_hits += candidate_query_hits
+        if candidate_query_hits > baseline_query_hits:
+            hit_gains += 1
+        elif candidate_query_hits < baseline_query_hits:
+            hit_losses += 1
+        else:
+            hit_unchanged += 1
+
+        baseline_ndcg = ndcg_at_k(baseline, relevant, k)
+        candidate_ndcg = ndcg_at_k(candidate, relevant, k)
+        if candidate_ndcg > baseline_ndcg:
+            ndcg_improved += 1
+        elif candidate_ndcg < baseline_ndcg:
+            ndcg_worsened += 1
+        else:
+            ndcg_unchanged += 1
+
+    return RankingComparison(
+        k=k,
+        queries=queries,
+        reordered_queries=reordered,
+        top_k_changed_queries=top_k_changed,
+        baseline_relevant_hits_at_k=baseline_hits,
+        candidate_relevant_hits_at_k=candidate_hits,
+        relevant_hit_gain_queries=hit_gains,
+        relevant_hit_loss_queries=hit_losses,
+        relevant_hit_unchanged_queries=hit_unchanged,
+        ndcg_improved_queries=ndcg_improved,
+        ndcg_worsened_queries=ndcg_worsened,
+        ndcg_unchanged_queries=ndcg_unchanged,
+    )

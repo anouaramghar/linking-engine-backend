@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from datetime import UTC, datetime
-from time import monotonic, sleep
+from time import monotonic
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -9,6 +10,7 @@ from rq.exceptions import NoSuchJobError
 from rq.job import Job
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_audit_actor, get_db, require_api_key
 from app.db import SessionLocal
@@ -28,6 +30,26 @@ from app.tasks.queues import redis_conn
 router = APIRouter(prefix="/pipelines", tags=["pipelines"])
 logger = logging.getLogger(__name__)
 TERMINAL_BATCH_STATUSES = {"succeeded", "failed", "partial_failed", "cancelled"}
+#: How long a stream waits before it reads the batch again. It starts fast so a
+#: click feels answered, and slows down while nothing changes.
+MIN_STREAM_INTERVAL = 1.0
+MAX_STREAM_INTERVAL = 5.0
+
+
+def _next_stream_interval(interval: float, changed: bool) -> float:
+    """Poll fast while a batch is moving, slowly while it is not.
+
+    Every snapshot is a database round trip and a worker thread, and both are
+    shared with every other request in the process — so a batch that ingests for
+    twenty minutes must not cost one query per second per open tab for all of
+    them. The cost of the backoff is bounded and paid once: the first change
+    after a quiet spell is seen up to `MAX_STREAM_INTERVAL` late, and because any
+    change resets the stream to its fastest interval, a stage that is actually
+    moving is then reported within a second.
+    """
+    if changed:
+        return MIN_STREAM_INTERVAL
+    return min(interval * 2, MAX_STREAM_INTERVAL)
 
 
 def _batch_out(db: Session, batch: PipelineBatch) -> PipelineBatchOut:
@@ -47,6 +69,42 @@ def _batch_out(db: Session, batch: PipelineBatch) -> PipelineBatchOut:
         finished_at=batch.finished_at,
         sites=[PipelineSiteRunOut.model_validate(item) for item in items],
     )
+
+
+def _pipeline_snapshot(batch_id: int) -> tuple[str | None, bool]:
+    """Read one stream snapshot in a short-lived worker-thread session."""
+    with SessionLocal() as stream_db:
+        batch = stream_db.get(PipelineBatch, batch_id)
+        if batch is None:
+            return None, True
+        return (
+            _batch_out(stream_db, batch).model_dump_json(),
+            batch.status in TERMINAL_BATCH_STATUSES,
+        )
+
+
+def _authorized_batch(db: Session, principal: Principal, batch_id: int) -> PipelineBatch:
+    """Load a batch the caller is allowed to act on, or raise 404/403.
+
+    A batch carries no scope of its own: the sites it runs are its only
+    ownership evidence, so every one of them must be in scope. Reading, streaming
+    and cancelling all go through here, because a caller who may not see a batch
+    must not be able to stop it either.
+    """
+    batch = db.get(PipelineBatch, batch_id)
+    if batch is None:
+        raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    site_ids = list(
+        db.scalars(select(PipelineSiteRun.site_id).where(PipelineSiteRun.batch_id == batch.id))
+    )
+    if not site_ids and not principal.is_admin:
+        # Deleting a site cascades its runs away, which can empty a batch that
+        # still exists. Hiding it from a scoped key is right — there is nothing left
+        # to prove ownership with — but an admin should still see the record.
+        raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    for site_id in site_ids:
+        authorize_site(db, principal, site_id)
+    return batch
 
 
 def _enqueue_pipeline_stage(
@@ -135,41 +193,37 @@ def get_pipeline_batch(
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> PipelineBatchOut:
-    batch = db.get(PipelineBatch, batch_id)
-    if batch is None:
-        raise HTTPException(404, f"pipeline batch {batch_id} not found")
-    items = list(db.scalars(select(PipelineSiteRun).where(PipelineSiteRun.batch_id == batch.id)))
-    if not items and not principal.is_admin:
-        # Deleting a site cascades its runs away, which can empty a batch that
-        # still exists. Hiding it from tenants is right — there is nothing left
-        # to prove ownership with — but an admin should still see the record.
-        raise HTTPException(404, f"pipeline batch {batch_id} not found")
-    for item in items:
-        authorize_site(db, principal, item.site_id)
-    return _batch_out(db, batch)
+    return _batch_out(db, _authorized_batch(db, principal, batch_id))
 
 
 @router.get("/batches/{batch_id}/events")
-def stream_pipeline_batch(batch_id: int) -> StreamingResponse:
-    # Do not hold the request dependency's database session for the lifetime of
-    # a potentially long stream. Each snapshot gets a short read-only session.
-    with SessionLocal() as initial_db:
-        if initial_db.get(PipelineBatch, batch_id) is None:
-            raise HTTPException(404, f"pipeline batch {batch_id} not found")
+def stream_pipeline_batch(
+    batch_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    # Authorized once, at connect time, through the same dependency as every
+    # other route here. The snapshots below carry site ids, job state and error
+    # text, so a caller who may not read this batch must not reach them.
+    _authorized_batch(db, principal, batch_id)
+    # Then hand the connection back before the stream starts. A dependency's
+    # session is only released once the response completes, which for a stream
+    # is however long the batch runs; each snapshot opens its own short
+    # read-only session instead.
+    db.close()
 
-    def events():
+    async def events():
         previous = None
         last_sent = monotonic()
+        interval = MIN_STREAM_INTERVAL
         while True:
-            with SessionLocal() as stream_db:
-                batch = stream_db.get(PipelineBatch, batch_id)
-                if batch is None:
-                    yield 'event: error\ndata: {"detail":"batch deleted"}\n\n'
-                    return
-                payload = _batch_out(stream_db, batch).model_dump_json()
-                terminal = batch.status in TERMINAL_BATCH_STATUSES
+            payload, terminal = await run_in_threadpool(_pipeline_snapshot, batch_id)
+            if payload is None:
+                yield 'event: error\ndata: {"detail":"batch deleted"}\n\n'
+                return
             now = monotonic()
-            if payload != previous:
+            changed = payload != previous
+            if changed:
                 yield f"event: batch\ndata: {payload}\n\n"
                 previous = payload
                 last_sent = now
@@ -179,7 +233,8 @@ def stream_pipeline_batch(batch_id: int) -> StreamingResponse:
             if terminal:
                 yield "event: done\ndata: {}\n\n"
                 return
-            sleep(1)
+            interval = _next_stream_interval(interval, changed)
+            await asyncio.sleep(interval)
 
     return StreamingResponse(
         events(),
@@ -214,12 +269,12 @@ def _stop_queue_job(db: Session, job_run_id: int | None, reason: str) -> None:
 @router.post("/batches/{batch_id}/cancel", response_model=PipelineBatchOut)
 def cancel_pipeline_batch(
     batch_id: int,
+    principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
     actor: str = Depends(get_audit_actor),
 ) -> PipelineBatchOut:
-    batch = db.scalar(
-        select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update()
-    )
+    _authorized_batch(db, principal, batch_id)
+    batch = db.scalar(select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update())
     if batch is None:
         raise HTTPException(404, f"pipeline batch {batch_id} not found")
     if batch.status in {"succeeded", "failed", "partial_failed"}:
@@ -230,9 +285,7 @@ def cancel_pipeline_batch(
     reason = f"Cancelled by {actor}"
     items = list(
         db.scalars(
-            select(PipelineSiteRun)
-            .where(PipelineSiteRun.batch_id == batch_id)
-            .with_for_update()
+            select(PipelineSiteRun).where(PipelineSiteRun.batch_id == batch_id).with_for_update()
         )
     )
     now = datetime.now(UTC)
@@ -263,10 +316,12 @@ def retry_pipeline_site(
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> PipelineBatchOut:
-    authorize_site(db, principal, site_id)
-    batch = db.get(PipelineBatch, batch_id)
-    if batch is None:
-        raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    # The whole batch, not just the site being retried. This route answers with
+    # _batch_out, which carries every run in the batch, so authorizing one site
+    # would hand a caller the site ids, statuses and error text of the others.
+    # An admin may build a batch that spans scopes, which is exactly when that
+    # matters.
+    batch = _authorized_batch(db, principal, batch_id)
     item = db.scalar(
         select(PipelineSiteRun).where(
             PipelineSiteRun.batch_id == batch_id,

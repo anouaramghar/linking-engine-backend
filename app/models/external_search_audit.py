@@ -34,9 +34,7 @@ class ExternalSearchAuditEvent(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    site_id: Mapped[int] = mapped_column(
-        ForeignKey("sites.id", ondelete="CASCADE"), index=True
-    )
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id", ondelete="CASCADE"), index=True)
     source_article_id: Mapped[int] = mapped_column(
         ForeignKey("articles.id", ondelete="CASCADE"), index=True
     )
@@ -52,9 +50,5 @@ class ExternalSearchAuditEvent(Base):
     candidate_url: Mapped[str | None] = mapped_column(String(2048))
     provider_score: Mapped[float | None] = mapped_column(Float)
     decision: Mapped[str] = mapped_column(String(30))
-    details: Mapped[dict] = mapped_column(
-        JSONB, default=dict, server_default=text("'{}'::jsonb")
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    details: Mapped[dict] = mapped_column(JSONB, default=dict, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

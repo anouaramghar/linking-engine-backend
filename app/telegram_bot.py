@@ -97,7 +97,13 @@ def handle_update(db, update: dict) -> list[Reply]:
     )
     db.commit()
     if user.status == "approved":
-        assert code is not None
+        if code is None:
+            # `create_login_code` withholds a code only for an account that is
+            # not approved, so this contradicts the branch. It is a raise rather
+            # than an assertion because `python -O` strips assertions, and a
+            # stripped one here would send the operator the text "None" as their
+            # login code.
+            raise RuntimeError("approved account received no login code")
         return [Reply(chat_id, LOGIN_CODE.format(code=code))]
     if user.status == "revoked":
         return [Reply(chat_id, REVOKED)]
@@ -107,7 +113,7 @@ def handle_update(db, update: dict) -> list[Reply]:
     # `notified_at` column; add it if the repeats ever become noise.
     notice = NEW_REQUEST.format(who=dashboard_auth.describe_user(user))
     return [Reply(chat_id, PENDING)] + [
-        Reply(approver_id, notice) for approver_id in dashboard_auth.approved_telegram_ids(db)
+        Reply(approver_id, notice) for approver_id in dashboard_auth.admin_telegram_ids(db)
     ]
 
 

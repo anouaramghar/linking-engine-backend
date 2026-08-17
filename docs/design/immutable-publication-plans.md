@@ -49,15 +49,19 @@ snapshot per post; terminal rows accumulate as history.
 ## The three steps
 
 ```text
-POST /publish/{id}/plans/prepare   read live posts, render, store, show
-POST /publish/{id}/plans/approve   a named human binds themselves to hashes
-POST /publish/{id}                 queue named approved artifacts, nothing else
+POST /publish/{id}/plans/prepare-async  queue the live read, render and store
+POST /publish/{id}/plans/approve        a named human binds themselves to hashes
+POST /publish/{id}                      queue named approved artifacts, nothing else
 ```
+
+Preparation has no synchronous route. It is live work on the customer's site and a
+paid model call, so it is always a durable job owned by a named operator, and its
+result is read from that job.
 
 **Preparation** is where every decision now happens: reciprocal suppression,
 anchor arbitration, ordering, the last placement generation, one WordPress GET
 per source article, and the rendering. It is allowed to spend money and to read
-the customer's site. It writes nothing back to WordPress, approves nothing, and
+the managed site. It writes nothing back to WordPress, approves nothing, and
 changes no suggestion's review status. An unreachable source yields an error and
 no plan, so a dead post cannot ride along in someone else's approval.
 

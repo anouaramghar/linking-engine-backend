@@ -69,9 +69,7 @@ def upgrade() -> None:
         sa.column("slug", sa.String),
         sa.column("name", sa.String),
     )
-    op.execute(
-        tenants.insert().values(slug=DEFAULT_TENANT_SLUG, name=DEFAULT_TENANT_NAME)
-    )
+    op.execute(tenants.insert().values(slug=DEFAULT_TENANT_SLUG, name=DEFAULT_TENANT_NAME))
 
     op.add_column("sites", sa.Column("tenant_id", sa.Integer(), nullable=True))
     op.execute(

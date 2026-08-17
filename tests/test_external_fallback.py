@@ -6,7 +6,14 @@ from sqlalchemy import select
 from app.config import settings
 from app.domain_policy import domain_from_url
 from app.ml.external.base import ExternalSearchResponse, ExternalSearchResult
-from app.models import Article, Embedding, ExternalSearchAuditEvent, Suggestion, SuggestionEvent
+from app.models import (
+    Article,
+    Embedding,
+    ExternalLinkPolicy,
+    ExternalSearchAuditEvent,
+    Suggestion,
+    SuggestionEvent,
+)
 from app.models.article import EMBEDDING_DIM
 from app.services.external_suggestion_service import fill_external_suggestion_gap
 
@@ -59,6 +66,10 @@ class FakeProvider:
 
 def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> None:
     source = _source(db, site)
+    # External discovery is a separately enabled capability. The normal v2
+    # default is off, so this test opts into the provider path explicitly.
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
+    db.commit()
     provider = FakeProvider(
         ExternalSearchResponse(
             provider="tavily",
@@ -174,3 +185,45 @@ def test_zero_gap_never_calls_provider(db, site) -> None:
 
     assert provider.calls == []
     assert outcome.searched == 0
+
+
+def test_disabled_external_links_never_reach_the_provider(db, site) -> None:
+    """The refusal has to happen before the request, not after the results.
+
+    A search is billed and it sends this article's title to a third party. Both
+    happen the moment the request leaves, so rejecting every candidate on the
+    way back undoes neither: a site with external links switched off has to
+    produce no outbound request at all.
+    """
+    source = _source(db, site)
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=False))
+    db.commit()
+    provider = FakeProvider(
+        ExternalSearchResponse(provider="tavily", query=source.title, results=())
+    )
+
+    outcome = fill_external_suggestion_gap(
+        db,
+        site=site,
+        article=source,
+        missing_slots=2,
+        model=settings.embedding_model,
+        provider=provider,
+    )
+    db.commit()
+
+    assert provider.calls == []
+    assert outcome.searched == 0
+    assert outcome.credits_used == 0
+    assert outcome.created == 0
+    assert outcome.filtered["external_links_disabled"] == 1
+    # The refusal is still on the record: an operator asking why no external
+    # suggestions appeared gets an answer without reading the policy table.
+    decisions = list(
+        db.scalars(
+            select(ExternalSearchAuditEvent.decision).where(
+                ExternalSearchAuditEvent.site_id == site.id
+            )
+        )
+    )
+    assert decisions == ["external_links_disabled"]

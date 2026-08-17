@@ -14,9 +14,17 @@ from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
 from app.schemas.suggestion import MAX_BULK_REVIEW
 from app.db import engine
-from app.models import Article, Embedding, IngestionRun, InternalLink, Site, Suggestion
+from app.models import (
+    Article,
+    Embedding,
+    ExternalLinkPolicy,
+    IngestionRun,
+    InternalLink,
+    Site,
+    Suggestion,
+)
 from app.models.article import EMBEDDING_DIM
-from app.services.ingestion_service import _reconcile_snapshot
+from app.services.crawl_snapshot import _reconcile_snapshot
 from app.services.suggestion_service import generate_suggestions
 
 
@@ -92,6 +100,7 @@ def source_with_pool_targets(db):
             pool_source_approved=True,
         )
         db.add(pool)
+        db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
         db.commit()
         pool_ids.append(pool.id)
         targets = _make_articles(db, pool, [_vec(0) for _ in range(target_count)])
