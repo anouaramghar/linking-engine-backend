@@ -33,6 +33,12 @@ _LOW_VALUE_TARGET_SQL = """
   AND (:low_value_url_pattern = '' OR lower(a2.url) !~ :low_value_url_pattern)
 """
 
+_EXTERNAL_POLICY_SQL = """
+  AND (
+      :restrict_target_ids IS FALSE
+      OR a2.id = ANY(CAST(:allowed_target_ids AS integer[])))
+"""
+
 
 def low_value_target_params() -> dict[str, object]:
     """The bound values behind `_LOW_VALUE_TARGET_SQL`.
@@ -71,6 +77,7 @@ WHERE a1.id = :article_id
           AND candidate_site.pool_source_approved IS TRUE
           AND candidate_site.pool_source_quarantined IS FALSE))
   AND a2.is_active IS TRUE
+  {_EXTERNAL_POLICY_SQL}
   AND (1 - (e2.vector <=> e1.vector)) >= :minimum_score
   {_LOW_VALUE_TARGET_SQL}
   AND NOT EXISTS (          -- already linked (editorial filter)
@@ -88,7 +95,7 @@ WHERE a1.id = :article_id
       WHERE s.source_article_id = a2.id
         AND s.target_article_id = a1.id
         AND s.status IN ('pending', 'approved', 'applying', 'applied'))
-ORDER BY e2.vector <=> e1.vector
+ORDER BY e2.vector <=> e1.vector, a2.id
 LIMIT :k
 """)
 
@@ -117,6 +124,7 @@ WHERE a1.id = :article_id
           AND candidate_site.pool_source_approved IS TRUE
           AND candidate_site.pool_source_quarantined IS FALSE))
   AND a2.is_active IS TRUE
+  {_EXTERNAL_POLICY_SQL}
   {_LOW_VALUE_TARGET_SQL}
   AND (                     -- identical inputs are duplicate pages, not link candidates
       e1.content_fingerprint IS NULL
@@ -168,7 +176,21 @@ WHERE e1.article_id = :article_id
 """).bindparams(bindparam("target_ids", expanding=True))
 
 
-def top_candidates(db: Session, article_id: int, model: str, k: int) -> list[tuple[int, float]]:
+def _external_policy_params(allowed_target_ids: Sequence[int] | None) -> dict[str, object]:
+    return {
+        "restrict_target_ids": allowed_target_ids is not None,
+        "allowed_target_ids": list(allowed_target_ids or ()),
+    }
+
+
+def top_candidates(
+    db: Session,
+    article_id: int,
+    model: str,
+    k: int,
+    *,
+    allowed_target_ids: Sequence[int] | None = None,
+) -> list[tuple[int, float]]:
     """The baseline query used by explicit comparisons and fallback."""
     rows = db.execute(
         TOP_K_SQL,
@@ -177,6 +199,7 @@ def top_candidates(db: Session, article_id: int, model: str, k: int) -> list[tup
             "model": model,
             "k": k,
             "minimum_score": settings.suggestion_min_score,
+            **_external_policy_params(allowed_target_ids),
             **low_value_target_params(),
         },
     ).all()
@@ -189,6 +212,8 @@ def eligible_top_candidates(
     model: str,
     k: int,
     duplicate_similarity_threshold: float,
+    *,
+    allowed_target_ids: Sequence[int] | None = None,
 ) -> list[tuple[int, float]]:
     """The Hybrid dense pool: closest targets that pass every Hybrid rule."""
     rows = db.execute(
@@ -199,6 +224,7 @@ def eligible_top_candidates(
             "k": k,
             "duplicate_distance": 1.0 - duplicate_similarity_threshold,
             "minimum_score": settings.suggestion_min_score,
+            **_external_policy_params(allowed_target_ids),
             **low_value_target_params(),
         },
     ).all()
@@ -211,6 +237,8 @@ def eligible_candidate_scores(
     model: str,
     target_ids: Sequence[int],
     duplicate_similarity_threshold: float,
+    *,
+    allowed_target_ids: Sequence[int] | None = None,
 ) -> dict[int, float]:
     """Filter a candidate list to the eligible targets, with each one's cosine score.
 
@@ -228,6 +256,7 @@ def eligible_candidate_scores(
             "target_ids": list(target_ids),
             "duplicate_distance": 1.0 - duplicate_similarity_threshold,
             "minimum_score": settings.suggestion_min_score,
+            **_external_policy_params(allowed_target_ids),
             **low_value_target_params(),
         },
     ).all()

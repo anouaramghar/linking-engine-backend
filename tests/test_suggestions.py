@@ -14,9 +14,17 @@ from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
 from app.schemas.suggestion import MAX_BULK_REVIEW
 from app.db import engine
-from app.models import Article, Embedding, IngestionRun, InternalLink, Site, Suggestion
+from app.models import (
+    Article,
+    Embedding,
+    ExternalLinkPolicy,
+    IngestionRun,
+    InternalLink,
+    Site,
+    Suggestion,
+)
 from app.models.article import EMBEDDING_DIM
-from app.services.ingestion_service import _reconcile_snapshot
+from app.services.crawl_snapshot import _reconcile_snapshot
 from app.services.suggestion_service import generate_suggestions
 
 
@@ -92,6 +100,7 @@ def source_with_pool_targets(db):
             pool_source_approved=True,
         )
         db.add(pool)
+        db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
         db.commit()
         pool_ids.append(pool.id)
         targets = _make_articles(db, pool, [_vec(0) for _ in range(target_count)])
@@ -169,9 +178,7 @@ def test_generation_rejects_pairs_below_the_minimum_score(db, site, monkeypatch)
 
     targets = set(
         db.scalars(
-            select(Suggestion.target_article_id).where(
-                Suggestion.source_article_id == source.id
-            )
+            select(Suggestion.target_article_id).where(Suggestion.source_article_id == source.id)
         )
     )
     assert strong.id in targets
@@ -252,9 +259,7 @@ def test_reanalysis_respects_total_suggestion_cap(db, site):
     assert max(counts.values()) <= settings.hybrid_max_suggestions_per_article
 
 
-def test_rejected_and_applied_suggestions_free_active_quota(
-    db, site, source_with_pool_targets
-):
+def test_rejected_and_applied_suggestions_free_active_quota(db, site, source_with_pool_targets):
     source, _pool, _targets = source_with_pool_targets(
         site, settings.hybrid_max_suggestions_per_article + 3
     )
@@ -496,9 +501,9 @@ def test_review_lifecycle(client, db, site):
     listed = client.get(f"/api/v1/suggestions/{site.id}", params={"status": "approved"}).json()
     assert [s["id"] for s in listed] == [first.id]
 
-    # publication status counts
+    # publication status counts — a selected row is not yet a publishable plan
     status = client.get(f"/api/v1/publish/{site.id}/status").json()
-    assert status == {"applied": 0, "awaiting_publication": 1}
+    assert status == {"applied": 0, "selected_suggestions": 1, "approved_plans": 0}
 
 
 def test_review_can_be_undone(client, db, site):
@@ -606,8 +611,9 @@ def test_bulk_review_round_trips_do_not_scale_with_the_batch(client, db, site):
         event.remove(engine, "before_cursor_execute", record)
 
     assert resp.status_code == 200
-    # One SELECT for which ids exist, one UPDATE ... RETURNING for the reviews.
-    assert len(selects) == 1, f"{len(selects)} SELECTs for {len(ids)} suggestions"
+    # One SELECT for which ids exist, one constant-cost actor label for the
+    # lifecycle trigger, and one UPDATE ... RETURNING for the reviews.
+    assert len(selects) == 2, f"{len(selects)} SELECTs for {len(ids)} suggestions"
     assert len(updates) == 1, f"{len(updates)} UPDATEs for {len(ids)} suggestions"
 
 

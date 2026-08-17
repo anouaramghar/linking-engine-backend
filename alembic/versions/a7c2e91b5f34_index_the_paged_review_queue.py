@@ -18,9 +18,11 @@ depends_on = None
 def _drop_invalid_index(name: str) -> None:
     """Remove a failed concurrent build before retrying this unstamped revision."""
 
-    valid = op.get_bind().execute(
-        sa.text(
-            """
+    valid = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                """
             SELECT idx.indisvalid
             FROM pg_index AS idx
             JOIN pg_class AS relation ON relation.oid = idx.indexrelid
@@ -28,9 +30,11 @@ def _drop_invalid_index(name: str) -> None:
             WHERE relation.relname = :name
               AND namespace.nspname = current_schema()
             """
-        ),
-        {"name": name},
-    ).scalar_one_or_none()
+            ),
+            {"name": name},
+        )
+        .scalar_one_or_none()
+    )
     if valid is False:
         # The autocommit block is required for both DROP/CREATE CONCURRENTLY.
         op.execute(sa.text(f'DROP INDEX CONCURRENTLY IF EXISTS "{name}"'))

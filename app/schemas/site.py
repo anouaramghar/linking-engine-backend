@@ -1,10 +1,11 @@
-from datetime import datetime
+from datetime import UTC, date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.config import settings
 from app.connectors.url_guard import UnsafeURLError, validate_url
+from app.ml.external.cleaning import normalize_external_url
 from app.security.credentials import CredentialEncryptionError, validate_credential_encryption_key
 
 MAX_BULK_SITES = 1000
@@ -17,6 +18,7 @@ class SiteCreate(BaseModel):
     crawl_frequency: Literal["manual", "daily"] | None = None
     wp_username: str | None = Field(default=None, max_length=255)
     wp_app_password: str | None = Field(default=None, max_length=255)
+    domain_registered_at: date | None = None
 
     @model_validator(mode="after")
     def safe_base_url(self) -> "SiteCreate":
@@ -33,6 +35,19 @@ class SiteCreate(BaseModel):
                 raise ValueError(str(error)) from error
         if self.platform != "pool" and self.crawl_frequency not in (None, "manual"):
             raise ValueError("daily crawl frequency is reserved for content-pool sources")
+        if self.platform != "pool" and self.domain_registered_at is not None:
+            raise ValueError("domain registration date is only valid for content-pool sources")
+        if (
+            self.domain_registered_at is not None
+            and self.domain_registered_at > datetime.now(UTC).date()
+        ):
+            raise ValueError("domain registration date cannot be in the future")
+        if self.platform == "pool":
+            # A pool source is external input and may arrive from a copied URL
+            # containing a fragment, tracking parameters, or a default port.
+            # Store one canonical representation so the unique base_url
+            # constraint catches repeated registrations of the same source.
+            self.base_url = normalize_external_url(self.base_url)
         allow = settings.allow_unsafe_crawl_targets
         try:
             validate_url(
@@ -49,6 +64,29 @@ class SiteCreate(BaseModel):
         self.base_url = self.base_url.rstrip("/")
         if self.crawl_frequency is None:
             self.crawl_frequency = "daily" if self.platform == "pool" else "manual"
+        return self
+
+
+class SiteCredentials(BaseModel):
+    """A WordPress account for a site that already exists.
+
+    Separate from `SiteCreate` because rotation is not creation: the base URL,
+    the platform, and the tenant are settled, and only the account may move. An
+    application password that is revoked, or one that was never given, otherwise
+    leaves the site unpublishable with no way back but deleting it.
+    """
+
+    wp_username: str = Field(min_length=1, max_length=255)
+    wp_app_password: str = Field(min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def encryption_configured(self) -> "SiteCredentials":
+        try:
+            # Fail before the request reaches the database, exactly as creation
+            # does: the value is encrypted by the model's database type on write.
+            validate_credential_encryption_key()
+        except CredentialEncryptionError as error:
+            raise ValueError(str(error)) from error
         return self
 
 
@@ -123,30 +161,47 @@ class SiteOut(BaseModel):
     pool_source_quarantine_reason: str | None = None
     pool_source_last_reactivated_at: datetime | None = None
     pool_source_last_reactivated_by: str | None = None
+    domain_registered_at: date | None = None
+    editorial_feedback_enabled: bool = False
+    editorial_min_score_percent: int = 0
+    editorial_feedback_weight: float = 0.20
+    editorial_feedback_min_samples: int = 10
     suggestion_method: Literal["hybrid_bm25"] = "hybrid_bm25"
-    suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool = True
-    suggestion_comparison_enabled: bool = False
     suggestion_slots_available: int = 0
+    #: Whether an account exists that could edit this site's posts. Read from
+    #: the model's property, which tests the username alone — the password is an
+    #: encrypted column, and decrypting every row of a list page to learn a
+    #: boolean would be work for nothing. The two are always written together.
+    has_wordpress_credentials: bool = False
     created_at: datetime
     last_ingestion_status: str | None = None
+    #: Why the last crawl failed, in the crawler's own words. Carried on the
+    #: list row so a failed site can say what went wrong where it is shown,
+    #: instead of sending the operator to the engine logs. Trimmed, because a
+    #: stack-trace-length message on every row is payload nobody reads.
+    last_ingestion_error: str | None = None
     # Last *finished* analysis, so a crawled site reads differently from an
     # analysed one once both jobs have left the active feed.
     last_analysis_status: str | None = None
     last_analysis_at: datetime | None = None
+    last_analysis_error: str | None = None
     article_count: int = 0
     internal_link_count: int = 0
     last_crawl_at: datetime | None = None
 
 
-class SiteSuggestionModeUpdate(BaseModel):
-    suggestion_mode: Literal["standard", "experimental"]
+class EditorialRankingPolicyUpdate(BaseModel):
+    #: Required, not defaulted: switching feedback reranking on is a deliberate
+    #: act while it is unproven, so an omitted field must not turn it on as a
+    #: side effect of editing the thresholds beside it.
+    enabled: bool
+    min_score_percent: int = Field(ge=0, le=100)
+    feedback_weight: float = Field(ge=0.0, le=1.0)
+    min_samples: int = Field(ge=1, le=10_000)
 
 
-class SiteSuggestionModeState(BaseModel):
-    suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool
-    suggestion_comparison_enabled: bool
+class EditorialRankingPolicyOut(EditorialRankingPolicyUpdate):
+    site_id: int
 
 
 class ArticleBrief(BaseModel):
@@ -176,6 +231,29 @@ class IngestionRunOut(BaseModel):
     status: str
     articles_upserted: int
     links_found: int
+    discovered_urls: int
+    accepted_urls: int
+    skipped_urls: int
+    diagnostic_summary: dict
     error: str | None
     started_at: datetime
     finished_at: datetime | None
+
+
+class IngestionDiagnosticOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    site_id: int
+    ingestion_run_id: int
+    url: str
+    state: str
+    reason_code: str
+    reason_detail: str | None
+    discovered_from: str | None
+    depth: int
+    http_status: int | None
+    content_type: str | None
+    final_url: str | None
+    canonical_url: str | None
+    created_at: datetime

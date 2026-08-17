@@ -7,6 +7,7 @@ here is what the engine does with an answer, not that a model produced one.
 """
 
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -83,9 +84,9 @@ def _stub_completion(monkeypatch, answer: dict | Exception, calls: list | None =
 
 
 def _client_returning(payload, status: int = 200) -> httpx.Client:
-    body = payload if isinstance(payload, dict) else {
-        "choices": [{"message": {"content": payload}}]
-    }
+    body = (
+        payload if isinstance(payload, dict) else {"choices": [{"message": {"content": payload}}]}
+    )
     return httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(status, json=body)))
 
 
@@ -132,6 +133,17 @@ def test_client_raises_on_an_error_status(enable_openrouter):
     with _client_returning({"error": {"message": "no credit"}}, status=402) as client:
         with pytest.raises(OpenRouterError, match="402"):
             _complete(client)
+
+
+def test_client_rejects_an_unbounded_response(enable_openrouter):
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"x" * 1_000_001, request=request)
+        )
+    )
+
+    with client, pytest.raises(OpenRouterError, match="decoded-body limit|declares"):
+        _complete(client)
 
 
 def test_client_raises_on_prose_instead_of_json(enable_openrouter):
@@ -228,9 +240,7 @@ def test_the_model_only_sees_the_configured_slice(monkeypatch, enable_openrouter
     assert not placement.found  # the passage is past the cut
 
 
-def test_an_anchor_a_sibling_already_took_is_rejected(
-    monkeypatch, enable_openrouter, suggestion
-):
+def test_an_anchor_a_sibling_already_took_is_rejected(monkeypatch, enable_openrouter, suggestion):
     """Two suggestions on one source cannot both link the same words.
 
     Publication gives the phrase to the first and the loser publishes as the
@@ -414,3 +424,39 @@ def test_the_queue_does_not_carry_placement(monkeypatch, enable_openrouter, clie
 
     assert response.status_code == 200
     assert "placement_context" not in response.json()["items"][0]
+
+
+def test_the_first_stored_placement_wins_a_race(db, suggestion):
+    """A late write must not re-describe an edit somebody has already approved.
+
+    Both callers check for a missing placement before a multi-second model call,
+    so a drawer opened during a preparation pass can finish second. Preparation
+    freezes the edited HTML and its hash from what it generated; letting the
+    loser overwrite the columns would leave an approved edit sitting beside an
+    explanation of a different anchor in a different passage.
+    """
+    first = placement_service.Placement(
+        anchor_text="fewer acids",
+        placement_context=REAL_PASSAGE,
+        llm_model="model-a",
+        generated_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+    second = placement_service.Placement(
+        anchor_text="another phrase",
+        placement_context="a different passage",
+        llm_model="model-b",
+        generated_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+
+    assert placement_service.store(db, suggestion.id, first) is first
+    db.commit()
+    winner = placement_service.store(db, suggestion.id, second)
+    db.commit()
+
+    assert winner.anchor_text == "fewer acids"
+    assert winner.llm_model == "model-a"
+    db.expire_all()
+    stored = db.get(Suggestion, suggestion.id)
+    assert stored.anchor_text == "fewer acids"
+    assert stored.placement_context == REAL_PASSAGE
+    assert stored.llm_model == "model-a"

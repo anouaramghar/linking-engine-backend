@@ -5,10 +5,10 @@ mostly SQL — pgvector distance, the eligibility predicate, partial indexes —
 a stubbed engine would exercise almost none of it.
 
 That makes pointing pytest at the wrong database a data-loss risk rather than an
-inconvenience. Suggestions keep no history rows, so a bulk-review test that
-writes `approved` across a developer's real queue cannot be undone: the previous
-statuses and `reviewed_at` values are simply gone. This has already happened
-once against the `linkmesh` development database.
+inconvenience. Suggestion audit events explain changes but do not make a bulk
+review reversible: a test that writes `approved` across a developer's real queue
+still overwrites live workflow state. This has already happened once against the
+`linkmesh` development database.
 
 So the suite refuses to start unless it has been told, explicitly, which
 database is disposable. Import order is load-bearing: the resolution below
@@ -118,13 +118,14 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 # Only now is importing the application safe: app.db reads settings.database_url at
 # import time, and the assignment above is what that read resolves to.
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import event, select  # noqa: E402
+from sqlalchemy import event, select, text  # noqa: E402
 
 from app.api.deps import require_api_key  # noqa: E402
 from app.config import settings  # noqa: E402
-from app.db import SessionLocal, engine  # noqa: E402
+from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Site, Tenant  # noqa: E402
+from app.services import telegram  # noqa: E402
 from app.services.authorization import Principal, ensure_default_tenant  # noqa: E402
 
 
@@ -174,6 +175,25 @@ def engine_is_bound_to_the_test_database():
     yield
 
 
+@pytest.fixture(scope="session", autouse=True)
+def reset_test_database(engine_is_bound_to_the_test_database):
+    """Start every suite against a clean schema-owned disposable database.
+
+    The database name guard above makes this bounded destructive setup safe. A
+    previous run can leave pool sites, jobs, or suggestions that are not owned
+    by a function fixture; those rows change pagination and quota outcomes even
+    though the current test is correct. Reset only mapped application tables,
+    preserving Alembic's version table so the fixture never becomes a migration
+    substitute.
+    """
+    table_names = [table.name for table in Base.metadata.sorted_tables]
+    if table_names:
+        quoted = ", ".join(f'"{name}"' for name in table_names)
+        with engine.begin() as connection:
+            connection.execute(text(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE"))
+    yield
+
+
 @pytest.fixture(autouse=True)
 def disable_api_key(monkeypatch):
     # Keep unrelated endpoint tests focused on their own behavior while auth
@@ -200,7 +220,7 @@ def disable_api_key(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def offline_publication_defaults(monkeypatch):
-    """Two things a publication run does to the outside world that tests must not.
+    """External calls a test run must not make unless it opts in explicitly.
 
     The inter-article pause exists to be polite to a customer's host; against a
     mock transport it only adds real seconds. Preflight placement generation
@@ -212,6 +232,23 @@ def offline_publication_defaults(monkeypatch):
     """
     monkeypatch.setattr(settings, "publish_request_delay_seconds", 0.0)
     monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
+    monkeypatch.setattr(settings, "tavily_api_key", "")
+
+
+@pytest.fixture(autouse=True)
+def offline_telegram(monkeypatch):
+    """Nothing in the suite may message Telegram for real.
+
+    `.env` carries a live bot token and the login tests set a fake one, so an
+    unpatched `notify` would either spam a real chat or post a bad token at
+    api.telegram.org. Tests that care what was sent take this fixture by name
+    and assert on the list.
+    """
+    sent: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        telegram, "notify", lambda telegram_id, text: sent.append((telegram_id, text))
+    )
+    return sent
 
 
 @pytest.fixture
@@ -228,12 +265,20 @@ def db():
 
 @pytest.fixture
 def site(db):
-    """A throwaway site, cascade-deleted after the test."""
+    """A throwaway site, cascade-deleted after the test.
+
+    It carries a WordPress account, because a site without one cannot be
+    prepared for publication at all and most callers here are exercising what
+    happens *after* that gate. Only the username is set: the password is an
+    encrypted column whose key is installed by an autouse fixture, and
+    `has_wordpress_credentials` — the thing the gate reads — tests the username.
+    """
     tenant = ensure_default_tenant(db)
     site = Site(
         name="test-site",
         base_url=f"https://test-{uuid.uuid4().hex[:8]}.example.com",
         platform="wordpress",
+        wp_username="editor",
         tenant_id=tenant.id,
     )
     db.add(site)

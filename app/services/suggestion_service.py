@@ -13,8 +13,20 @@ from app.db import SessionLocal, engine
 from app.models import Article, Embedding, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
+from app.ml.candidate_ordering import order_candidates
+from app.ml.external.base import ExternalSearchProvider
 from app.ml.hybrid import HybridRanker, RankedCandidate
+from app.services.external_suggestion_service import fill_external_suggestion_gap
 from app.services.job_service import record_progress
+from app.services.external_link_policy import external_target_context
+from app.services.editorial_feedback import (
+    FEEDBACK_CANDIDATE_POOL,
+    load_editorial_feedback,
+)
+from app.services.graph_service import (
+    ensure_graph_snapshot,
+    snapshot_features,
+)
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
@@ -166,20 +178,23 @@ def _validate_embedding_dimension(model: str) -> None:
 
 
 def _ranking_mode(
-    site_id: int,
-    configured_mode: str,
     ranking_mode_override: str | None = None,
 ) -> str:
     if ranking_mode_override is not None:
         if ranking_mode_override not in {"baseline", "shadow", "hybrid"}:
             raise ValueError(f"unsupported ranking mode override: {ranking_mode_override}")
         return ranking_mode_override
-    # Hybrid is the product default. `configured_mode` remains in the signature
-    # for rolling API compatibility; only explicit comparison overrides differ.
     return "hybrid"
 
 
-def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[RankedCandidate]:
+def _baseline_rows(
+    db,
+    article_id: int,
+    model: str,
+    remaining: int,
+    *,
+    allowed_target_ids: set[int] | None = None,
+) -> list[RankedCandidate]:
     """The unchanged cosine path, in the shape the persistence loop expects.
 
     Baseline rows carry no score components: `score` is cosine similarity and
@@ -188,7 +203,13 @@ def _baseline_rows(db, article_id: int, model: str, remaining: int) -> list[Rank
     """
     return [
         RankedCandidate(target_id=target_id, semantic_score=score)
-        for target_id, score in top_candidates(db, article_id, model, remaining)
+        for target_id, score in top_candidates(
+            db,
+            article_id,
+            model,
+            remaining,
+            allowed_target_ids=allowed_target_ids,
+        )
     ]
 
 
@@ -205,8 +226,10 @@ def generate_suggestions(
     site_id: int,
     job_run_id: int | None = None,
     *,
+    article_id: int | None = None,
     ranking_mode_override: str | None = None,
     comparison_only: bool = False,
+    external_provider: ExternalSearchProvider | None = None,
 ) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
@@ -217,17 +240,28 @@ def generate_suggestions(
                 raise ValueError(f"site {site_id} not found")
             if site.platform == "pool":
                 raise ValueError("content-pool sources cannot generate suggestions")
+            allowed_target_ids, external_trust = external_target_context(db, site)
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
+            graph_snapshot, graph_created = ensure_graph_snapshot(db, site_id)
+            # The snapshot is a derived observation of the accepted article/link
+            # state. Persist it before candidate generation so every suggestion
+            # can carry the exact graph version it was ranked against.
+            if graph_created:
+                db.commit()
+                db.refresh(graph_snapshot)
+            else:
+                db.commit()
+            graph_features = snapshot_features(db, graph_snapshot.id)
             pool_site_ids = db.scalars(
-                select(Site.id)
+                select(Article.site_id)
                 .where(
-                    Site.platform == "pool",
-                    Site.pool_source_approved.is_(True),
-                    Site.pool_source_quarantined.is_(False),
+                    Article.id.in_(allowed_target_ids),
+                    Article.site_id != site_id,
                 )
-                .order_by(Site.id)
+                .distinct()
+                .order_by(Article.site_id)
             ).all()
             for pool_site_id in pool_site_ids:
                 # Different customer analyses may share the same pool. Reuse the
@@ -242,10 +276,9 @@ def generate_suggestions(
                         encoded_offset=encoded,
                     )
             ranking_mode = _ranking_mode(
-                site_id,
-                site.suggestion_mode,
                 ranking_mode_override,
             )
+            feedback_profile = load_editorial_feedback(db, site)
             if comparison_only and ranking_mode != "shadow":
                 raise ValueError("comparison-only analysis requires shadow ranking")
             suggestion_cap = settings.hybrid_max_suggestions_per_article
@@ -258,6 +291,7 @@ def generate_suggestions(
                         db,
                         site_id=site_id,
                         model=model,
+                        allowed_target_ids=allowed_target_ids,
                     )
                 except Exception:
                     # A PostgreSQL statement error leaves the transaction aborted.
@@ -272,14 +306,13 @@ def generate_suggestions(
                         site_id,
                     )
 
-            article_ids = db.scalars(
-                select(Article.id)
-                .where(
-                    Article.site_id == site_id,
-                    Article.is_active.is_(True),
-                )
-                .order_by(Article.id)
-            ).all()
+            article_query = select(Article.id).where(
+                Article.site_id == site_id,
+                Article.is_active.is_(True),
+            )
+            if article_id is not None:
+                article_query = article_query.where(Article.id == article_id)
+            article_ids = db.scalars(article_query.order_by(Article.id)).all()
             shadow_source_ids = (
                 _evenly_spaced_ids(article_ids, settings.hybrid_max_sources_per_run)
                 if ranking_mode == "shadow"
@@ -322,6 +355,11 @@ def generate_suggestions(
             shadow_overlap_total = 0.0
             shadow_exact_matches = 0
             hybrid_sources_selected = 0
+            external_searches = 0
+            external_created = 0
+            external_credits_used = 0
+            external_filtered: dict[str, int] = {}
+            graph_reordered_sources = 0
             for article_id in article_ids:
                 if ranking_mode == "hybrid" and site_capacity <= 0:
                     break
@@ -344,12 +382,18 @@ def generate_suggestions(
                     eligible_sources += 1
                 method = "baseline_cosine"
                 candidate_rows: list[RankedCandidate]
+                candidate_pool_limit = (
+                    max(remaining, FEEDBACK_CANDIDATE_POOL)
+                    if feedback_profile is not None and has_capacity and not comparison_only
+                    else remaining
+                )
                 if ranking_mode == "baseline" or (ranking_mode == "shadow" and not shadow_selected):
                     candidate_rows = _baseline_rows(
                         db,
                         article_id,
                         model,
-                        remaining,
+                        candidate_pool_limit,
+                        allowed_target_ids=allowed_target_ids,
                     )
                 elif hybrid_ranker is None:
                     fallback_sources += 1
@@ -358,14 +402,15 @@ def generate_suggestions(
                             db,
                             article_id,
                             model,
-                            remaining,
+                            candidate_pool_limit,
+                            allowed_target_ids=allowed_target_ids,
                         )
                         if has_capacity
                         else []
                     )
                 else:
                     try:
-                        ranking_limit = suggestion_cap if shadow_selected else remaining
+                        ranking_limit = suggestion_cap if shadow_selected else candidate_pool_limit
                         ranking = hybrid_ranker.rank(
                             db,
                             source_id=article_id,
@@ -419,32 +464,79 @@ def generate_suggestions(
                                 db,
                                 article_id,
                                 model,
-                                remaining,
+                                candidate_pool_limit,
+                                allowed_target_ids=allowed_target_ids,
                             )
                             if has_capacity
                             else []
                         )
 
-                if comparison_only:
+                ordered_rows = ()
+                if has_capacity and not comparison_only:
+                    ordering = order_candidates(
+                        candidate_rows,
+                        method=method,
+                        minimum_score_percent=site.editorial_min_score_percent,
+                        remaining=remaining,
+                        graph_features=graph_features,
+                        graph_snapshot=graph_snapshot,
+                        source_article_id=article_id,
+                        graph_mode=settings.graph_reranking_mode,
+                        minimum_relevance=settings.suggestion_min_score,
+                        feedback_profile=feedback_profile,
+                        feedback_weight=site.editorial_feedback_weight,
+                        external_trust=external_trust,
+                    )
+                    ordered_rows = ordering.items
+                    candidate_rows = [item.candidate for item in ordered_rows]
+                    if ordering.graph_reordered:
+                        graph_reordered_sources += 1
+                else:
                     candidate_rows = []
-                for candidate in candidate_rows:
+                for ordered_candidate in ordered_rows:
+                    candidate = ordered_candidate.candidate
                     db.add(
                         Suggestion(
                             site_id=site_id,
                             source_article_id=article_id,
+                            generation_job_run_id=job_run_id,
                             target_article_id=candidate.target_id,
                             method=method,
                             # Cosine similarity for both methods, so one number keeps
                             # one meaning across the mixed queue.
                             score=candidate.semantic_score,
-                            score_components=(
-                                candidate.score_components() if method == "hybrid_bm25" else None
-                            ),
+                            score_components=ordered_candidate.score_components,
+                            retrieval_version=ordered_candidate.retrieval_version,
+                            ranking_version=ordered_candidate.ranking_version,
+                            final_rank=ordered_candidate.final_rank,
+                            feature_snapshot=ordered_candidate.score_components,
                             status="pending",
                         )
                     )
                     created += 1
-                site_capacity -= len(candidate_rows)
+                external_for_source = 0
+                external_missing = remaining - len(candidate_rows)
+                if external_missing > 0 and has_capacity and not comparison_only:
+                    article = db.get(Article, article_id)
+                    if article is None:
+                        raise ValueError(f"source article {article_id} disappeared during analysis")
+                    external_outcome = fill_external_suggestion_gap(
+                        db,
+                        site=site,
+                        article=article,
+                        missing_slots=external_missing,
+                        model=model,
+                        job_run_id=job_run_id,
+                        provider=external_provider,
+                    )
+                    external_searches += external_outcome.searched
+                    external_for_source = external_outcome.created
+                    external_created += external_for_source
+                    external_credits_used += external_outcome.credits_used
+                    created += external_for_source
+                    for reason, count in external_outcome.filtered.items():
+                        external_filtered[reason] = external_filtered.get(reason, 0) + count
+                site_capacity -= len(candidate_rows) + external_for_source
                 record_progress(
                     db,
                     job_run_id,
@@ -452,11 +544,35 @@ def generate_suggestions(
                     created=created,
                     ranking_mode=ranking_mode,
                     hybrid_fallback_sources=fallback_sources,
+                    external_searches=external_searches,
+                    external_suggestions_created=external_created,
+                    external_credits_used=external_credits_used,
+                    external_filtered=external_filtered,
                 )
                 db.commit()
             result = {
                 "articles_encoded": encoded,
                 "suggestions_created": created,
+                "external_searches": external_searches,
+                "external_suggestions_created": external_created,
+                "external_credits_used": external_credits_used,
+                "external_filtered": external_filtered,
+                "external_candidates_eligible": sum(
+                    evaluation.eligible for evaluation in external_trust.values()
+                ),
+                "external_candidates_blocked": sum(
+                    not evaluation.eligible for evaluation in external_trust.values()
+                ),
+                "editorial_feedback_applied": feedback_profile is not None,
+                "editorial_feedback_samples": (
+                    feedback_profile.samples if feedback_profile is not None else 0
+                ),
+                "editorial_min_score_percent": site.editorial_min_score_percent,
+                "graph_snapshot_id": graph_snapshot.id,
+                "graph_version": graph_snapshot.graph_version,
+                "graph_reranking_mode": settings.graph_reranking_mode,
+                "graph_reordered_sources": graph_reordered_sources,
+                "source_article_id": article_id,
             }
             if ranking_mode != "baseline":
                 result.update(

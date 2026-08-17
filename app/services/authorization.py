@@ -1,4 +1,26 @@
-"""Tenant-scoped API authentication and site ownership checks."""
+"""Scoped API authentication and site ownership checks.
+
+**A scope is blast-radius containment, not client isolation.** LinkMesh has no
+clients: every site in the database belongs to the same team, and every person
+who reaches the dashboard sees all of it. The team lead settled this on
+2026-08-06 -- "keep the scoped keys, they're for limiting blast radius if one
+ever leaks, not client isolation, since we don't have clients" -- and the
+mechanism below is kept for exactly that reason.
+
+So the question a scope answers is "if this one key leaks, how much can the
+holder touch?", never "may this customer see that customer's data?". Two
+consequences worth stating, because they are easy to get backwards:
+
+- A cross-scope 403 is a containment failure, not a privacy breach. It is still
+  a defect and still worth fixing, but nobody's data is exposed to a stranger.
+- Nothing here should grow to model customers, billing or per-person
+  permissions. If that is ever wanted it is a new decision, not an extension of
+  this one.
+
+The ``tenant`` name in the table, columns and identifiers below is historical.
+It was not renamed because the rename buys no behaviour and costs a migration;
+read it as "key scope" everywhere it appears.
+"""
 
 from __future__ import annotations
 
@@ -38,8 +60,13 @@ _UNCONFIGURED_PEPPER = "linkmesh-unconfigured-pepper"
 class Principal:
     """Authenticated caller for one request.
 
-    Admin principals may cross tenants. Tenant principals may only touch sites
+    Admin principals may cross scopes. Scoped principals may only touch sites
     whose tenant_id matches. Legacy env and operator keys are always admin.
+
+    Note that the dashboard's own traffic arrives as an admin principal: the
+    proxy attaches one shared service key downstream of a verified session. Every
+    approved operator is therefore unscoped by design, which is what "full access
+    once approved" means. Scopes bound machine credentials, not people.
     """
 
     is_admin: bool
@@ -50,7 +77,11 @@ class Principal:
 
 
 def _pepper() -> bytes:
-    value = settings.api_key_pepper or _UNCONFIGURED_PEPPER
+    value = settings.api_key_pepper.strip()
+    if not value:
+        if settings.environment != "development":
+            raise RuntimeError("API_KEY_PEPPER must be set outside development")
+        value = _UNCONFIGURED_PEPPER
     return value.encode("utf-8")
 
 
@@ -62,7 +93,7 @@ def require_configured_pepper() -> None:
     setting a real pepper later invalidates every existing key at once, with a
     401 and no explanation. Fail at mint time, where the operator can still act.
     """
-    if settings.api_key_pepper:
+    if settings.api_key_pepper.strip():
         return
     if settings.environment == "development":
         logger.warning(
@@ -206,6 +237,11 @@ def authorize_site(db: Session, principal: Principal, site_id: int) -> Site:
         raise HTTPException(status_code=404, detail=f"site {site_id} not found")
     if principal.is_admin:
         return site
+    if site.platform == POOL_PLATFORM:
+        raise HTTPException(
+            status_code=403,
+            detail="content-pool sources are shared infrastructure and require an admin key",
+        )
     if principal.tenant_id is None or site.tenant_id != principal.tenant_id:
         raise HTTPException(status_code=403, detail="access denied for this site")
     return site

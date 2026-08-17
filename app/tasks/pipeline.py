@@ -30,7 +30,7 @@ def _mark_stage_failure(pipeline_site_run_id: int, stage: str, error: Exception)
         db.commit()
 
 
-def _require_pipeline_site(pipeline_site_run_id: int, site_id: int) -> None:
+def _require_pipeline_site(pipeline_site_run_id: int, site_id: int) -> bool:
     with SessionLocal() as db:
         item = db.get(PipelineSiteRun, pipeline_site_run_id)
         if item is None:
@@ -40,6 +40,7 @@ def _require_pipeline_site(pipeline_site_run_id: int, site_id: int) -> None:
                 f"pipeline site run {pipeline_site_run_id} belongs to site "
                 f"{item.site_id}, not site {site_id}"
             )
+        return item.status != "cancelled"
 
 
 def ingest_pipeline_site(
@@ -49,7 +50,8 @@ def ingest_pipeline_site(
 ) -> dict:
     if batch_site_run_id is None:
         raise ValueError("batch_site_run_id is required")
-    _require_pipeline_site(batch_site_run_id, site_id)
+    if not _require_pipeline_site(batch_site_run_id, site_id):
+        return {"cancelled": True}
     with SessionLocal() as db:
         update_pipeline_site(
             db,
@@ -63,6 +65,9 @@ def ingest_pipeline_site(
     except Exception as error:
         _mark_stage_failure(batch_site_run_id, "ingestion", error)
         raise
+
+    if not _require_pipeline_site(batch_site_run_id, site_id):
+        return {**result, "cancelled": True}
 
     try:
         with SessionLocal() as db:
@@ -108,7 +113,8 @@ def analyze_pipeline_site(
 ) -> dict:
     if batch_site_run_id is None:
         raise ValueError("batch_site_run_id is required")
-    _require_pipeline_site(batch_site_run_id, site_id)
+    if not _require_pipeline_site(batch_site_run_id, site_id):
+        return {"cancelled": True}
     with SessionLocal() as db:
         update_pipeline_site(
             db,
@@ -122,6 +128,8 @@ def analyze_pipeline_site(
     except Exception as error:
         _mark_stage_failure(batch_site_run_id, "analysis", error)
         raise
+    if not _require_pipeline_site(batch_site_run_id, site_id):
+        return {**result, "cancelled": True}
     with SessionLocal() as db:
         item = update_pipeline_site(
             db,

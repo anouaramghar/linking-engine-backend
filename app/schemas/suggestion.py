@@ -17,16 +17,67 @@ MAX_BULK_REVIEW = MAX_ENGINE_PAGE_SIZE
 # is a performance bound as much as a validation one.
 MAX_SEARCH_TERM = 200
 
-TargetOrigin = Literal["internal", "content_pool"]
+TargetOrigin = Literal["internal", "content_pool", "web_search"]
+
+RejectionReason = Literal[
+    "not_relevant",
+    "wrong_target",
+    "bad_anchor",
+    "bad_placement",
+    "already_covered",
+    "duplicate",
+    "other",
+]
+
+ExposureSurface = Literal["queue", "preview"]
+
+
+class SuggestionTargetBrief(BaseModel):
+    """A stored article or a direct external-search target."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None
+    title: str
+    url: str
+
+
+class SuggestionEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    suggestion_id: int
+    event_type: str
+    actor: str
+    details: dict
+    created_at: datetime
+
+
+class TraceEventOut(SuggestionEventOut):
+    trace_id: str
+    site_id: int
+    site_name: str
+    source_title: str
+    target_title: str
+    suggestion_status: str
+    publish_error: str | None = None
+
+
+class TraceEventPage(BaseModel):
+    items: list[TraceEventOut]
+    total: int
+    limit: int
+    offset: int
 
 
 class SuggestionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    trace_id: str
     site_id: int
     source_article: ArticleBrief
-    target_article: ArticleBrief
+    target_article: SuggestionTargetBrief
     #: Where the target lives relative to the site being reviewed.
     target_origin: TargetOrigin
     #: The site that owns the target article; useful when the target is external.
@@ -39,11 +90,24 @@ class SuggestionOut(BaseModel):
     #: the recipe names. Null for `baseline_cosine`, whose score already is its
     #: whole explanation.
     score_components: dict | None = None
+    provider: str | None = None
+    provider_request_id: str | None = None
+    provider_score: float | None = None
+    search_query: str | None = None
+    external_snippet: str | None = None
     status: str
     anchor_text: str | None
     publish_outcome: str | None = None
     publish_attempts: int = 0
     publish_error: str | None = None
+    shown_at: datetime | None = None
+    last_shown_at: datetime | None = None
+    exposure_count: int = 0
+    reviewer_id: str | None = None
+    rejection_reason: RejectionReason | None = None
+    retrieval_version: str | None = None
+    ranking_version: str | None = None
+    final_rank: int | None = None
     created_at: datetime
 
 
@@ -78,11 +142,34 @@ BulkRuleStatus = Literal["approved", "rejected"]
 
 class SuggestionReview(BaseModel):
     status: ReviewStatus
+    rejection_reason: RejectionReason | None = None
+
+    @model_validator(mode="after")
+    def reason_only_applies_to_rejection(self) -> "SuggestionReview":
+        if self.rejection_reason is not None and self.status != "rejected":
+            raise ValueError("rejection_reason is only valid when status is rejected")
+        return self
 
 
 class BulkReview(BaseModel):
     suggestion_ids: list[int] = Field(min_length=1, max_length=MAX_BULK_REVIEW)
     status: ReviewStatus
+    rejection_reason: RejectionReason | None = None
+
+    @model_validator(mode="after")
+    def reason_only_applies_to_rejection(self) -> "BulkReview":
+        if self.rejection_reason is not None and self.status != "rejected":
+            raise ValueError("rejection_reason is only valid when status is rejected")
+        return self
+
+
+class SuggestionExposure(BaseModel):
+    suggestion_ids: list[int] = Field(min_length=1, max_length=MAX_BULK_REVIEW)
+    surface: ExposureSurface = "queue"
+
+
+class SuggestionExposureResult(BaseModel):
+    exposed: int
 
 
 class SuggestionCursor(BaseModel):
@@ -138,6 +225,7 @@ class BulkReviewFilter(BaseModel):
     """
 
     status: BulkRuleStatus
+    rejection_reason: RejectionReason | None = None
     # Only reviewable rows can be matched; `applying`/`applied`/`expired` are the
     # worker's and are excluded by the guarded transition regardless.
     match_status: ReviewStatus = "pending"
@@ -166,13 +254,23 @@ class BulkReviewFilter(BaseModel):
             raise ValueError("set site_id, or all_sites=true to review every site at once")
         if self.site_id is not None and self.all_sites:
             raise ValueError("site_id and all_sites=true contradict each other")
+        if self.rejection_reason is not None and self.status != "rejected":
+            raise ValueError("rejection_reason is only valid when status is rejected")
         return self
 
 
 class BulkReviewFilterResult(BaseModel):
-    """Counts for every review, plus ids while an exact undo remains practical."""
+    """Counts for every review and a durable exact-undo operation."""
 
     reviewed: int
     skipped: int
     reviewed_ids: list[int] | None
+    undo_operation_id: str | None
     status: ReviewStatus
+
+
+class BulkReviewUndoResult(BaseModel):
+    restored: int
+    skipped: int
+    status: ReviewStatus
+    already_undone: bool = False

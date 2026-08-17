@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
+    get_audit_actor,
     get_db,
     require_api_key,
     require_operator_identity,
@@ -17,12 +18,18 @@ from app.api.pagination import MAX_PAGE_SIZE
 from app.config import settings
 from app.models import (
     Article,
+    ExternalLinkPolicy,
     IngestionRun,
     InternalLink,
     JobRun,
     PoolSourceAuditEvent,
     Site,
     Suggestion,
+)
+from app.schemas.external_policy import (
+    ExternalLinkPolicyOut,
+    ExternalLinkPolicyUpdate,
+    ExternalSourceEvaluationList,
 )
 from app.services.authorization import (
     Principal,
@@ -34,27 +41,66 @@ from app.services.authorization import (
 from app.schemas.pool_audit import PoolSourceAuditEventOut
 from app.schemas.site import (
     ArticleOut,
+    EditorialRankingPolicyOut,
+    EditorialRankingPolicyUpdate,
     SiteBulkCreated,
     SiteBulkFailure,
     SiteBulkRequest,
     SiteBulkResult,
     SiteCreate,
+    SiteCredentials,
     SiteOut,
-    SiteSuggestionModeState,
-    SiteSuggestionModeUpdate,
+)
+from app.services.external_link_policy import (
+    expire_ineligible_external_suggestions,
+    policy_state,
+    source_evaluations,
 )
 from app.services.ingestion_service import latest_run
+from app.services.pool_source_audit import record_pool_source_audit_event
 from app.services.pool_source_policy import (
     PoolSourcePolicyError,
     expire_pool_target_suggestions,
     require_allowed_pool_domain,
     require_no_pbn_conflict,
 )
-from app.services.pool_source_audit import record_pool_source_audit_event
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
 DUPLICATE_REASON = "a site with this base_url already exists"
+
+#: How much of a failure message travels on a list row. Long enough for the
+#: sentence that names the cause, short enough that 250 failed sites do not
+#: turn one page into a megabyte of tracebacks.
+MAX_ROW_ERROR_CHARS = 300
+
+
+def _row_error(message: str | None) -> str | None:
+    if not message:
+        return None
+    trimmed = " ".join(message.split())
+    if len(trimmed) <= MAX_ROW_ERROR_CHARS:
+        return trimmed
+    return trimmed[: MAX_ROW_ERROR_CHARS - 1].rstrip() + "…"
+
+
+def _managed_site_or_409(site: Site) -> Site:
+    if site.platform == "pool":
+        raise HTTPException(409, "external-link policies belong to managed sites")
+    return site
+
+
+def _external_policy_out(
+    db: Session, site_id: int, *, expired_suggestions: int = 0
+) -> ExternalLinkPolicyOut:
+    state = policy_state(db, site_id)
+    stored = db.get(ExternalLinkPolicy, site_id)
+    return ExternalLinkPolicyOut(
+        **state.as_payload(),
+        updated_by=stored.updated_by if stored is not None else None,
+        updated_at=stored.updated_at if stored is not None else None,
+        expired_suggestions=expired_suggestions,
+    )
 
 
 def _first_error(exc: ValidationError) -> str:
@@ -133,12 +179,29 @@ def _latest_analyses(db: Session, site_ids: list[int]) -> dict[int, JobRun]:
     return {run.site_id: run for run in runs}
 
 
-def _suggestion_mode_state(_site: Site) -> SiteSuggestionModeState:
-    return SiteSuggestionModeState(
-        suggestion_mode="experimental",
-        suggestion_mode_managed=True,
-        suggestion_comparison_enabled=False,
+def _latest_ingestions(db: Session, site_ids: list[int]) -> dict[int, IngestionRun]:
+    """The newest crawl per listed site in one query, not one query per row."""
+    if not site_ids:
+        return {}
+    ranked = (
+        select(
+            IngestionRun.id.label("run_id"),
+            func.row_number()
+            .over(
+                partition_by=IngestionRun.site_id,
+                order_by=(IngestionRun.started_at.desc(), IngestionRun.id.desc()),
+            )
+            .label("position"),
+        )
+        .where(IngestionRun.site_id.in_(site_ids))
+        .subquery()
     )
+    runs = db.scalars(
+        select(IngestionRun)
+        .join(ranked, ranked.c.run_id == IngestionRun.id)
+        .where(ranked.c.position == 1)
+    ).all()
+    return {run.site_id: run for run in runs}
 
 
 def _site_out(
@@ -151,10 +214,6 @@ def _site_out(
     analysis: JobRun | None = None,
 ) -> SiteOut:
     item = SiteOut.model_validate(site)
-    mode = _suggestion_mode_state(site)
-    item.suggestion_mode = mode.suggestion_mode
-    item.suggestion_mode_managed = mode.suggestion_mode_managed
-    item.suggestion_comparison_enabled = mode.suggestion_comparison_enabled
     site_capacity = min(
         article_count * settings.hybrid_max_suggestions_per_article,
         settings.hybrid_max_active_suggestions_per_site,
@@ -167,9 +226,15 @@ def _site_out(
     if run is not None:
         item.last_ingestion_status = run.status
         item.last_crawl_at = run.finished_at or run.started_at
+        # Only for a failure: a message left on a succeeded run would read as a
+        # problem the site does not have.
+        if run.status == "failed":
+            item.last_ingestion_error = _row_error(run.error)
     if analysis is not None:
         item.last_analysis_status = analysis.status
         item.last_analysis_at = analysis.finished_at or analysis.enqueued_at
+        if analysis.status == "failed":
+            item.last_analysis_error = _row_error(analysis.error)
     return item
 
 
@@ -292,6 +357,7 @@ def bulk_create_sites(
 def list_sites(
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
+    search: str | None = Query(None, min_length=1, max_length=255),
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> list[SiteOut]:
@@ -299,25 +365,107 @@ def list_sites(
     readable = readable_site_filter(principal)
     if readable is not None:
         query = query.where(readable)
+    if search:
+        pattern = f"%{search.strip()}%"
+        query = query.where(
+            Site.name.ilike(pattern) | Site.base_url.ilike(pattern) | Site.platform.ilike(pattern)
+        )
     sites = db.scalars(query.order_by(Site.id).limit(limit).offset(offset)).all()
     article_counts, internal_link_counts, active_suggestion_counts = _site_counts(
         db, [site.id for site in sites]
     )
     analyses = _latest_analyses(db, [site.id for site in sites])
+    ingestions = _latest_ingestions(db, [site.id for site in sites])
     out = []
     for site in sites:
-        run = latest_run(db, site.id)
         out.append(
             _site_out(
                 site,
                 article_count=article_counts.get(site.id, 0),
                 internal_link_count=internal_link_counts.get(site.id, 0),
                 active_suggestion_count=active_suggestion_counts.get(site.id, 0),
-                run=run,
+                run=ingestions.get(site.id),
                 analysis=analyses.get(site.id),
             )
         )
     return out
+
+
+@router.get("/{site_id}/external-link-policy", response_model=ExternalLinkPolicyOut)
+def get_external_link_policy(
+    site: Site = Depends(require_site_read), db: Session = Depends(get_db)
+) -> ExternalLinkPolicyOut:
+    _managed_site_or_409(site)
+    return _external_policy_out(db, site.id)
+
+
+@router.put("/{site_id}/external-link-policy", response_model=ExternalLinkPolicyOut)
+def update_external_link_policy(
+    payload: ExternalLinkPolicyUpdate,
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+    operator_id: str = Depends(get_audit_actor),
+) -> ExternalLinkPolicyOut:
+    _managed_site_or_409(site)
+    policy = db.get(ExternalLinkPolicy, site.id)
+    if policy is None:
+        policy = ExternalLinkPolicy(site_id=site.id)
+        db.add(policy)
+    # The policy surface accepts partial updates in practice.  Do not turn an
+    # omitted field into its schema default: an existing explicitly enabled
+    # policy must remain enabled when an operator changes only a domain rule.
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(policy, field, value)
+    policy.updated_by = operator_id
+    db.flush()
+    expired = expire_ineligible_external_suggestions(db, site, actor=operator_id)
+    db.commit()
+    db.refresh(policy)
+    return _external_policy_out(db, site.id, expired_suggestions=expired)
+
+
+@router.get(
+    "/{site_id}/external-link-policy/sources",
+    response_model=ExternalSourceEvaluationList,
+)
+def list_external_source_evaluations(
+    site: Site = Depends(require_site_read), db: Session = Depends(get_db)
+) -> ExternalSourceEvaluationList:
+    _managed_site_or_409(site)
+    return ExternalSourceEvaluationList(items=source_evaluations(db, site))
+
+
+def _editorial_policy_out(site: Site) -> EditorialRankingPolicyOut:
+    return EditorialRankingPolicyOut(
+        site_id=site.id,
+        enabled=site.editorial_feedback_enabled,
+        min_score_percent=site.editorial_min_score_percent,
+        feedback_weight=site.editorial_feedback_weight,
+        min_samples=site.editorial_feedback_min_samples,
+    )
+
+
+@router.get("/{site_id}/editorial-ranking-policy", response_model=EditorialRankingPolicyOut)
+def get_editorial_ranking_policy(
+    site: Site = Depends(require_site_read),
+) -> EditorialRankingPolicyOut:
+    return _editorial_policy_out(_managed_site_or_409(site))
+
+
+@router.put("/{site_id}/editorial-ranking-policy", response_model=EditorialRankingPolicyOut)
+def update_editorial_ranking_policy(
+    payload: EditorialRankingPolicyUpdate,
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> EditorialRankingPolicyOut:
+    _managed_site_or_409(site)
+    site.editorial_feedback_enabled = payload.enabled
+    site.editorial_min_score_percent = payload.min_score_percent
+    site.editorial_feedback_weight = payload.feedback_weight
+    site.editorial_feedback_min_samples = payload.min_samples
+    db.commit()
+    db.refresh(site)
+    return _editorial_policy_out(site)
 
 
 def _fresh_site_out(db: Session, site: Site) -> SiteOut:
@@ -435,15 +583,48 @@ def reactivate_pool_source(
     return _fresh_site_out(db, site)
 
 
-@router.put("/{site_id}/suggestion-mode", response_model=SiteSuggestionModeState)
-def update_suggestion_mode(
-    payload: SiteSuggestionModeUpdate,
+@router.put("/{site_id}/credentials", response_model=SiteOut)
+def set_wordpress_credentials(
+    payload: SiteCredentials,
     site: Site = Depends(require_site_access),
-) -> SiteSuggestionModeState:
-    raise HTTPException(
-        409,
-        "Hybrid/BM25 is the global suggestion method and cannot be changed per site",
-    )
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    """Give an existing site a WordPress account, or replace the one it has.
+
+    Creation is the only other place a credential can be set, so before this an
+    application password that was revoked, rotated, or simply never supplied
+    left the site permanently unable to publish: the only route back was
+    deleting the site and losing its articles, links, and review history.
+
+    Replacing is deliberately the same call as setting. WordPress hashes an
+    application password, so the old value cannot be read back and compared, and
+    a "change" that had to prove the previous value would be unusable exactly
+    when it is needed — after the old one stopped working.
+    """
+    if site.platform != "wordpress":
+        raise HTTPException(409, "WordPress credentials are only valid for WordPress sites")
+    site.wp_username = payload.wp_username
+    site.wp_app_password = payload.wp_app_password
+    db.commit()
+    db.refresh(site)
+    return _fresh_site_out(db, site)
+
+
+@router.delete("/{site_id}/credentials", response_model=SiteOut)
+def clear_wordpress_credentials(
+    site: Site = Depends(require_site_access),
+    db: Session = Depends(get_db),
+) -> SiteOut:
+    """Detach the account without deleting the site.
+
+    The site keeps crawling public pages; it stops being publishable, and the
+    queue says so before anyone prepares edits for it.
+    """
+    site.wp_username = None
+    site.wp_app_password = None
+    db.commit()
+    db.refresh(site)
+    return _fresh_site_out(db, site)
 
 
 @router.delete("/{site_id}", status_code=204)

@@ -57,15 +57,17 @@ def delete_tenant(
     """Remove a tenant that owns nothing. Its API keys cascade away with it.
 
     Sites hold the tenant with ON DELETE RESTRICT, so this refuses rather than
-    orphaning or silently reassigning a live customer's inventory. Delete or
-    move the sites first — that has to be a deliberate act, not a side effect.
+    orphaning or silently reassigning live sites. Delete or move them first —
+    that has to be a deliberate act, not a side effect.
     """
     tenant = db.get(Tenant, tenant_id)
     if tenant is None:
         raise HTTPException(404, f"tenant {tenant_id} not found")
     if tenant.slug == DEFAULT_TENANT_SLUG:
         raise HTTPException(409, "the default tenant cannot be deleted")
-    owned = db.scalar(select(func.count()).select_from(Site).where(Site.tenant_id == tenant_id)) or 0
+    owned = (
+        db.scalar(select(func.count()).select_from(Site).where(Site.tenant_id == tenant_id)) or 0
+    )
     if owned:
         raise HTTPException(
             409,

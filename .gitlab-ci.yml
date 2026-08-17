@@ -14,6 +14,7 @@ lint:
   script:
     - uv lock --check
     - uv run ruff check .
+    - uv run ruff format --check .
 
 test:
   extends: .python-job
@@ -62,7 +63,9 @@ test:
       wait_for("Redis", redis.ping)
       PY
     - uv run alembic upgrade head
-    - uv run pytest -q
+    - uv run --with pytest-cov pytest -q --cov=app --cov-report=term-missing
+    - uv export --frozen --no-dev --no-emit-project --format requirements.txt --output-file /tmp/linkmesh-runtime-requirements.txt
+    - uv run --no-project --with pip-audit pip-audit -r /tmp/linkmesh-runtime-requirements.txt --strict
     - uv run alembic check
 
 build:

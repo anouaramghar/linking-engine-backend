@@ -23,8 +23,10 @@ choosing one.
 
 import re
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -32,16 +34,26 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.ml.baseline import low_value_target_params, semantic_scores_for_targets
 from app.ml.hybrid import (
-    DENSE_POOL_SIZE,
     HYBRID_POOL_SIZE,
-    LEXICAL_POOL_SIZE,
     CorpusArticle,
+    RankedCandidate,
+    rank_hybrid_candidates,
     normalized_title,
     structured_terms,
-    weighted_rrf_scores,
 )
 from app.ml.lexical import BM25Index, rank_scores
 from app.models import Article, ArticleTaxonomy, Embedding, Taxonomy
+
+
+#: The three orderings a comparison table holds, weakest first.
+#:
+#:  lexical  BM25 over titles, taxonomies and body text. Baseline 2 on the board.
+#:  dense    cosine over the article embeddings. The V1 ranking.
+#:  hybrid   what production ships: BM25 order with the fused rank breaking ties.
+#:
+#: A GNN becomes a fourth name here and nothing else in the measurement changes.
+RankingMethod = Literal["lexical", "dense", "hybrid"]
+RANKING_METHODS: tuple[RankingMethod, ...] = ("lexical", "dense", "hybrid")
 
 
 @dataclass(frozen=True)
@@ -52,6 +64,14 @@ class PoolStats:
     pool_articles: int
     source_articles: int
     excluded_low_value: int
+
+
+@dataclass(frozen=True)
+class _CandidateOrders:
+    eligible_scores: dict[int, float]
+    dense_order: tuple[int, ...]
+    lexical_order: tuple[int, ...]
+    bm25_scores: dict[int, float]
 
 
 def _low_value_filter():
@@ -207,38 +227,106 @@ class EvaluationRanker:
             eligible[target_id] = score
         return eligible
 
-    def rank(self, db: Session, *, source_id: int, limit: int = HYBRID_POOL_SIZE) -> list[int]:
-        """Target article ids for one source, best first."""
-        if limit <= 0:
-            raise ValueError("limit must be positive")
-        if source_id not in self.sources or self.index is None:
-            return []
+    def rank(
+        self,
+        db: Session,
+        *,
+        source_id: int,
+        limit: int = HYBRID_POOL_SIZE,
+        method: RankingMethod = "hybrid",
+    ) -> list[int]:
+        """Target article ids for one source under one method, best first."""
+        return self.rank_all(db, source_id=source_id, limit=limit, methods=(method,))[method]
 
+    def _candidate_orders(self, db: Session, source_id: int) -> _CandidateOrders | None:
+        if source_id not in self.sources or self.index is None:
+            return None
         eligible = self._eligible_scores(db, source_id)
         if not eligible:
-            return []
-        dense_ids = [
+            return _CandidateOrders({}, (), (), {})
+        dense_order = tuple(
             target_id
             for target_id, _score in sorted(eligible.items(), key=lambda kv: (-kv[1], kv[0]))
-        ][:DENSE_POOL_SIZE]
-
+        )
         bm25_scores = self.index.score_documents(
             self.terms_by_source[source_id],
             excluded_ids=set(self.pool) - set(eligible),
         )
-        lexical_ids = [target_id for target_id, _score in rank_scores(bm25_scores)][
-            :LEXICAL_POOL_SIZE
-        ]
+        lexical_order = tuple(target_id for target_id, _score in rank_scores(bm25_scores))
+        return _CandidateOrders(eligible, dense_order, lexical_order, bm25_scores)
 
-        fused = weighted_rrf_scores(dense_ids, lexical_ids)
-        fusion_ranks = {target_id: rank for rank, (target_id, _score) in enumerate(fused, start=1)}
-        # BM25-512 decides the order and the fused rank breaks ties, exactly as
-        # `HybridRanker.rank` does. See the module docstring in app/ml/hybrid.py.
-        return sorted(
-            fusion_ranks,
-            key=lambda target_id: (
-                -bm25_scores.get(target_id, 0.0),
-                fusion_ranks[target_id],
-                target_id,
-            ),
-        )[:limit]
+    def ranked_candidates(
+        self,
+        db: Session,
+        *,
+        source_id: int,
+        limit: int = HYBRID_POOL_SIZE,
+        method: RankingMethod = "hybrid",
+    ) -> tuple[RankedCandidate, ...]:
+        """Return an ordering with semantic scores for post-ranking evaluation."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        if method not in RANKING_METHODS:
+            raise ValueError(f"unsupported ranking methods: {[method]}")
+        orders = self._candidate_orders(db, source_id)
+        if orders is None or not orders.eligible_scores:
+            return ()
+        if method == "hybrid":
+            return rank_hybrid_candidates(
+                orders.dense_order,
+                orders.lexical_order,
+                orders.bm25_scores,
+                orders.eligible_scores,
+                limit=limit,
+            )
+        ranked_ids = (orders.dense_order if method == "dense" else orders.lexical_order)[:limit]
+        return tuple(
+            RankedCandidate(target_id=target_id, semantic_score=orders.eligible_scores[target_id])
+            for target_id in ranked_ids
+        )
+
+    def rank_all(
+        self,
+        db: Session,
+        *,
+        source_id: int,
+        limit: int = HYBRID_POOL_SIZE,
+        methods: Sequence[RankingMethod] = RANKING_METHODS,
+    ) -> dict[RankingMethod, list[int]]:
+        """Rank one source under several methods, reading the embeddings once.
+
+        Every method sees the same eligible targets. That is the point of the
+        comparison: a difference between two rows of the table is then a
+        difference in ordering, not in which candidates each method was offered.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        unknown = [method for method in methods if method not in RANKING_METHODS]
+        if unknown:
+            raise ValueError(f"unsupported ranking methods: {unknown}")
+
+        empty: dict[RankingMethod, list[int]] = {method: [] for method in methods}
+        orders = self._candidate_orders(db, source_id)
+        if orders is None:
+            return empty
+        if not orders.eligible_scores:
+            return empty
+
+        ranked: dict[RankingMethod, list[int]] = {}
+        for method in methods:
+            if method == "dense":
+                ranked[method] = list(orders.dense_order[:limit])
+            elif method == "lexical":
+                ranked[method] = list(orders.lexical_order[:limit])
+            else:
+                ranked[method] = [
+                    candidate.target_id
+                    for candidate in rank_hybrid_candidates(
+                        orders.dense_order,
+                        orders.lexical_order,
+                        orders.bm25_scores,
+                        orders.eligible_scores,
+                        limit=limit,
+                    )
+                ]
+        return ranked

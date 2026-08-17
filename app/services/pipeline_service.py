@@ -16,11 +16,14 @@ ACTIVE_SITE_STATUSES = {
 
 def refresh_pipeline_batch_status(db: Session, batch_id: int) -> PipelineBatch:
     """Recompute aggregate status while locking the batch against concurrent workers."""
-    batch = db.scalar(
-        select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update()
-    )
+    batch = db.scalar(select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update())
     if batch is None:
         raise ValueError(f"pipeline batch {batch_id} not found")
+    # Cancellation is terminal and operator-owned. A worker finishing a stage
+    # after the request must never resurrect the batch as running/succeeded.
+    if batch.status == "cancelled":
+        db.flush()
+        return batch
     statuses = list(
         db.scalars(select(PipelineSiteRun.status).where(PipelineSiteRun.batch_id == batch_id))
     )
@@ -35,6 +38,10 @@ def refresh_pipeline_batch_status(db: Session, batch_id: int) -> PipelineBatch:
         batch.finished_at = now
     elif statuses and all(status == "failed" for status in statuses):
         batch.status = "failed"
+        batch.started_at = batch.started_at or now
+        batch.finished_at = now
+    elif "cancelled" in statuses:
+        batch.status = "cancelled"
         batch.started_at = batch.started_at or now
         batch.finished_at = now
     else:
@@ -54,12 +61,12 @@ def update_pipeline_site(
     error: str | None = None,
 ) -> PipelineSiteRun:
     item = db.scalar(
-        select(PipelineSiteRun)
-        .where(PipelineSiteRun.id == pipeline_site_run_id)
-        .with_for_update()
+        select(PipelineSiteRun).where(PipelineSiteRun.id == pipeline_site_run_id).with_for_update()
     )
     if item is None:
         raise ValueError(f"pipeline site run {pipeline_site_run_id} not found")
+    if item.status == "cancelled" and status != "cancelled":
+        return item
     now = datetime.now(UTC)
     item.status = status
     item.stage = stage
@@ -67,7 +74,7 @@ def update_pipeline_site(
     if status in ("ingestion_running", "analysis_running"):
         item.started_at = item.started_at or now
         item.finished_at = None
-    elif status in ("succeeded", "failed"):
+    elif status in ("succeeded", "failed", "cancelled"):
         item.started_at = item.started_at or now
         item.finished_at = now
     db.flush()
@@ -88,4 +95,5 @@ def pipeline_batch_counts(db: Session, batch_id: int) -> dict[str, int]:
         "active": sum(counts.get(status, 0) for status in ACTIVE_SITE_STATUSES),
         "succeeded": counts.get("succeeded", 0),
         "failed": counts.get("failed", 0),
+        "cancelled": counts.get("cancelled", 0),
     }

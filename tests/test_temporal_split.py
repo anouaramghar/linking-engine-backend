@@ -1,8 +1,13 @@
+import json
 from datetime import UTC, datetime
 
 import pytest
 
-from app.ml.evaluation.temporal_split import build_temporal_evaluation_split
+from app.ml.evaluation.temporal_split import (
+    FrozenSplitError,
+    TemporalEvaluationSplit,
+    build_temporal_evaluation_split,
+)
 from app.models import Article, InternalLink, Site, Suggestion
 
 
@@ -274,3 +279,53 @@ def test_serialized_contract_is_ready_for_metrics_handoff(db):
         "test": [],
         "skipped_without_publication_date": 0,
     }
+
+
+def test_a_frozen_split_reads_back_as_the_split_that_was_written(db):
+    """The frozen file is the fixed target every method is scored against.
+
+    If a round trip lost a row or a timezone, two methods measured a week apart
+    would be scored on two different test sets and the difference reported as an
+    improvement.
+    """
+    site = _site(db, "frozen")
+    source = _article(db, site, "source", datetime(2026, 2, 1, tzinfo=UTC))
+    target = _article(db, site, "target", datetime(2025, 3, 1, tzinfo=UTC))
+    db.add(
+        Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="hybrid_bm25",
+            score=0.8,
+            status="applied",
+            applied_at=datetime(2026, 3, 1, tzinfo=UTC),
+        )
+    )
+    db.commit()
+
+    split = build_temporal_evaluation_split(db, cutoff_at=CUTOFF, site_ids=(site.id,))
+    reloaded = TemporalEvaluationSplit.from_dict(json.loads(json.dumps(split.to_dict())))
+
+    assert len(split.test) == 1
+    assert reloaded == split
+    assert reloaded.test[0].event_at.tzinfo is not None
+    assert reloaded.test[0].source_is_new is True
+    assert reloaded.test[0].target_is_new is False
+
+    db.delete(site)
+    db.commit()
+
+
+def test_a_split_written_by_another_schema_is_refused(db):
+    payload = build_temporal_evaluation_split(
+        db, cutoff_at=CUTOFF, site_ids=(2_147_483_647,)
+    ).to_dict()
+
+    with pytest.raises(FrozenSplitError, match="schema_version"):
+        TemporalEvaluationSplit.from_dict({**payload, "schema_version": 1})
+    with pytest.raises(FrozenSplitError, match="ground_truth"):
+        TemporalEvaluationSplit.from_dict({**payload, "ground_truth": "guessed"})
+    # A naive timestamp compares as if it were UTC and would move the cutoff.
+    with pytest.raises(FrozenSplitError, match="timezone"):
+        TemporalEvaluationSplit.from_dict({**payload, "cutoff_at": "2026-01-01T00:00:00"})

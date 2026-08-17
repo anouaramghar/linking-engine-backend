@@ -17,10 +17,10 @@ through a rule that dense retrieval would have applied.
 """
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, true
 from sqlalchemy.orm import Session, aliased
 
 from app.config import settings
@@ -131,9 +131,7 @@ def normalized_title(title: str) -> str:
 def structured_terms(article: CorpusArticle) -> list[str]:
     """Reproduce the frozen BM25-512 recipe selected by the offline evaluation."""
     if len(article.content_text) > settings.crawl_max_article_chars:
-        raise ValueError(
-            f"article content exceeded {settings.crawl_max_article_chars} characters"
-        )
+        raise ValueError(f"article content exceeded {settings.crawl_max_article_chars} characters")
     title_terms = tokenize(article.title)
     taxonomy_terms = [
         term for taxonomy_name in article.taxonomy_names for term in tokenize(taxonomy_name)
@@ -184,6 +182,58 @@ def weighted_reciprocal_rank_fusion(
     ]
 
 
+def rank_hybrid_candidates(
+    dense_ids: Sequence[int],
+    lexical_ids: Sequence[int],
+    bm25_scores: Mapping[int, float],
+    semantic_scores: Mapping[int, float],
+    *,
+    limit: int,
+) -> tuple[RankedCandidate, ...]:
+    """Return the production Hybrid order with its complete rank evidence.
+
+    The candidate pools may be larger than the frozen retrieval pools. The
+    bounded slices and the final BM25-first ordering live here so production
+    analysis and offline evaluation cannot silently diverge.
+    """
+
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    dense_pool = list(dense_ids[:DENSE_POOL_SIZE])
+    lexical_pool = list(lexical_ids[:LEXICAL_POOL_SIZE])
+    fused = weighted_rrf_scores(dense_pool, lexical_pool)
+    fusion_scores = dict(fused)
+    fusion_ranks = {target_id: rank for rank, (target_id, _score) in enumerate(fused, start=1)}
+    dense_ranks = {target_id: rank for rank, target_id in enumerate(dense_pool, start=1)}
+    lexical_ranks = {target_id: rank for rank, target_id in enumerate(lexical_pool, start=1)}
+
+    missing_scores = [target_id for target_id in fusion_ranks if target_id not in semantic_scores]
+    if missing_scores:
+        raise ValueError(
+            f"Hybrid ranking is missing semantic scores for target ids {missing_scores[:5]}"
+        )
+    final_ids = sorted(
+        fusion_ranks,
+        key=lambda target_id: (
+            -bm25_scores.get(target_id, 0.0),
+            fusion_ranks[target_id],
+            target_id,
+        ),
+    )[:limit]
+    return tuple(
+        RankedCandidate(
+            target_id=target_id,
+            semantic_score=min(1.0, max(0.0, semantic_scores[target_id])),
+            bm25_score=bm25_scores.get(target_id, 0.0),
+            fusion_rank=fusion_ranks[target_id],
+            fusion_score=fusion_scores[target_id],
+            dense_rank=dense_ranks.get(target_id),
+            lexical_rank=lexical_ranks.get(target_id),
+        )
+        for target_id in final_ids
+    )
+
+
 class HybridRanker:
     """One immutable site snapshot reused for every source in an analysis run."""
 
@@ -192,11 +242,15 @@ class HybridRanker:
         *,
         articles: dict[int, CorpusArticle],
         blocked_targets: dict[int, set[int]],
+        allowed_target_ids: set[int] | None = None,
     ) -> None:
         if not articles:
             raise ValueError("hybrid ranking requires at least one active embedded article")
         self.articles = articles
         self.blocked_targets = blocked_targets
+        self.allowed_target_ids = (
+            tuple(sorted(allowed_target_ids)) if allowed_target_ids is not None else None
+        )
         self.terms_by_article = {
             article_id: structured_terms(article) for article_id, article in articles.items()
         }
@@ -212,7 +266,14 @@ class HybridRanker:
         self.fingerprint_groups = dict(fingerprint_groups)
 
     @classmethod
-    def load(cls, db: Session, *, site_id: int, model: str) -> "HybridRanker":
+    def load(
+        cls,
+        db: Session,
+        *,
+        site_id: int,
+        model: str,
+        allowed_target_ids: set[int] | None = None,
+    ) -> "HybridRanker":
         article_rows = list(
             db.execute(
                 select(
@@ -236,6 +297,9 @@ class HybridRanker:
                         ),
                     ),
                     Article.is_active.is_(True),
+                    Article.id.in_(allowed_target_ids)
+                    if allowed_target_ids is not None
+                    else true(),
                 )
                 .order_by(Article.id)
                 .limit(settings.analysis_max_corpus_articles + 1)
@@ -291,7 +355,11 @@ class HybridRanker:
             )
         ):
             blocked_targets[source_id].add(target_id)
-        return cls(articles=articles, blocked_targets=dict(blocked_targets))
+        return cls(
+            articles=articles,
+            blocked_targets=dict(blocked_targets),
+            allowed_target_ids=allowed_target_ids,
+        )
 
     def _duplicate_ids(self, source_id: int) -> set[int]:
         article = self.articles[source_id]
@@ -323,6 +391,11 @@ class HybridRanker:
             model,
             DENSE_POOL_SIZE,
             duplicate_similarity_threshold,
+            **(
+                {"allowed_target_ids": self.allowed_target_ids}
+                if self.allowed_target_ids is not None
+                else {}
+            ),
         )
         dense_ids = [target_id for target_id, _score in dense_rows]
         semantic_scores = dict(dense_rows)
@@ -359,37 +432,22 @@ class HybridRanker:
                     model,
                     lexical_only_ids,
                     duplicate_similarity_threshold,
+                    **(
+                        {"allowed_target_ids": self.allowed_target_ids}
+                        if self.allowed_target_ids is not None
+                        else {}
+                    ),
                 )
             )
             lexical_ids.extend(target_id for target_id in page_ids if target_id in semantic_scores)
         lexical_ids = lexical_ids[:LEXICAL_POOL_SIZE]
 
-        fused = weighted_rrf_scores(dense_ids, lexical_ids)
-        fusion_scores = dict(fused)
-        fusion_ranks = {target_id: rank for rank, (target_id, _score) in enumerate(fused, start=1)}
-        dense_ranks = {target_id: rank for rank, target_id in enumerate(dense_ids, start=1)}
-        lexical_ranks = {target_id: rank for rank, target_id in enumerate(lexical_ids, start=1)}
-
-        # BM25-512 alone decides the final order; the fused rank only breaks ties.
-        final_ids = sorted(
-            fusion_ranks,
-            key=lambda target_id: (
-                -bm25_scores.get(target_id, 0.0),
-                fusion_ranks[target_id],
-                target_id,
-            ),
-        )[:limit]
-        candidates = tuple(
-            RankedCandidate(
-                target_id=target_id,
-                semantic_score=min(1.0, max(0.0, semantic_scores[target_id])),
-                bm25_score=bm25_scores.get(target_id, 0.0),
-                fusion_rank=fusion_ranks[target_id],
-                fusion_score=fusion_scores[target_id],
-                dense_rank=dense_ranks.get(target_id),
-                lexical_rank=lexical_ranks.get(target_id),
-            )
-            for target_id in final_ids
+        candidates = rank_hybrid_candidates(
+            dense_ids,
+            lexical_ids,
+            bm25_scores,
+            semantic_scores,
+            limit=limit,
         )
 
         # The shadow comparison must be against what the baseline path would
@@ -403,7 +461,15 @@ class HybridRanker:
                     semantic_score=min(1.0, max(0.0, semantic_score)),
                 )
                 for target_id, semantic_score in top_candidates(
-                    db, source_id, model, DENSE_POOL_SIZE
+                    db,
+                    source_id,
+                    model,
+                    DENSE_POOL_SIZE,
+                    **(
+                        {"allowed_target_ids": self.allowed_target_ids}
+                        if self.allowed_target_ids is not None
+                        else {}
+                    ),
                 )
             )
         return HybridRanking(

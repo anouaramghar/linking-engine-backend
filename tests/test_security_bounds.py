@@ -6,9 +6,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from app.api.csv_stream import csv_escape_formula
+
 from app.config import Settings, settings
 from app.connectors.base import ArticleData, ContentConnector
 from app.connectors.html_crawler import HTMLConnector
+from app.connectors import http_limits
 from app.connectors.http_limits import ResponseTooLargeError, get_limited_http_response
 from app.connectors.wordpress import WordPressConnector
 from app.ml.hybrid import CorpusArticle, structured_terms
@@ -24,6 +27,21 @@ def _site(base_url: str = "https://example.com") -> SimpleNamespace:
         wp_app_password=None,
         platform="wordpress",
     )
+
+
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@", "\t", "\r"])
+def test_an_export_cell_cannot_open_as_a_formula(prefix):
+    """A title an editor never wrote is still a title the export carries.
+
+    The tab and the carriage return are in this list because a spreadsheet
+    discards them before it parses the cell, so escaping only the four visible
+    characters leaves the same formula one keystroke away.
+    """
+    assert csv_escape_formula(f"{prefix}HYPERLINK(\"http://evil\")").startswith("'")
+
+
+def test_an_ordinary_export_cell_is_left_alone():
+    assert csv_escape_formula("Ordinary article title") == "Ordinary article title"
 
 
 def test_html_sitemap_response_is_bounded(monkeypatch):
@@ -58,6 +76,26 @@ def test_bounded_http_response_does_not_decode_compressed_body_twice():
 
     assert response.content == payload
     assert "content-encoding" not in response.headers
+
+
+def test_streaming_response_rechecks_the_crawl_deadline_for_each_chunk(monkeypatch):
+    checked = []
+    monkeypatch.setattr(http_limits, "check_crawl_deadline", checked.append)
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"chunk", request=request)
+        )
+    )
+
+    response = get_limited_http_response(
+        client,
+        "https://example.com/data",
+        max_bytes=100,
+        crawl_started_at=123.0,
+    )
+
+    assert response.content == b"chunk"
+    assert checked == [123.0]
 
 
 def test_wordpress_pagination_has_a_local_page_budget(monkeypatch):
@@ -118,7 +156,7 @@ class _TooManyArticlesConnector(ContentConnector):
     def supports_incremental_sync(self):
         return False
 
-    def apply_links(self, suggestions, *, dry_run=False):
+    def apply_planned_edit(self, source, *, original_html, updated_html):
         raise NotImplementedError
 
 

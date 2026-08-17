@@ -11,22 +11,34 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import delete, select
 
+from app.api.deps import require_api_key
 from app.config import settings
+from app.connectors.feed_discovery import (
+    FeedNotFoundError,
+    FeedPayloadError,
+    validate_feed_payload,
+)
 from app.connectors.registry import get_connector
 from app.connectors.rss_connector import RSSConnector
 from app.connectors.wikipedia_connector import WikipediaConnector
 from app.models import (
     Article,
     Embedding,
+    ExternalLinkPolicy,
     IngestionRun,
     PoolSourceAuditEvent,
     Site,
     Suggestion,
 )
 from app.models.article import EMBEDDING_DIM
+from app.ml.external.cleaning import (
+    deduplicate_external_urls,
+    normalize_external_url,
+)
+from app.main import app
 from app.schemas.site import SiteCreate
 from app.connectors.url_guard import UnsafeURLError
-from app.services.ingestion_service import _reconcile_snapshot
+from app.services.crawl_snapshot import _reconcile_snapshot
 from app.services.pool_source_policy import (
     PoolSourceFetchError,
     PoolSourcePolicyError,
@@ -68,7 +80,13 @@ def _delete_audit_events(db, site_id: int) -> None:
     db.commit()
 
 
-def test_pool_schema_defaults_to_daily_and_rejects_credentials():
+def test_pool_schema_defaults_to_daily_and_rejects_credentials(monkeypatch):
+    # `SiteCreate` relaxes the HTTPS and private-address rules when this is on,
+    # and settings fall back to the developer's .env, which the suite shares.
+    # Pinned here so this asserts the guard rather than the machine it runs on,
+    # as `test_url_guard` and `test_site_bulk_import` already do.
+    monkeypatch.setattr(settings, "allow_unsafe_crawl_targets", False)
+
     payload = SiteCreate(
         name="Wikipedia",
         base_url="https://en.wikipedia.org/wiki/Search_engine_optimization",
@@ -99,6 +117,52 @@ def test_pool_schema_defaults_to_daily_and_rejects_credentials():
             base_url="http://en.wikipedia.org/wiki/Search_engine_optimization",
             platform="pool",
         )
+
+
+def test_external_urls_have_one_stable_storage_identity():
+    assert (
+        normalize_external_url(
+            " HTTPS://B\u00dcCHER.Example:443/report/?utm_source=test&id=7&b=2#section "
+        )
+        == "https://xn--bcher-kva.example/report/?b=2&id=7"
+    )
+    assert normalize_external_url("http://[2001:DB8::1]:80") == "http://[2001:db8::1]/"
+
+    assert deduplicate_external_urls(
+        [
+            "https://Example.com/report?id=7&utm_medium=email",
+            "https://example.com:443/report?utm_source=search&id=7#result",
+            "https://example.com/report?id=8",
+        ]
+    ) == [
+        "https://example.com/report?id=7",
+        "https://example.com/report?id=8",
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "ftp://example.com/report",
+        "https://user:secret@example.com/report",
+        "https://example.com/a path",
+        "https://example.com:99999/report",
+    ],
+)
+def test_external_url_normalization_rejects_unsafe_or_ambiguous_values(value):
+    with pytest.raises(ValueError, match="external URL"):
+        normalize_external_url(value)
+
+
+def test_pool_registration_normalizes_the_source_url_before_deduplication():
+    payload = SiteCreate(
+        name="Tracked feed",
+        base_url="HTTPS://EN.WIKIPEDIA.ORG:443/feed.xml?utm_source=setup&id=7#feed",
+        platform="pool",
+    )
+
+    assert payload.base_url == "https://en.wikipedia.org/feed.xml?id=7"
 
 
 def test_pool_allowlist_accepts_subdomains_but_not_lookalikes(monkeypatch):
@@ -154,8 +218,13 @@ def test_rss_rejects_html_and_oversized_responses(monkeypatch):
             content=b"<html>not a feed</html>",
         )
     )
-    with pytest.raises(ValueError, match="HTML page"):
+    # A page where a feed was expected starts a search for the real feed; this
+    # host serves the same page everywhere, so the source still fails. See
+    # tests/test_feed_discovery.py for the search itself.
+    with pytest.raises(FeedNotFoundError, match="no feed was found"):
         RSSConnector(site, transport=html_transport)._feed()
+    with pytest.raises(FeedPayloadError, match="HTML page"):
+        validate_feed_payload(b"<html>not a feed</html>", "application/rss+xml")
 
     monkeypatch.setattr(settings, "pool_max_response_bytes", 8)
     large_transport = httpx.MockTransport(
@@ -205,8 +274,12 @@ def test_rss_rejects_non_feed_content_type():
         ),
     )
     try:
-        with pytest.raises(ValueError, match="unsupported Content-Type 'text/html'"):
+        # An HTML error page is never accepted as content, whether the search for
+        # a real feed runs or not.
+        with pytest.raises(FeedNotFoundError, match="no feed was found"):
             list(connector.fetch_articles())
+        with pytest.raises(FeedPayloadError, match="unsupported Content-Type 'text/html'"):
+            validate_feed_payload(b"<html>temporary error</html>", "text/html")
     finally:
         connector.client.close()
 
@@ -330,9 +403,7 @@ def test_wikipedia_connector_bounds_empty_continuations(monkeypatch):
         return httpx.Response(
             200,
             headers={"content-type": "application/json"},
-            content=json.dumps(
-                {"query": {"pages": []}, "continue": {"gsroffset": calls}}
-            ).encode(),
+            content=json.dumps({"query": {"pages": []}, "continue": {"gsroffset": calls}}).encode(),
         )
 
     monkeypatch.setattr(settings, "pool_max_articles_per_source", 2)
@@ -635,6 +706,7 @@ def test_a_managed_domain_can_never_become_a_pool_target(client, db, monkeypatch
 
 
 def test_pool_approval_identity_comes_from_operator_key(client, db, monkeypatch):
+    app.dependency_overrides.pop(require_api_key, None)
     monkeypatch.setattr(settings, "operator_api_keys", {"alice": SecretStr("alice-key")})
     response = client.post(
         "/api/v1/sites",
@@ -1015,6 +1087,7 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
         content_text="tomato canning jars boiling water safety",
     )
     db.add_all([source, target])
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
     db.flush()
     db.add_all(
         [
@@ -1117,15 +1190,14 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
     ("approved", "quarantined"),
     [(False, False), (True, True)],
 )
-def test_hybrid_excludes_disabled_pool_sources(
-    db, site, monkeypatch, approved, quarantined
-):
+def test_hybrid_excludes_disabled_pool_sources(db, site, monkeypatch, approved, quarantined):
     monkeypatch.setattr(
         "app.ml.embeddings.encode",
         lambda texts: [_vector(1.0) for _text in texts],
     )
     pool = _pool(db, approved=approved)
     pool.pool_source_quarantined = quarantined
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
     source = Article(
         site_id=site.id,
         url=f"{site.base_url}/{uuid.uuid4().hex}",

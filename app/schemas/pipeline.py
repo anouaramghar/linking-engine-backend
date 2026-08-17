@@ -29,6 +29,7 @@ class PipelineSiteRunOut(BaseModel):
         "analysis_running",
         "succeeded",
         "failed",
+        "cancelled",
     ]
     stage: Literal["ingestion", "analysis", "completed"]
     ingestion_job_run_id: int | None
@@ -42,11 +43,12 @@ class PipelineSiteRunOut(BaseModel):
 
 class PipelineBatchOut(BaseModel):
     id: int
-    status: Literal["queued", "running", "succeeded", "failed", "partial_failed"]
+    status: Literal["queued", "running", "succeeded", "failed", "partial_failed", "cancelled"]
     total: int
     active: int
     succeeded: int
     failed: int
+    cancelled: int
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None

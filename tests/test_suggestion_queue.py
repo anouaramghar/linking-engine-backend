@@ -228,17 +228,11 @@ def test_total_is_opt_in(client, db, site):
 
 
 def test_page_size_is_capped(client, site):
-    assert client.get(
-        "/api/v1/suggestions", params={"limit": MAX_PAGE_SIZE}
-    ).status_code == 200
-    assert client.get(
-        "/api/v1/suggestions", params={"limit": MAX_PAGE_SIZE + 1}
-    ).status_code == 422
+    assert client.get("/api/v1/suggestions", params={"limit": MAX_PAGE_SIZE}).status_code == 200
+    assert client.get("/api/v1/suggestions", params={"limit": MAX_PAGE_SIZE + 1}).status_code == 422
 
 
-def test_counts_report_every_status_and_a_total_matching_the_list(
-    client, db, site, other_site
-):
+def test_counts_report_every_status_and_a_total_matching_the_list(client, db, site, other_site):
     pair, other_pair = _pair(db, site), _pair(db, other_site)
     _suggest(db, site, pair, 0.10)
     _suggest(db, site, pair, 0.20)
@@ -287,9 +281,7 @@ def test_counts_respect_the_displayed_percent_window(client, db, site):
     assert (counts["pending"], counts["total"]) == (2, 2)
 
 
-def test_percent_threshold_partitions_exact_half_boundary(
-    client, db, site
-):
+def test_percent_threshold_partitions_exact_half_boundary(client, db, site):
     pair = _pair(db, site)
     below = _suggest(db, site, pair, 0.7949)
     at = _suggest(db, site, pair, 0.795)
@@ -321,9 +313,7 @@ def test_percent_threshold_partitions_exact_half_boundary(
     assert approve_half["total"] + reject_half["total"] == 3
 
 
-def test_bulk_rule_approves_displayed_threshold_with_reviewed_ids(
-    client, db, site, other_site
-):
+def test_bulk_rule_approves_displayed_threshold_with_reviewed_ids(client, db, site, other_site):
     pair, other_pair = _pair(db, site), _pair(db, other_site)
     below = _suggest(db, site, pair, 0.7949)
     at = _suggest(db, site, pair, 0.795)
@@ -338,6 +328,7 @@ def test_bulk_rule_approves_displayed_threshold_with_reviewed_ids(
         threshold_percent=80,
     ).json()
 
+    assert isinstance(body.pop("undo_operation_id"), str)
     assert body == {
         "reviewed": 2,
         "skipped": 0,
@@ -364,6 +355,7 @@ def test_bulk_rule_rejects_strictly_below_the_same_threshold(client, db, site):
         threshold_percent=80,
     ).json()
 
+    assert isinstance(body.pop("undo_operation_id"), str)
     assert body == {
         "reviewed": 1,
         "skipped": 0,
@@ -407,6 +399,7 @@ def test_bulk_rule_default_match_status_is_pending(client, db, site):
         threshold_percent=100,
     ).json()
 
+    assert isinstance(body.pop("undo_operation_id"), str)
     assert body == {
         "reviewed": 1,
         "skipped": 0,
@@ -504,10 +497,9 @@ def test_small_filtered_review_can_be_undone_by_returned_ids(client, db, site):
     assert db.get(Suggestion, pending.id).reviewed_at is None
 
 
-def test_large_filtered_review_returns_counts_without_ids(client, db, site):
+def test_large_filtered_review_has_exact_idempotent_server_side_undo(client, db, site):
     pair = _pair(db, site)
-    for _ in range(MAX_BULK_REVIEW + 1):
-        _suggest(db, site, pair, 0.90)
+    suggestions = [_suggest(db, site, pair, 0.90) for _ in range(MAX_BULK_REVIEW + 1)]
     db.commit()
 
     body = _rule(
@@ -517,11 +509,35 @@ def test_large_filtered_review_returns_counts_without_ids(client, db, site):
         threshold_percent=80,
     ).json()
 
+    operation_id = body.pop("undo_operation_id")
+    assert isinstance(operation_id, str)
     assert body == {
         "reviewed": MAX_BULK_REVIEW + 1,
         "skipped": 0,
         "reviewed_ids": None,
         "status": "approved",
+    }
+
+    # A row that has moved on since the review must not be overwritten by Undo.
+    suggestions[0].status = "applied"
+    db.commit()
+    undone = client.post(f"/api/v1/suggestions/bulk-review-operations/{operation_id}/undo")
+    assert undone.status_code == 200
+    assert undone.json() == {
+        "restored": MAX_BULK_REVIEW,
+        "skipped": 1,
+        "status": "pending",
+        "already_undone": False,
+    }
+    assert _status(db, suggestions[0].id) == "applied"
+    assert _status(db, suggestions[-1].id) == "pending"
+
+    repeated = client.post(f"/api/v1/suggestions/bulk-review-operations/{operation_id}/undo")
+    assert repeated.json() == {
+        "restored": MAX_BULK_REVIEW,
+        "skipped": 1,
+        "status": "pending",
+        "already_undone": True,
     }
 
 
@@ -541,17 +557,21 @@ def test_bulk_rule_matching_nothing_is_not_an_error(client, db, site):
         "reviewed": 0,
         "skipped": 0,
         "reviewed_ids": [],
+        "undo_operation_id": None,
         "status": "approved",
     }
 
 
 def test_bulk_rule_cannot_set_a_worker_owned_status(client, site):
-    assert _rule(
-        client,
-        status="applied",
-        site_id=site.id,
-        threshold_percent=80,
-    ).status_code == 422
+    assert (
+        _rule(
+            client,
+            status="applied",
+            site_id=site.id,
+            threshold_percent=80,
+        ).status_code
+        == 422
+    )
 
 
 def test_fleet_wide_bulk_rule_must_be_asked_for_explicitly(client, db, site):
@@ -603,15 +623,20 @@ def test_paged_queue_and_bulk_rule_agree_on_the_same_filter(client, db, site):
     ).json()
 
     assert listed["total"] == reviewed["reviewed"] == 3
-    remaining = db.scalars(
-        select(Suggestion.status).where(Suggestion.site_id == site.id)
-    ).all()
+    remaining = db.scalars(select(Suggestion.status).where(Suggestion.site_id == site.id)).all()
     assert sorted(remaining) == ["approved", "approved", "approved", "pending"]
 
 
-def test_pending_publication_lists_only_sites_with_approved_backlogs(
+def test_pending_publication_separates_selected_rows_from_approved_plans(
     client, db, site, other_site
 ):
+    """Two numbers, because they ask for two different things.
+
+    Selected suggestions need someone to prepare and approve an exact edit.
+    Approved plans need only a job. Reporting them as one "awaiting publication"
+    is what let a dashboard offer a publish button for work no human had ever
+    seen rendered.
+    """
     pair, other_pair = _pair(db, site), _pair(db, other_site)
     _suggest(db, site, pair, 0.90, status="approved")
     _suggest(db, site, pair, 0.80, status="approved")
@@ -619,14 +644,13 @@ def test_pending_publication_lists_only_sites_with_approved_backlogs(
     _suggest(db, other_site, other_pair, 0.60, status="pending")
     db.commit()
 
-    pending = client.get("/api/v1/publish/pending").json()
+    pending = client.get("/api/v1/publish/pending").json()["items"]
     owned = {
-        row["site_id"]: row["awaiting_publication"]
+        row["site_id"]: (row["selected_suggestions"], row["approved_plans"])
         for row in pending
         if row["site_id"] in {site.id, other_site.id}
     }
 
-    assert owned == {site.id: 2}
-    assert client.get(f"/api/v1/publish/{site.id}/status").json()[
-        "awaiting_publication"
-    ] == owned[site.id]
+    assert owned == {site.id: (2, 0)}
+    status = client.get(f"/api/v1/publish/{site.id}/status").json()
+    assert (status["selected_suggestions"], status["approved_plans"]) == (2, 0)

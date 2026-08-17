@@ -52,9 +52,13 @@ def encrypt_credential(value: str) -> str:
 
 
 def decrypt_credential(value: str) -> str:
-    """Decrypt a token; accept plaintext temporarily while legacy rows migrate."""
-    if not value or not is_encrypted_credential(value):
+    """Decrypt a versioned token; never silently return plaintext from storage."""
+    if not value:
         return value
+    if not is_encrypted_credential(value):
+        raise CredentialEncryptionError(
+            "stored WordPress credential is not encrypted; run the credential migration"
+        )
     token = value.removeprefix(CREDENTIAL_TOKEN_PREFIX)
     try:
         encoded = token.encode("ascii")

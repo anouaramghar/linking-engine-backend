@@ -41,9 +41,7 @@ def _status_counts(db, site_id: int, method: str | None) -> dict[str, int]:
         conditions.append(Suggestion.method == method)
     return dict(
         db.execute(
-            select(Suggestion.status, func.count())
-            .where(*conditions)
-            .group_by(Suggestion.status)
+            select(Suggestion.status, func.count()).where(*conditions).group_by(Suggestion.status)
         ).all()
     )
 

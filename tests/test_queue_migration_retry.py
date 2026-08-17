@@ -13,9 +13,7 @@ import pytest
     ],
 )
 def test_queue_migration_drops_an_invalid_same_named_index(monkeypatch, revision):
-    migration = run_path(
-        Path(__file__).parents[1] / "alembic" / "versions" / revision
-    )
+    migration = run_path(Path(__file__).parents[1] / "alembic" / "versions" / revision)
     operation = migration["op"]
     result = Mock()
     result.scalar_one_or_none.return_value = False

@@ -102,7 +102,9 @@ def test_ingestion_success_chains_analysis_and_completes_batch(db, monkeypatch):
     db.refresh(item)
     db.refresh(ingestion_run)
 
-    monkeypatch.setattr(pipeline_tasks, "run_ingestion", lambda _site_id, job_run_id=None: {"articles": 4})
+    monkeypatch.setattr(
+        pipeline_tasks, "run_ingestion", lambda _site_id, job_run_id=None: {"articles": 4}
+    )
     monkeypatch.setattr(pipeline_tasks, "enqueue_job", _fake_enqueue)
     result = pipeline_tasks.ingest_pipeline_site(
         site.id,
@@ -227,3 +229,72 @@ def test_batch_rejects_duplicate_missing_and_pool_sites(client, db):
     db.delete(site)
     db.delete(pool)
     db.commit()
+
+
+def test_cancel_batch_marks_unfinished_sites_terminal_and_workers_stop(client, db, monkeypatch):
+    site = _site(db, "cancel")
+    batch = PipelineBatch(status="running")
+    db.add(batch)
+    db.flush()
+    item = PipelineSiteRun(
+        batch_id=batch.id,
+        site_id=site.id,
+        status="analysis_running",
+        stage="analysis",
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(batch)
+    db.refresh(item)
+    monkeypatch.setattr(pipeline_routes, "_stop_queue_job", lambda *_args: None)
+
+    response = client.post(f"/api/v1/pipelines/batches/{batch.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["cancelled"] == 1
+    assert response.json()["sites"][0]["status"] == "cancelled"
+    assert pipeline_tasks.analyze_pipeline_site(site.id, batch_site_run_id=item.id) == {
+        "cancelled": True
+    }
+    _cleanup(db, batch.id, [site.id])
+
+
+def test_terminal_batch_stream_emits_snapshot_and_done(client, db):
+    site = _site(db, "stream")
+    batch = PipelineBatch(status="succeeded")
+    db.add(batch)
+    db.flush()
+    db.add(
+        PipelineSiteRun(
+            batch_id=batch.id,
+            site_id=site.id,
+            status="succeeded",
+            stage="completed",
+        )
+    )
+    db.commit()
+    db.refresh(batch)
+
+    response = client.get(f"/api/v1/pipelines/batches/{batch.id}/events")
+    assert response.status_code == 200
+    assert "event: batch" in response.text
+    assert '"status":"succeeded"' in response.text
+    assert "event: done" in response.text
+    _cleanup(db, batch.id, [site.id])
+
+
+def test_a_quiet_stream_backs_off_and_a_change_speeds_it_up_again():
+    """Each snapshot costs a query and a worker thread shared with every request.
+
+    A batch that ingests for twenty minutes must not cost one of each per second
+    per open tab, and a batch that starts moving must not be reported late.
+    """
+    interval = pipeline_routes.MIN_STREAM_INTERVAL
+    quiet = []
+    for _ in range(5):
+        interval = pipeline_routes._next_stream_interval(interval, changed=False)
+        quiet.append(interval)
+
+    assert quiet == [2.0, 4.0, 5.0, 5.0, 5.0]
+    assert pipeline_routes._next_stream_interval(interval, changed=True) == 1.0

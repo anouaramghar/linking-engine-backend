@@ -84,9 +84,9 @@ def test_search_is_case_insensitive_and_matches_mid_word(client, db, site):
     db.commit()
 
     for term in ("react", "REACT", "eact Hoo"):
-        assert _ids(client.get(QUEUE, params={"site_id": site.id, "q": term})) == [
-            suggestion.id
-        ], term
+        assert _ids(client.get(QUEUE, params={"site_id": site.id, "q": term})) == [suggestion.id], (
+            term
+        )
 
 
 def test_search_treats_like_metacharacters_as_literal_text(client, db, site):
@@ -101,9 +101,7 @@ def test_search_treats_like_metacharacters_as_literal_text(client, db, site):
     # A bare '%' would match every row if it reached LIKE unescaped.
     assert _ids(client.get(QUEUE, params={"site_id": site.id, "q": "50%"})) == [on_literal.id]
     # '_' would match any single character, so this would also find "the cache".
-    assert _ids(client.get(QUEUE, params={"site_id": site.id, "q": "the_cache"})) == [
-        on_snake.id
-    ]
+    assert _ids(client.get(QUEUE, params={"site_id": site.id, "q": "the_cache"})) == [on_snake.id]
 
 
 def test_blank_search_does_not_narrow_the_queue(client, db, site):
@@ -114,18 +112,14 @@ def test_blank_search_does_not_narrow_the_queue(client, db, site):
     db.commit()
 
     for term in ("", "   "):
-        assert _ids(client.get(QUEUE, params={"site_id": site.id, "q": term})) == [
-            suggestion.id
-        ]
+        assert _ids(client.get(QUEUE, params={"site_id": site.id, "q": term})) == [suggestion.id]
 
 
 def test_search_bounds_the_term_length(client, site):
     assert client.get(QUEUE, params={"site_id": site.id, "q": "x" * 201}).status_code == 422
 
 
-def test_target_origin_separates_pool_targets_from_internal_ones(
-    client, db, site, pool_site
-):
+def test_target_origin_separates_pool_targets_from_internal_ones(client, db, site, pool_site):
     """The filter reads ownership from the target's site, like the card's badge."""
     source = _article(db, site, "Our article")
     internal_target = _article(db, site, "Our other article")
@@ -349,8 +343,6 @@ def test_search_does_not_leak_rows_from_another_site(client, db, site, pool_site
     mine = _suggest(db, site, ours, theirs, 0.9)
     db.commit()
 
-    other_site_rows = db.scalars(
-        select(Suggestion).where(Suggestion.site_id == pool_site.id)
-    ).all()
+    other_site_rows = db.scalars(select(Suggestion).where(Suggestion.site_id == pool_site.id)).all()
     assert other_site_rows == []
     assert _ids(client.get(QUEUE, params={"site_id": site.id, "q": "Shared"})) == [mine.id]

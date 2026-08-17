@@ -29,7 +29,6 @@ ml = [
     # Heavy ML stack — install with: uv sync --extra ml
     "sentence-transformers>=3.0",
     "torch>=2.4",
-    "torch-geometric>=2.6",
 ]
 
 [dependency-groups]

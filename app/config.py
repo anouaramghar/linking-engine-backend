@@ -1,4 +1,4 @@
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -10,9 +10,12 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://linkmesh:linkmesh@localhost:5432/linkmesh"
     redis_url: str = "redis://localhost:6379/0"
 
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
     environment: str = "development"
+    # Commit this build was made from, set by the image build. Reported with the
+    # evaluation numbers so a figure can be traced back to the code that computed
+    # it. Empty means "this deployment does not record one", which is reported as
+    # unknown rather than guessed.
+    build_commit: str = ""
 
     # Static API key for all non-health endpoints; empty fails closed at the API boundary.
     # When set, this key is a legacy admin principal (all tenants) with a deprecation warning.
@@ -25,13 +28,37 @@ class Settings(BaseSettings):
     # every non-dev environment before minting tenant keys.
     api_key_pepper: str = ""
 
+    # Dashboard login via Telegram; see docs/design/dashboard-authentication.md.
+    # The Login Widget is deliberately not used: it needs a publicly routable
+    # registered domain, and this deployment sits behind an IP restriction. The
+    # bot deep-link flow needs only outbound access to api.telegram.org.
+    # An empty token disables dashboard login; the proxy then has no gate to
+    # consult, so it must not be deployed with auth_request enabled.
+    telegram_bot_token: SecretStr | None = None
+    # Used to build the static t.me deep link the browser shows. No leading '@'.
+    telegram_bot_username: str = ""
+    # Pre-approved Telegram user ID allowed to approve everyone else. Without it
+    # the first login has nobody to admit it and the dashboard is unreachable.
+    dashboard_bootstrap_admin_id: int | None = None
+    # Sliding: a request within the window extends it. 12 hours covers a working
+    # day without forcing a re-login over lunch.
+    dashboard_session_ttl_minutes: int = Field(default=720, gt=0, le=43_200)
+    # Long enough to switch to Telegram and press Start, short enough that an
+    # abandoned one-time code is not a standing invitation. The environment
+    # name stays stable for deployment compatibility.
+    dashboard_login_nonce_ttl_seconds: int = Field(default=300, gt=0, le=3_600)
+
     # Fernet key used to encrypt WordPress application passwords at rest.
     credential_encryption_key: SecretStr | None = None
     # Comma-separated previous Fernet keys accepted only for decryption during rotation.
     credential_decryption_keys: SecretStr | None = None
 
-    # External search (v3)
+    # External search (v3). Search stays disabled while the API key is empty.
+    # Basic depth and a small per-request cap keep paid discovery predictable.
     tavily_api_key: str = ""
+    tavily_base_url: str = "https://api.tavily.com"
+    tavily_timeout_seconds: float = Field(default=10.0, gt=0.0, le=120.0)
+    tavily_max_results_per_request: int = Field(default=5, ge=1, le=5)
 
     # Placement context (v4): an OpenRouter-hosted model reads the source article
     # and picks the passage the link belongs in. Empty key disables the feature —
@@ -90,18 +117,43 @@ class Settings(BaseSettings):
     # segment. Emptying either list disables that half of the rule.
     low_value_target_titles: list[str] = Field(
         default=[
-            "login", "log in", "sign in", "sign up", "register", "registration",
-            "dashboard", "my account", "cart", "shopping cart", "checkout",
-            "privacy policy", "terms of service", "terms of use", "cookie policy",
+            "login",
+            "log in",
+            "sign in",
+            "sign up",
+            "register",
+            "registration",
+            "dashboard",
+            "my account",
+            "cart",
+            "shopping cart",
+            "checkout",
+            "privacy policy",
+            "terms of service",
+            "terms of use",
+            "cookie policy",
             "support portal",
         ]
     )
     low_value_target_url_slugs: list[str] = Field(
         default=[
-            "login", "log-in", "sign-in", "sign-up", "signup", "register",
-            "registration", "dashboard", "my-account", "cart", "shopping-cart",
-            "checkout", "privacy-policy", "terms-of-service", "terms-of-use",
-            "cookie-policy", "support-portal",
+            "login",
+            "log-in",
+            "sign-in",
+            "sign-up",
+            "signup",
+            "register",
+            "registration",
+            "dashboard",
+            "my-account",
+            "cart",
+            "shopping-cart",
+            "checkout",
+            "privacy-policy",
+            "terms-of-service",
+            "terms-of-use",
+            "cookie-policy",
+            "support-portal",
         ]
     )
 
@@ -121,13 +173,16 @@ class Settings(BaseSettings):
     # write traffic LinkMesh ever sends a customer site, and shared hosting
     # answers that with a WAF block rather than a Retry-After we could honour.
     publish_request_delay_seconds: float = Field(default=0.5, ge=0.0, le=60.0)
-    # Placements missing at publication time are generated in a preflight pass,
-    # because the review queue is worked in bulk and a bulk-approved row never
-    # had its drawer opened. Each is a model call of a few seconds, so the pass
-    # is capped: past this many the rest publish as the appended block, exactly
-    # as they do today. 0 disables preflight and restores lazy-only generation.
+    # Placements missing when publication plans are *prepared* are generated in
+    # one pass, because the review queue is worked in bulk and a selected row
+    # never had its drawer opened. This is the last moment a model may be asked:
+    # a placement generated after approval cannot change the approved edit, so
+    # the appended block an operator saw stays the block that is published. Each
+    # call is a few seconds, so the pass is capped: past this many the rest are
+    # prepared as the appended block. 0 disables it and restores lazy-only
+    # generation.
     publish_max_placement_calls_per_run: int = Field(default=200, ge=0, le=5_000)
-    # How many preflight placement calls run at once. The pass is latency-bound
+    # How many preparation placement calls run at once. The pass is latency-bound
     # on an external API, not CPU-bound; the ceiling is the provider's rate
     # limit, not ours.
     publish_placement_concurrency: int = Field(default=4, ge=1, le=16)
@@ -150,10 +205,29 @@ class Settings(BaseSettings):
     crawl_max_article_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
     crawl_max_links_per_article: int = Field(default=1_000, ge=1, le=100_000)
     crawl_max_total_links: int = Field(default=100_000, ge=1, le=1_000_000)
+    # HTML discovery falls back to a small same-origin frontier when a site has
+    # no usable sitemap. The frontier is bounded independently of article and
+    # response-size limits so navigation cannot turn into an unbounded crawl.
+    crawl_bfs_fallback_enabled: bool = True
+    crawl_max_depth: int = Field(default=2, ge=0, le=10)
+    crawl_max_discovered_urls: int = Field(default=20_000, ge=1, le=100_000)
 
     # Analysis bounds are checked before embedding or corpus construction.
     analysis_max_articles_per_site: int = Field(default=10_000, ge=1, le=100_000)
     analysis_max_corpus_articles: int = Field(default=20_000, ge=1, le=200_000)
+
+    # Deterministic graph intelligence. Shadow is the safe default: it records
+    # the proposed graph-aware order beside the frozen BM25-512 order until a
+    # representative evaluation set proves that promotion is worthwhile.
+    graph_algorithm_version: str = Field(default="deterministic_v1", min_length=1, max_length=40)
+    graph_underlinked_max_in_degree: int = Field(default=1, ge=0, le=1_000)
+    graph_hub_min_out_degree: int = Field(default=10, ge=1, le=100_000)
+    graph_saturation_min_in_degree: int = Field(default=10, ge=1, le=100_000)
+    graph_reranking_mode: Literal["off", "shadow", "active"] = "shadow"
+    # A structural opportunity may only move a candidate inside this bounded
+    # relevance margin. It can never compensate for a large topical gap.
+    graph_max_relevance_boost: float = Field(default=0.03, ge=0.0, le=0.10)
+    graph_simulation_target_share_warning: float = Field(default=0.50, gt=0.0, le=1.0)
 
     # External content pool (RSS/Atom and Wikipedia).
     pool_max_articles_per_source: int = Field(default=50, ge=1, le=50)
@@ -172,6 +246,17 @@ class Settings(BaseSettings):
     pool_poll_interval_seconds: int = Field(default=86400, ge=60)
     pool_poll_repeat_count: int = Field(default=3650, ge=1)
 
+    # One durable observation per managed site and day. Historical orphan-page
+    # counts cannot be reconstructed after a crawl, so the evaluation dashboard
+    # records them prospectively instead of inventing a pre-deployment trend.
+    evaluation_snapshot_interval_seconds: int = Field(default=86400, ge=60)
+    evaluation_snapshot_repeat_count: int = Field(default=3650, ge=1)
+
+    # A ceiling on concurrent work per key scope. With one scope in use this is
+    # simply a global cap on active jobs, which is the useful reading today; it
+    # is not fair-share scheduling between competing customers.
+    max_active_jobs_per_tenant: int = Field(default=100, ge=1, le=10_000)
+
     # Crawl-target safety (Phase 0, finding #1): block private/loopback/link-local/
     # metadata destinations and require HTTPS when WP credentials are used.
     # True relaxes both for crawling local test sites — development only.
@@ -188,6 +273,12 @@ class Settings(BaseSettings):
         key = self.credential_encryption_key
         if self.environment != "development" and (key is None or not key.get_secret_value()):
             raise ValueError("CREDENTIAL_ENCRYPTION_KEY must be set outside development")
+        return self
+
+    @model_validator(mode="after")
+    def require_api_key_pepper_outside_development(self) -> Self:
+        if self.environment != "development" and not self.api_key_pepper.strip():
+            raise ValueError("API_KEY_PEPPER must be set outside development")
         return self
 
     @model_validator(mode="after")
