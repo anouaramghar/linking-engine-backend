@@ -155,14 +155,20 @@ def test_evaluation_distinguishes_exposed_and_unseen_decisions(client, db, site)
         json={"suggestion_ids": [exposed.id]},
     )
     assert response.status_code == 200, response.text
-    assert client.put(
-        f"/api/v1/suggestions/{exposed.id}",
-        json={"status": "rejected", "rejection_reason": "not_relevant"},
-    ).status_code == 200
-    assert client.put(
-        f"/api/v1/suggestions/{unseen.id}",
-        json={"status": "rejected", "rejection_reason": "duplicate"},
-    ).status_code == 200
+    assert (
+        client.put(
+            f"/api/v1/suggestions/{exposed.id}",
+            json={"status": "rejected", "rejection_reason": "not_relevant"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.put(
+            f"/api/v1/suggestions/{unseen.id}",
+            json={"status": "rejected", "rejection_reason": "duplicate"},
+        ).status_code
+        == 200
+    )
 
     metrics = client.get("/api/v1/evaluation/metrics", params={"site_id": site.id})
     assert metrics.status_code == 200, metrics.text

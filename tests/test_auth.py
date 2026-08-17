@@ -67,9 +67,7 @@ def test_api_key_pepper_required_outside_development():
             environment="production",
             api_key="sekret",
             api_key_pepper="",
-            credential_encryption_key=SecretStr(
-                "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
-            ),
+            credential_encryption_key=SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
             _env_file=None,
         )
 

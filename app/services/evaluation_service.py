@@ -300,9 +300,7 @@ def _graph_impact_metrics(
         accepted_status = status in ACCEPTED_STATUSES
         accepted += int(accepted_status)
         orphan_accepted += int(accepted_status and graph.get("target_orphan", False))
-        underlinked_accepted += int(
-            accepted_status and graph.get("target_underlinked", False)
-        )
+        underlinked_accepted += int(accepted_status and graph.get("target_underlinked", False))
     return GraphImpactMetrics(
         suggestions_with_graph_context=with_context,
         graph_adjusted_suggestions=adjusted,

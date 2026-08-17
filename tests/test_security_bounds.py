@@ -37,7 +37,7 @@ def test_an_export_cell_cannot_open_as_a_formula(prefix):
     discards them before it parses the cell, so escaping only the four visible
     characters leaves the same formula one keystroke away.
     """
-    assert csv_escape_formula(f"{prefix}HYPERLINK(\"http://evil\")").startswith("'")
+    assert csv_escape_formula(f'{prefix}HYPERLINK("http://evil")').startswith("'")
 
 
 def test_an_ordinary_export_cell_is_left_alone():

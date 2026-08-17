@@ -315,9 +315,7 @@ def export_non_wordpress_publication(
         for plan in plans:
             items = list(plan.items or [])
             suggestion_ids = [
-                item.get("suggestion_id")
-                for item in items
-                if item.get("suggestion_id") is not None
+                item.get("suggestion_id") for item in items if item.get("suggestion_id") is not None
             ]
             suggestions = (
                 db.scalars(
@@ -344,9 +342,7 @@ def export_non_wordpress_publication(
                     ),
                     _export_cell(item.get("target_url")),
                     _export_cell(item.get("anchor_text")),
-                    _export_cell(
-                        suggestion.placement_context if suggestion is not None else None
-                    ),
+                    _export_cell(suggestion.placement_context if suggestion is not None else None),
                     _export_cell(item.get("outcome")),
                     _export_cell(plan.original_html),
                     _export_cell(plan.updated_html),

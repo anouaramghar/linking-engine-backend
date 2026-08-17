@@ -48,7 +48,9 @@ class LabelReadinessError(RuntimeError):
 
     def __init__(self, readiness: "LabelReadiness") -> None:
         self.readiness = readiness
-        super().__init__("reviewer-label evidence is not ready: " + "; ".join(readiness.blocked_reasons))
+        super().__init__(
+            "reviewer-label evidence is not ready: " + "; ".join(readiness.blocked_reasons)
+        )
 
 
 def _parse_datetime(value: object, *, field: str) -> datetime:
@@ -217,9 +219,7 @@ class LabelReadiness:
             site_counts=tuple(SiteLabelCount.from_dict(item) for item in payload["site_counts"]),
             excluded_unexposed=int(payload["excluded_unexposed"]),
             excluded_missing_reviewer=int(payload["excluded_missing_reviewer"]),
-            excluded_missing_exposure_timestamp=int(
-                payload["excluded_missing_exposure_timestamp"]
-            ),
+            excluded_missing_exposure_timestamp=int(payload["excluded_missing_exposure_timestamp"]),
             excluded_external_targets=int(payload["excluded_external_targets"]),
             excluded_incomplete_snapshots=int(payload["excluded_incomplete_snapshots"]),
             blocked_reasons=tuple(str(value) for value in payload["blocked_reasons"]),
@@ -391,7 +391,9 @@ def _review_rows(
     ).all()
 
 
-def _complete_example(event: SuggestionEvent, suggestion: Suggestion) -> ReviewerLabelExample | None:
+def _complete_example(
+    event: SuggestionEvent, suggestion: Suggestion
+) -> ReviewerLabelExample | None:
     details = event.details if isinstance(event.details, dict) else {}
     if details.get("review_kind") != "individual":
         return None
@@ -509,9 +511,7 @@ def _readiness(collected: _CollectedLabels) -> LabelReadiness:
         for site_id, counts in sorted((collected.site_counts or {}).items())
     )
     qualifying = tuple(
-        item.site_id
-        for item in site_counts
-        if item.eligible_labels >= INDIVIDUAL_LABEL_TARGET
+        item.site_id for item in site_counts if item.eligible_labels >= INDIVIDUAL_LABEL_TARGET
     )
     ready = len(qualifying) >= BASELINE_SITE_TARGET
     if collected.individual_labels == 0:
@@ -531,7 +531,9 @@ def _readiness(collected: _CollectedLabels) -> LabelReadiness:
     if collected.excluded_missing_reviewer:
         blocked.append("individual decisions without reviewer identity are excluded")
     if collected.excluded_incomplete_snapshots:
-        blocked.append("individual decisions without complete immutable ranking snapshots are excluded")
+        blocked.append(
+            "individual decisions without complete immutable ranking snapshots are excluded"
+        )
     if not blocked:
         blocked.append("evidence gate passed")
     return LabelReadiness(
@@ -592,7 +594,9 @@ def eligible_reviewer_labels(
     )
 
 
-def _latest_per_suggestion(labels: Sequence[ReviewerLabelExample]) -> tuple[ReviewerLabelExample, ...]:
+def _latest_per_suggestion(
+    labels: Sequence[ReviewerLabelExample],
+) -> tuple[ReviewerLabelExample, ...]:
     latest: dict[int, ReviewerLabelExample] = {}
     for row in labels:
         previous = latest.get(row.suggestion_id)
@@ -601,9 +605,7 @@ def _latest_per_suggestion(labels: Sequence[ReviewerLabelExample]) -> tuple[Revi
             previous.review_event_id,
         ):
             latest[row.suggestion_id] = row
-    return tuple(
-        sorted(latest.values(), key=lambda row: (row.reviewed_at, row.review_event_id))
-    )
+    return tuple(sorted(latest.values(), key=lambda row: (row.reviewed_at, row.review_event_id)))
 
 
 def _split(
