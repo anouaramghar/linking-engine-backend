@@ -20,7 +20,10 @@ from app.connectors.feed_discovery import (
 )
 from app.connectors.registry import get_connector
 from app.connectors.rss_connector import RSSConnector
-from app.connectors.wikipedia_connector import WikipediaConnector
+from app.connectors.wikipedia_connector import (
+    MAX_EMPTY_RESPONSES,
+    WikipediaConnector,
+)
 from app.models import (
     Article,
     Embedding,
@@ -371,6 +374,16 @@ def test_wikipedia_connector_follows_continuation_and_validates_json(monkeypatch
 
     def handler(request):
         nonlocal calls
+        # The link pass is a separate query and is answered separately, so the
+        # extract continuation below still counts one request per article.
+        if request.url.params.get("prop") == "links" or (
+            request.url.params.get("rvdir") == "newer"
+        ):
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json; charset=utf-8"},
+                content=json.dumps({"query": {"pages": []}}).encode(),
+            )
         calls += 1
         assert "rvlimit" not in request.url.params
         payload = {"query": {"pages": [pages[calls - 1]]}}
@@ -391,7 +404,9 @@ def test_wikipedia_connector_follows_continuation_and_validates_json(monkeypatch
 
     assert [article.title for article in articles] == ["First", "Second"]
     assert calls == 2
-    assert sleeps == [settings.pool_request_delay_seconds]
+    # One delay between the two extract requests, one between the two
+    # creation-date requests. Both passes are paced by the same setting.
+    assert sleeps == [settings.pool_request_delay_seconds] * 2
 
 
 def test_wikipedia_direct_article_lookup_ignores_older_revision_continuation():
@@ -466,7 +481,10 @@ def test_wikipedia_connector_bounds_empty_continuations(monkeypatch):
         list(connector.fetch_articles())
 
     connector.client.close()
-    assert calls == 2
+    # One request per requested article, plus the one that detects the budget is
+    # spent. MediaWiki returns a single extract per query, so the budget counts
+    # articles rather than generator pages.
+    assert calls == MAX_EMPTY_RESPONSES
 
 
 def test_wikipedia_connector_rejects_oversized_and_non_json_responses(monkeypatch):
@@ -1313,3 +1331,136 @@ def test_pool_reconciliation_expires_customer_suggestions_to_missing_targets(db,
     finally:
         db.delete(pool)
         db.commit()
+
+
+def test_wikipedia_connector_captures_links_between_fetched_articles(monkeypatch):
+    """The link pass is what makes an offline ranking benchmark possible.
+
+    Wikipedia's inter-article links are human-authored link decisions, so they
+    are the only relevance judgments LinkMesh can read without asking a
+    reviewer. Only links whose target is also in the fetched set are kept:
+    ingestion resolves an outbound URL against the same site and drops the rest.
+    """
+    site = Site(
+        name="Wiki",
+        base_url="https://en.wikipedia.org/wiki/Bread",
+        platform="pool",
+    )
+    pages = [
+        {
+            "pageid": 1,
+            "title": "Bread",
+            "fullurl": "https://en.wikipedia.org/wiki/Bread",
+            "extract": "bread article",
+            "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+        },
+        {
+            "pageid": 2,
+            "title": "Sourdough",
+            "fullurl": "https://en.wikipedia.org/wiki/Sourdough",
+            "extract": "sourdough article",
+            "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+        },
+    ]
+    extract_calls = 0
+
+    def handler(request):
+        nonlocal extract_calls
+        if request.url.params.get("rvdir") == "newer":
+            # The creation-date pass; this test asserts only the link graph.
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=json.dumps({"query": {"pages": []}}).encode(),
+            )
+        if request.url.params.get("prop") == "links":
+            assert request.url.params.get("plnamespace") == "0"
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=json.dumps(
+                    {
+                        "query": {
+                            "pages": [
+                                {
+                                    "pageid": 1,
+                                    "links": [
+                                        {"ns": 0, "title": "Sourdough"},
+                                        # Outside the fetched set, so dropped.
+                                        {"ns": 0, "title": "Rye bread"},
+                                        # A self-link must never become a row.
+                                        {"ns": 0, "title": "Bread"},
+                                    ],
+                                },
+                                {"pageid": 2, "links": []},
+                            ]
+                        }
+                    }
+                ).encode(),
+            )
+        extract_calls += 1
+        payload = {"query": {"pages": [pages[extract_calls - 1]]}}
+        if extract_calls == 1:
+            payload["continue"] = {"continue": "-||", "gsroffset": 20}
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(payload).encode(),
+        )
+
+    monkeypatch.setattr(settings, "pool_max_articles_per_source", 2)
+    monkeypatch.setattr("app.connectors.wikipedia_connector.time.sleep", lambda _delay: None)
+    connector = WikipediaConnector(site, transport=httpx.MockTransport(handler))
+    articles = {article.title: article for article in connector.fetch_articles()}
+    connector.client.close()
+
+    links = articles["Bread"].outbound_internal_links
+    assert [link.url for link in links] == ["https://en.wikipedia.org/wiki/Sourdough"]
+    assert links[0].anchor_text == "Sourdough"
+    assert articles["Sourdough"].outbound_internal_links == []
+
+
+def test_wikipedia_link_capture_can_be_disabled(monkeypatch):
+    """`pool_max_links_per_article = 0` must send no link query at all."""
+    site = Site(name="Wiki", base_url="https://en.wikipedia.org/wiki/Bread", platform="pool")
+    link_queries = 0
+
+    def handler(request):
+        nonlocal link_queries
+        if request.url.params.get("prop") == "links":
+            link_queries += 1
+        if request.url.params.get("rvdir") == "newer":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=json.dumps({"query": {"pages": []}}).encode(),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(
+                {
+                    "query": {
+                        "pages": [
+                            {
+                                "pageid": 1,
+                                "title": "Bread",
+                                "fullurl": "https://en.wikipedia.org/wiki/Bread",
+                                "extract": "bread article",
+                                "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+                            }
+                        ]
+                    }
+                }
+            ).encode(),
+        )
+
+    monkeypatch.setattr(settings, "pool_max_articles_per_source", 1)
+    monkeypatch.setattr(settings, "pool_max_links_per_article", 0)
+    monkeypatch.setattr("app.connectors.wikipedia_connector.time.sleep", lambda _delay: None)
+    connector = WikipediaConnector(site, transport=httpx.MockTransport(handler))
+    articles = list(connector.fetch_articles())
+    connector.client.close()
+
+    assert link_queries == 0
+    assert articles[0].outbound_internal_links == []
