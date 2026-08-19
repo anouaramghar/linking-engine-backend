@@ -32,6 +32,8 @@ from app.schemas.suggestion import (
     BulkReviewFilter,
     BulkReviewFilterResult,
     BulkReviewUndoResult,
+    CitationNeedAnalysisOut,
+    CitationNeedOut,
     PlacementOut,
     SuggestionCounts,
     SuggestionCursor,
@@ -47,6 +49,7 @@ from app.schemas.suggestion import (
     TraceEventPage,
 )
 from app.services import placement_service
+from app.services.citation_need import analyze_citation_needs
 from app.services.authorization import (
     Principal,
     authorize_site,
@@ -1189,6 +1192,42 @@ def trigger_article_analysis(
     except DuplicateJobError as error:
         raise HTTPException(409, str(error)) from error
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
+
+
+@router.get(
+    "/articles/{article_id}/citation-needs",
+    response_model=CitationNeedAnalysisOut,
+)
+def get_article_citation_needs(
+    article_id: int,
+    limit: int = Query(default=10, ge=1, le=100),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> CitationNeedAnalysisOut:
+    """Return bounded, local citation-need evidence for one source article."""
+
+    article = db.get(Article, article_id)
+    if article is None:
+        raise HTTPException(404, f"article {article_id} not found")
+    site = authorize_site(db, principal, article.site_id)
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool articles cannot be suggestion sources")
+    analysis = analyze_citation_needs(
+        article.content_text,
+        language=article.language,
+        max_results=limit,
+    )
+    return CitationNeedAnalysisOut(
+        article_id=article.id,
+        content_fingerprint=analysis.content_fingerprint,
+        detector_version=analysis.detector_version,
+        threshold=analysis.threshold,
+        language=analysis.language,
+        sentences_analyzed=analysis.sentences_analyzed,
+        total_detected=analysis.total_detected,
+        truncated=analysis.truncated,
+        items=[CitationNeedOut(**need.as_score_component()) for need in analysis.needs],
+    )
 
 
 @router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)

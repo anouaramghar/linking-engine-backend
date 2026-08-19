@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     tavily_timeout_seconds: float = Field(default=10.0, gt=0.0, le=120.0)
     tavily_max_results_per_request: int = Field(default=5, ge=1, le=5)
 
+    # Explainable citation-need baseline. It runs locally and records evidence;
+    # it does not send article sentences to Tavily or block publication.
+    citation_need_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    citation_need_max_article_chars: int = Field(default=30_000, ge=1_000, le=100_000)
+    citation_need_max_sentences: int = Field(default=500, ge=1, le=5_000)
+    citation_need_max_results: int = Field(default=10, ge=1, le=100)
+
     # Placement context (v4): an OpenRouter-hosted model reads the source article
     # and picks the passage the link belongs in. Empty key disables the feature —
     # the placement endpoint reports it as unavailable rather than the review

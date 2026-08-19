@@ -17,6 +17,7 @@ from app.ml.external.base import ExternalSearchProvider
 from app.ml.hybrid import HybridRanker, RankedCandidate
 from app.models import Article, Embedding, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
+from app.services.citation_need import analyze_citation_needs
 from app.services.editorial_feedback import (
     FEEDBACK_CANDIDATE_POOL,
     load_editorial_feedback,
@@ -384,6 +385,8 @@ def generate_suggestions(
             external_filtered: dict[str, int] = {}
             live_url_candidates_checked = 0
             live_url_candidates_blocked = 0
+            citation_need_sources_detected = 0
+            citation_need_sentences_detected = 0
             graph_reordered_sources = 0
             for source_article_id in article_ids:
                 if ranking_mode == "hybrid" and site_capacity <= 0:
@@ -407,6 +410,26 @@ def generate_suggestions(
                     hybrid_sources_selected += 1
                 if has_capacity:
                     eligible_sources += 1
+                source_article = db.get(Article, source_article_id)
+                if source_article is None:
+                    raise ValueError(
+                        f"source article {source_article_id} disappeared during analysis"
+                    )
+                citation_analysis = (
+                    analyze_citation_needs(
+                        source_article.content_text,
+                        language=source_article.language,
+                    )
+                    if has_capacity and not comparison_only
+                    else None
+                )
+                citation_need = citation_analysis.primary if citation_analysis else None
+                citation_evidence = (
+                    citation_need.as_score_component() if citation_need is not None else None
+                )
+                if citation_analysis is not None:
+                    citation_need_sources_detected += int(citation_analysis.total_detected > 0)
+                    citation_need_sentences_detected += citation_analysis.total_detected
                 method = "baseline_cosine"
                 candidate_rows: list[RankedCandidate]
                 candidate_pool_limit = (
@@ -583,6 +606,10 @@ def generate_suggestions(
                     candidate_rows = []
                 for ordered_candidate in ordered_rows:
                     candidate = ordered_candidate.candidate
+                    generation_evidence = ordered_candidate.score_components
+                    if citation_evidence is not None:
+                        generation_evidence = dict(generation_evidence or {})
+                        generation_evidence["citation_need"] = citation_evidence
                     db.add(
                         Suggestion(
                             site_id=site_id,
@@ -593,11 +620,11 @@ def generate_suggestions(
                             # Cosine similarity for both methods, so one number keeps
                             # one meaning across the mixed queue.
                             score=candidate.semantic_score,
-                            score_components=ordered_candidate.score_components,
+                            score_components=generation_evidence,
                             retrieval_version=ordered_candidate.retrieval_version,
                             ranking_version=ordered_candidate.ranking_version,
                             final_rank=ordered_candidate.final_rank,
-                            feature_snapshot=ordered_candidate.score_components,
+                            feature_snapshot=generation_evidence,
                             status="pending",
                         )
                     )
@@ -605,20 +632,16 @@ def generate_suggestions(
                 external_for_source = 0
                 external_missing = remaining - len(candidate_rows)
                 if external_missing > 0 and has_capacity and not comparison_only:
-                    article = db.get(Article, source_article_id)
-                    if article is None:
-                        raise ValueError(
-                            f"source article {source_article_id} disappeared during analysis"
-                        )
                     external_outcome = fill_external_suggestion_gap(
                         db,
                         site=site,
-                        article=article,
+                        article=source_article,
                         missing_slots=external_missing,
                         model=model,
                         job_run_id=job_run_id,
                         provider=external_provider,
                         live_url_checker=live_url_checker,
+                        citation_analysis=citation_analysis,
                     )
                     external_searches += external_outcome.searched
                     external_for_source = external_outcome.created
@@ -654,6 +677,8 @@ def generate_suggestions(
                 "external_filtered": external_filtered,
                 "live_url_candidates_checked": live_url_candidates_checked,
                 "live_url_candidates_blocked": live_url_candidates_blocked,
+                "citation_need_sources_detected": citation_need_sources_detected,
+                "citation_need_sentences_detected": citation_need_sentences_detected,
                 "external_candidates_eligible": sum(
                     evaluation.eligible for evaluation in external_trust.values()
                 ),
