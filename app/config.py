@@ -246,6 +246,12 @@ class Settings(BaseSettings):
     pool_poll_interval_seconds: int = Field(default=86400, ge=60)
     pool_poll_repeat_count: int = Field(default=3650, ge=1)
 
+    # External target checks are synchronous and run only on candidates that
+    # survived static policy/ranking. This is one wall-clock budget shared by
+    # DNS, connect, TLS, HEAD/GET fallback and every redirect hop.
+    live_url_timeout_seconds: float = Field(default=8.0, gt=0.0, le=30.0)
+    live_url_max_redirects: int = Field(default=5, ge=0, le=10)
+
     # One durable observation per managed site and day. Historical orphan-page
     # counts cannot be reconstructed after a crawl, so the evaluation dashboard
     # records them prospectively instead of inventing a pre-deployment trend.
