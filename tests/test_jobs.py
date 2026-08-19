@@ -175,7 +175,7 @@ def test_lost_job_is_reconciled_and_retriggerable(client, db, site, cleanup_rq, 
             "attempts": 0,
             "error": "lost from queue before completion",
         },
-        {"kind": "job_lost", "site_id": site.id},
+        {"kind": "job_lost", "site_id": site.id, "dedupe": False},
     ) in alerts
 
 
@@ -202,6 +202,43 @@ def test_final_job_failure_sends_alert(db, site, monkeypatch):
         "attempts": 1,
         "error": "x" * 2000,
     }
+
+
+def test_successful_job_records_a_partial_in_app_notification(db, site, monkeypatch):
+    run = JobRun(site_id=site.id, kind="publication")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(job_service, "send_alert", lambda *_args, **_kwargs: pytest.fail())
+
+    result = run_durably(
+        run.id,
+        lambda _site_id: {"applied": 2, "skipped": 1},
+        site.id,
+    )
+
+    assert result == {"applied": 2, "skipped": 1}
+    db.expire_all()
+    alert = db.scalar(select(Alert).where(Alert.site_id == site.id, Alert.kind == "job_partial"))
+    assert alert is not None
+    assert alert.subject == "LinkMesh publication job partially completed"
+    assert alert.payload["job_run_id"] == run.id
+    assert alert.payload["outcome"] == "partial"
+
+
+def test_successful_job_records_a_completed_in_app_notification(db, site, monkeypatch):
+    run = JobRun(site_id=site.id, kind="analysis")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(job_service, "send_alert", lambda *_args, **_kwargs: pytest.fail())
+
+    run_durably(run.id, lambda _site_id: {"suggestions": 3}, site.id)
+
+    db.expire_all()
+    alert = db.scalar(select(Alert).where(Alert.site_id == site.id, Alert.kind == "job_succeeded"))
+    assert alert is not None
+    assert alert.subject == "LinkMesh analysis job completed"
+    assert alert.payload["job_run_id"] == run.id
+    assert alert.payload["outcome"] == "succeeded"
 
 
 def test_nonfinal_job_failure_does_not_send_alert(db, site, monkeypatch):
@@ -336,7 +373,7 @@ def test_terminal_killed_work_horse_fails_once_and_alerts_once(db, site, monkeyp
                 "attempts": 3,
                 "error": stored.error,
             },
-            {"kind": "job_failed", "site_id": site.id},
+            {"kind": "job_failed", "site_id": site.id, "dedupe": False},
         )
     ]
 
@@ -557,7 +594,7 @@ def test_terminal_abandoned_job_fails_and_alerts_once(db, site, monkeypatch):
                 "attempts": 3,
                 "error": "job abandoned after worker termination",
             },
-            {"kind": "job_failed", "site_id": site.id},
+            {"kind": "job_failed", "site_id": site.id, "dedupe": False},
         )
     ]
 
@@ -611,7 +648,7 @@ def test_stopped_job_fails_linked_ingestion_and_alerts_once(db, site, monkeypatc
                 "attempts": 1,
                 "error": "job stopped intentionally",
             },
-            {"kind": "job_stopped", "site_id": site.id},
+            {"kind": "job_stopped", "site_id": site.id, "dedupe": False},
         )
     ]
 

@@ -15,21 +15,32 @@ logger = logging.getLogger(__name__)
 _ALERT_TIMEOUT_SECONDS = 5.0
 
 
-def _store_alert(subject: str, payload: dict, kind: str, site_id: int | None) -> None:
+def _store_alert(
+    subject: str,
+    payload: dict,
+    kind: str,
+    site_id: int | None,
+    *,
+    dedupe: bool,
+) -> None:
     try:
         with SessionLocal() as db:
-            site_filter = Alert.site_id.is_(None) if site_id is None else Alert.site_id == site_id
-            existing = db.scalars(
-                select(Alert)
-                .where(
-                    site_filter,
-                    Alert.kind == kind,
-                    Alert.subject == subject,
-                    Alert.acknowledged_at.is_(None),
+            existing = None
+            if dedupe:
+                site_filter = (
+                    Alert.site_id.is_(None) if site_id is None else Alert.site_id == site_id
                 )
-                .order_by(Alert.id.desc())
-                .with_for_update()
-            ).first()
+                existing = db.scalars(
+                    select(Alert)
+                    .where(
+                        site_filter,
+                        Alert.kind == kind,
+                        Alert.subject == subject,
+                        Alert.acknowledged_at.is_(None),
+                    )
+                    .order_by(Alert.id.desc())
+                    .with_for_update()
+                ).first()
             now = datetime.now(timezone.utc)
             if existing is None:
                 db.add(
@@ -49,15 +60,28 @@ def _store_alert(subject: str, payload: dict, kind: str, site_id: int | None) ->
         logger.exception("failed to persist alert: %s", subject)
 
 
+def record_alert(
+    subject: str,
+    payload: dict,
+    *,
+    kind: str,
+    site_id: int | None,
+    dedupe: bool = True,
+) -> None:
+    """Persist one shared in-app alert without contacting an external webhook."""
+    _store_alert(subject, payload, kind, site_id, dedupe=dedupe)
+
+
 def send_alert(
     subject: str,
     payload: dict,
     *,
     kind: str,
     site_id: int | None,
+    dedupe: bool = True,
 ) -> None:
     """Persist an alert and optionally send it to the configured webhook."""
-    _store_alert(subject, payload, kind, site_id)
+    record_alert(subject, payload, kind=kind, site_id=site_id, dedupe=dedupe)
     body = {
         "kind": kind,
         "site_id": site_id,

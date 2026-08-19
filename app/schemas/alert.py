@@ -15,3 +15,4 @@ class AlertOut(BaseModel):
     created_at: datetime
     last_seen_at: datetime
     acknowledged_at: datetime | None
+    site_name: str | None = None

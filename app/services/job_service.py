@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.db import SessionLocal, engine
 from app.models import IngestionRun, JobRun, Site
-from app.services.alerts import send_alert
+from app.services.alerts import record_alert, send_alert
 from app.services.publication_progress import mark_publication_failure
 from app.tasks.queues import (
     analysis_queue,
@@ -57,6 +57,60 @@ _PUBLIC_JOB_STATUSES = {
 _UNASSIGNED_QUEUE_ID_GRACE_SECONDS = 30
 
 logger = logging.getLogger(__name__)
+
+
+def _count_result_value(value: object) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int | float):
+        return max(0, int(value))
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    return 0
+
+
+def _job_outcome(result: object) -> str:
+    """Classify a successful task result without changing its durable contract."""
+    if not isinstance(result, dict):
+        return "succeeded"
+    if result.get("partial") is True:
+        return "partial"
+
+    failure_count = sum(
+        _count_result_value(result.get(key))
+        for key in ("failed", "errors", "error_count", "rejected", "skipped", "blocked")
+    )
+    success_count = sum(
+        _count_result_value(result.get(key))
+        for key in (
+            "applied",
+            "created",
+            "imported",
+            "inserted",
+            "links",
+            "suggestions",
+            "updated",
+        )
+    )
+    return "partial" if failure_count and success_count else "succeeded"
+
+
+def _record_completed_job_alert(run: JobRun, result: dict) -> None:
+    outcome = _job_outcome(result)
+    label = "partially completed" if outcome == "partial" else "completed"
+    record_alert(
+        f"LinkMesh {run.kind} job {label}",
+        {
+            "site_id": run.site_id,
+            "kind": run.kind,
+            "job_run_id": run.id,
+            "attempts": run.attempts,
+            "outcome": outcome,
+        },
+        kind=f"job_{outcome if outcome == 'partial' else 'succeeded'}",
+        site_id=run.site_id,
+        dedupe=False,
+    )
 
 
 class DuplicateJobError(Exception):
@@ -115,6 +169,7 @@ def _mark_run_lost(run: JobRun) -> None:
         },
         kind="job_lost",
         site_id=run.site_id,
+        dedupe=False,
     )
 
 
@@ -378,6 +433,7 @@ def run_durably(job_run_id: int | None, fn, site_id: int, **task_kwargs) -> dict
                     },
                     kind="job_failed",
                     site_id=site_id,
+                    dedupe=False,
                 )
             raise
         if run is not None:
@@ -386,6 +442,7 @@ def run_durably(job_run_id: int | None, fn, site_id: int, **task_kwargs) -> dict
             run.error = None  # clear any earlier attempt's failure
             run.finished_at = datetime.now(timezone.utc)
             db.commit()
+            _record_completed_job_alert(run, result)
         return result
     finally:
         db.close()
@@ -509,6 +566,7 @@ def _reconcile_interrupted_job(
                 alert_payload,
                 kind=alert_kind,
                 site_id=alert_payload["site_id"],
+                dedupe=False,
             )
         except Exception:
             # send_alert is best-effort itself, but preserve RQ's failure handling if

@@ -1,8 +1,10 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 MAX_GRAPH_SIMULATION_SUGGESTIONS = 500
+MAX_GRAPH_NEIGHBORHOOD_NODES = 80
 
 
 class GraphFeatureOut(BaseModel):
@@ -35,6 +37,26 @@ class GraphSummaryOut(BaseModel):
     items: list[GraphFeatureOut]
     limit: int
     offset: int
+
+
+class GraphNetworkEdgeOut(BaseModel):
+    source_article_id: int
+    target_article_id: int
+
+
+class GraphNetworkOut(BaseModel):
+    site_id: int
+    snapshot_id: int
+    graph_version: str
+    computed_at: datetime
+    article_count: int
+    edge_count: int
+    orphan_count: int
+    underlinked_count: int
+    hub_count: int
+    saturated_count: int
+    nodes: list[GraphFeatureOut]
+    edges: list[GraphNetworkEdgeOut]
 
 
 class GraphSimulationRequest(BaseModel):
@@ -70,4 +92,46 @@ class GraphSimulationOut(BaseModel):
     newly_connected_article_ids: list[int]
     newly_saturated_article_ids: list[int]
     target_concentration: float
+    warnings: list[str]
+
+
+class GraphNeighborhoodRequest(BaseModel):
+    """The exact suggestions an editor is inspecting in the Graph Lens."""
+
+    suggestion_ids: list[int] = Field(
+        min_length=1,
+        max_length=MAX_GRAPH_SIMULATION_SUGGESTIONS,
+    )
+    max_nodes: int = Field(default=48, ge=1, le=MAX_GRAPH_NEIGHBORHOOD_NODES)
+
+
+class GraphNeighborhoodNodeOut(GraphFeatureOut):
+    """A graph node, marked when it belongs to the selected suggestion set."""
+
+    focus: bool
+
+
+class GraphNeighborhoodEdgeOut(BaseModel):
+    source_article_id: int
+    target_article_id: int
+
+
+class GraphProposedEdgeOut(BaseModel):
+    suggestion_id: int
+    source_article_id: int
+    target_article_id: int
+    status: Literal["new", "already_present"]
+
+
+class GraphNeighborhoodOut(BaseModel):
+    site_id: int
+    snapshot_id: int
+    graph_version: str
+    computed_at: datetime
+    requested_suggestion_ids: list[int]
+    skipped_suggestion_ids: list[int]
+    nodes: list[GraphNeighborhoodNodeOut]
+    existing_edges: list[GraphNeighborhoodEdgeOut]
+    proposed_edges: list[GraphProposedEdgeOut]
+    truncated: bool
     warnings: list[str]
