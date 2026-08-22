@@ -16,6 +16,7 @@ worth keeping alive between requests and one less lifecycle to leak.
 """
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 
 from fastapi import HTTPException
@@ -28,9 +29,18 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.agent_tools import REGISTRY, AgentTool, call_tool, error_of, json_schema
+from app.agent_tools import (
+    REGISTRY,
+    AgentTool,
+    call_tool,
+    error_of,
+    json_schema,
+    output_schema_violation,
+)
 from app.db import SessionLocal
 from app.services.authorization import authenticate_api_key
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     name="LinkMesh",
@@ -123,6 +133,12 @@ def _register(tool: AgentTool) -> None:
         failure = error_of(result)
         if failure is not None:
             raise ToolError(failure)
+        # A tool that publishes an `outputSchema` has promised this shape, and
+        # fastmcp does not check it. Answer anyway — a usable result is worth
+        # more than a strict outage — but say so, loudly, in the log.
+        drift = output_schema_violation(tool, result)
+        if drift is not None:
+            logger.error("%s", drift)
         return result
 
     # Constructed rather than introspected: the registry's pydantic models are
@@ -133,6 +149,7 @@ def _register(tool: AgentTool) -> None:
             name=tool.name,
             description=tool.description,
             parameters=json_schema(tool.args_model),
+            output_schema=json_schema(tool.output_model) if tool.output_model else None,
             annotations=ToolAnnotations(
                 title=tool.title or tool.name,
                 **READ_ONLY_ANNOTATIONS,

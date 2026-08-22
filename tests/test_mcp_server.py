@@ -250,3 +250,38 @@ def test_an_unauthenticated_call_still_cannot_reach_a_tool(monkeypatch, client):
             key="wrong-key",
         )
     assert response.status_code == 401
+
+
+def test_output_schemas_reach_the_client(monkeypatch, client):
+    """A client must be able to read the result shape before it calls.
+
+    `inputSchema` stops a model inventing an argument; `outputSchema` stops it
+    inventing — or misreading — a field. It is declared for the tools where one
+    number was being mistaken for another, and left off the rest.
+    """
+    monkeypatch.setattr(settings, "api_key", "test-mcp-key")
+    with TestClient(app=client.app) as fresh:
+        _post(fresh, "/mcp/", INITIALIZE, key="test-mcp-key")
+        listed = _post(
+            fresh,
+            "/mcp/",
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            key="test-mcp-key",
+        ).json()["result"]["tools"]
+
+    schemas = {tool["name"]: tool.get("outputSchema") for tool in listed}
+    assert schemas["search_queue"] is not None
+    assert schemas["get_queue_counts"] is None
+
+    published = schemas["search_queue"]["properties"]
+    assert "how many" in published["match_count"]["description"]
+    assert "suggestions" in published
+
+    # fastmcp inlines nested definitions, so the client gets one self-contained
+    # schema — no $ref pointing at a $defs block that did not travel with it.
+    page = published["page"]["properties"]
+    assert "Never the answer to 'how many'" in page["returned"]["description"]
+    assert "$ref" not in json.dumps(schemas["search_queue"])
+    # And none of pydantic's generated titles, at any depth: a model quotes
+    # them back as though they were content.
+    assert "title" not in json.dumps(schemas["search_queue"])

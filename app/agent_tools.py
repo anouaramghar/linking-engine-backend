@@ -273,6 +273,91 @@ class OpsDigestArgs(BaseModel):
     )
 
 
+#: ---------------------------------------------------------------------------
+#: Result shapes for the tools that return a count beside a list.
+#:
+#: These are the tools where one number was mistaken for another, so they are
+#: the ones worth publishing a contract for. The contract is what an MCP client
+#: reads *before* calling: ``inputSchema`` stops a model inventing an argument,
+#: ``outputSchema`` stops it inventing — or misreading — a field.
+#:
+#: Handlers still return plain dicts. These models describe that dict and are
+#: checked against it rather than replacing it, because the same dict is what
+#: the chat loop reads and what the tests assert on.
+
+
+class Page(BaseModel):
+    """What one call returned, kept apart from what matched.
+
+    Every field here is about *this response*. A tool's ``match_count`` is
+    about the data. Reading ``returned`` as an answer to "how many" is the
+    mistake this separation exists to prevent.
+    """
+
+    returned: int = Field(description="Rows in this response only. Never the answer to 'how many'.")
+    has_more: bool = Field(description="True when more rows match than were returned.")
+    next_cursor: str | None = Field(
+        None,
+        description="Absent on the last page. Pass back as `cursor` with the same filters.",
+    )
+    offset: int | None = Field(None, description="Rows skipped before this page.")
+
+
+class SearchQueueResult(BaseModel):
+    match_count: int | None = Field(
+        None,
+        description=(
+            "Suggestions matching the filters in total — the answer to 'how many'. "
+            "Counted on the first page only, so it is absent when continuing from a "
+            "cursor; the count has not changed."
+        ),
+    )
+    page: Page
+    dashboard_url: str | None = Field(
+        None, description="The queue view with these filters already applied."
+    )
+    suggestions: list[dict[str, Any]] = Field(description="At most `limit` rows, best first.")
+
+
+class FindArticlesResult(BaseModel):
+    site_id: int
+    match_count: int = Field(
+        description="Articles matching the filters in total, not the number returned."
+    )
+    page: Page
+    articles: list[dict[str, Any]]
+
+
+class SiteJobsResult(BaseModel):
+    site_id: int
+    match_count: int = Field(description="Job runs matching in total, not the number returned.")
+    page: Page
+    jobs: list[dict[str, Any]]
+
+
+class SuggestionHistoryResult(BaseModel):
+    trace_id: str | None = Field(
+        None, description="The trace these events belong to, when the call named one."
+    )
+    match_count: int = Field(description="Events matching in total, not the number returned.")
+    page: Page
+    events: list[dict[str, Any]]
+
+
+class IngestionDiagnosticsResult(BaseModel):
+    run: dict[str, Any] = Field(description="The ingestion run these rows came from.")
+    counts: dict[str, int] = Field(
+        description="The run's own URL counters: discovered, accepted, skipped, upserted, links."
+    )
+    reasons: dict[str, int] = Field(
+        description="The crawl's own histogram: reason code to number of URLs. Complete."
+    )
+    match_count: int = Field(
+        description="Diagnostic rows matching the reason filter in total; `examples` is a sample."
+    )
+    examples: list[dict[str, Any]]
+
+
 @dataclass(frozen=True)
 class AgentTool:
     name: str
@@ -283,6 +368,12 @@ class AgentTool:
     #: name in permission prompts and call traces; the model still calls
     #: ``name``. Falls back to the name when unset.
     title: str | None = None
+    #: The shape this tool answers with, published to MCP clients as
+    #: ``outputSchema``. Optional on purpose: a tool whose payload is a handful
+    #: of unambiguous scalars gains nothing from a contract, and an unused model
+    #: is one more thing to keep true. Declared shapes are kept true by
+    #: ``test_declared_output_schemas_describe_the_real_payload``.
+    output_model: type[BaseModel] | None = None
     #: Fleet-wide surfaces (evaluation) are admin-only for scoped keys on the
     # REST API too; the registry enforces the same line so neither surface can
     # forget it.
@@ -1392,6 +1483,7 @@ REGISTRY: dict[str, AgentTool] = {
                 "`page.next_cursor` back as `cursor` with the same filters."
             ),
             args_model=SearchQueueArgs,
+            output_model=SearchQueueResult,
             handler=_search_queue,
         ),
         AgentTool(
@@ -1428,6 +1520,7 @@ REGISTRY: dict[str, AgentTool] = {
                 "site's recent review activity."
             ),
             args_model=SuggestionHistoryArgs,
+            output_model=SuggestionHistoryResult,
             handler=_suggestion_history,
         ),
         AgentTool(
@@ -1439,6 +1532,7 @@ REGISTRY: dict[str, AgentTool] = {
                 '"why did the crawl only find N articles" or a failed crawl.'
             ),
             args_model=IngestionDiagnosticsArgs,
+            output_model=IngestionDiagnosticsResult,
             handler=_ingestion_diagnostics,
         ),
         AgentTool(
@@ -1450,6 +1544,7 @@ REGISTRY: dict[str, AgentTool] = {
                 "only what is running now."
             ),
             args_model=SiteJobsArgs,
+            output_model=SiteJobsResult,
             handler=_site_jobs,
         ),
         AgentTool(
@@ -1476,6 +1571,7 @@ REGISTRY: dict[str, AgentTool] = {
                 "Find articles on a site by title/URL substring; can restrict to orphan pages."
             ),
             args_model=FindArticlesArgs,
+            output_model=FindArticlesResult,
             handler=_find_articles,
         ),
     ]
@@ -1500,13 +1596,47 @@ def error_of(result: dict[str, Any]) -> str | None:
     return None
 
 
+def output_schema_violation(tool: AgentTool, result: dict[str, Any]) -> str | None:
+    """Why ``result`` does not match what ``tool`` promised, or ``None``.
+
+    fastmcp publishes ``outputSchema`` but does not enforce it, so a declared
+    shape is a promise nothing checks. That is the failure mode this whole
+    surface has been spending its time removing: a client reads the contract,
+    trusts it, and is quietly wrong. A drifted payload is therefore reported
+    here and logged.
+
+    It is *not* turned into an error. A read-only status tool answering with an
+    extra key is still a useful answer, and refusing it would turn a schema slip
+    into an outage. Drift is meant to be caught by
+    ``test_declared_output_schemas_describe_the_real_payload`` before it ships;
+    this is the net under that, for a payload shape no fixture reaches.
+    """
+    if tool.output_model is None or error_of(result) is not None:
+        return None
+    try:
+        tool.output_model.model_validate(result)
+    except ValidationError as exc:
+        return f"{tool.name} result does not match its output schema: {_argument_problems(exc)}"
+    return None
+
+
 def json_schema(model: type[BaseModel]) -> dict[str, Any]:
-    """JSON Schema without pydantic's ``title`` noise — models quote it back."""
-    schema = model.model_json_schema()
-    schema.pop("title", None)
-    for prop in schema.get("properties", {}).values():
-        prop.pop("title", None)
-    return schema
+    """JSON Schema without pydantic's ``title`` noise — models quote it back.
+
+    Stripped at every depth, not just the top: an output model nests, and
+    fastmcp inlines the nested definitions into what it publishes, so a title
+    left on ``Page.returned`` reaches the client exactly like one left on the
+    root would.
+    """
+
+    def strip(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {key: strip(value) for key, value in node.items() if key != "title"}
+        if isinstance(node, list):
+            return [strip(item) for item in node]
+        return node
+
+    return strip(model.model_json_schema())
 
 
 def openai_tool_specs() -> list[dict[str, Any]]:

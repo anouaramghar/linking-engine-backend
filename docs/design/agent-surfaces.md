@@ -49,6 +49,30 @@ Two things the protocol carries that prose cannot:
   `test_registry_is_read_only_by_construction` is what keeps that true.
   `idempotentHint` is not declared: the specification gives it meaning only
   when `readOnlyHint` is false.
+- **Result schemas.** Five tools publish an `outputSchema`: `search_queue`,
+  `find_articles`, `get_site_jobs`, `get_suggestion_history`,
+  `get_ingestion_diagnostics` — the ones that return a count beside a list,
+  which is where one number was being read as another. `inputSchema` stops a
+  model inventing an argument; `outputSchema` stops it misreading a field, and
+  it does so *before* the call rather than after. The schema carries the
+  distinction in prose a model reads: `match_count` says "the answer to how
+  many", `page.returned` says "never the answer to how many".
+
+  The rest of the registry declares none, deliberately. A payload of
+  unambiguous scalars gains nothing from a contract, and an unused model is one
+  more thing to keep true.
+
+  fastmcp publishes the schema but does **not** validate results against it, so
+  a declared shape is otherwise a promise nothing checks —
+  `test_declared_output_schemas_describe_the_real_payload` calls every
+  contracted tool against real fixtures, and `output_schema_violation` logs any
+  drift a fixture never reaches. Drift is logged, not raised: a read-only
+  status tool answering with an extra key is still a useful answer, and a
+  schema slip should not become an outage.
+
+  `structuredContent` is separate and was already there — fastmcp derives it
+  from the handler's dict. The schema is the *contract*; `structuredContent` is
+  the data.
 - **Failures.** The registry answers failures as `{"error", "status"}` data,
   which the chat loop reads directly. Over MCP that shape is indistinguishable
   from a successful payload, so `_register` translates it through `error_of`
@@ -274,6 +298,12 @@ handler calls its route *function*, so `Query(..., le=100)` never runs — the
 pydantic model is the only validation an agent's arguments meet. `search_queue`
 is the worked example: its percent band, term length, and page size are all
 re-declared there.
+
+Give a tool an `output_model` when its payload has a number that could be read
+as a different number — in practice, a count beside a list. Handlers still
+return plain dicts; the model describes that dict and is checked against it,
+because the same dict is what the chat loop reads and what the tests assert on.
+A tool answering with unambiguous scalars should not have one.
 
 Cross-field rules belong on the model too, as a `model_validator`, not in the
 handler. A rule in the handler is absent from the JSON Schema, so a model meets

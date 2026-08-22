@@ -1057,3 +1057,112 @@ class TestUncoveredTools:
         finally:
             db.delete(run)
             db.commit()
+
+
+class TestDeclaredOutputSchemas:
+    """The contract MCP clients read before they call.
+
+    fastmcp publishes `outputSchema` but does not enforce it, so a declared
+    shape that drifts from the handler is a promise nothing checks — the exact
+    failure this surface has spent its time removing. These tests are the
+    enforcement.
+    """
+
+    def test_declared_output_schemas_describe_the_real_payload(
+        self, db, site, pending_history, crawl_run, finished_jobs
+    ):
+        from app.agent_tools import output_schema_violation
+
+        calls = {
+            "search_queue": {"site_id": site.id},
+            "find_articles": {"site_id": site.id},
+            "get_site_jobs": {"site_id": site.id},
+            "get_suggestion_history": {"trace_id": pending_history.trace_id},
+            "get_ingestion_diagnostics": {"site_id": site.id, "run_id": crawl_run.id},
+        }
+        for name, arguments in calls.items():
+            tool = REGISTRY[name]
+            assert tool.output_model is not None, f"{name} lost its output model"
+            result = call_tool(db, _admin(), name, arguments)
+            assert "error" not in result, (name, result)
+            assert output_schema_violation(tool, result) is None, name
+
+    def test_a_continuation_page_still_conforms(self, db, site):
+        """`match_count` is absent when continuing, so the model must allow it."""
+        from app.agent_tools import output_schema_violation
+
+        source = Article(site_id=site.id, url=f"{site.base_url}/c-s", title="s", content_text="s")
+        targets = [
+            Article(site_id=site.id, url=f"{site.base_url}/c-t{n}", title=f"t{n}", content_text="t")
+            for n in range(2)
+        ]
+        db.add_all([source, *targets])
+        db.flush()
+        rows = [
+            Suggestion(
+                site_id=site.id,
+                source_article_id=source.id,
+                target_article_id=target.id,
+                method="hybrid_bm25",
+                score=0.9 - index / 100,
+                status="pending",
+            )
+            for index, target in enumerate(targets)
+        ]
+        db.add_all(rows)
+        db.commit()
+        try:
+            first = call_tool(db, _admin(), "search_queue", {"site_id": site.id, "limit": 1})
+            assert first["match_count"] == 2
+            cursor = first["page"]["next_cursor"]
+
+            second = call_tool(
+                db, _admin(), "search_queue", {"site_id": site.id, "limit": 1, "cursor": cursor}
+            )
+            # The count is issued once. The shape has to survive its absence.
+            assert "match_count" not in second
+            assert output_schema_violation(REGISTRY["search_queue"], second) is None
+        finally:
+            for row in rows:
+                db.delete(row)
+            for row in [source, *targets]:
+                db.delete(row)
+            db.commit()
+
+    def test_drift_is_reported_rather_than_assumed_away(self):
+        from app.agent_tools import output_schema_violation
+
+        drifted = {"site_id": 1, "page": {"returned": 0, "has_more": False}, "articles": []}
+        violation = output_schema_violation(REGISTRY["find_articles"], drifted)
+        assert violation is not None
+        assert "match_count" in violation
+
+    def test_a_failure_is_not_measured_against_the_success_shape(self):
+        from app.agent_tools import output_schema_violation
+
+        failure = {"error": "site 9 not found", "status": 404}
+        assert output_schema_violation(REGISTRY["find_articles"], failure) is None
+
+    def test_the_schema_says_which_number_answers_how_many(self):
+        from app.agent_tools import json_schema
+
+        schema = json_schema(REGISTRY["search_queue"].output_model)
+        # The whole reason for declaring a shape: the distinction that was
+        # getting lost is written down, not inferred from key names.
+        assert "how many" in schema["properties"]["match_count"]["description"]
+        page = schema["$defs"]["Page"]["properties"]
+        assert "Never the answer to 'how many'" in page["returned"]["description"]
+
+    def test_only_the_ambiguous_tools_declare_one(self):
+        """A contract is a maintenance cost, so it is spent where it buys something."""
+        declared = {name for name, tool in REGISTRY.items() if tool.output_model is not None}
+        assert declared == {
+            "search_queue",
+            "find_articles",
+            "get_site_jobs",
+            "get_suggestion_history",
+            "get_ingestion_diagnostics",
+        }
+        # These answer with unambiguous scalars; a model would add nothing.
+        assert REGISTRY["get_queue_counts"].output_model is None
+        assert REGISTRY["list_active_jobs"].output_model is None
