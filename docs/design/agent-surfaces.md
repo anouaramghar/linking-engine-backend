@@ -127,6 +127,37 @@ once at startup when one is configured. The point is not to prevent the choice;
 it is that a development convenience should not become the production path
 without anyone noticing.
 
+### Choosing a model
+
+`AGENT_MODEL` must support tool calling, because the registry is the whole
+feature: a model that cannot call a tool answers every operational question
+from nothing. Three properties beyond that decide whether one is usable, and
+none of them is visible from a model's name, size, or catalogue description.
+
+**Two tools in one turn.** Some models emit both calls in a single assistant
+message and then reject that transcript on the following request.
+`meta/llama-3.1-8b-instruct` on NVIDIA NIM answers a one-tool question and
+fails a two-tool one with `500 ... This model only supports single tool-calls
+at once!` — the failure is in the provider's prompt template, not in
+`chat_with_tools`, so there is nothing to catch and retry. A model that calls
+its tools sequentially across turns never meets it. Test with a question that
+needs two tools; the one-tool case proves nothing.
+
+**Latency tracks demand, not size.** On a shared free tier a newly published
+model can spend over a minute queued before generating anything — a three-word
+prompt returning two tokens in eighty-odd seconds is queue wait, not compute,
+since two tokens cost milliseconds to produce. A comparable model on the same
+key and endpoint answered in under a second. No prompt, budget, or timeout
+change touches it; it simply exceeds `AGENT_TIMEOUT_SECONDS` partway through a
+conversation, which the operator sees as the 503 from *Model failures* below.
+
+**Reasoning models spend the output budget on thinking.** Where a model returns
+`reasoning_content`, that text counts against `AGENT_MAX_OUTPUT_TOKENS` before
+any answer is generated. A budget sized for the reply alone can be consumed
+entirely by a model reasoning about a surprising tool result, and the turn
+returns `finish_reason=length` with empty content — a blank panel rather than
+an error, which is the harder version to diagnose.
+
 ### One answer path
 
 Every question reaches the model. There is no shortcut for "easy" questions,
@@ -296,7 +327,7 @@ failure of it.
 | --- | --- | --- |
 | `AGENT_BASE_URL` | *(empty)* | Assistant's endpoint; empty reuses `OPENROUTER_BASE_URL` |
 | `AGENT_API_KEY` | *(empty)* | Assistant's key; empty reuses `OPENROUTER_API_KEY` |
-| `AGENT_MODEL` | `anthropic/claude-sonnet-4.5` | Must support tool calling |
+| `AGENT_MODEL` | `anthropic/claude-sonnet-4.5` | Must support tool calling; see *Choosing a model* |
 | `AGENT_TIMEOUT_SECONDS` | `90` | Per model turn |
 | `AGENT_MAX_TOOL_ROUNDS` | `4` | Tool-bearing turns per question |
 | `AGENT_MAX_OUTPUT_TOKENS` | `1500` | Per turn |

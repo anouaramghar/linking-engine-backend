@@ -1,5 +1,6 @@
 """The shared read-only action registry behind both agent surfaces."""
 
+import json
 import uuid
 
 import pytest
@@ -180,8 +181,10 @@ def test_search_queue_reports_empty_total(db, site):
     assert result["match_count"] == 0
     assert result["suggestions"] == []
     # The page size lives one level down, so it cannot be read as the count.
-    assert result["page"] == {"returned": 0, "has_more": False}
-    assert "returned" not in result
+    assert result["page"] == {"has_more": False}
+    # No row count anywhere: the suggestions array already says how many came
+    # back, and a second integer beside match_count is what gets misread.
+    assert "returned" not in json.dumps(result)
 
 
 def test_find_articles_scopes_to_site(db, client, site):
@@ -189,7 +192,7 @@ def test_find_articles_scopes_to_site(db, client, site):
     assert result == {
         "site_id": site.id,
         "match_count": 0,
-        "page": {"returned": 0, "has_more": False},
+        "page": {"has_more": False},
         "articles": [],
     }
 
@@ -265,7 +268,7 @@ class TestSearchQueueFilters:
     def test_cursor_walks_the_whole_queue(self, db, site, graded):
         first = call_tool(db, _admin(), "search_queue", {"site_id": site.id, "limit": 2})
         assert first["match_count"] == 4, "the first page counts the full match once"
-        assert first["page"]["returned"] == 2
+        assert len(first["suggestions"]) == 2, "the page size is the array, not a field"
         assert first["page"]["has_more"] is True
 
         second = call_tool(
@@ -692,7 +695,7 @@ class TestSuggestionHistory:
             db, _admin(), "get_suggestion_history", {"trace_id": pending_history.trace_id}
         )
         assert result["match_count"] == 1
-        assert result["page"] == {"returned": 1, "offset": 0, "has_more": False}
+        assert result["page"] == {"offset": 0, "has_more": False}
 
     def test_unknown_id_is_data_not_an_exception(self, db, site):
         result = call_tool(db, _admin(), "get_suggestion_history", {"suggestion_id": 10_000_000})
@@ -823,7 +826,8 @@ class TestCapsAreVisible:
     def test_find_articles_reports_the_whole_match_not_the_page(self, db, site, many_articles):
         result = call_tool(db, _admin(), "find_articles", {"site_id": site.id, "limit": 5})
         assert result["match_count"] == 30, "the count is the answer to 'how many'"
-        assert result["page"] == {"returned": 5, "has_more": True}
+        assert result["page"] == {"has_more": True}
+        assert len(result["articles"]) == 5
 
     def test_the_count_respects_the_same_filters(self, db, site, many_articles):
         result = call_tool(
@@ -831,7 +835,7 @@ class TestCapsAreVisible:
         )
         # "article 1", "article 10".."article 19" — eleven, of which two shown.
         assert result["match_count"] == 11
-        assert result["page"]["returned"] == 2
+        assert len(result["articles"]) == 2
 
     def test_ops_digest_counts_what_it_only_samples(self, db, site):
         from app.models import Alert
@@ -1150,8 +1154,10 @@ class TestDeclaredOutputSchemas:
         # The whole reason for declaring a shape: the distinction that was
         # getting lost is written down, not inferred from key names.
         assert "how many" in schema["properties"]["match_count"]["description"]
+        # And the page object carries nothing that could answer it instead.
         page = schema["$defs"]["Page"]["properties"]
-        assert "Never the answer to 'how many'" in page["returned"]["description"]
+        assert "returned" not in page
+        assert set(page) <= {"has_more", "next_cursor", "offset"}
 
     def test_only_the_ambiguous_tools_declare_one(self):
         """A contract is a maintenance cost, so it is spent where it buys something."""
@@ -1166,3 +1172,121 @@ class TestDeclaredOutputSchemas:
         # These answer with unambiguous scalars; a model would add nothing.
         assert REGISTRY["get_queue_counts"].output_model is None
         assert REGISTRY["list_active_jobs"].output_model is None
+
+
+class TestUnknownSiteIsRecoverable:
+    """A rejected site id must tell the caller which ones would work.
+
+    A bare "site 123 not found" is a dead end: the model spends another round
+    on list_sites to learn what it should have said, and a small model tends to
+    retry the same wrong id instead. Observed live: four rounds burned on one
+    question, reaching list_sites only after the round cap.
+    """
+
+    def test_the_refusal_names_the_ids_that_would_work(self, db, site):
+        result = call_tool(db, _admin(), "get_graph_summary", {"site_id": 10_000_000})
+        assert result["status"] == 404
+        assert "Sites you can use" in result["error"]
+        assert f"{site.id} ({site.name})" in result["error"]
+
+    def test_it_lists_only_what_the_caller_may_read(self, db, site):
+        """Scoped to the caller's own, exactly as list_sites is."""
+        foreign = _scoped((site.tenant_id or 0) + 999)
+        result = call_tool(db, foreign, "get_graph_summary", {"site_id": 10_000_000})
+        assert result["status"] == 404
+        assert site.name not in result["error"]
+
+    def test_other_failures_are_left_alone(self, db, site):
+        """Only a missing site is answerable this way; nothing else is padded."""
+        result = call_tool(db, _admin(), "get_suggestion_history", {"suggestion_id": 10_000_000})
+        assert result["status"] == 404
+        assert "Sites you can use" not in result["error"]
+
+
+class TestSiteIdIsOmittable:
+    """ "My site" has to be expressible when there is only one to mean.
+
+    Requiring the id made a model spend its rounds guessing one — observed
+    live inventing 123, then burning the round cap retrying — for a question
+    that had exactly one correct answer.
+    """
+
+    def test_a_single_site_account_needs_no_id(self, db, site):
+        named = call_tool(db, _admin(), "get_graph_summary", {"site_id": site.id})
+        omitted = call_tool(db, _admin(), "get_graph_summary", {})
+        assert "error" not in omitted
+        assert omitted == named
+
+    def test_every_site_tool_accepts_the_omission(self, db, site):
+        for name in (
+            "get_site_status",
+            "get_graph_summary",
+            "get_site_jobs",
+            "find_articles",
+        ):
+            result = call_tool(db, _admin(), name, {})
+            assert "error" not in result, (name, result)
+
+    def test_several_sites_stay_an_error_that_names_them(self, db, site):
+        from app.models import Site
+
+        second = Site(
+            name="second-site",
+            base_url="https://second.example",
+            platform="wordpress",
+            tenant_id=site.tenant_id,
+        )
+        db.add(second)
+        db.commit()
+        try:
+            result = call_tool(db, _admin(), "get_graph_summary", {})
+            # Choosing one would be a guess presented as an answer.
+            assert result["status"] == 422
+            assert "second-site" in result["error"]
+            assert site.name in result["error"]
+        finally:
+            db.delete(second)
+            db.commit()
+
+    def test_an_explicit_id_still_wins(self, db, site):
+        result = call_tool(db, _admin(), "get_site_status", {"site_id": site.id})
+        assert result["site"]["id"] == site.id
+
+    def test_the_resolved_site_is_still_authorized(self, db, site):
+        """Resolution picks the id; it does not bypass the check that follows."""
+        foreign = call_tool(db, _scoped((site.tenant_id or 0) + 999), "get_graph_summary", {})
+        # A caller who owns nothing resolves to nothing, rather than to a site
+        # they would then be refused.
+        assert foreign["status"] == 404
+        assert "no sites are connected" in foreign["error"]
+
+
+def test_site_id_descriptions_name_no_tool_to_copy():
+    """A field description is read as instructions for filling that field.
+
+    "Get this from list_sites" was sent back as `{"site_id": "list_sites"}` —
+    three rounds in a row, live — because a model reads the description as a
+    source for the value. Say what to omit, not where to look.
+    """
+    from app.agent_tools import json_schema
+
+    for name in ("get_site_status", "get_graph_summary", "get_site_jobs", "find_articles"):
+        described = json_schema(REGISTRY[name].args_model)["properties"]["site_id"]
+        assert "list_sites" not in described["description"], name
+        assert "Omit" in described["description"], name
+
+
+def test_no_payload_publishes_a_count_the_list_already_gives():
+    """The one field that has now caused a wrong answer twice.
+
+    As a top-level `returned` it was read as the match count; grouped under
+    `page` it was read as the match count again — live, answering "are you
+    sure?" with 10, the default page size. It is exactly len(rows), so the
+    fix is to stop publishing it rather than to explain it a third time.
+    """
+    from app.agent_tools import Page
+
+    assert "returned" not in Page.model_fields
+    for name in ("search_queue", "find_articles", "get_site_jobs", "get_suggestion_history"):
+        model = REGISTRY[name].output_model
+        assert model is not None and "returned" not in model.model_fields, name

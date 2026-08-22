@@ -48,6 +48,20 @@ approved or rejected anything yourself; the operator confirms, the engine acts.
 4. When advising on a suggestion, look it up with explain_suggestion first and \
 ground your advice in its score components, placement, and article contents.
 5. Be concise. Lead with the answer, then the supporting numbers with their ids.
+6. Never invent a site id. When the operator does not name a site, omit site_id \
+entirely — the tool resolves it. Only pass a site id you have read from a tool result.
+
+Formatting. The panel renders a small Markdown subset, and anything outside it \
+reaches the operator as literal punctuation, so stay inside it:
+- **Bold** the figure that answers the question, and the name of a site, job, or \
+suggestion. Never bold a whole sentence: everything emphasised is nothing emphasised.
+- *Italics* only for article titles, so crawled words are visibly not your own.
+- `Backticks` for ids, slugs, statuses, and hashes — they are read character by character.
+- "* " for lists and "1. " for ranked ones, with two spaces of indent for detail \
+under an entry. Never nest deeper than that single level, and never give one entry \
+both markers: a bullet that also carries a number reads as both and is neither.
+- Open a group with a bold label on its own line, such as **Review queue**.
+- No tables, headings, block quotes, or horizontal rules; they arrive as characters.
 """
 
 RETRY_REPLY = "I couldn't produce a complete answer. Please try again."
@@ -225,10 +239,8 @@ def _summarize(outcome: dict) -> dict:
         if key in outcome:
             summary[key] = outcome[key]
     page = outcome.get("page")
-    if isinstance(page, dict):
-        for key in ("returned", "has_more"):
-            if key in page:
-                summary[key] = page[key]
+    if isinstance(page, dict) and "has_more" in page:
+        summary["has_more"] = page["has_more"]
     for key in ("sites", "suggestions", "articles", "active_jobs", "jobs", "events"):
         if isinstance(outcome.get(key), list):
             summary[f"{key}_count"] = len(outcome[key])

@@ -142,7 +142,10 @@ class EvaluationArgs(BaseModel):
 
 
 class SiteStatusArgs(BaseModel):
-    site_id: int = Field(description="The site to report on.")
+    site_id: int | None = Field(
+        None,
+        description="Which site to report on. Omit it to use the only connected site.",
+    )
 
 
 class SuggestionHistoryArgs(BaseModel):
@@ -170,7 +173,10 @@ class SuggestionHistoryArgs(BaseModel):
 
 
 class IngestionDiagnosticsArgs(BaseModel):
-    site_id: int = Field(description="The crawled site.")
+    site_id: int | None = Field(
+        None,
+        description="Which crawled site. Omit it to use the only connected site.",
+    )
     run_id: int | None = Field(None, description="Defaults to the most recent ingestion run.")
     reason_code: str | None = Field(
         None, max_length=80, description="Only example rows with this reason."
@@ -179,7 +185,10 @@ class IngestionDiagnosticsArgs(BaseModel):
 
 
 class SiteJobsArgs(BaseModel):
-    site_id: int = Field(description="The site whose jobs to list.")
+    site_id: int | None = Field(
+        None,
+        description="Which site's jobs to list. Omit it to use the only connected site.",
+    )
     kind: JobKind | None = Field(None, description="Restrict to one job kind.")
     limit: int = Field(15, ge=1, le=50)
 
@@ -193,7 +202,10 @@ class PublicationStatusArgs(BaseModel):
 
 
 class GraphSummaryArgs(BaseModel):
-    site_id: int = Field(description="The site whose link graph to summarize.")
+    site_id: int | None = Field(
+        None,
+        description="Which site's link graph to summarize. Omit it to use the only connected site.",
+    )
 
 
 class ActiveJobsArgs(BaseModel):
@@ -201,7 +213,10 @@ class ActiveJobsArgs(BaseModel):
 
 
 class FindArticlesArgs(BaseModel):
-    site_id: int = Field(description="The site to search.")
+    site_id: int | None = Field(
+        None,
+        description="Which site to search. Omit it to use the only connected site.",
+    )
     q: str | None = Field(
         None, max_length=MAX_SEARCH_TERM, description="Title or URL substring to match."
     )
@@ -289,12 +304,17 @@ class OpsDigestArgs(BaseModel):
 class Page(BaseModel):
     """What one call returned, kept apart from what matched.
 
-    Every field here is about *this response*. A tool's ``match_count`` is
-    about the data. Reading ``returned`` as an answer to "how many" is the
-    mistake this separation exists to prevent.
+    There is deliberately no row count here. It was exactly ``len(rows)`` of the
+    list beside it, and a second integer saying what the list already says is
+    the field a model reaches for when asked "how many" — first at the top level
+    as ``returned``, then, after grouping, as ``page.returned``. Twice is
+    enough: a number that cannot be seen cannot be reported, and nothing is
+    lost, because counting the array gives it back exactly.
+
+    What remains is not derivable and is not a count: whether more rows match,
+    and how to ask for them.
     """
 
-    returned: int = Field(description="Rows in this response only. Never the answer to 'how many'.")
     has_more: bool = Field(description="True when more rows match than were returned.")
     next_cursor: str | None = Field(
         None,
@@ -497,7 +517,7 @@ def _site_status(db: Session, principal: Principal, args: SiteStatusArgs) -> dic
     shows the arithmetic instead of the result, and names which of the two
     limits is actually binding.
     """
-    site = authorize_site_read(db, principal, args.site_id)
+    site = authorize_site_read(db, principal, _resolve_site_id(db, principal, args.site_id))
     out = get_site(site=site, db=db)
     _, _, active_counts = _site_counts(db, [site.id])
     active = active_counts.get(site.id, 0)
@@ -669,10 +689,7 @@ def _search_queue(db: Session, principal: Principal, args: SearchQueueArgs) -> d
     if page.total is not None:
         # Issued on the first page only; continuations ride the look-ahead row.
         result["match_count"] = page.total
-    result["page"] = {
-        "returned": len(items),
-        "has_more": page.next_cursor is not None,
-    }
+    result["page"] = {"has_more": page.next_cursor is not None}
     if page.next_cursor is not None:
         result["page"]["next_cursor"] = f"{page.next_cursor.score}:{page.next_cursor.id}"
     # The view these rows came from, so the answer ends somewhere the operator
@@ -935,7 +952,6 @@ def _suggestion_history(
         "trace_id": trace_id,
         "match_count": page.total,
         "page": {
-            "returned": len(page.items),
             "offset": page.offset,
             "has_more": page.offset + len(page.items) < page.total,
         },
@@ -969,7 +985,7 @@ def _ingestion_diagnostics(
     pages" is answered by counts per reason, not by a list of URLs. Examples
     come second, and few of them: the whole table can run to thousands of rows.
     """
-    site = authorize_site(db, principal, args.site_id)
+    site = authorize_site(db, principal, _resolve_site_id(db, principal, args.site_id))
     if args.run_id is None:
         run = latest_ingestion_run(site=site, db=db)
     else:
@@ -1043,7 +1059,7 @@ def _site_jobs(db: Session, principal: Principal, args: SiteJobsArgs) -> dict[st
     ``list_active_jobs`` shows only what is queued or running, so a job that
     failed ten minutes ago is invisible there.
     """
-    site = authorize_site(db, principal, args.site_id)
+    site = authorize_site(db, principal, _resolve_site_id(db, principal, args.site_id))
     # Rows stay the route's, so ordering cannot drift; the count is this tool's
     # because the route has none and a capped list without one reads complete.
     conditions = [JobRun.site_id == site.id]
@@ -1054,7 +1070,7 @@ def _site_jobs(db: Session, principal: Principal, args: SiteJobsArgs) -> dict[st
     return {
         "site_id": site.id,
         "match_count": match_count,
-        "page": {"returned": len(runs), "has_more": match_count > len(runs)},
+        "page": {"has_more": match_count > len(runs)},
         "jobs": [
             {
                 "id": run.id,
@@ -1073,7 +1089,7 @@ def _site_jobs(db: Session, principal: Principal, args: SiteJobsArgs) -> dict[st
 
 
 def _graph_summary(db: Session, principal: Principal, args: GraphSummaryArgs) -> dict[str, Any]:
-    site = authorize_site(db, principal, args.site_id)
+    site = authorize_site(db, principal, _resolve_site_id(db, principal, args.site_id))
     from app.api.routes.graph import get_graph_summary
 
     summary = get_graph_summary(site=site, limit=20, offset=0, db=db)
@@ -1103,7 +1119,7 @@ def _find_articles(db: Session, principal: Principal, args: FindArticlesArgs) ->
     through ``authorize_site_read``, the exact dependency the route uses, so a
     tenant key sees precisely the sites it may already read.
     """
-    site = authorize_site_read(db, principal, args.site_id)
+    site = authorize_site_read(db, principal, _resolve_site_id(db, principal, args.site_id))
     conditions = [Article.site_id == site.id, Article.is_active.is_(True)]
     if args.q:
         pattern = f"%{args.q.strip()}%"
@@ -1125,7 +1141,7 @@ def _find_articles(db: Session, principal: Principal, args: FindArticlesArgs) ->
     return {
         "site_id": site.id,
         "match_count": match_count,
-        "page": {"returned": len(rows), "has_more": match_count > len(rows)},
+        "page": {"has_more": match_count > len(rows)},
         "articles": [
             {
                 "id": row.id,
@@ -1659,6 +1675,57 @@ def openai_tool_specs() -> list[dict[str, Any]]:
 MAX_REPORTED_ARGUMENT_PROBLEMS = 5
 
 
+def _resolve_site_id(db: Session, principal: Principal, site_id: int | None) -> int:
+    """The site the caller means when they did not name one.
+
+    "How many orphan articles do I have" names no site because, on a
+    single-site account, there is only one to mean. Requiring the id anyway
+    made a model spend rounds guessing one — we watched it invent 123, then
+    burn the round cap retrying — and the operator got no answer to a question
+    that had exactly one.
+
+    With several sites this stays an error naming them, because choosing one
+    would be a guess presented as an answer. Same line the rest of the module
+    holds: answer exactly, or say what is needed.
+    """
+    if site_id is not None:
+        return site_id
+    rows = db.execute(
+        select(Site.id, Site.name).where(*_owned_site_conditions(principal)).limit(10)
+    ).all()
+    if len(rows) == 1:
+        return rows[0][0]
+    if not rows:
+        raise HTTPException(404, "no sites are connected")
+    named = ", ".join(f"{row_id} ({name})" for row_id, name in rows)
+    raise HTTPException(422, f"name a site_id; you have several: {named}")
+
+
+def _usable_site_hint(db: Session, principal: Principal) -> str:
+    """The site ids this caller may use, appended to an error that named a bad one.
+
+    A bare "site 123 not found" is a dead end: the model has to spend another
+    round on ``list_sites`` to learn what it should have said, and a small model
+    tends to retry the same wrong id instead. Naming the ids turns the refusal
+    into the answer to the question the model was about to ask.
+
+    Nothing is disclosed here that ``list_sites`` would not return to the same
+    caller — the scope is the caller's own, and admins see the fleet either way.
+    """
+    rows = db.execute(
+        select(Site.id, Site.name).where(*_owned_site_conditions(principal)).limit(10)
+    ).all()
+    if not rows:
+        return ""
+    named = ", ".join(f"{site_id} ({name})" for site_id, name in rows)
+    return f" Sites you can use: {named}."
+
+
+def _owned_site_conditions(principal: Principal) -> list[Any]:
+    owned = tenant_site_filter(principal)
+    return [] if owned is None else [owned]
+
+
 def _argument_problems(exc: ValidationError) -> str:
     """Name what was wrong with an agent's arguments, and why.
 
@@ -1697,7 +1764,12 @@ def call_tool(db: Session, principal: Principal, name: str, arguments: dict[str,
     try:
         result = tool.handler(db=db, principal=principal, args=args)
     except HTTPException as exc:
-        return {"error": str(exc.detail), "status": exc.status_code}
+        detail = str(exc.detail)
+        # A rejected site id is the one refusal an agent can act on immediately,
+        # so it is answered with the ids that would have worked.
+        if exc.status_code == 404 and detail.startswith("site "):
+            detail += _usable_site_hint(db, principal)
+        return {"error": detail, "status": exc.status_code}
     except Exception:  # noqa: BLE001 - surfaces stay answerable
         # Deliberately not `str(exc)`. A SQLAlchemy error stringifies to the
         # statement and its bound parameters, and over /mcp that reaches any

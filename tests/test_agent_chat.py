@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from app.config import settings
@@ -14,7 +16,19 @@ def _chat(client: TestClient, message: str, history=None):
     return client.post("/api/v1/agent/chat", json={"message": message, "history": history or []})
 
 
-def test_status_reports_unconfigured_by_default(client):
+@pytest.fixture
+def unconfigured(monkeypatch):
+    """No key on either account.
+
+    Stated rather than assumed: the assistant reads its own settings first and
+    falls back to placement's, so "no key" is now two settings, and a developer
+    with a real `.env` would otherwise fail these on their machine only.
+    """
+    monkeypatch.setattr(settings, "agent_api_key", "")
+    monkeypatch.setattr(settings, "openrouter_api_key", "")
+
+
+def test_status_reports_unconfigured_without_a_key(client, unconfigured):
     response = client.get("/api/v1/agent/status")
     assert response.status_code == 200
     body = response.json()
@@ -22,9 +36,9 @@ def test_status_reports_unconfigured_by_default(client):
     assert body["model"] == settings.agent_model
 
 
-def test_chat_is_503_without_a_key(client):
-    # No OpenRouter key in the suite (offline defaults); chat must say so
-    # rather than pretend to think.
+def test_chat_is_503_without_a_key(client, unconfigured):
+    # Chat must say so rather than pretend to think. MCP tools are unaffected:
+    # they answer from the database and need no model.
     response = _chat(client, "how many pending suggestions are there?")
     assert response.status_code == 503
 
@@ -207,7 +221,7 @@ class TestToolResultBudget:
     def _page(self, rows: int) -> dict:
         return {
             "match_count": 64,
-            "page": {"returned": rows, "has_more": True, "next_cursor": "0.93:40"},
+            "page": {"has_more": True, "next_cursor": "0.93:40"},
             "suggestions": [
                 {
                     "id": n,
@@ -260,13 +274,12 @@ class TestTraceSummary:
         summary = agent_service._summarize(
             {
                 "match_count": 64,
-                "page": {"returned": 10, "has_more": True, "next_cursor": "0.9:1"},
+                "page": {"has_more": True, "next_cursor": "0.9:1"},
                 "suggestions": [{"id": 1}, {"id": 2}],
             }
         )
         assert self._flat(summary), summary
         assert summary["match_count"] == 64
-        assert summary["returned"] == 10
         assert summary["has_more"] is True
         assert summary["suggestions_count"] == 2
 

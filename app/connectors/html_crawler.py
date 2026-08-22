@@ -552,11 +552,7 @@ class HTMLConnector(ContentConnector):
         for suggestion in suggestions:
             target_url = suggestion.resolved_target_url
             tree = lxml_html.fromstring(content)
-            existing = {
-                urljoin(source.url, href)
-                for href in tree.xpath("//a/@href")
-                if href
-            }
+            existing = {urljoin(source.url, href) for href in tree.xpath("//a/@href") if href}
             if target_url in existing:
                 outcomes.append("already_present")
                 continue
@@ -571,8 +567,8 @@ class HTMLConnector(ContentConnector):
             if start >= 0 and open_tag <= close_tag:
                 href = escape(target_url, quote=True)
                 content = (
-                    f'{content[:start]}<a href="{href}">{content[start:start + len(anchor)]}</a>'
-                    f"{content[start + len(anchor):]}"
+                    f'{content[:start]}<a href="{href}">{content[start : start + len(anchor)]}</a>'
+                    f"{content[start + len(anchor) :]}"
                 )
                 outcomes.append("inserted")
                 continue

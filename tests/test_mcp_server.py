@@ -279,8 +279,8 @@ def test_output_schemas_reach_the_client(monkeypatch, client):
 
     # fastmcp inlines nested definitions, so the client gets one self-contained
     # schema — no $ref pointing at a $defs block that did not travel with it.
-    page = published["page"]["properties"]
-    assert "Never the answer to 'how many'" in page["returned"]["description"]
+    # Nothing in the page object can stand in for the count.
+    assert "returned" not in published["page"]["properties"]
     assert "$ref" not in json.dumps(schemas["search_queue"])
     # And none of pydantic's generated titles, at any depth: a model quotes
     # them back as though they were content.
