@@ -20,12 +20,14 @@ from app.api.routes import (
     suggestions,
 )
 from app.mcp_server import authenticated_mcp_app, mcp_lifespan
+from app.ml.llm.agent import log_provider_notice
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Starlette does not run mounted apps' lifespans; the MCP streamable-HTTP
     # session manager needs its own, so it is composed into the API's.
+    log_provider_notice()
     async with mcp_lifespan()(_):
         yield
 

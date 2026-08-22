@@ -44,3 +44,5 @@ class AgentChatResponse(BaseModel):
 class AgentStatusResponse(BaseModel):
     configured: bool
     model: str
+    #: The host the assistant calls. Empty when nothing is configured.
+    provider: str = ""

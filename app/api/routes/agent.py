@@ -25,9 +25,15 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 
 @router.get("/status", response_model=AgentStatusResponse)
 def agent_status(principal: Principal = Depends(require_api_key)) -> AgentStatusResponse:
-    from app.ml.llm.openrouter import is_configured
+    from app.ml.llm.agent import is_configured, provider_host
 
-    return AgentStatusResponse(configured=is_configured(), model=settings.agent_model)
+    # `provider` is the host, not a brand name we map to: an operator debugging
+    # "why is chat down" needs to know which endpoint is actually being called.
+    return AgentStatusResponse(
+        configured=is_configured(),
+        model=settings.agent_model,
+        provider=provider_host(),
+    )
 
 
 @router.post("/chat", response_model=AgentChatResponse)

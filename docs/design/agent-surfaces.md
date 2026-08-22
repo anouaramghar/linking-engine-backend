@@ -101,9 +101,31 @@ and `AGENT_MAX_HISTORY_TURNS` on the client-supplied transcript. The panel
 (`src/components/agent/AgentPanel.tsx`) renders complete turns plus a chip
 per tool consulted; there is no streaming by design.
 
-An empty `OPENROUTER_API_KEY` disables chat only (503 from `/agent/chat`,
-honest status from `/agent/status`). MCP tools keep working without it —
-they answer from the database, not from a model.
+An empty key disables chat only (503 from `/agent/chat`, honest status from
+`/agent/status`). MCP tools keep working without it — they answer from the
+database, not from a model.
+
+### Provider
+
+The assistant reads `AGENT_BASE_URL` / `AGENT_API_KEY`, falling back to the
+`OPENROUTER_*` pair when they are empty — which is what every deployment did
+before they existed. Any OpenAI chat-completions endpoint works, because that
+is all `chat_with_tools` speaks; `/agent/status` reports the host it resolves
+to, since "which endpoint is actually being called" is the question an operator
+debugging a dead panel is asking.
+
+They are separate settings rather than a repointing of the shared pair because
+those also drive **placement context**, which runs on every preview an editor
+opens. Moving the assistant onto a development endpoint must not take a
+production feature with it, and `test_placement_does_not_follow_it` is what
+keeps that true.
+
+`DEVELOPMENT_ONLY_HOSTS` names providers whose terms permit evaluation only —
+NVIDIA NIM's API Trial terms allow internal testing and evaluation, and count
+activity serving real end-users as production — and `log_provider_notice` warns
+once at startup when one is configured. The point is not to prevent the choice;
+it is that a development convenience should not become the production path
+without anyone noticing.
 
 ### One answer path
 
@@ -272,6 +294,8 @@ failure of it.
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
+| `AGENT_BASE_URL` | *(empty)* | Assistant's endpoint; empty reuses `OPENROUTER_BASE_URL` |
+| `AGENT_API_KEY` | *(empty)* | Assistant's key; empty reuses `OPENROUTER_API_KEY` |
 | `AGENT_MODEL` | `anthropic/claude-sonnet-4.5` | Must support tool calling |
 | `AGENT_TIMEOUT_SECONDS` | `90` | Per model turn |
 | `AGENT_MAX_TOOL_ROUNDS` | `4` | Tool-bearing turns per question |
@@ -283,7 +307,7 @@ failure of it.
 `agent_service`, not deployment configuration: it is a property of how much of
 one tool result belongs in a four-round conversation.
 
-Chat reuses `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL`.
+Chat falls back to `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` when the two `AGENT_*` settings above are empty.
 
 ## Adding a tool
 

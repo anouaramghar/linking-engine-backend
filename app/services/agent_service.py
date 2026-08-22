@@ -22,8 +22,7 @@ from dataclasses import dataclass, field
 
 from app.agent_tools import call_tool, openai_tool_specs
 from app.config import settings
-from app.ml.llm.agent import chat_with_tools
-from app.ml.llm.openrouter import is_configured
+from app.ml.llm.agent import chat_with_tools, is_configured
 from app.services.authorization import Principal
 
 logger = logging.getLogger(__name__)

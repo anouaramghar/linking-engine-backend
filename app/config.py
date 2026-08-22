@@ -81,6 +81,17 @@ class Settings(BaseSettings):
     # OpenRouter account; an empty key disables only chat — MCP tools keep
     # working because they answer from the database directly. The default model
     # must support tool calling; placement's extraction model is not assumed to.
+    # The assistant may run on a different provider from placement above. Both
+    # speak OpenAI chat-completions, so repointing these is the whole switch —
+    # NVIDIA NIM (https://integrate.api.nvidia.com/v1) is the one this was added
+    # for. Empty means "use the placement account", which is what every
+    # deployment did before these existed, so nothing changes by default.
+    #
+    # Separate settings rather than repointing the shared pair, because those
+    # also drive placement context — a production feature that must not follow
+    # the assistant onto a development provider.
+    agent_base_url: str = ""
+    agent_api_key: str = ""
     agent_model: str = "anthropic/claude-sonnet-4.5"
     agent_timeout_seconds: float = Field(default=90.0, gt=0.0, le=300.0)
     # One round is one model turn that may carry tool calls. The bound keeps a
