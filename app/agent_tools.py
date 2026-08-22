@@ -308,22 +308,34 @@ def _urls(**candidates: str | None) -> dict[str, str]:
 
 
 def _compact_site(site_out: Any, *, active_suggestion_count: int) -> dict[str, Any]:
+    """One site's row, grouped so a count cannot be read as a capacity.
+
+    ``slots_available`` is room left, not a number of suggestions. Flat beside
+    ``active_suggestion_count`` the two read as synonyms, and a site at
+    capacity publishes both 0 and 147 at the same level with nothing to tell
+    them apart — either is a plausible answer to "how many suggestions do I
+    have", and the wrong one is the kind of figure nobody double-checks.
+    Separate nouns are what make the answer unambiguous, which is why
+    ``get_site_status`` already shapes its payload this way.
+
+    The counts are the same active figures ``GET /sites`` returns, so this
+    view and the Sites page cannot disagree.
+    """
+    slots_available = site_out.suggestion_slots_available
     return {
         "id": site_out.id,
         "name": site_out.name,
         "base_url": site_out.base_url,
         "platform": site_out.platform,
-        # Keep the old short names for MCP clients that already consume them,
-        # but expose the semantics explicitly to a language model. These are
-        # the same active counts returned by GET /sites.
-        "article_count": site_out.article_count,
-        "internal_link_count": site_out.internal_link_count,
-        "active_article_count": site_out.article_count,
-        "active_internal_link_count": site_out.internal_link_count,
-        "active_suggestion_count": active_suggestion_count,
-        # This is capacity, not a count of suggestions. Naming it beside the
-        # active count prevents the model from treating the two as synonyms.
-        "suggestion_slots_available": site_out.suggestion_slots_available,
+        "content": {
+            "active_article_count": site_out.article_count,
+            "active_internal_link_count": site_out.internal_link_count,
+        },
+        "queue": {"active_suggestion_count": active_suggestion_count},
+        "suggestion_capacity": {
+            "slots_available": slots_available,
+            "at_capacity": slots_available == 0,
+        },
         "last_ingestion_status": site_out.last_ingestion_status,
         "has_wordpress_credentials": site_out.has_wordpress_credentials,
         **_urls(queue_url=_queue_url(site_id=site_out.id, status="pending")),
@@ -347,11 +359,11 @@ def _sites(db: Session, principal: Principal, args: ListSitesArgs) -> dict[str, 
 def _site_status(db: Session, principal: Principal, args: SiteStatusArgs) -> dict[str, Any]:
     """One site in depth, and why its suggestion capacity is where it is.
 
-    ``list_sites`` reports ``suggestion_slots_available`` as a bare number, so
-    a site sitting at 0 gives an operator no way to ask why — the ceiling is
-    two settings and an article count that appear nowhere in the API. This
-    tool shows the arithmetic instead of the result, and names which of the
-    two limits is actually binding.
+    ``list_sites`` reports ``slots_available`` as a bare number, so a site
+    sitting at 0 gives an operator no way to ask why — the ceiling is two
+    settings and an article count that appear nowhere in the API. This tool
+    shows the arithmetic instead of the result, and names which of the two
+    limits is actually binding.
     """
     site = authorize_site_read(db, principal, args.site_id)
     out = get_site(site=site, db=db)
@@ -1217,10 +1229,9 @@ REGISTRY: dict[str, AgentTool] = {
             name="list_sites",
             title="List sites",
             description=(
-                "List connected sites with canonical dashboard counts. Each site returns "
-                "active_article_count, active_internal_link_count, and "
-                "active_suggestion_count. suggestion_slots_available is remaining "
-                "capacity, not a suggestion count. Start here when the caller does not "
+                "List connected sites with the canonical dashboard counts, grouped as "
+                "content (articles, internal links), queue (suggestions), and "
+                "suggestion_capacity (room left). Start here when the caller does not "
                 "name a specific site."
             ),
             args_model=ListSitesArgs,
@@ -1233,8 +1244,8 @@ REGISTRY: dict[str, AgentTool] = {
                 "One site in depth: content and link counts, last crawl, per-status queue "
                 "counts, and the suggestion-capacity arithmetic — the two caps, which one "
                 "is binding, and how many slots rejecting or publishing would free. Use "
-                "this when a site shows 0 suggestion_slots_available, or when asked why a "
-                "site is not producing new suggestions."
+                "this when a site is at capacity, or when asked why a site is not "
+                "producing new suggestions."
             ),
             args_model=SiteStatusArgs,
             handler=_site_status,

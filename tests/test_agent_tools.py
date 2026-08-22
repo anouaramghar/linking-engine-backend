@@ -30,7 +30,7 @@ def test_list_sites_returns_fixture(client, db, site):
     names = [entry["name"] for entry in result["sites"]]
     assert site.name in names
     entry = next(e for e in result["sites"] if e["name"] == site.name)
-    assert entry["article_count"] == 0
+    assert entry["content"]["active_article_count"] == 0
     assert entry["platform"] == "wordpress"
 
 
@@ -70,9 +70,49 @@ def test_list_sites_exposes_the_dashboard_count_semantics(db, site):
     result = call_tool(db, _admin(), "list_sites", {})
     entry = next(item for item in result["sites"] if item["id"] == site.id)
 
-    assert entry["active_article_count"] == 2
-    assert entry["active_internal_link_count"] == 1
-    assert entry["active_suggestion_count"] == 1
+    assert entry["content"]["active_article_count"] == 2
+    assert entry["content"]["active_internal_link_count"] == 1
+    assert entry["queue"]["active_suggestion_count"] == 1
+    # A count and a capacity never sit at the same level: "how many
+    # suggestions" has exactly one field that can answer it.
+    assert "active_suggestion_count" not in entry
+    assert "slots_available" not in entry
+
+
+def test_a_full_site_keeps_its_count_apart_from_its_capacity(db, site, monkeypatch):
+    """The payload a site at capacity publishes must have one readable count.
+
+    A full site reports 1 active suggestion and 0 slots left. Flat, those are
+    two bare numbers at the same level and either answers "how many
+    suggestions do I have" — the wrong one silently, because nobody
+    re-derives a count. Grouping is what makes the question have one answer.
+    """
+    from app.config import settings
+
+    source = Article(site_id=site.id, url=f"{site.base_url}/a", title="a", content_text="a")
+    target = Article(site_id=site.id, url=f"{site.base_url}/b", title="b", content_text="b")
+    db.add_all([source, target])
+    db.flush()
+    db.add(
+        Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="baseline_cosine",
+            score=0.8,
+            status="pending",
+        )
+    )
+    db.commit()
+    # Shrink the ceiling to the one suggestion that already exists.
+    monkeypatch.setattr(settings, "hybrid_max_active_suggestions_per_site", 1)
+
+    entry = next(
+        item for item in call_tool(db, _admin(), "list_sites", {})["sites"] if item["id"] == site.id
+    )
+
+    assert entry["queue"]["active_suggestion_count"] == 1
+    assert entry["suggestion_capacity"] == {"slots_available": 0, "at_capacity": True}
 
 
 def test_unknown_tool_and_bad_args_are_data_not_exceptions(db, site):

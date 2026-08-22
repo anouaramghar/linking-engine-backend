@@ -6,14 +6,19 @@ key as every other route and performs no writes — the loop's tools are the
 shared read-only registry.
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_api_key
 from app.config import settings
+from app.ml.llm.openrouter import OpenRouterError
 from app.schemas.agent import AgentChatRequest, AgentChatResponse, AgentStatusResponse
 from app.services.agent_service import AgentUnavailable, answer_question
 from app.services.authorization import Principal
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -39,6 +44,13 @@ def chat(
         result = answer_question(db, principal, payload.message, history)
     except AgentUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
+    except OpenRouterError as exc:
+        # Rate limit, timeout, or an unusable body. The operator gets the same
+        # honest "temporarily unavailable" they get from an unconfigured
+        # deployment rather than a 500, and the provider text stays in the log
+        # because it can carry key and account detail.
+        logger.warning("assistant model call failed: %s", exc)
+        raise HTTPException(503, "the assistant is temporarily unavailable") from exc
     return AgentChatResponse(
         reply=result.reply,
         tools_used=[

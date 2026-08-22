@@ -1,9 +1,11 @@
 """The dashboard assistant: status, availability gating, and the tool loop."""
 
-import pytest
+import json
+
 from fastapi.testclient import TestClient
 
 from app.config import settings
+from app.ml.llm.openrouter import OpenRouterError
 from app.models import Article, InternalLink
 from app.services import agent_service
 
@@ -65,7 +67,18 @@ def test_chat_executes_tool_then_answers(monkeypatch, client):
     assert calls[-1][-1] == "tool"
 
 
-def test_count_question_uses_canonical_site_counts(monkeypatch, client, db, site):
+def test_a_count_question_reaches_the_model_with_an_unambiguous_payload(
+    monkeypatch, client, db, site
+):
+    """No question is answered behind the model's back.
+
+    Plain counts used to be short-circuited with hand-written replies, which
+    forced a regex to decide whether a question was one of the few it could
+    express. A near-miss answered a *different* question confidently. Every
+    question reaches the model now, and the guarantee moved into the payload:
+    a count and a capacity are separate nouns, so "how many suggestions do I
+    have" has exactly one field that can answer it.
+    """
     source = Article(
         site_id=site.id,
         url=f"{site.base_url}/source",
@@ -84,18 +97,35 @@ def test_count_question_uses_canonical_site_counts(monkeypatch, client, db, site
     db.commit()
 
     monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    seen: list[dict] = []
 
-    def model_must_not_be_used(messages, tools):
-        raise AssertionError("count questions must be answered from engine data")
+    def scripted(messages, tools):
+        seen.append(messages[-1])
+        if len(seen) == 1:
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "function": {"name": "list_sites", "arguments": "{}"}}],
+            }
+        return {"content": "test-site has 2 active articles and 1 active internal link."}
 
-    monkeypatch.setattr(agent_service, "chat_with_tools", model_must_not_be_used)
+    monkeypatch.setattr(agent_service, "chat_with_tools", scripted)
 
     response = _chat(client, "how many articles and internal links does the site have?")
 
     assert response.status_code == 200
-    body = response.json()
-    assert body["reply"] == "test-site has 2 active articles and 1 active internal link."
-    assert body["tools_used"][0]["name"] == "list_sites"
+    assert response.json()["tools_used"][0]["name"] == "list_sites"
+
+    # What the model actually read back.
+    payload = json.loads(seen[-1]["content"])
+    entry = next(item for item in payload["sites"] if item["id"] == site.id)
+    assert entry["content"] == {
+        "active_article_count": 2,
+        "active_internal_link_count": 1,
+    }
+    assert "slots_available" in entry["suggestion_capacity"]
+    # The trap: capacity must not be reachable as a bare top-level number.
+    assert "suggestion_slots_available" not in entry
 
 
 def test_blank_model_reply_is_replaced_with_an_honest_retry_message(monkeypatch, client):
@@ -143,51 +173,21 @@ def test_chat_rejects_unknown_history_roles(client):
     assert response.status_code == 422
 
 
-class TestGroundedCountScope:
-    """Which count questions the deterministic path may answer.
+def test_a_model_failure_is_a_503_not_a_500(monkeypatch, client):
+    """A spent quota is a temporary outage, not a bug in the engine.
 
-    It reads two whole-aggregate tools, so it can answer "how many articles do
-    I have" exactly and cannot answer "how many above 90%" at all. Matching the
-    second kind is the failure worth testing: the operator would get a
-    confident reply to a different question with no model in the loop.
+    ``chat_with_tools`` raises ``OpenRouterError`` for rate limits, timeouts,
+    and unusable bodies. Uncaught, the operator saw a bare 500. The provider's
+    text stays in the log because it can carry key and account detail.
     """
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
 
-    @pytest.mark.parametrize(
-        "question",
-        [
-            "how many suggestions are above 90%?",
-            "how many articles are orphans?",
-            "how many pending suggestions on site 1?",
-            "how many of those are worth approving?",
-            "how many suggestions score higher than the rest?",
-        ],
-    )
-    def test_qualified_questions_reach_the_model(self, question):
-        assert agent_service._count_tool_for(question) is None
+    def rate_limited(messages, tools):
+        raise OpenRouterError("OpenRouter returned 429: rate limit exceeded")
 
-    @pytest.mark.parametrize(
-        ("question", "expected"),
-        [
-            ("how many sites do I have?", "list_sites"),
-            ("how many articles are there?", "list_sites"),
-            ("what is the total number of internal links?", "list_sites"),
-            ("how many suggestions are in the queue?", "get_queue_counts"),
-            ("how many pending suggestions are there?", "get_queue_counts"),
-        ],
-    )
-    def test_plain_counts_stay_deterministic(self, question, expected):
-        assert agent_service._count_tool_for(question) == expected
+    monkeypatch.setattr(agent_service, "chat_with_tools", rate_limited)
 
-    def test_a_named_status_is_answered_with_that_status(self):
-        counts = {"pending": 146, "approved": 1, "rejected": 0, "total": 147}
-        # Falling back to the total here reported the whole queue as the
-        # rejected count.
-        assert "0 rejected suggestions" in agent_service._queue_count_reply(
-            counts, "how many rejected suggestions are there?"
-        )
-        assert "146 pending suggestions" in agent_service._queue_count_reply(
-            counts, "how many pending suggestions are there?"
-        )
-        assert "147 suggestions" in agent_service._queue_count_reply(
-            counts, "how many suggestions are there?"
-        )
+    response = _chat(client, "how many articles do I have?")
+
+    assert response.status_code == 503
+    assert "429" not in response.json()["detail"]

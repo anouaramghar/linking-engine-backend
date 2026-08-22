@@ -76,23 +76,44 @@ An empty `OPENROUTER_API_KEY` disables chat only (503 from `/agent/chat`,
 honest status from `/agent/status`). MCP tools keep working without it —
 they answer from the database, not from a model.
 
-### The grounded count path
+### One answer path
 
-Plain count questions ("how many articles do I have") skip the model and are
-answered from `list_sites` or `get_queue_counts` directly, so the figures in
-the reply are the same aggregates the Sites page and queue header show.
+Every question reaches the model. There is no shortcut for "easy" questions,
+and adding one back is the thing to argue against.
 
-The rule that keeps this honest is in `_QUALIFIED`: a count question carrying
-a threshold, a graph predicate, a named site, or a pronoun referring back to
-an earlier turn falls through to the model instead. Those two tools return
-whole-site and whole-queue aggregates and nothing else — answering "how many
-above 90%" from them would hand the operator a confident reply to a different
-question with no model in the loop to catch it. Falling through is always the
-safe direction: the model still has `search_queue`'s percent band and rule 1
-telling it to quote figures rather than invent them.
+An earlier version answered plain counts deterministically, which meant a
+regex had to decide whether a question was one of the few the hand-written
+replies could express. That decision cannot be made from words alone. It
+matched on substrings, so "how many pending suggestions on **site** 1?" hit
+the all-sites branch; the blocklist that was supposed to catch the misses
+listed `above`, `orphan`, and `site <n>` but not `today`, `last week`, or
+`no internal links`, and every phrasing outside the list was answered with a
+whole-queue aggregate. The failure is silent by construction: the operator
+gets a confident reply to a *different* question with no model in the loop.
+That blocklist can never be finished, because it enumerates the language
+people do not use.
 
-Widen `_count_tool_for` only together with `_QUALIFIED`. A phrasing the
-deterministic replies cannot express belongs in the second, not the first.
+The guarantee it was protecting now lives in the payload instead. The one
+answer a model could plausibly get wrong was a count, because `list_sites`
+published a capacity beside it — `suggestion_slots_available: 0` next to
+`active_suggestion_count: 147`, two bare numbers at the same level, either a
+reasonable answer to "how many suggestions do I have". `_compact_site` groups
+them under separate nouns (`content`, `queue`, `suggestion_capacity`), which
+is the shape `get_site_status` already used. Structure, not prose, is what
+makes the question have one answer — the prompt rule that used to warn about
+this is gone with it.
+
+Keep new tool payloads that way. Where a number could be read as another
+number, group them or rename them; do not add a warning to the system prompt
+and do not add a code path that answers around the model.
+
+### Model failures
+
+`chat_with_tools` raises `OpenRouterError` for rate limits, timeouts, and
+unusable bodies. The route answers 503 with a fixed message and logs the
+provider's text, which can carry key and account detail. A spent free-tier
+quota is a temporary outage, and it reads as one for every question rather
+than working for a lucky few.
 
 ## Dashboard links
 
