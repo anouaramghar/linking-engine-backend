@@ -187,3 +187,66 @@ def test_admin_only_tools_refuse_a_scoped_key(monkeypatch, client, db):
 
     assert called["isError"] is True
     assert "admin" in called["content"][0]["text"]
+
+
+def test_a_call_authenticates_once_not_twice(monkeypatch, client, site):
+    """The gate's work is carried down, not repeated inside the tool.
+
+    ``ApiKeyGate`` resolves the key before JSON-RPC parsing so an
+    unauthenticated caller cannot open a session. The tool then used to resolve
+    the same header again against a second database session, which meant three
+    sessions and two identical lookups per call and bought nothing.
+    """
+    from app import mcp_server
+
+    monkeypatch.setattr(settings, "api_key", "test-mcp-key")
+    real = mcp_server.authenticate_api_key
+    calls: list[str | None] = []
+
+    def counted(db, raw_key):
+        calls.append(raw_key)
+        return real(db, raw_key)
+
+    monkeypatch.setattr(mcp_server, "authenticate_api_key", counted)
+
+    with TestClient(app=client.app) as fresh:
+        _post(fresh, "/mcp/", INITIALIZE, key="test-mcp-key")
+        calls.clear()
+        response = _post(
+            fresh,
+            "/mcp/",
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "list_sites", "arguments": {}},
+            },
+            key="test-mcp-key",
+        )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["isError"] is False
+    assert len(calls) == 1, f"authenticated {len(calls)} times for one tool call"
+
+
+def test_an_unauthenticated_call_still_cannot_reach_a_tool(monkeypatch, client):
+    """The carried principal must never become a way in.
+
+    If the gate rejects, nothing downstream runs — so the fallback path inside
+    the tool is unreachable for an unauthenticated caller, and the scope key it
+    reads is never set by anyone but the gate.
+    """
+    monkeypatch.setattr(settings, "api_key", "right-key")
+    with TestClient(app=client.app) as fresh:
+        response = _post(
+            fresh,
+            "/mcp/",
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "list_sites", "arguments": {}},
+            },
+            key="wrong-key",
+        )
+    assert response.status_code == 401

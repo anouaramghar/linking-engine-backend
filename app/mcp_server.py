@@ -5,9 +5,10 @@ Two layers stand between an MCP client and the database:
 1. ``ApiKeyGate`` — transport middleware on the mounted ASGI app. Every request
    must carry a valid ``X-API-Key`` or it is rejected before any JSON-RPC is
    parsed, so unauthenticated callers cannot even open a protocol session.
-2. Per-call authorization inside each tool — the same
-   ``authenticate_api_key`` resolves the header into a ``Principal``, and the
-   shared registry handlers scope their queries by it, exactly like REST.
+2. Per-call authorization inside each tool — the ``Principal`` the gate
+   resolved is carried down the ASGI scope, and the shared registry handlers
+   scope their queries by it, exactly like REST. Authentication happens once
+   per request; authorization happens on every tool call.
 
 The server runs stateless (no client session state) with plain JSON responses:
 this surface answers questions from the database per call, so there is nothing
@@ -20,7 +21,7 @@ from collections.abc import Awaitable, Callable
 from fastapi import HTTPException
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 from fastmcp.tools.function_tool import FunctionTool
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
@@ -52,8 +53,31 @@ mcp = FastMCP(
 )
 
 
+#: Where ``ApiKeyGate`` leaves the principal it has already resolved, so the
+#: tool below can read it instead of running the same lookup again.
+PRINCIPAL_SCOPE_KEY = "linkmesh.principal"
+
+
 def _principal_from_headers():
-    """Authenticate the current MCP-over-HTTP request like a REST route."""
+    """The authenticated caller for the current MCP-over-HTTP request.
+
+    ``ApiKeyGate`` authenticates every request before JSON-RPC parsing, so by
+    the time a tool runs the answer already exists. Carrying it forward turns
+    three database sessions and two identical key lookups per call into two and
+    one. ``Principal`` is a dataclass of scalars, so nothing here depends on
+    the session that produced it still being open.
+
+    The header path stays as a fallback: it is what runs if this module is ever
+    mounted without the gate, and losing authentication is not an acceptable
+    failure mode for a missing optimisation.
+    """
+    try:
+        carried = get_http_request().scope.get(PRINCIPAL_SCOPE_KEY)
+    except RuntimeError:
+        carried = None  # no HTTP request in context (in-process transport)
+    if carried is not None:
+        return carried
+
     headers = get_http_headers()
     db = SessionLocal()
     try:
@@ -68,10 +92,13 @@ def _principal_from_headers():
 #: has to prompt for each call, while ``readOnlyHint`` lets it auto-approve a
 #: surface that provably cannot change anything. ``openWorldHint`` is false
 #: because every answer comes from this deployment's own database.
+#:
+#: ``idempotentHint`` is deliberately absent: the specification gives it meaning
+#: only when ``readOnlyHint`` is false, so declaring it here would publish a
+#: property of the surface that asserts nothing.
 READ_ONLY_ANNOTATIONS = dict(
     readOnlyHint=True,
     destructiveHint=False,
-    idempotentHint=True,
     openWorldHint=False,
 )
 
@@ -143,7 +170,7 @@ class ApiKeyGate:
         try:
             db = SessionLocal()
             try:
-                authenticate_api_key(db, request.headers.get("x-api-key"))
+                principal = authenticate_api_key(db, request.headers.get("x-api-key"))
             finally:
                 db.close()
         except HTTPException as exc:
@@ -155,6 +182,9 @@ class ApiKeyGate:
             )
             await response(scope, receive, send)
             return
+        # Hand the resolved principal down rather than making each tool
+        # re-derive it from the same header against a second session.
+        scope[PRINCIPAL_SCOPE_KEY] = principal
         await self.app(scope, receive, send)
 
 

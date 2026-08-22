@@ -19,19 +19,20 @@ way out — see ``error_of`` and ``app.mcp_server``, which turns that shape into
 an MCP ``isError`` result carrying the same text.
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urlencode
 from typing import Any, Callable, Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.api.routes.evaluation import get_evaluation_metrics
-from app.api.routes.ingestion import ingestion_diagnostics, latest_ingestion_run
+from app.api.routes.ingestion import latest_ingestion_run
 from app.api.routes.jobs import list_active_job_runs, list_job_runs
 from app.api.routes.suggestions import (
     MAX_SEARCH_TERM,
@@ -46,6 +47,7 @@ from app.api.routes.sites import _site_counts, get_site, list_sites
 from app.models import (
     Alert,
     Article,
+    IngestionDiagnostic,
     IngestionRun,
     InternalLink,
     JobRun,
@@ -61,6 +63,8 @@ from app.services.authorization import (
     require_admin_principal,
     tenant_site_filter,
 )
+
+logger = logging.getLogger(__name__)
 
 
 #: The closed vocabularies an agent may filter on. Each mirrors a column
@@ -138,7 +142,7 @@ class EvaluationArgs(BaseModel):
 
 
 class SiteStatusArgs(BaseModel):
-    site_id: int
+    site_id: int = Field(description="The site to report on.")
 
 
 class SuggestionHistoryArgs(BaseModel):
@@ -166,7 +170,7 @@ class SuggestionHistoryArgs(BaseModel):
 
 
 class IngestionDiagnosticsArgs(BaseModel):
-    site_id: int
+    site_id: int = Field(description="The crawled site.")
     run_id: int | None = Field(None, description="Defaults to the most recent ingestion run.")
     reason_code: str | None = Field(
         None, max_length=80, description="Only example rows with this reason."
@@ -175,7 +179,7 @@ class IngestionDiagnosticsArgs(BaseModel):
 
 
 class SiteJobsArgs(BaseModel):
-    site_id: int
+    site_id: int = Field(description="The site whose jobs to list.")
     kind: JobKind | None = Field(None, description="Restrict to one job kind.")
     limit: int = Field(15, ge=1, le=50)
 
@@ -189,7 +193,7 @@ class PublicationStatusArgs(BaseModel):
 
 
 class GraphSummaryArgs(BaseModel):
-    site_id: int
+    site_id: int = Field(description="The site whose link graph to summarize.")
 
 
 class ActiveJobsArgs(BaseModel):
@@ -197,7 +201,7 @@ class ActiveJobsArgs(BaseModel):
 
 
 class FindArticlesArgs(BaseModel):
-    site_id: int
+    site_id: int = Field(description="The site to search.")
     q: str | None = Field(
         None, max_length=MAX_SEARCH_TERM, description="Title or URL substring to match."
     )
@@ -238,9 +242,29 @@ class PreviewBulkReviewArgs(BaseModel):
     target_origin: Literal["internal", "content_pool", "web_search"] | None = None
     exclude_reciprocal: bool = False
 
+    @model_validator(mode="after")
+    def _rule_must_be_executable(self) -> "PreviewBulkReviewArgs":
+        """Refuse here what ``BulkReviewFilter`` would refuse on submission.
+
+        These lived in the handler, so they were absent from the JSON Schema
+        and a model met them only by failing. Worse, the tool was the looser of
+        the two: it accepted ``site_id`` *and* ``all_sites`` together, which the
+        endpoint rejects — so it could preview a rule the operator could not
+        then confirm.
+        """
+        if self.site_id is None and not self.all_sites:
+            raise ValueError("set site_id, or all_sites=true to review every site at once")
+        if self.site_id is not None and self.all_sites:
+            raise ValueError("site_id and all_sites=true contradict each other")
+        if self.action == "reject" and self.rejection_reason is None:
+            raise ValueError("rejection_reason is required when action is reject")
+        if self.rejection_reason is not None and self.action != "reject":
+            raise ValueError("rejection_reason is only valid when action is reject")
+        return self
+
 
 class ExplainSuggestionArgs(BaseModel):
-    suggestion_id: int
+    suggestion_id: int = Field(description="The numeric id shown in the review queue.")
 
 
 class OpsDigestArgs(BaseModel):
@@ -672,6 +696,17 @@ def _publication_next_action(
     return ("nothing_waiting", "no approved suggestions and no approved plans")
 
 
+def _next_action_fields(**kwargs: Any) -> dict[str, str]:
+    """Both halves of the ranking, so the fleet view explains itself too.
+
+    The fleet rows used to take the action and drop the reason, which meant
+    calling this twice per site would have been needed to report both — and
+    left the two views disagreeing about how much they explain.
+    """
+    action, detail = _publication_next_action(**kwargs)
+    return {"next_action": action, "next_action_detail": detail}
+
+
 def _publication_status(
     db: Session, principal: Principal, args: PublicationStatusArgs
 ) -> dict[str, Any]:
@@ -711,13 +746,13 @@ def _publication_status(
                     "prepared_plans": prepared.get(row.site_id, 0),
                     "can_publish": row.can_publish,
                     "can_export": row.can_export,
-                    "next_action": _publication_next_action(
+                    **_next_action_fields(
                         selected_suggestions=row.selected_suggestions,
                         approved_plans=row.approved_plans,
                         prepared_plans=prepared.get(row.site_id, 0),
                         can_publish=row.can_publish,
                         can_export=row.can_export,
-                    )[0],
+                    ),
                     **_urls(publication_url=_dashboard_url(f"/publish/{row.site_id}")),
                 }
                 for row in page.items
@@ -731,18 +766,24 @@ def _publication_status(
     can_publish = site.platform == "wordpress" and site.has_wordpress_credentials
     can_export = site.platform == "html"
     prepared_plans = _prepared_plan_counts(db, [site.id]).get(site.id, 0)
-    action, detail = _publication_next_action(
+    next_action = _next_action_fields(
         selected_suggestions=counts["selected_suggestions"],
         approved_plans=counts["approved_plans"],
         prepared_plans=prepared_plans,
         can_publish=can_publish,
         can_export=can_export,
     )
-    runs = [
-        run
-        for run in list_job_runs(site=site, kind=None, limit=50, offset=0, db=db)
-        if run.kind in PUBLICATION_JOB_KINDS
-    ][:5]
+    # Queried directly rather than through ``list_job_runs``, which takes one
+    # kind and this needs two. Fetching 50 rows of every kind and filtering in
+    # Python lost the publication jobs entirely on a site whose crawls and
+    # analyses are more recent — and an empty list here reads as "publication
+    # has never run", which is a different answer.
+    runs = db.scalars(
+        select(JobRun)
+        .where(JobRun.site_id == site.id, JobRun.kind.in_(PUBLICATION_JOB_KINDS))
+        .order_by(JobRun.enqueued_at.desc())
+        .limit(5)
+    ).all()
     return {
         "site_id": site.id,
         "site_name": site.name,
@@ -755,8 +796,7 @@ def _publication_status(
         "prepared_plans": prepared_plans,
         "can_publish": can_publish,
         "can_export": can_export,
-        "next_action": action,
-        "next_action_detail": detail,
+        **next_action,
         "recent_publication_jobs": [
             {
                 "id": run.id,
@@ -850,13 +890,27 @@ def _ingestion_diagnostics(
         if run is None:
             raise HTTPException(404, f"ingestion run {args.run_id} not found")
 
+    # The route has no reason filter, and applying one in Python to its first
+    # 200 rows reported zero examples for a reason whose rows sat outside that
+    # window — while the histogram beside it counted thousands. The filter and
+    # the count both belong in SQL; the composite index
+    # (ingestion_run_id, reason_code) is there for exactly this.
+    conditions = [IngestionDiagnostic.ingestion_run_id == run.id]
+    if args.reason_code:
+        conditions.append(IngestionDiagnostic.reason_code == args.reason_code)
+    match_count = (
+        db.scalar(select(func.count()).select_from(IngestionDiagnostic).where(*conditions)) or 0
+    )
     rows = (
-        ingestion_diagnostics(run_id=run.id, site=site, limit=200, offset=0, db=db)
+        db.scalars(
+            select(IngestionDiagnostic)
+            .where(*conditions)
+            .order_by(IngestionDiagnostic.id)
+            .limit(args.examples)
+        ).all()
         if args.examples
         else []
     )
-    if args.reason_code:
-        rows = [row for row in rows if row.reason_code == args.reason_code]
 
     return {
         "run": {
@@ -876,6 +930,9 @@ def _ingestion_diagnostics(
         },
         # The crawl's own histogram: reason code to number of URLs.
         "reasons": run.diagnostic_summary or {},
+        # How many diagnostic rows the filter matches in total. The examples
+        # below are a sample of them, never the answer to "how many".
+        "match_count": match_count,
         "examples": [
             {
                 "url": row.url,
@@ -884,7 +941,7 @@ def _ingestion_diagnostics(
                 "reason_detail": _clip(row.reason_detail, 200),
                 "discovered_from": row.discovered_from,
             }
-            for row in rows[: args.examples]
+            for row in rows
         ],
     }
 
@@ -896,10 +953,17 @@ def _site_jobs(db: Session, principal: Principal, args: SiteJobsArgs) -> dict[st
     failed ten minutes ago is invisible there.
     """
     site = authorize_site(db, principal, args.site_id)
+    # Rows stay the route's, so ordering cannot drift; the count is this tool's
+    # because the route has none and a capped list without one reads complete.
+    conditions = [JobRun.site_id == site.id]
+    if args.kind:
+        conditions.append(JobRun.kind == args.kind)
+    match_count = db.scalar(select(func.count()).select_from(JobRun).where(*conditions)) or 0
     runs = list_job_runs(site=site, kind=args.kind, limit=args.limit, offset=0, db=db)
     return {
         "site_id": site.id,
-        "returned": len(runs),
+        "match_count": match_count,
+        "page": {"returned": len(runs), "has_more": match_count > len(runs)},
         "jobs": [
             {
                 "id": run.id,
@@ -949,31 +1013,38 @@ def _find_articles(db: Session, principal: Principal, args: FindArticlesArgs) ->
     tenant key sees precisely the sites it may already read.
     """
     site = authorize_site_read(db, principal, args.site_id)
-    query = select(Article).where(
-        Article.site_id == site.id,
-        Article.is_active.is_(True),
-    )
+    conditions = [Article.site_id == site.id, Article.is_active.is_(True)]
     if args.q:
         pattern = f"%{args.q.strip()}%"
-        query = query.where(Article.title.ilike(pattern) | Article.url.ilike(pattern))
+        conditions.append(Article.title.ilike(pattern) | Article.url.ilike(pattern))
     if args.orphans:  # Expired links do not count (Phase 0, finding 3).
-        query = query.where(
+        conditions.append(
             ~exists().where(
                 InternalLink.target_article_id == Article.id,
                 InternalLink.is_active.is_(True),
             )
         )
-    rows = db.scalars(query.order_by(Article.id.desc()).limit(args.limit)).all()
-    articles = [
-        {
-            "id": row.id,
-            "title": row.title,
-            "url": row.url,
-            "published_at": row.published_at.isoformat() if row.published_at else None,
-        }
-        for row in rows
-    ]
-    return {"site_id": site.id, "returned": len(articles), "articles": articles}
+    # Counted separately because the rows are capped. A bare `returned` after a
+    # LIMIT is indistinguishable from a complete answer, and "how many articles
+    # are orphans" is exactly the question asked of this tool.
+    match_count = db.scalar(select(func.count()).select_from(Article).where(*conditions)) or 0
+    rows = db.scalars(
+        select(Article).where(*conditions).order_by(Article.id.desc()).limit(args.limit)
+    ).all()
+    return {
+        "site_id": site.id,
+        "match_count": match_count,
+        "page": {"returned": len(rows), "has_more": match_count > len(rows)},
+        "articles": [
+            {
+                "id": row.id,
+                "title": row.title,
+                "url": row.url,
+                "published_at": row.published_at.isoformat() if row.published_at else None,
+            }
+            for row in rows
+        ],
+    }
 
 
 def _clip(text: str | None, limit: int = 1_800) -> str | None:
@@ -986,7 +1057,13 @@ def _clip(text: str | None, limit: int = 1_800) -> str | None:
 def _explain_suggestion(
     db: Session, principal: Principal, args: ExplainSuggestionArgs
 ) -> dict[str, Any]:
-    suggestion = db.get(Suggestion, args.suggestion_id)
+    # Both articles are read below, so fetch them with the row rather than
+    # letting two lazy loads turn one explanation into three round trips.
+    suggestion = db.scalars(
+        select(Suggestion)
+        .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
+        .where(Suggestion.id == args.suggestion_id)
+    ).first()
     if suggestion is None:
         raise HTTPException(404, f"suggestion {args.suggestion_id} not found")
     authorize_site(db, principal, suggestion.site_id)
@@ -1024,7 +1101,9 @@ def _explain_suggestion(
         "rejection_reason": suggestion.rejection_reason,
         "publish_outcome": suggestion.publish_outcome,
         "publish_attempts": suggestion.publish_attempts,
-        "publish_error": suggestion.publish_error,
+        # Clipped like every other reading of this column: a WordPress failure
+        # body is the long one, and this is the tool most likely to meet it.
+        "publish_error": _clip(suggestion.publish_error, 300),
         "ranking": {
             "retrieval_version": suggestion.retrieval_version,
             "ranking_version": suggestion.ranking_version,
@@ -1088,7 +1167,19 @@ def _ops_digest(db: Session, principal: Principal, args: OpsDigestArgs) -> dict[
     def iso(value: datetime | None) -> str | None:
         return value.isoformat() if value else None
 
+    def total(query: Any) -> int:
+        return db.scalar(select(func.count()).select_from(query.subquery())) or 0
+
     return {
+        # Complete totals for each section. The lists below are the most recent
+        # few of each, so "how many jobs failed" is answered from here — a
+        # digest that shows ten rows and no count can only be read as ten.
+        "counts": {
+            "alerts": total(alert_query),
+            "failed_jobs": total(job_query),
+            "stuck_suggestions": total(stuck_query),
+            "failed_crawls": total(crawl_query),
+        },
         "alerts": [
             {
                 "id": alert.id,
@@ -1147,15 +1238,10 @@ def _preview_bulk_review(
     only when) the operator clicks Confirm, so execution rides the audited,
     undoable REST path rather than any agent-specific code.
     """
+    # Shape is the args model's job now; this is the part that needs a caller.
     if args.all_sites:
         require_admin_principal(principal)
-    elif args.site_id is None:
-        return {"error": "set site_id or all_sites=true", "status": 422}
-    if args.action == "reject" and args.rejection_reason is None:
-        return {"error": "rejection_reason is required when rejecting", "status": 422}
-    if args.rejection_reason is not None and args.action != "reject":
-        return {"error": "rejection_reason is only valid when rejecting", "status": 422}
-    if args.site_id is not None:
+    else:
         authorize_site(db, principal, args.site_id)
 
     conditions = _queue_conditions(
@@ -1438,6 +1524,30 @@ def openai_tool_specs() -> list[dict[str, Any]]:
     ]
 
 
+#: How many field problems one rejection names. A model fixing its call needs
+#: the fields, not all of them; the rest would only crowd the turn.
+MAX_REPORTED_ARGUMENT_PROBLEMS = 5
+
+
+def _argument_problems(exc: ValidationError) -> str:
+    """Name what was wrong with an agent's arguments, and why.
+
+    A bare problem count told a model nothing it could act on, so it retried
+    the same call until the round cap ended the turn. Pydantic's messages are
+    exactly what is needed here — a rejected Literal lists the values it does
+    accept — and they describe the caller's own input, so there is nothing in
+    them to withhold.
+    """
+    errors = exc.errors()
+    named = [
+        f"{'.'.join(str(part) for part in error['loc']) or '(root)'}: {error['msg']}"
+        for error in errors[:MAX_REPORTED_ARGUMENT_PROBLEMS]
+    ]
+    if len(errors) > MAX_REPORTED_ARGUMENT_PROBLEMS:
+        named.append(f"and {len(errors) - MAX_REPORTED_ARGUMENT_PROBLEMS} more")
+    return "; ".join(named)
+
+
 def call_tool(db: Session, principal: Principal, name: str, arguments: dict[str, Any]) -> dict:
     """Execute one registry tool, converting every failure into a payload.
 
@@ -1453,11 +1563,16 @@ def call_tool(db: Session, principal: Principal, name: str, arguments: dict[str,
     try:
         args = tool.args_model.model_validate(arguments or {})
     except ValidationError as exc:
-        return {"error": f"invalid arguments: {exc.error_count()} problem(s)", "status": 422}
+        return {"error": f"invalid arguments: {_argument_problems(exc)}", "status": 422}
     try:
         result = tool.handler(db=db, principal=principal, args=args)
     except HTTPException as exc:
         return {"error": str(exc.detail), "status": exc.status_code}
-    except Exception as exc:  # noqa: BLE001 - surfaces stay answerable
-        return {"error": f"tool failed: {exc}", "status": 500}
+    except Exception:  # noqa: BLE001 - surfaces stay answerable
+        # Deliberately not `str(exc)`. A SQLAlchemy error stringifies to the
+        # statement and its bound parameters, and over /mcp that reaches any
+        # external client holding a key. The caller gets a fixed sentence; the
+        # detail goes to the log, where an operator can read it.
+        logger.exception("agent tool %r failed", name)
+        return {"error": f"tool {name!r} failed unexpectedly", "status": 500}
     return result

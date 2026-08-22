@@ -186,7 +186,12 @@ def test_search_queue_reports_empty_total(db, site):
 
 def test_find_articles_scopes_to_site(db, client, site):
     result = call_tool(db, _admin(), "find_articles", {"site_id": site.id})
-    assert result == {"site_id": site.id, "returned": 0, "articles": []}
+    assert result == {
+        "site_id": site.id,
+        "match_count": 0,
+        "page": {"returned": 0, "has_more": False},
+        "articles": [],
+    }
 
     foreign = call_tool(
         db, _scoped((site.tenant_id or 0) + 999), "find_articles", {"site_id": site.id}
@@ -746,3 +751,309 @@ class TestSiteJobs:
     def test_kind_narrows_the_history(self, db, site, finished_jobs):
         result = call_tool(db, _admin(), "get_site_jobs", {"site_id": site.id, "kind": "analysis"})
         assert [row["kind"] for row in result["jobs"]] == ["analysis"]
+
+
+class TestArgumentErrors:
+    """What a rejected call tells the model it got wrong.
+
+    A bare problem count gave a model nothing to act on, so it retried the same
+    call until the round cap ended the turn.
+    """
+
+    def test_the_rejected_field_is_named(self, db, site):
+        result = call_tool(db, _admin(), "search_queue", {"status": "nope"})
+        assert result["status"] == 422
+        assert "status" in result["error"]
+
+    def test_a_rejected_literal_lists_what_it_accepts(self, db, site):
+        error = call_tool(db, _admin(), "search_queue", {"status": "nope"})["error"]
+        # Pydantic's own message for a Literal is the permitted set, which is
+        # exactly what a model needs to fix the call on its next round.
+        assert "pending" in error and "approved" in error
+
+    def test_several_problems_are_all_named(self, db, site):
+        error = call_tool(
+            db, _admin(), "search_queue", {"status": "nope", "min_percent": 150, "limit": 999}
+        )["error"]
+        for field in ("status", "min_percent", "limit"):
+            assert field in error
+
+    def test_an_internal_failure_reveals_nothing_about_the_query(self, db, site, monkeypatch):
+        """A SQLAlchemy error stringifies to its statement and parameters.
+
+        Over /mcp that reaches any external client holding a key, so the caller
+        gets a fixed sentence and the detail goes to the log instead.
+        """
+        from app import agent_tools
+
+        def boom(**kwargs):
+            raise RuntimeError("SELECT secret_col FROM suggestions WHERE id = 1")
+
+        monkeypatch.setattr(agent_tools, "list_sites", boom)
+        result = call_tool(db, _admin(), "list_sites", {})
+
+        assert result["status"] == 500
+        assert result["error"] == "tool 'list_sites' failed unexpectedly"
+        assert "SELECT" not in result["error"]
+
+
+class TestCapsAreVisible:
+    """A capped list must never be mistakable for a complete one."""
+
+    @pytest.fixture
+    def many_articles(self, db, site):
+        from app.models import Article
+
+        rows = [
+            Article(
+                site_id=site.id,
+                url=f"{site.base_url}/a{n}",
+                title=f"article {n}",
+                content_text="x",
+            )
+            for n in range(30)
+        ]
+        db.add_all(rows)
+        db.commit()
+        yield rows
+        for row in rows:
+            db.delete(row)
+        db.commit()
+
+    def test_find_articles_reports_the_whole_match_not_the_page(self, db, site, many_articles):
+        result = call_tool(db, _admin(), "find_articles", {"site_id": site.id, "limit": 5})
+        assert result["match_count"] == 30, "the count is the answer to 'how many'"
+        assert result["page"] == {"returned": 5, "has_more": True}
+
+    def test_the_count_respects_the_same_filters(self, db, site, many_articles):
+        result = call_tool(
+            db, _admin(), "find_articles", {"site_id": site.id, "q": "article 1", "limit": 2}
+        )
+        # "article 1", "article 10".."article 19" — eleven, of which two shown.
+        assert result["match_count"] == 11
+        assert result["page"]["returned"] == 2
+
+    def test_ops_digest_counts_what_it_only_samples(self, db, site):
+        from app.models import Alert
+
+        alerts = [
+            Alert(
+                site_id=site.id,
+                kind="job_failed",
+                subject=f"failure {n}",
+                payload={"n": n},
+                occurrences=1,
+            )
+            for n in range(20)
+        ]
+        db.add_all(alerts)
+        db.commit()
+        try:
+            result = call_tool(db, _admin(), "get_ops_digest", {})
+            # The list is capped at 15; the count must still be honest.
+            assert result["counts"]["alerts"] >= 20
+            assert len(result["alerts"]) == 15
+        finally:
+            for alert in alerts:
+                db.delete(alert)
+            db.commit()
+
+
+class TestPublicationJobWindow:
+    """Publication history must not vanish behind newer jobs of other kinds."""
+
+    def test_a_publication_job_survives_fifty_newer_crawls(self, db, site):
+        from datetime import UTC, datetime, timedelta
+
+        from app.models import JobRun
+
+        base = datetime.now(UTC) - timedelta(days=1)
+        published = JobRun(
+            site_id=site.id, kind="publication", status="succeeded", enqueued_at=base
+        )
+        # Sixty ingestion runs, every one of them newer.
+        noise = [
+            JobRun(
+                site_id=site.id,
+                kind="ingestion",
+                status="succeeded",
+                enqueued_at=base + timedelta(minutes=n + 1),
+            )
+            for n in range(60)
+        ]
+        db.add_all([published, *noise])
+        db.commit()
+        try:
+            result = call_tool(db, _admin(), "get_publication_status", {"site_id": site.id})
+            # Fetching 50 rows of any kind and filtering in Python returned an
+            # empty list here, which reads as "publication has never run".
+            kinds = [row["kind"] for row in result["recent_publication_jobs"]]
+            assert kinds == ["publication"]
+        finally:
+            for row in [published, *noise]:
+                db.delete(row)
+            db.commit()
+
+
+class TestIngestionExampleWindow:
+    """A reason filter must search the run, not the first page of it."""
+
+    @pytest.fixture
+    def crowded_run(self, db, site):
+        from app.models import IngestionDiagnostic, IngestionRun
+
+        run = IngestionRun(
+            site_id=site.id,
+            status="succeeded",
+            discovered_urls=210,
+            accepted_urls=0,
+            skipped_urls=210,
+            diagnostic_summary={"blocked_by_robots": 209, "too_short": 1},
+        )
+        db.add(run)
+        db.flush()
+        rows = [
+            IngestionDiagnostic(
+                site_id=site.id,
+                ingestion_run_id=run.id,
+                url=f"{site.base_url}/p{n}",
+                state="skipped",
+                reason_code="blocked_by_robots",
+            )
+            for n in range(209)
+        ]
+        # The rare one is last by id, so it sits outside the first 200 rows.
+        rows.append(
+            IngestionDiagnostic(
+                site_id=site.id,
+                ingestion_run_id=run.id,
+                url=f"{site.base_url}/rare",
+                state="skipped",
+                reason_code="too_short",
+            )
+        )
+        db.add_all(rows)
+        db.commit()
+        yield run
+        for row in rows:
+            db.delete(row)
+        db.delete(run)
+        db.commit()
+
+    def test_a_reason_beyond_the_first_page_is_still_found(self, db, site, crowded_run):
+        result = call_tool(
+            db,
+            _admin(),
+            "get_ingestion_diagnostics",
+            {"site_id": site.id, "run_id": crowded_run.id, "reason_code": "too_short"},
+        )
+        # Filtering the route's first 200 rows in Python reported none of these
+        # while the histogram beside it counted one.
+        assert result["match_count"] == 1
+        assert [row["url"] for row in result["examples"]] == [f"{site.base_url}/rare"]
+
+    def test_the_count_is_the_run_not_the_sample(self, db, site, crowded_run):
+        result = call_tool(
+            db,
+            _admin(),
+            "get_ingestion_diagnostics",
+            {"site_id": site.id, "run_id": crowded_run.id, "examples": 5},
+        )
+        assert result["match_count"] == 210
+        assert len(result["examples"]) == 5
+
+
+class TestBulkPreviewRules:
+    """The rule's own constraints, published in the schema rather than found by failing."""
+
+    def test_a_scope_must_be_chosen(self, db, site):
+        result = call_tool(
+            db, _admin(), "preview_bulk_review", {"action": "approve", "threshold_percent": 90}
+        )
+        assert result["status"] == 422
+        assert "all_sites" in result["error"]
+
+    def test_the_two_scopes_cannot_both_be_given(self, db, site):
+        result = call_tool(
+            db,
+            _admin(),
+            "preview_bulk_review",
+            {
+                "action": "approve",
+                "threshold_percent": 90,
+                "site_id": site.id,
+                "all_sites": True,
+            },
+        )
+        # BulkReviewFilter rejects this on submission, so previewing it would
+        # promise the operator a rule they could not confirm.
+        assert result["status"] == 422
+
+    def test_a_rejection_needs_its_reason(self, db, site):
+        result = call_tool(
+            db,
+            _admin(),
+            "preview_bulk_review",
+            {"action": "reject", "threshold_percent": 60, "site_id": site.id},
+        )
+        assert result["status"] == 422
+        assert "rejection_reason" in result["error"]
+
+    def test_the_rules_are_visible_in_the_schema(self):
+        from app.agent_tools import json_schema
+
+        schema = json_schema(REGISTRY["preview_bulk_review"].args_model)
+        # The point of moving them: a model reads them before calling, not after.
+        assert "all_sites" in schema["properties"]
+        assert "rejection_reason" in schema["properties"]
+
+
+class TestUncoveredTools:
+    """The two tools the audit found with no behavioural test at all."""
+
+    def test_graph_summary_reports_the_sites_structure(self, db, site):
+        source = Article(site_id=site.id, url=f"{site.base_url}/s", title="s", content_text="s")
+        target = Article(site_id=site.id, url=f"{site.base_url}/t", title="t", content_text="t")
+        db.add_all([source, target])
+        db.flush()
+        db.add(InternalLink(source_article_id=source.id, target_article_id=target.id))
+        db.commit()
+
+        result = call_tool(db, _admin(), "get_graph_summary", {"site_id": site.id})
+        assert result["article_count"] == 2
+        # One link in, so exactly one article has no incoming link.
+        assert result["orphan_count"] == 1
+
+    def test_graph_summary_is_scoped_to_the_callers_tenant(self, db, site):
+        result = call_tool(
+            db, _scoped((site.tenant_id or 0) + 999), "get_graph_summary", {"site_id": site.id}
+        )
+        assert result["status"] == 403
+
+    def test_ops_digest_reports_a_failed_job(self, db, site):
+        from app.models import JobRun
+
+        run = JobRun(site_id=site.id, kind="ingestion", status="failed", error="robots.txt")
+        db.add(run)
+        db.commit()
+        try:
+            result = call_tool(db, _admin(), "get_ops_digest", {})
+            assert any(row["id"] == run.id for row in result["failed_jobs"])
+            assert result["counts"]["failed_jobs"] >= 1
+        finally:
+            db.delete(run)
+            db.commit()
+
+    def test_ops_digest_is_scoped_to_the_callers_tenant(self, db, site):
+        from app.models import JobRun
+
+        run = JobRun(site_id=site.id, kind="ingestion", status="failed", error="robots.txt")
+        db.add(run)
+        db.commit()
+        try:
+            foreign = call_tool(db, _scoped((site.tenant_id or 0) + 999), "get_ops_digest", {})
+            assert foreign["failed_jobs"] == []
+            assert foreign["counts"]["failed_jobs"] == 0
+        finally:
+            db.delete(run)
+            db.commit()

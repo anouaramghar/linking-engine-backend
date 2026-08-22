@@ -27,9 +27,13 @@ Streamable HTTP at `/mcp/`, stateless, JSON responses (no SSE). Two layers:
 1. `ApiKeyGate` transport middleware rejects any request without a valid
    `X-API-Key` before JSON-RPC parsing, so unauthenticated callers cannot
    even open a protocol session.
-2. Each tool execution re-authenticates the header into a `Principal` and
-   runs the shared handler against a fresh session — identical to a REST
-   request's identity and lifetime.
+2. Each tool execution runs the shared handler against a fresh session, using
+   the `Principal` the gate resolved and left on the ASGI scope. Authentication
+   happens once per request; authorization runs on every call, exactly as in
+   REST. The tool keeps a header fallback for the case where this module is
+   mounted without the gate — losing authentication is not an acceptable
+   failure mode for a missing optimisation, and
+   `test_a_call_authenticates_once_not_twice` pins the fast path.
 
 Fleet-wide tools (`get_evaluation_metrics`) enforce the same admin-only
 rule as their REST router.
@@ -37,13 +41,14 @@ rule as their REST router.
 Two things the protocol carries that prose cannot:
 
 - **Annotations.** Every tool ships `readOnlyHint: true`,
-  `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
-  A host that can only read this note has to prompt for each call; one that
-  reads the annotation can auto-approve a surface that provably changes
-  nothing. The hints are set once in `mcp_server.READ_ONLY_ANNOTATIONS`
-  because the read-only property belongs to the whole registry, not to
-  individual tools — `test_registry_is_read_only_by_construction` is what
-  keeps that true.
+  `destructiveHint: false`, `openWorldHint: false`. A host that can only read
+  this note has to prompt for each call; one that reads the annotation can
+  auto-approve a surface that provably changes nothing. The hints are set once
+  in `mcp_server.READ_ONLY_ANNOTATIONS` because the read-only property belongs
+  to the whole registry, not to individual tools —
+  `test_registry_is_read_only_by_construction` is what keeps that true.
+  `idempotentHint` is not declared: the specification gives it meaning only
+  when `readOnlyHint` is false.
 - **Failures.** The registry answers failures as `{"error", "status"}` data,
   which the chat loop reads directly. Over MCP that shape is indistinguishable
   from a successful payload, so `_register` translates it through `error_of`
@@ -154,6 +159,36 @@ list and reporting `omitted_rows`, never by slicing the serialized string. A
 slice cuts mid-token, so the model parses a broken object and cannot tell a
 short answer from a complete one.
 
+## Capped lists carry a count
+
+Every tool that applies a `LIMIT` also returns `match_count` — the whole match,
+under the same filters — and a `page` object saying what it actually returned.
+`find_articles`, `get_site_jobs`, `get_ingestion_diagnostics` and `search_queue`
+all use that shape; `get_ops_digest` returns a `counts` block for its four
+sections. A bare row count after a `LIMIT` is indistinguishable from a complete
+answer, and "how many articles are orphans" is exactly what these tools are
+asked.
+
+Filter in SQL, not after the fetch. Two tools used to read a page and narrow it
+in Python: `get_publication_status` fetched 50 job runs of any kind and kept the
+publication ones, which returned nothing at all on a site whose crawls are more
+recent; `get_ingestion_diagnostics` applied `reason_code` to the route's first
+200 rows, reporting no examples for a reason the run's own histogram counted in
+the thousands. Both now filter and count in the query.
+
+## Failures
+
+Two channels, and they carry opposite amounts of detail.
+
+Rejected **arguments** are described in full — field paths and pydantic's own
+messages, which for a rejected `Literal` include the values it accepts. This is
+the caller's own input, and a model given only a problem count reissued the
+same call until the round cap ended the turn.
+
+An **internal** failure returns a fixed sentence and logs the exception.
+`str(exc)` on a SQLAlchemy error is the statement and its bound parameters, and
+over `/mcp` that reaches any client holding a key.
+
 ## Dashboard links
 
 Tools return ids. Inside the dashboard that is enough — the operator is
@@ -239,6 +274,13 @@ handler calls its route *function*, so `Query(..., le=100)` never runs — the
 pydantic model is the only validation an agent's arguments meet. `search_queue`
 is the worked example: its percent band, term length, and page size are all
 re-declared there.
+
+Cross-field rules belong on the model too, as a `model_validator`, not in the
+handler. A rule in the handler is absent from the JSON Schema, so a model meets
+it only by failing — and `preview_bulk_review` had drifted looser than the
+endpoint it proposes to, accepting a `site_id` and `all_sites` combination
+`BulkReviewFilter` rejects on submission. Only authorization stays in the
+handler, because it needs a caller.
 
 Paginate with a cursor, not an offset. `search_queue` takes the route's two
 sort keys — valid only as a pair, which a model supplies correctly about half
