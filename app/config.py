@@ -76,6 +76,16 @@ class Settings(BaseSettings):
     # large enough that a valid response is never truncated mid-JSON.
     placement_max_output_tokens: int = Field(default=800, ge=64, le=4_000)
 
+    # Agent tool surface (/mcp): a read-only action registry answering from the
+    # engine's own database, so it needs no model and no model settings.
+    #
+    # Where the dashboard is served, so agent tools can hand back a link to the
+    # view they are describing rather than a bare id. Only the engine knows its
+    # own database; nothing tells it where the operator's browser should go, so
+    # this is deployment configuration. Empty means links are simply omitted —
+    # every tool still answers, and no deployment has to set it.
+    dashboard_base_url: str = ""
+
     # Best-effort operations alerting; empty logs alerts locally.
     alert_webhook_url: str = ""
 
