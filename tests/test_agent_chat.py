@@ -243,3 +243,56 @@ class TestToolResultBudget:
         # handed a broken one that looks whole.
         trimmed = json.loads(agent_service._bounded_json({"text": "x" * 20_000}))
         assert trimmed["truncated"] is True
+
+
+class TestTraceSummary:
+    """What the dashboard chip shows beside a reply.
+
+    ``AgentPanel``'s ToolTrace builds its tooltip as `key: String(value)`, so a
+    nested value renders as "[object Object]". Every entry here has to be a
+    scalar to survive that.
+    """
+
+    def _flat(self, summary: dict) -> bool:
+        return all(isinstance(v, (str, int, float, bool, type(None))) for v in summary.values())
+
+    def test_a_paged_result_summarizes_to_scalars(self):
+        summary = agent_service._summarize(
+            {
+                "match_count": 64,
+                "page": {"returned": 10, "has_more": True, "next_cursor": "0.9:1"},
+                "suggestions": [{"id": 1}, {"id": 2}],
+            }
+        )
+        assert self._flat(summary), summary
+        assert summary["match_count"] == 64
+        assert summary["returned"] == 10
+        assert summary["has_more"] is True
+        assert summary["suggestions_count"] == 2
+
+    def test_site_counts_read_as_one_line(self):
+        summary = agent_service._summarize(
+            {
+                "sites": [
+                    {
+                        "id": 1,
+                        "name": "hipcollection",
+                        "content": {
+                            "active_article_count": 49,
+                            "active_internal_link_count": 1,
+                        },
+                        "queue": {"active_suggestion_count": 147},
+                        "suggestion_capacity": {"slots_available": 0},
+                    }
+                ]
+            }
+        )
+        assert self._flat(summary), summary
+        # Articles / links / suggestions, and no capacity: the exact string is
+        # the assertion, because a fourth number here is the old ambiguity back.
+        assert summary["site_counts"] == "hipcollection: 49/1/147"
+
+    def test_a_failure_summarizes_to_its_message(self):
+        summary = agent_service._summarize({"error": "nope", "status": 422})
+        assert self._flat(summary)
+        assert summary == {"error": "nope", "status": 422}

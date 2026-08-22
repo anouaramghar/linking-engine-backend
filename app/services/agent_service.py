@@ -211,29 +211,39 @@ def answer_question(
 
 
 def _summarize(outcome: dict) -> dict:
-    """A compact copy of the outcome for the panel's trace, not the model."""
+    """A compact copy of the outcome for the panel's trace, not the model.
+
+    Values must be scalars. ``AgentPanel``'s chip renders this as
+    ``key: String(value)`` pairs in a tooltip, so anything nested arrives as
+    "[object Object]" — a line of noise where a number was meant to be. Group
+    the *payload* to keep a model from confusing two figures; flatten here,
+    where a person is reading one line of text.
+    """
     if "error" in outcome:
         return {"error": outcome["error"], "status": outcome.get("status")}
     summary: dict = {}
     for key in ("site_id", "action", "match_count", "total", "omitted_rows"):
         if key in outcome:
             summary[key] = outcome[key]
-    if isinstance(outcome.get("page"), dict):
-        summary["page"] = outcome["page"]
-    for key in ("sites", "suggestions", "articles", "active_jobs"):
+    page = outcome.get("page")
+    if isinstance(page, dict):
+        for key in ("returned", "has_more"):
+            if key in page:
+                summary[key] = page[key]
+    for key in ("sites", "suggestions", "articles", "active_jobs", "jobs", "events"):
         if isinstance(outcome.get(key), list):
             summary[f"{key}_count"] = len(outcome[key])
     if isinstance(outcome.get("sites"), list):
-        # The trace shows counts only. Capacity is deliberately left out: the
-        # panel renders these beside the reply, and a capacity number sitting
-        # among counts is the same ambiguity the payload groups away.
-        summary["site_counts"] = [
-            {
-                "id": site.get("id"),
-                "name": site.get("name"),
-                **site.get("content", {}),
-                **site.get("queue", {}),
-            }
+        # One site per entry, as "name: articles/links/suggestions". Capacity is
+        # deliberately absent: a capacity number sitting among counts is the
+        # same ambiguity the payload groups away.
+        summary["site_counts"] = "; ".join(
+            "{}: {}/{}/{}".format(
+                site.get("name") or f"site {site.get('id')}",
+                site.get("content", {}).get("active_article_count", 0),
+                site.get("content", {}).get("active_internal_link_count", 0),
+                site.get("queue", {}).get("active_suggestion_count", 0),
+            )
             for site in outcome["sites"]
-        ]
+        )
     return summary
