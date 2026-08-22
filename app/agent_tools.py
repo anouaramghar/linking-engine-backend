@@ -63,13 +63,28 @@ from app.services.authorization import (
 )
 
 
+#: The closed vocabularies an agent may filter on. Each mirrors a column
+#: definition, not a guess: ``SuggestionStatus`` and ``SuggestionMethod`` in
+#: app/models/suggestion.py, and ``_QUEUES`` in app/services/job_service.py.
+#:
+#: Declared as literals rather than derived from those objects because
+#: ``Literal`` members must be literal, and the JSON Schema a model reads is
+#: built from them. ``test_filter_vocabularies_match_the_database`` is what
+#: keeps the two equal. Getting this wrong is not a validation nicety: an
+#: unconstrained filter accepts an invented value, matches nothing, and answers
+#: a confident zero that reads exactly like "there are none of these".
+QueueStatus = Literal["pending", "approved", "rejected", "expired", "applying", "applied", "failed"]
+SuggestionMethodName = Literal["baseline_cosine", "hybrid_bm25", "gnn_graphsage", "external_search"]
+JobKind = Literal["ingestion", "analysis", "publication_preparation", "publication"]
+
+
 class ListSitesArgs(BaseModel):
     search: str | None = Field(None, description="Filter by name, URL, or platform substring.")
 
 
 class QueueCountsArgs(BaseModel):
     site_id: int | None = Field(None, description="Restrict to one site.")
-    method: str | None = Field(None, description='Suggestion method filter, e.g. "hybrid_bm25".')
+    method: SuggestionMethodName | None = Field(None, description="Suggestion method filter.")
     q: str | None = Field(None, description="Title/URL text filter.")
 
 
@@ -83,12 +98,9 @@ class SearchQueueArgs(BaseModel):
     """
 
     site_id: int | None = Field(None, description="Restrict to one site.")
-    status: str = Field(
-        "pending",
-        description="pending, approved, rejected, applying, applied, failed, or expired.",
-    )
+    status: QueueStatus = "pending"
     q: str | None = Field(None, max_length=MAX_SEARCH_TERM, description="Title/URL text filter.")
-    method: str | None = Field(None, description='Suggestion method filter, e.g. "hybrid_bm25".')
+    method: SuggestionMethodName | None = Field(None, description="Suggestion method filter.")
     min_percent: int | None = Field(
         None, ge=0, le=100, description="Only rows at or above this whole-percent similarity."
     )
@@ -141,8 +153,13 @@ class SuggestionHistoryArgs(BaseModel):
     suggestion_id: int | None = Field(None, description="Resolved to its trace_id.")
     trace_id: str | None = Field(None, max_length=MAX_SEARCH_TERM)
     site_id: int | None = Field(None, description="Every event on one site.")
+    # Left open on purpose. Unlike status, method, and job kind, the event
+    # vocabulary has no column enum behind it (``suggestion_events.event_type``
+    # is a plain String(30)) and is written from both the application and a
+    # database trigger, so any list here would be a guess that silently blocks
+    # real events.
     event_type: str | None = Field(
-        None, max_length=50, description="Restrict to one kind of event."
+        None, max_length=30, description="Restrict to one kind of event."
     )
     limit: int = Field(20, ge=1, le=50)
     offset: int = Field(0, ge=0)
@@ -159,9 +176,7 @@ class IngestionDiagnosticsArgs(BaseModel):
 
 class SiteJobsArgs(BaseModel):
     site_id: int
-    kind: str | None = Field(
-        None, description='One job kind, e.g. "ingestion", "analysis", "publication".'
-    )
+    kind: JobKind | None = Field(None, description="Restrict to one job kind.")
     limit: int = Field(15, ge=1, le=50)
 
 
@@ -183,7 +198,9 @@ class ActiveJobsArgs(BaseModel):
 
 class FindArticlesArgs(BaseModel):
     site_id: int
-    q: str | None = Field(None, description="Title or URL substring to match.")
+    q: str | None = Field(
+        None, max_length=MAX_SEARCH_TERM, description="Title or URL substring to match."
+    )
     orphans: bool = Field(False, description="Only articles with no active incoming link.")
     limit: int = Field(15, ge=1, le=25)
 
@@ -217,7 +234,7 @@ class PreviewBulkReviewArgs(BaseModel):
         | None
     ) = Field(None, description="Required by the endpoint when action=reject.")
     q: str | None = Field(None, max_length=MAX_SEARCH_TERM)
-    method: str | None = None
+    method: SuggestionMethodName | None = None
     target_origin: Literal["internal", "content_pool", "web_search"] | None = None
     exclude_reciprocal: bool = False
 
@@ -524,12 +541,29 @@ def _search_queue(db: Session, principal: Principal, args: SearchQueueArgs) -> d
         }
         for item in page.items
     ]
-    result: dict[str, Any] = {
+    # Field order is load-bearing. The transcript budget trims from the end, so
+    # anything after `suggestions` is what gets dropped first — and `total` and
+    # the cursor sitting there is how a 50-row page answered "how many match"
+    # with its own page size and called the list complete. Decisive scalars
+    # lead; the rows are last because they are the part that may be shortened.
+    #
+    # `page.returned` is nested rather than left beside the count for the same
+    # reason `list_sites` groups a capacity away from a count: two bare
+    # integers at one level are two plausible answers to one question.
+    result: dict[str, Any] = {}
+    if page.total is not None:
+        # Issued on the first page only; continuations ride the look-ahead row.
+        result["match_count"] = page.total
+    result["page"] = {
         "returned": len(items),
-        "suggestions": items,
-        # The view these rows came from, so the answer ends somewhere the
-        # operator can act rather than at a list of ids.
-        **_urls(
+        "has_more": page.next_cursor is not None,
+    }
+    if page.next_cursor is not None:
+        result["page"]["next_cursor"] = f"{page.next_cursor.score}:{page.next_cursor.id}"
+    # The view these rows came from, so the answer ends somewhere the operator
+    # can act rather than at a list of ids.
+    result.update(
+        _urls(
             dashboard_url=_queue_url(
                 site_id=args.site_id,
                 status=args.status,
@@ -538,12 +572,9 @@ def _search_queue(db: Session, principal: Principal, args: SearchQueueArgs) -> d
                 exclude_reciprocal=args.exclude_reciprocal,
                 min_percent=args.min_percent,
             )
-        ),
-    }
-    if page.total is not None:
-        result["total"] = page.total
-    if page.next_cursor is not None:
-        result["next_cursor"] = f"{page.next_cursor.score}:{page.next_cursor.id}"
+        )
+    )
+    result["suggestions"] = items
     return result
 
 
@@ -771,9 +802,14 @@ def _suggestion_history(
     )
     return {
         "trace_id": trace_id,
-        "total": page.total,
-        "returned": len(page.items),
-        "offset": page.offset,
+        "match_count": page.total,
+        "page": {
+            "returned": len(page.items),
+            "offset": page.offset,
+            "has_more": page.offset + len(page.items) < page.total,
+        },
+        # Last: the only key here whose rows a tight transcript budget may
+        # shorten, so the counts above it always survive.
         "events": [
             {
                 "id": item.id,
@@ -1264,9 +1300,10 @@ REGISTRY: dict[str, AgentTool] = {
                 "Search review-queue suggestions, highest score first. Filter by site, "
                 "status, text, method, target origin, and a similarity band "
                 "(min_percent/max_percent) — use the band to size a threshold before "
-                "calling preview_bulk_review. Returns at most `limit` rows plus "
-                "`next_cursor`; pass it back as `cursor` with the same filters to read "
-                "the rest of a queue larger than one page."
+                "calling preview_bulk_review. `match_count` is how many rows match the "
+                'filters in total; answer "how many" from it, never from the length of '
+                "`suggestions`, which holds at most `limit` rows. To read the rest, pass "
+                "`page.next_cursor` back as `cursor` with the same filters."
             ),
             args_model=SearchQueueArgs,
             handler=_search_queue,

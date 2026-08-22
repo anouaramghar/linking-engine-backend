@@ -25,6 +25,44 @@ def test_registry_is_read_only_by_construction():
         assert not any(word in name for word in forbidden), name
 
 
+def test_filter_vocabularies_match_the_database():
+    """The permitted filter values must equal the columns they filter on.
+
+    The literals in agent_tools are what a model reads out of the JSON Schema
+    and what pydantic enforces. They are written by hand because Literal
+    members must be literal, so nothing but this test stops them drifting from
+    the enums. Drift in either direction is a silent wrong answer: a value
+    dropped here becomes "no such filter", and a value added here becomes a
+    filter that matches nothing and reports zero.
+    """
+    from typing import get_args
+
+    from app.agent_tools import JobKind, QueueStatus, SuggestionMethodName
+    from app.models.suggestion import SuggestionMethod, SuggestionStatus
+    from app.services.job_service import _QUEUES
+
+    assert set(get_args(QueueStatus)) == set(SuggestionStatus.enums)
+    assert set(get_args(SuggestionMethodName)) == set(SuggestionMethod.enums)
+    assert set(get_args(JobKind)) == set(_QUEUES)
+
+
+def test_an_unknown_filter_value_is_refused_not_answered_with_zero(db, site):
+    """A status the queue does not have must fail, not report an empty queue.
+
+    Unvalidated, this returned {"returned": 0, "total": 0} with no error, which
+    reads to a model — and then to an operator — as "there are none of these".
+    """
+    result = call_tool(db, _admin(), "search_queue", {"status": "nope"})
+    assert result["status"] == 422
+
+    for arguments in (
+        {"site_id": site.id, "method": "cosine"},
+        {"site_id": site.id, "kind": "crawl"},
+    ):
+        tool = "search_queue" if "method" in arguments else "get_site_jobs"
+        assert call_tool(db, _admin(), tool, arguments)["status"] == 422
+
+
 def test_list_sites_returns_fixture(client, db, site):
     result = call_tool(db, _admin(), "list_sites", {})
     names = [entry["name"] for entry in result["sites"]]
@@ -139,8 +177,11 @@ def json_keys(payload):
 
 def test_search_queue_reports_empty_total(db, site):
     result = call_tool(db, _admin(), "search_queue", {"site_id": site.id})
-    assert result["total"] == 0
+    assert result["match_count"] == 0
     assert result["suggestions"] == []
+    # The page size lives one level down, so it cannot be read as the count.
+    assert result["page"] == {"returned": 0, "has_more": False}
+    assert "returned" not in result
 
 
 def test_find_articles_scopes_to_site(db, client, site):
@@ -218,18 +259,20 @@ class TestSearchQueueFilters:
 
     def test_cursor_walks_the_whole_queue(self, db, site, graded):
         first = call_tool(db, _admin(), "search_queue", {"site_id": site.id, "limit": 2})
-        assert first["total"] == 4, "the first page counts the full match once"
-        assert first["returned"] == 2
+        assert first["match_count"] == 4, "the first page counts the full match once"
+        assert first["page"]["returned"] == 2
+        assert first["page"]["has_more"] is True
 
         second = call_tool(
             db,
             _admin(),
             "search_queue",
-            {"site_id": site.id, "limit": 2, "cursor": first["next_cursor"]},
+            {"site_id": site.id, "limit": 2, "cursor": first["page"]["next_cursor"]},
         )
         # A continuation rides the look-ahead row instead of paying for COUNT(*).
-        assert "total" not in second
-        assert "next_cursor" not in second, "the last page must not invite another call"
+        assert "match_count" not in second
+        assert second["page"]["has_more"] is False
+        assert "next_cursor" not in second["page"], "the last page must not invite another call"
 
         walked = [row["id"] for row in first["suggestions"] + second["suggestions"]]
         assert walked == [row.id for row in graded], "every row, in score order, exactly once"
@@ -643,7 +686,8 @@ class TestSuggestionHistory:
         result = call_tool(
             db, _admin(), "get_suggestion_history", {"trace_id": pending_history.trace_id}
         )
-        assert result["total"] == 1
+        assert result["match_count"] == 1
+        assert result["page"] == {"returned": 1, "offset": 0, "has_more": False}
 
     def test_unknown_id_is_data_not_an_exception(self, db, site):
         result = call_tool(db, _admin(), "get_suggestion_history", {"suggestion_id": 10_000_000})

@@ -115,6 +115,45 @@ provider's text, which can carry key and account detail. A spent free-tier
 quota is a temporary outage, and it reads as one for every question rather
 than working for a lucky few.
 
+## Filter vocabularies
+
+`status`, `method`, and job `kind` are `Literal`s in `agent_tools`, mirroring
+`SuggestionStatus`, `SuggestionMethod`, and `job_service._QUEUES`. They are
+written by hand because `Literal` members must be literal, and
+`test_filter_vocabularies_match_the_database` is what keeps them equal to their
+sources.
+
+This is not validation hygiene. An unconstrained filter *accepts* an invented
+value — `search_queue {"status": "nope"}` returned `{"returned": 0, "total": 0}`
+with no error, which reads to a model, and then to an operator, as "there are
+none of these". A closed filter fails loudly with the permitted values instead,
+which the model can act on.
+
+`event_type` is deliberately left open: `suggestion_events.event_type` is a
+plain `String(30)` written from both the application and a database trigger, so
+any list here would be a guess that silently blocks real events. Close a filter
+only where a column definition already closes it.
+
+## Payload order
+
+Field order is load-bearing, because the transcript budget trims from the end.
+
+Put the decisive scalars first and the rows last. `search_queue` published
+`total` and `next_cursor` after its suggestion array; a 50-row page serializes
+to 19,014 characters against a 12,000 budget, so both were cut, and the model
+answered "how many match" with its own page size and called the list complete.
+
+Group a page size away from a count for the same reason `list_sites` groups a
+capacity away from one: `search_queue` and `get_suggestion_history` nest
+`returned` under `page`, leaving `match_count` as the only top-level integer
+that answers "how many". `match_count` is the name `preview_bulk_review`
+already used.
+
+`_bounded_json` enforces the budget by dropping whole rows from the longest
+list and reporting `omitted_rows`, never by slicing the serialized string. A
+slice cuts mid-token, so the model parses a broken object and cannot tell a
+short answer from a complete one.
+
 ## Dashboard links
 
 Tools return ids. Inside the dashboard that is enough — the operator is
@@ -180,6 +219,10 @@ failure of it.
 | `AGENT_MAX_OUTPUT_TOKENS` | `1500` | Per turn |
 | `AGENT_MAX_HISTORY_TURNS` | `20` | Transcript bound at the API edge |
 | `DASHBOARD_BASE_URL` | *(empty)* | Dashboard origin for result links; empty omits them |
+
+`TOOL_RESULT_BUDGET` (12,000 characters) is a module constant in
+`agent_service`, not deployment configuration: it is a property of how much of
+one tool result belongs in a four-round conversation.
 
 Chat reuses `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL`.
 

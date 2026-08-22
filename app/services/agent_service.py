@@ -75,6 +75,47 @@ class AgentUnavailable(RuntimeError):
     """Chat is off because no OpenRouter key is configured."""
 
 
+#: How much of one tool result the model may read. Large enough for a full page
+#: of suggestions with their titles; small enough that four rounds of them do
+#: not crowd out the conversation.
+TOOL_RESULT_BUDGET = 12_000
+
+
+def _bounded_json(outcome: dict) -> str:
+    """Serialize a tool result within the budget, keeping it valid JSON.
+
+    Slicing the serialized string is the obvious version and the wrong one. It
+    cuts mid-token, so the model parses a truncated object, and it always
+    removes whatever the payload put last — which is how a 19,014-character
+    ``search_queue`` page lost both its ``match_count`` and its ``next_cursor``
+    at 12,000 and answered "how many match" with its own page size.
+
+    Drop whole rows from the longest list instead, and say how many went. The
+    model then reads a complete object, sees the real count beside a shortened
+    list, and can page for the rest. Handlers order their payloads to suit
+    this: scalars first, rows last.
+    """
+    blob = json.dumps(outcome, default=str)
+    if len(blob) <= TOOL_RESULT_BUDGET:
+        return blob
+
+    lists = [key for key, value in outcome.items() if isinstance(value, list) and value]
+    if not lists:
+        # Nothing row-shaped to shorten — a single oversized field. Cutting is
+        # all that is left, and the model is told the object is incomplete.
+        return json.dumps({"truncated": True, "partial": blob[:TOOL_RESULT_BUDGET]}, default=str)
+
+    key = max(lists, key=lambda name: len(outcome[name]))
+    rows = list(outcome[key])
+    while rows:
+        rows.pop()
+        candidate = {**outcome, key: rows, "omitted_rows": len(outcome[key]) - len(rows)}
+        blob = json.dumps(candidate, default=str)
+        if len(blob) <= TOOL_RESULT_BUDGET:
+            return blob
+    return blob
+
+
 def _record_tool(
     db,
     principal: Principal,
@@ -155,7 +196,7 @@ def answer_question(
                 {
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
-                    "content": json.dumps(outcome, default=str)[:12_000],
+                    "content": _bounded_json(outcome),
                 }
             )
 
@@ -174,9 +215,11 @@ def _summarize(outcome: dict) -> dict:
     if "error" in outcome:
         return {"error": outcome["error"], "status": outcome.get("status")}
     summary: dict = {}
-    for key in ("total", "returned", "site_id", "action", "match_count"):
+    for key in ("site_id", "action", "match_count", "total", "omitted_rows"):
         if key in outcome:
             summary[key] = outcome[key]
+    if isinstance(outcome.get("page"), dict):
+        summary["page"] = outcome["page"]
     for key in ("sites", "suggestions", "articles", "active_jobs"):
         if isinstance(outcome.get(key), list):
             summary[f"{key}_count"] = len(outcome[key])

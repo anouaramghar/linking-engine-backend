@@ -191,3 +191,55 @@ def test_a_model_failure_is_a_503_not_a_500(monkeypatch, client):
 
     assert response.status_code == 503
     assert "429" not in response.json()["detail"]
+
+
+class TestToolResultBudget:
+    """What a tool result loses when it does not fit the model's context.
+
+    The budget used to be a slice of the serialized string. That cut mid-token,
+    so the model parsed a broken object, and it always removed the end of the
+    payload — where the count and the pagination cursor sat. A 50-row
+    search_queue page is 19,014 characters against a 12,000 budget, so the
+    model saw a page size, no total, no cursor, and answered "how many match"
+    with 50 out of 64.
+    """
+
+    def _page(self, rows: int) -> dict:
+        return {
+            "match_count": 64,
+            "page": {"returned": rows, "has_more": True, "next_cursor": "0.93:40"},
+            "suggestions": [
+                {
+                    "id": n,
+                    "score": 0.9,
+                    "source_title": "a fairly long article title, as real ones are" * 4,
+                }
+                for n in range(rows)
+            ],
+        }
+
+    def test_a_result_that_fits_is_untouched(self):
+        outcome = self._page(2)
+        assert json.loads(agent_service._bounded_json(outcome)) == outcome
+
+    def test_an_oversized_result_stays_parseable(self):
+        blob = agent_service._bounded_json(self._page(200))
+        assert len(blob) <= agent_service.TOOL_RESULT_BUDGET
+        json.loads(blob)  # the point: still a whole object, not a cut string
+
+    def test_the_count_and_the_cursor_survive_the_trim(self):
+        trimmed = json.loads(agent_service._bounded_json(self._page(200)))
+        assert trimmed["match_count"] == 64
+        assert trimmed["page"]["next_cursor"] == "0.93:40"
+        assert len(trimmed["suggestions"]) < 200
+
+    def test_the_trim_says_how_many_rows_it_dropped(self):
+        trimmed = json.loads(agent_service._bounded_json(self._page(200)))
+        assert trimmed["omitted_rows"] == 200 - len(trimmed["suggestions"])
+
+    def test_a_single_oversized_field_is_marked_incomplete(self):
+        # Nothing row-shaped to shorten. Cutting is all that is left, so the
+        # model is told the object it received is partial rather than being
+        # handed a broken one that looks whole.
+        trimmed = json.loads(agent_service._bounded_json({"text": "x" * 20_000}))
+        assert trimmed["truncated"] is True
