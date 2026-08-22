@@ -7,6 +7,15 @@ jobs.
 
 ## Local stack
 
+## Agent surfaces
+
+A read-only MCP tool server at `/mcp/` (for Claude Code, Cursor, and any MCP
+client) and an optional chat assistant in the dashboard share one action
+registry that reuses the REST route functions, tenant scoping included. Tools
+never write: review and publication stay human-only. Configuration, the tool
+list, and the security boundary are documented in
+[docs/design/agent-surfaces.md](docs/design/agent-surfaces.md).
+
 ## Review reliability and traceability
 
 Large reversible review operations, exact partial-failure recovery, and their

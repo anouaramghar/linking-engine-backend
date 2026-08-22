@@ -76,9 +76,21 @@ class Settings(BaseSettings):
     # large enough that a valid response is never truncated mid-JSON.
     placement_max_output_tokens: int = Field(default=800, ge=64, le=4_000)
 
-    # Agent tool surface (/mcp): a read-only action registry answering from the
-    # engine's own database, so it needs no model and no model settings.
-    #
+    # Operator assistant (agent surfaces): the dashboard side panel and the
+    # /mcp tool surface share one read-only action registry. Chat reuses the
+    # OpenRouter account; an empty key disables only chat — MCP tools keep
+    # working because they answer from the database directly. The default model
+    # must support tool calling; placement's extraction model is not assumed to.
+    agent_model: str = "anthropic/claude-sonnet-4.5"
+    agent_timeout_seconds: float = Field(default=90.0, gt=0.0, le=300.0)
+    # One round is one model turn that may carry tool calls. The bound keeps a
+    # confused model from circling through the queue for ever; four rounds is
+    # comfortably more than any real question needs.
+    agent_max_tool_rounds: int = Field(default=4, ge=1, le=8)
+    agent_max_output_tokens: int = Field(default=1500, ge=64, le=8000)
+    # Transcript bound: the panel sends recent turns, and this is where an
+    # abusive client is stopped before tokens are spent.
+    agent_max_history_turns: int = Field(default=20, ge=0, le=100)
     # Where the dashboard is served, so agent tools can hand back a link to the
     # view they are describing rather than a bare id. Only the engine knows its
     # own database; nothing tells it where the operator's browser should go, so

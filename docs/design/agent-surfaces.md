@@ -1,0 +1,183 @@
+# Agent surfaces
+
+LinkMesh exposes one read-only action set to two agent-facing surfaces: an
+MCP server for external clients (Claude Code, Cursor, any MCP host) and a
+chat assistant embedded in the dashboard. This note records what they may
+touch, why the boundary sits where it sits, and how to operate them.
+
+## The single registry
+
+`app/agent_tools.py` is the whole tool surface — both surfaces execute its
+handlers, and neither defines tools anywhere else. Most handlers call the
+REST route functions directly (`count_suggestions`,
+`list_suggestion_page`, `list_sites`, `get_evaluation_metrics`, …), so an
+agent's answer is computed by exactly the code path the dashboard uses,
+including tenant scoping and site authorization.
+
+Every tool reads. Nothing in the registry approves, rejects, publishes,
+crawls, or enqueues. That line is deliberate: suggestions carry untrusted
+crawled text, and a manipulated model with write access would be an
+injection path into customer sites. Review actions stay human-only; the
+review workflow's success gates were designed for people, not prompts.
+
+## MCP server (`/mcp`)
+
+Streamable HTTP at `/mcp/`, stateless, JSON responses (no SSE). Two layers:
+
+1. `ApiKeyGate` transport middleware rejects any request without a valid
+   `X-API-Key` before JSON-RPC parsing, so unauthenticated callers cannot
+   even open a protocol session.
+2. Each tool execution re-authenticates the header into a `Principal` and
+   runs the shared handler against a fresh session — identical to a REST
+   request's identity and lifetime.
+
+Fleet-wide tools (`get_evaluation_metrics`) enforce the same admin-only
+rule as their REST router.
+
+Two things the protocol carries that prose cannot:
+
+- **Annotations.** Every tool ships `readOnlyHint: true`,
+  `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
+  A host that can only read this note has to prompt for each call; one that
+  reads the annotation can auto-approve a surface that provably changes
+  nothing. The hints are set once in `mcp_server.READ_ONLY_ANNOTATIONS`
+  because the read-only property belongs to the whole registry, not to
+  individual tools — `test_registry_is_read_only_by_construction` is what
+  keeps that true.
+- **Failures.** The registry answers failures as `{"error", "status"}` data,
+  which the chat loop reads directly. Over MCP that shape is indistinguishable
+  from a successful payload, so `_register` translates it through `error_of`
+  into a `ToolError` — the client gets `isError` *and* the same quotable
+  message in the content.
+
+Connect a client with:
+
+```json
+{
+  "mcpServers": {
+    "linkmesh": {
+      "url": "https://<engine-host>/mcp/",
+      "headers": { "X-API-Key": "<key>" }
+    }
+  }
+}
+```
+
+## Dashboard assistant (`POST /api/v1/agent/chat`)
+
+A small tool-calling loop over OpenRouter (`app/services/agent_service.py`)
+with the same registry as its toolset. Bounds: `AGENT_MAX_TOOL_ROUNDS`
+model turns that may carry calls, a final no-tools turn if the cap hits,
+and `AGENT_MAX_HISTORY_TURNS` on the client-supplied transcript. The panel
+(`src/components/agent/AgentPanel.tsx`) renders complete turns plus a chip
+per tool consulted; there is no streaming by design.
+
+An empty `OPENROUTER_API_KEY` disables chat only (503 from `/agent/chat`,
+honest status from `/agent/status`). MCP tools keep working without it —
+they answer from the database, not from a model.
+
+### The grounded count path
+
+Plain count questions ("how many articles do I have") skip the model and are
+answered from `list_sites` or `get_queue_counts` directly, so the figures in
+the reply are the same aggregates the Sites page and queue header show.
+
+The rule that keeps this honest is in `_QUALIFIED`: a count question carrying
+a threshold, a graph predicate, a named site, or a pronoun referring back to
+an earlier turn falls through to the model instead. Those two tools return
+whole-site and whole-queue aggregates and nothing else — answering "how many
+above 90%" from them would hand the operator a confident reply to a different
+question with no model in the loop to catch it. Falling through is always the
+safe direction: the model still has `search_queue`'s percent band and rule 1
+telling it to quote figures rather than invent them.
+
+Widen `_count_tool_for` only together with `_QUALIFIED`. A phrasing the
+deterministic replies cannot express belongs in the second, not the first.
+
+## Dashboard links
+
+Tools return ids. Inside the dashboard that is enough — the operator is
+already there. Over MCP it is a dead end, since the point is that a person
+reads the answer in their editor and then goes and reviews. So results carry
+a link to the view they describe: `search_queue` the filters it just applied,
+`preview_bulk_review` the rule staged for confirmation, `explain_suggestion`
+the queue holding that row (and `/publish/{site}?suggestion={id}` once it is
+past review), `get_site_status` its three pages.
+
+This works because the frontend already keeps queue filters in the URL on
+purpose (`useQueueFilters`), so the parameter names below are the frontend's,
+not the registry's:
+
+| Link | Query |
+| --- | --- |
+| `/queue` | `site`, `status`, `q`, `origin`, `unique`, `min`, `threshold` |
+| `/publish/{site_id}` | `suggestion` |
+| `/sites` | `q` |
+
+`DASHBOARD_BASE_URL` is deployment configuration — the engine knows its own
+database and nothing about where the operator's browser should go. Empty, or
+anything that is not an absolute http(s) URL, omits the links entirely rather
+than emitting a wrong one: an operator cannot tell a typo in deployment config
+from a bug in the engine, and follows the link either way. The keys are
+*absent* when unbuildable, never null, because a null link reads to a model as
+"there is no link for this", which it then says out loud.
+
+## Publication state
+
+`get_publication_status` answers "what is blocking publication" by keeping
+three counts apart, because each asks for different work:
+
+| Count | Meaning | Next step |
+| --- | --- | --- |
+| `selected_suggestions` | approved, no plan yet | prepare and approve a plan |
+| `prepared_plans` | plan built, unapproved | a human approves it |
+| `approved_plans` | bound artifact | queue a publication job |
+
+`next_action` ranks them: `blocked` (no credentials — preparation would fail
+on every article) → `publish` → `approve_plan` → `prepare` →
+`nothing_waiting`. The order is what has to happen first, so the answer is the
+*next* step rather than a list of everything outstanding.
+
+`prepared_plans` is the registry's own count. `publication_status` counts only
+approved plans, so a site with a plan sitting prepared was told to "prepare"
+work it had already prepared. The fleet view enriches the rows
+`_pending_publication_query` returns but does not change which rows those are —
+a site whose only work is a prepared plan is outside that route's definition of
+pending and stays outside it here, so this view and the dashboard's inbox agree.
+
+Unlike `pending_publication_site`, which 404s when a site has nothing waiting,
+this tool answers `nothing_waiting`. That is an answer to the question, not a
+failure of it.
+
+## Settings
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `AGENT_MODEL` | `anthropic/claude-sonnet-4.5` | Must support tool calling |
+| `AGENT_TIMEOUT_SECONDS` | `90` | Per model turn |
+| `AGENT_MAX_TOOL_ROUNDS` | `4` | Tool-bearing turns per question |
+| `AGENT_MAX_OUTPUT_TOKENS` | `1500` | Per turn |
+| `AGENT_MAX_HISTORY_TURNS` | `20` | Transcript bound at the API edge |
+| `DASHBOARD_BASE_URL` | *(empty)* | Dashboard origin for result links; empty omits them |
+
+Chat reuses `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL`.
+
+## Adding a tool
+
+Add it to the registry in `app/agent_tools.py`: an args pydantic model, a
+handler returning JSON-safe dicts, a `title`, and a description written for a
+model. Both surfaces pick it up automatically; add tests to
+`tests/test_agent_tools.py`. Keep it read-only, or open a design discussion
+first — the write boundary is the security property of this feature.
+
+State every bound on the args model, even one the route already declares. A
+handler calls its route *function*, so `Query(..., le=100)` never runs — the
+pydantic model is the only validation an agent's arguments meet. `search_queue`
+is the worked example: its percent band, term length, and page size are all
+re-declared there.
+
+Paginate with a cursor, not an offset. `search_queue` takes the route's two
+sort keys — valid only as a pair, which a model supplies correctly about half
+the time — and hands back one opaque `next_cursor` string to copy verbatim.
+Count the full match on the first page only; continuations ride the route's
+look-ahead row.

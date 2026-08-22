@@ -233,6 +233,10 @@ def offline_publication_defaults(monkeypatch):
     monkeypatch.setattr(settings, "publish_request_delay_seconds", 0.0)
     monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
     monkeypatch.setattr(settings, "tavily_api_key", "")
+    # Same hazard as placement above: a real OPENROUTER_API_KEY in `.env` would
+    # turn assistant-loop tests into live paid completions. Tests that exercise
+    # OpenRouter set a key themselves and stub the transport.
+    monkeypatch.setattr(settings, "openrouter_api_key", "")
 
 
 @pytest.fixture(autouse=True)

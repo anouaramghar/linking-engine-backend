@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI
 from app.api.deps import require_api_key
 from app.api.routes import (
     admin_keys,
+    agent,
     alerts,
     auth,
     evaluation,
@@ -51,5 +52,6 @@ for router in [
     evaluation.router,
     graph.router,
     admin_keys.router,
+    agent.router,
 ]:
     app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])
