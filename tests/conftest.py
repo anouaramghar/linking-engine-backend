@@ -240,6 +240,17 @@ def offline_publication_defaults(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def offline_tavily(monkeypatch):
+    """Never let an unrelated test spend Tavily credits.
+
+    Developer ``.env`` files may contain a live key.  Ranking tests that do not
+    exercise the external-search provider must stay deterministic and offline;
+    provider unit tests pass an explicit fake key and a mock HTTP transport.
+    """
+    monkeypatch.setattr(settings, "tavily_api_key", "")
+
+
+@pytest.fixture(autouse=True)
 def offline_telegram(monkeypatch):
     """Nothing in the suite may message Telegram for real.
 

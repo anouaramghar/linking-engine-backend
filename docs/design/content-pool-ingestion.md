@@ -20,11 +20,22 @@ POST /api/v1/sites/{site_id}/pool-source/approval
 Approval is checked again before every manual or scheduled crawl. It can be
 revoked with `DELETE /api/v1/sites/{site_id}/pool-source/approval`.
 
-Register one global repeating coordinator after deployment:
+Docker Compose registers one global repeating coordinator automatically through
+the one-shot `pool-scheduler-init` service. The ingestion worker waits for that
+service to succeed before it starts. Registration uses a unique job id, so
+restarting or redeploying the stack reuses the existing schedule instead of
+creating duplicates.
 
-```bash
-docker compose exec api python scripts/schedule_pool_ingestion.py
+For a deployment that does not use the provided Docker Compose stack, register
+the coordinator once from the application environment after deployment:
+
+```console
+python scripts/schedule_pool_ingestion.py
 ```
+
+For manual recovery in a Compose deployment, run
+`docker compose run --rm pool-scheduler-init`. Re-registration is safe because
+the coordinator job id is unique.
 
 The coordinator discovers all approved, non-quarantined daily pool sources every
 time it runs, so sources added later do not need their own schedule registration.

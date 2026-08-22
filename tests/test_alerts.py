@@ -91,6 +91,7 @@ def test_alert_dedupe_acknowledge_and_new_occurrence(client, db, site, monkeypat
     )
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()] == [stored[0].id]
+    assert listed.json()[0]["site_name"] == site.name
 
     first_ack = client.post(f"/api/v1/alerts/{stored[0].id}/acknowledge")
     second_ack = client.post(f"/api/v1/alerts/{stored[0].id}/acknowledge")
@@ -110,3 +111,25 @@ def test_alert_dedupe_acknowledge_and_new_occurrence(client, db, site, monkeypat
     assert stored[1].acknowledged_at is None
     assert stored[1].occurrences == 1
     assert client.post("/api/v1/alerts/999999999/acknowledge").status_code == 404
+
+
+def test_record_alert_keeps_distinct_in_app_job_outcomes_without_webhook(db, site, monkeypatch):
+    monkeypatch.setattr(settings, "alert_webhook_url", "https://alerts.example.test/hook")
+
+    alerts.record_alert(
+        "LinkMesh analysis job completed",
+        {"site_id": site.id, "job_run_id": 1, "outcome": "succeeded"},
+        kind="job_succeeded",
+        site_id=site.id,
+        dedupe=False,
+    )
+    alerts.record_alert(
+        "LinkMesh analysis job completed",
+        {"site_id": site.id, "job_run_id": 2, "outcome": "succeeded"},
+        kind="job_succeeded",
+        site_id=site.id,
+        dedupe=False,
+    )
+
+    stored = db.scalars(select(Alert).where(Alert.site_id == site.id).order_by(Alert.id)).all()
+    assert [item.payload["job_run_id"] for item in stored] == [1, 2]

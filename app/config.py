@@ -236,6 +236,31 @@ class Settings(BaseSettings):
     crawl_max_wordpress_pages: int = Field(default=1_000, ge=1, le=10_000)
     crawl_max_response_bytes: int = Field(default=10_000_000, ge=1_024, le=100_000_000)
     crawl_max_article_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
+    #: Stop a crawl after this many articles instead of taking the whole site.
+    #: `None` -- the default -- means take everything, which is the only correct
+    #: behavior for a managed site: a partial snapshot deactivates every article
+    #: it did not see. Set it only to sample a corpus far too large to ingest,
+    #: such as a public site used as an offline ranking benchmark.
+    #: Which score decides the delivered order of a hybrid run.
+    #:
+    #: "fusion" orders by the weighted-RRF score of the dense and lexical pools.
+    #: "bm25" reproduces the previous behavior, where the fusion score was
+    #: computed, stored, and then ignored in favour of BM25-512 alone.
+    #:
+    #: Measured on two real editorial blogs (kinsta 1075 + 528 sources,
+    #: speckyboy 417 + 580) against links their own editors wrote, "fusion" with
+    #: an equal dense weight recovered 10-26% more known-good targets in the top
+    #: five than "bm25" did, and beat either retriever used alone in all four
+    #: splits. See docs/research/suggestion-quality-research-2026-08-19.md.
+    hybrid_final_order: Literal["fusion", "bm25"] = "fusion"
+
+    #: Weight of the dense pool in the fusion score; the lexical pool is 1.0.
+    #: Was 0.25, which made the fusion lexical-heavy enough to be nearly a
+    #: no-op. 1.0 was best or within half a percent of best on every split
+    #: measured.
+    hybrid_dense_rrf_weight: float = Field(default=1.0, ge=0.0, le=10.0)
+
+    crawl_sample_articles: int | None = Field(default=None, ge=1, le=100_000)
     crawl_max_links_per_article: int = Field(default=1_000, ge=1, le=100_000)
     crawl_max_total_links: int = Field(default=100_000, ge=1, le=1_000_000)
     # HTML discovery falls back to a small same-origin frontier when a site has
@@ -263,7 +288,14 @@ class Settings(BaseSettings):
     graph_simulation_target_share_warning: float = Field(default=0.50, gt=0.0, le=1.0)
 
     # External content pool (RSS/Atom and Wikipedia).
-    pool_max_articles_per_source: int = Field(default=50, ge=1, le=50)
+    #: The default is unchanged at 50: every content pool behaves exactly as it
+    #: did. The ceiling is raised only so an offline benchmark corpus can be
+    #: built large enough to measure anything -- at 50 articles a Wikipedia
+    #: corpus yields about 7 evaluable source articles, and the confidence
+    #: interval on every metric swamps the difference between two rankers.
+    #: Raising this for a live pool source is a separate decision: cost grows
+    #: linearly, because MediaWiki returns one article extract per request.
+    pool_max_articles_per_source: int = Field(default=50, ge=1, le=500)
     pool_source_timeout: float = Field(default=20.0, gt=0.0, le=120.0)
     pool_max_response_bytes: int = Field(default=5_000_000, ge=1_024, le=50_000_000)
     pool_max_article_chars: int = Field(default=100_000, ge=1_000, le=1_000_000)
@@ -274,6 +306,13 @@ class Settings(BaseSettings):
         max_length=500,
     )
     pool_request_delay_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
+    #: Inter-article links captured per pool article. These are the only
+    #: human-authored link decisions LinkMesh can read without asking a
+    #: reviewer, so they are what an offline ranking benchmark is measured
+    #: against. Bounded well under `crawl_max_links_per_article`, which raises
+    #: rather than truncates: a heavily linked encyclopedia page would
+    #: otherwise fail the whole ingestion run. Set to 0 to capture none.
+    pool_max_links_per_article: int = Field(default=500, ge=0, le=5_000)
     pool_allowed_domains: str = "wikipedia.org"
     pool_quarantine_failure_threshold: int = Field(default=3, ge=1, le=20)
     pool_poll_interval_seconds: int = Field(default=86400, ge=60)

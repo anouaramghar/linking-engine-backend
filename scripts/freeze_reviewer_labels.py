@@ -37,9 +37,7 @@ def write_dataset(dataset: ReviewerLabelDataset, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = dataset.to_dict()
     output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    reloaded = ReviewerLabelDataset.from_dict(
-        json.loads(output.read_text(encoding="utf-8"))
-    )
+    reloaded = ReviewerLabelDataset.from_dict(json.loads(output.read_text(encoding="utf-8")))
     if reloaded != dataset:
         raise RuntimeError(f"{output} did not read back as the dataset that was written")
 

@@ -47,8 +47,8 @@ def test_ordering_returns_final_rank_and_retrieval_evidence():
 
     assert [item.candidate.target_id for item in ordered.items] == [20, 30]
     assert [item.final_rank for item in ordered.items] == [1, 2]
-    assert ordered.items[0].score_components["final_order"] == "bm25_512"
-    assert ordered.items[0].retrieval_version == "hybrid_bm25_v1"
+    assert ordered.items[0].score_components["final_order"] == "wrrf"
+    assert ordered.items[0].retrieval_version == "hybrid_wrrf_v2"
     assert ordered.items[0].ranking_version == "hybrid_bm25:graph=off:feedback=off"
 
 

@@ -768,10 +768,17 @@ class WordPressConnector(ContentConnector):
     def fetch_articles(self) -> Iterator[ArticleData]:
         self._begin_crawl()
         taxonomy_map = self._taxonomy_map()
+        sample = settings.crawl_sample_articles
         for article_number, post in enumerate(
             self._paginate("posts", {"status": "publish"}),
             start=1,
         ):
+            # A sample stops the crawl; the cap refuses it. The two are not the
+            # same request: `crawl_max_articles` exists to catch a site far
+            # larger than expected, and turning that into a silent truncation
+            # would let a partial snapshot deactivate most of a real site.
+            if sample and article_number > sample:
+                return
             if article_number > settings.crawl_max_articles:
                 raise ValueError(f"crawl article count exceeded {settings.crawl_max_articles}")
             yield self._to_article(post, taxonomy_map)

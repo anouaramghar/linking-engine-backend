@@ -265,9 +265,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute(
-        "DROP TRIGGER IF EXISTS trg_suggestion_ranking_snapshot_immutable ON suggestions"
-    )
+    op.execute("DROP TRIGGER IF EXISTS trg_suggestion_ranking_snapshot_immutable ON suggestions")
     op.execute("DROP FUNCTION IF EXISTS prevent_suggestion_ranking_snapshot_mutation()")
     op.execute("DROP TRIGGER trg_suggestion_lifecycle_event ON suggestions")
     _create_legacy_lifecycle_function()
