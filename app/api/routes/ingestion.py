@@ -5,11 +5,11 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
 from app.models import IngestionDiagnostic, IngestionRun, Site
-from app.schemas.job import JobAccepted
+from app.schemas.job import JobAccepted, JobStartGuard
 from app.schemas.ingestion import ArticleImportRequest, ArticleImportResult
 from app.schemas.site import IngestionDiagnosticOut, IngestionRunOut
 from app.services.ingestion_service import import_articles, latest_run
-from app.services.job_service import DuplicateJobError, enqueue_job
+from app.services.job_service import DuplicateJobError, enqueue_job, require_active_job_snapshot
 from app.services.pool_source_policy import PoolSourcePolicyError, require_approved_pool_source
 from app.tasks.ingestion import ingest_pool_site, ingest_site
 
@@ -42,9 +42,20 @@ def import_article_rows(
 
 @router.post("/{site_id}/ingest", status_code=202, response_model=JobAccepted)
 def trigger_ingestion(
+    payload: JobStartGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
+    if payload is not None:
+        try:
+            require_active_job_snapshot(
+                db,
+                site_ids=site.id,
+                kinds="ingestion",
+                expected_ids=payload.expected_active_job_run_ids,
+            )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
     task = ingest_site
     if site.platform == "pool":
         try:

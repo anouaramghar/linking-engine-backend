@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 JobStatusValue = Literal["queued", "running", "succeeded", "failed"]
 
@@ -9,6 +9,27 @@ JobStatusValue = Literal["queued", "running", "succeeded", "failed"]
 class JobAccepted(BaseModel):
     job_id: str
     job_run_id: int | None = None  # durable job_runs row (Phase 0, finding 7)
+
+
+class JobStartGuard(BaseModel):
+    """Optional optimistic guard used by staged dashboard job starts.
+
+    Ordinary dashboard callers may omit the body. A staged agent proposal
+    always supplies the exact active same-kind job ids it observed (normally
+    an empty list), so a confirmation card cannot start work after the site's
+    job state has changed underneath it.
+    """
+
+    expected_active_job_run_ids: list[int] = Field(max_length=100)
+
+    @field_validator("expected_active_job_run_ids")
+    @classmethod
+    def sorted_unique_positive_ids(cls, value: list[int]) -> list[int]:
+        if any(run_id <= 0 for run_id in value):
+            raise ValueError("expected_active_job_run_ids must contain positive integers")
+        if value != sorted(set(value)):
+            raise ValueError("expected_active_job_run_ids must be sorted and unique")
+        return value
 
 
 class JobStatus(BaseModel):

@@ -23,7 +23,7 @@ from app.models import (
     SuggestionEvent,
 )
 from app.models import PublicationPlan
-from app.schemas.job import JobAccepted
+from app.schemas.job import JobAccepted, JobStartGuard
 from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
     MAX_BULK_REVIEW,
@@ -53,7 +53,7 @@ from app.services.authorization import (
     check_site_access,
     require_admin_principal,
 )
-from app.services.job_service import DuplicateJobError, enqueue_job
+from app.services.job_service import DuplicateJobError, enqueue_job, require_active_job_snapshot
 from app.services.graph_service import current_feature_map
 from app.tasks.analysis import analyze_article, analyze_site, compare_site
 
@@ -1157,11 +1157,22 @@ def list_suggestion_page(
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)
 def trigger_analysis(
+    payload: JobStartGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    if payload is not None:
+        try:
+            require_active_job_snapshot(
+                db,
+                site_ids=site.id,
+                kinds="analysis",
+                expected_ids=payload.expected_active_job_run_ids,
+            )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
     try:
         run = enqueue_job(db, site.id, "analysis", analyze_site, job_timeout=7200)
     except DuplicateJobError as e:
@@ -1172,6 +1183,7 @@ def trigger_analysis(
 @router.post("/articles/{article_id}/suggestions", status_code=202, response_model=JobAccepted)
 def trigger_article_analysis(
     article_id: int,
+    payload: JobStartGuard | None = None,
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
@@ -1182,6 +1194,16 @@ def trigger_article_analysis(
     site = authorize_site(db, principal, article.site_id)
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    if payload is not None:
+        try:
+            require_active_job_snapshot(
+                db,
+                site_ids=site.id,
+                kinds="analysis",
+                expected_ids=payload.expected_active_job_run_ids,
+            )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
     try:
         run = enqueue_job(
             db,
@@ -1198,11 +1220,22 @@ def trigger_article_analysis(
 
 @router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)
 def trigger_analysis_comparison(
+    payload: JobStartGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    if payload is not None:
+        try:
+            require_active_job_snapshot(
+                db,
+                site_ids=site.id,
+                kinds="analysis",
+                expected_ids=payload.expected_active_job_run_ids,
+            )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
     try:
         run = enqueue_job(db, site.id, "analysis", compare_site, job_timeout=7200)
     except DuplicateJobError as e:

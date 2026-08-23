@@ -15,9 +15,20 @@ from starlette.concurrency import run_in_threadpool
 from app.api.deps import get_audit_actor, get_db, require_api_key
 from app.db import SessionLocal
 from app.models import JobRun, PipelineBatch, PipelineSiteRun, Site
-from app.schemas.pipeline import PipelineBatchCreate, PipelineBatchOut, PipelineSiteRunOut
+from app.schemas.pipeline import (
+    PipelineBatchCreate,
+    PipelineBatchOut,
+    PipelineCancelGuard,
+    PipelineCancelSiteGuard,
+    PipelineRetryGuard,
+    PipelineSiteRunOut,
+)
 from app.services.authorization import Principal, authorize_site
-from app.services.job_service import DuplicateJobError, enqueue_job
+from app.services.job_service import (
+    DuplicateJobError,
+    enqueue_job,
+    require_active_job_snapshot,
+)
 from app.services.pipeline_service import (
     pipeline_batch_counts,
     refresh_pipeline_batch_status,
@@ -153,6 +164,16 @@ def create_pipeline_batch(
             409,
             "content-pool sources cannot generate suggestions: " + ", ".join(map(str, pool_sites)),
         )
+    if payload.expected_active_job_run_ids is not None:
+        try:
+            require_active_job_snapshot(
+                db,
+                site_ids=payload.site_ids,
+                kinds=("ingestion", "analysis"),
+                expected_ids=payload.expected_active_job_run_ids,
+            )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
 
     batch = PipelineBatch()
     db.add(batch)
@@ -269,6 +290,7 @@ def _stop_queue_job(db: Session, job_run_id: int | None, reason: str) -> None:
 @router.post("/batches/{batch_id}/cancel", response_model=PipelineBatchOut)
 def cancel_pipeline_batch(
     batch_id: int,
+    payload: PipelineCancelGuard | None = None,
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
     actor: str = Depends(get_audit_actor),
@@ -277,6 +299,11 @@ def cancel_pipeline_batch(
     batch = db.scalar(select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update())
     if batch is None:
         raise HTTPException(404, f"pipeline batch {batch_id} not found")
+    if payload is not None and batch.status != payload.expected_batch_status:
+        raise HTTPException(
+            409,
+            "pipeline batch changed after this cancellation was previewed; refresh before confirming",
+        )
     if batch.status in {"succeeded", "failed", "partial_failed"}:
         raise HTTPException(409, f"pipeline batch {batch_id} is already {batch.status}")
     if batch.status == "cancelled":
@@ -288,6 +315,22 @@ def cancel_pipeline_batch(
             select(PipelineSiteRun).where(PipelineSiteRun.batch_id == batch_id).with_for_update()
         )
     )
+    cancelled_sites = [
+        PipelineCancelSiteGuard(
+            site_id=item.site_id,
+            status=item.status,
+            stage=item.stage,
+            ingestion_job_run_id=item.ingestion_job_run_id,
+            analysis_job_run_id=item.analysis_job_run_id,
+        )
+        for item in sorted(items, key=lambda row: row.site_id)
+        if item.status not in {"succeeded", "failed", "cancelled"}
+    ]
+    if payload is not None and cancelled_sites != payload.expected_sites:
+        raise HTTPException(
+            409,
+            "pipeline sites changed after this cancellation was previewed; refresh before confirming",
+        )
     now = datetime.now(UTC)
     for item in items:
         if item.status in {"succeeded", "failed"}:
@@ -313,6 +356,7 @@ def cancel_pipeline_batch(
 def retry_pipeline_site(
     batch_id: int,
     site_id: int,
+    payload: PipelineRetryGuard | None = None,
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> PipelineBatchOut:
@@ -321,17 +365,32 @@ def retry_pipeline_site(
     # would hand a caller the site ids, statuses and error text of the others.
     # An admin may build a batch that spans scopes, which is exactly when that
     # matters.
-    batch = _authorized_batch(db, principal, batch_id)
+    _authorized_batch(db, principal, batch_id)
+    batch = db.scalar(select(PipelineBatch).where(PipelineBatch.id == batch_id).with_for_update())
+    if batch is None:
+        raise HTTPException(404, f"pipeline batch {batch_id} not found")
     item = db.scalar(
-        select(PipelineSiteRun).where(
+        select(PipelineSiteRun)
+        .where(
             PipelineSiteRun.batch_id == batch_id,
             PipelineSiteRun.site_id == site_id,
         )
+        .with_for_update()
     )
     if item is None:
         raise HTTPException(404, f"site {site_id} is not in pipeline batch {batch_id}")
     if item.status != "failed":
         raise HTTPException(409, f"site {site_id} pipeline is {item.status}, not failed")
+    if payload is not None and (
+        batch.status != payload.expected_batch_status
+        or item.status != payload.expected_site_status
+        or item.stage != payload.expected_stage
+        or item.retry_count != payload.expected_retry_count
+    ):
+        raise HTTPException(
+            409,
+            "pipeline retry state changed after it was previewed; refresh before confirming",
+        )
     retry_stage = item.stage
     item.status = "queued"
     item.error = None

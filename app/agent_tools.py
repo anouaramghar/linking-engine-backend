@@ -27,7 +27,7 @@ from urllib.parse import urlencode
 from typing import Any, Callable, Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session, joinedload
 
@@ -35,6 +35,7 @@ from app.config import settings
 from app.api.routes.evaluation import get_evaluation_metrics
 from app.api.routes.ingestion import latest_ingestion_run
 from app.api.routes.jobs import list_active_job_runs, list_job_runs
+from app.api.routes.pipelines import _authorized_batch
 from app.api.routes.suggestions import (
     MAX_SEARCH_TERM,
     _queue_conditions,
@@ -53,6 +54,7 @@ from app.models import (
     IngestionRun,
     InternalLink,
     JobRun,
+    PipelineSiteRun,
     PublicationPlan,
     Site,
     Suggestion,
@@ -70,6 +72,8 @@ from app.services.external_link_policy import (
     ineligible_external_suggestions,
     policy_state,
 )
+from app.services.job_service import active_job_run_ids
+from app.services.pool_source_policy import PoolSourcePolicyError, require_approved_pool_source
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +185,38 @@ class PreviewExternalLinkPolicyArgs(ExternalLinkPolicyValues):
         None,
         description="Which managed site's policy. Omit it when only one site is connected.",
     )
+
+
+class PreviewSiteJobArgs(BaseModel):
+    site_id: int | None = Field(
+        None,
+        description="Which site to process. Omit it when only one site is connected.",
+    )
+    kind: Literal["ingestion", "analysis"] = Field(
+        description="Ingestion crawls and refreshes content; analysis generates suggestions."
+    )
+
+
+class PreviewPipelineBatchArgs(BaseModel):
+    site_ids: list[int] = Field(min_length=1, max_length=100)
+
+    @field_validator("site_ids")
+    @classmethod
+    def unique_positive_site_ids(cls, value: list[int]) -> list[int]:
+        if any(site_id <= 0 for site_id in value):
+            raise ValueError("site_ids must contain only positive integers")
+        if len(value) != len(set(value)):
+            raise ValueError("site_ids must not contain duplicates")
+        return value
+
+
+class PreviewPipelineRetryArgs(BaseModel):
+    batch_id: int = Field(ge=1)
+    site_id: int = Field(ge=1)
+
+
+class PreviewPipelineCancelArgs(BaseModel):
+    batch_id: int = Field(ge=1)
 
 
 class SuggestionHistoryArgs(BaseModel):
@@ -840,6 +876,210 @@ def _preview_external_link_policy(
         "impact": {key: value for key, value in impact.items() if key != "sample"},
     }
     return result
+
+
+def _site_work_scope(db: Session, site: Site) -> dict[str, int]:
+    article_counts, link_counts, suggestion_counts = _site_counts(db, [site.id])
+    return {
+        "active_article_count": article_counts.get(site.id, 0),
+        "active_internal_link_count": link_counts.get(site.id, 0),
+        "active_suggestion_count": suggestion_counts.get(site.id, 0),
+    }
+
+
+def _preview_site_job(
+    db: Session, principal: Principal, args: PreviewSiteJobArgs
+) -> dict[str, Any]:
+    """Stage one crawl or analysis start against an exact active-job snapshot."""
+
+    site = authorize_site(db, principal, _resolve_site_id(db, principal, args.site_id))
+    if args.kind == "analysis" and site.platform == POOL_PLATFORM:
+        raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    if args.kind == "ingestion" and site.platform == POOL_PLATFORM:
+        try:
+            require_approved_pool_source(site)
+        except PoolSourcePolicyError as error:
+            raise HTTPException(409, str(error)) from error
+
+    active_ids = active_job_run_ids(db, site.id, args.kind)
+    scope = _site_work_scope(db, site)
+    result: dict[str, Any] = {
+        "site": {"id": site.id, "name": site.name, "platform": site.platform},
+        "kind": args.kind,
+        "scope": scope,
+        "active_same_kind_job_run_ids": active_ids,
+        "ready": not active_ids,
+        **_urls(sites_url=_dashboard_url("/sites", q=site.name)),
+    }
+    if active_ids:
+        result["blocked_reason"] = (
+            f"an {args.kind} job is already queued or running; wait for it or inspect its status"
+        )
+        return result
+
+    endpoint = (
+        f"/api/v1/sites/{site.id}/ingest"
+        if args.kind == "ingestion"
+        else f"/api/v1/suggestions/{site.id}"
+    )
+    result["proposal"] = {
+        "kind": "site_job_start",
+        "risk": "sensitive",
+        "method": "POST",
+        "endpoint": endpoint,
+        "payload": {"expected_active_job_run_ids": active_ids},
+        "impact": {"site_count": 1, **scope},
+    }
+    return result
+
+
+def _preview_pipeline_batch(
+    db: Session, principal: Principal, args: PreviewPipelineBatchArgs
+) -> dict[str, Any]:
+    """Stage a crawl-then-analysis batch only when every selected site is idle."""
+
+    site_ids = sorted(args.site_ids)
+    sites = list(db.scalars(select(Site).where(Site.id.in_(site_ids))))
+    found = {site.id for site in sites}
+    missing = sorted(set(site_ids) - found)
+    if missing:
+        raise HTTPException(404, f"site(s) not found: {', '.join(map(str, missing))}")
+    for site in sites:
+        authorize_site(db, principal, site.id)
+    pool_ids = sorted(site.id for site in sites if site.platform == POOL_PLATFORM)
+    if pool_ids:
+        raise HTTPException(
+            409,
+            "content-pool sources cannot generate suggestions: " + ", ".join(map(str, pool_ids)),
+        )
+
+    active_ids = active_job_run_ids(db, site_ids, ("ingestion", "analysis"))
+    article_counts, _link_counts, _suggestion_counts = _site_counts(db, site_ids)
+    impact = {
+        "site_count": len(site_ids),
+        "active_article_count": sum(article_counts.values()),
+    }
+    result: dict[str, Any] = {
+        "sites": [
+            {"id": site.id, "name": site.name} for site in sorted(sites, key=lambda row: row.id)
+        ],
+        "impact": impact,
+        "active_job_run_ids": active_ids,
+        "ready": not active_ids,
+        **_urls(sites_url=_dashboard_url("/sites")),
+    }
+    if active_ids:
+        result["blocked_reason"] = (
+            "one or more selected sites already has a crawl or analysis queued or running"
+        )
+        return result
+    result["proposal"] = {
+        "kind": "pipeline_batch_start",
+        "risk": "sensitive",
+        "method": "POST",
+        "endpoint": "/api/v1/pipelines/batches",
+        "payload": {
+            "site_ids": site_ids,
+            "expected_active_job_run_ids": active_ids,
+        },
+        "impact": impact,
+    }
+    return result
+
+
+def _preview_pipeline_retry(
+    db: Session, principal: Principal, args: PreviewPipelineRetryArgs
+) -> dict[str, Any]:
+    """Stage exactly the failed stage currently shown for one batch site."""
+
+    batch = _authorized_batch(db, principal, args.batch_id)
+    item = db.scalar(
+        select(PipelineSiteRun).where(
+            PipelineSiteRun.batch_id == batch.id,
+            PipelineSiteRun.site_id == args.site_id,
+        )
+    )
+    if item is None:
+        raise HTTPException(404, f"site {args.site_id} is not in pipeline batch {batch.id}")
+    if item.status != "failed":
+        raise HTTPException(409, f"site {args.site_id} pipeline is {item.status}, not failed")
+    return {
+        "batch_id": batch.id,
+        "batch_status": batch.status,
+        "site_id": item.site_id,
+        "retry_stage": item.stage,
+        "current_retry_count": item.retry_count,
+        "error": _clip(item.error, 300),
+        **_urls(sites_url=_dashboard_url("/sites")),
+        "proposal": {
+            "kind": "pipeline_retry",
+            "risk": "sensitive",
+            "method": "POST",
+            "endpoint": f"/api/v1/pipelines/batches/{batch.id}/sites/{item.site_id}/retry",
+            "payload": {
+                "expected_batch_status": batch.status,
+                "expected_site_status": "failed",
+                "expected_stage": item.stage,
+                "expected_retry_count": item.retry_count,
+            },
+            "impact": {"site_count": 1, "next_retry_count": item.retry_count + 1},
+        },
+    }
+
+
+def _preview_pipeline_cancel(
+    db: Session, principal: Principal, args: PreviewPipelineCancelArgs
+) -> dict[str, Any]:
+    """Stage cancellation of the exact unfinished sites visible in a batch."""
+
+    batch = _authorized_batch(db, principal, args.batch_id)
+    if batch.status not in {"queued", "running"}:
+        raise HTTPException(409, f"pipeline batch {batch.id} is already {batch.status}")
+    items = list(
+        db.scalars(
+            select(PipelineSiteRun)
+            .where(PipelineSiteRun.batch_id == batch.id)
+            .order_by(PipelineSiteRun.site_id)
+        )
+    )
+    cancellable = [
+        item for item in items if item.status not in {"succeeded", "failed", "cancelled"}
+    ]
+    site_ids = [item.site_id for item in cancellable]
+    if not site_ids:
+        raise HTTPException(409, f"pipeline batch {batch.id} has no unfinished sites to cancel")
+    impact = {
+        "site_count": len(site_ids),
+        "ingestion_stage_count": sum(item.stage == "ingestion" for item in cancellable),
+        "analysis_stage_count": sum(item.stage == "analysis" for item in cancellable),
+    }
+    return {
+        "batch_id": batch.id,
+        "batch_status": batch.status,
+        "cancelling_site_ids": site_ids,
+        "impact": impact,
+        **_urls(sites_url=_dashboard_url("/sites")),
+        "proposal": {
+            "kind": "pipeline_cancel",
+            "risk": "sensitive",
+            "method": "POST",
+            "endpoint": f"/api/v1/pipelines/batches/{batch.id}/cancel",
+            "payload": {
+                "expected_batch_status": batch.status,
+                "expected_sites": [
+                    {
+                        "site_id": item.site_id,
+                        "status": item.status,
+                        "stage": item.stage,
+                        "ingestion_job_run_id": item.ingestion_job_run_id,
+                        "analysis_job_run_id": item.analysis_job_run_id,
+                    }
+                    for item in cancellable
+                ],
+            },
+            "impact": impact,
+        },
+    }
 
 
 def _queue_counts(db: Session, principal: Principal, args: QueueCountsArgs) -> dict[str, Any]:
@@ -1796,6 +2036,51 @@ REGISTRY: dict[str, AgentTool] = {
             ),
             args_model=SiteStatusArgs,
             handler=_site_status,
+        ),
+        AgentTool(
+            name="preview_site_job",
+            title="Preview site job",
+            description=(
+                "Stage one crawl (ingestion) or suggestion-generation analysis for a site. "
+                "Reports the exact content scope and any active same-kind job. Returns a "
+                "sensitive proposal only when no duplicate job is queued or running; the "
+                "editor must confirm and stale confirmations are refused."
+            ),
+            args_model=PreviewSiteJobArgs,
+            handler=_preview_site_job,
+        ),
+        AgentTool(
+            name="preview_pipeline_batch",
+            title="Preview pipeline batch",
+            description=(
+                "Stage a crawl-then-analysis pipeline for an explicit list of managed sites. "
+                "Reports site/article scope and refuses to stage while any selected site has "
+                "active crawl or analysis work. This sensitive tool never starts the batch."
+            ),
+            args_model=PreviewPipelineBatchArgs,
+            handler=_preview_pipeline_batch,
+        ),
+        AgentTool(
+            name="preview_pipeline_retry",
+            title="Preview pipeline retry",
+            description=(
+                "Stage a retry of exactly one failed pipeline site's current failed stage. "
+                "The sensitive proposal binds confirmation to batch status, site status, "
+                "stage, and retry count; this tool never queues work."
+            ),
+            args_model=PreviewPipelineRetryArgs,
+            handler=_preview_pipeline_retry,
+        ),
+        AgentTool(
+            name="preview_pipeline_cancel",
+            title="Preview pipeline cancellation",
+            description=(
+                "Stage cancellation of an active pipeline batch. Reports the exact unfinished "
+                "site ids and their stages; confirmation is refused if batch or site state "
+                "changes. Cancellation is sensitive and this tool never stops work itself."
+            ),
+            args_model=PreviewPipelineCancelArgs,
+            handler=_preview_pipeline_cancel,
         ),
         AgentTool(
             name="get_editorial_ranking_policy",

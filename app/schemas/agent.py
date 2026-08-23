@@ -1,5 +1,7 @@
 """Wire schemas for the dashboard assistant."""
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -27,12 +29,16 @@ class AgentToolTrace(BaseModel):
 
 
 class AgentProposal(BaseModel):
-    """A staged bulk rule awaiting the operator's confirm in the dashboard."""
+    """A typed mutation awaiting the operator's confirm in the dashboard."""
 
     tool: str
+    kind: str
+    risk: Literal["reversible", "sensitive"]
+    method: Literal["POST", "PUT"]
     endpoint: str
     payload: dict
     match_count: int | None = None
+    impact: dict | None = None
 
 
 class AgentChatResponse(BaseModel):

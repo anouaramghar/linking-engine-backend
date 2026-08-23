@@ -58,8 +58,11 @@ must never be mintable by another MCP tool.
    the exact pending and approved suggestion ids that would expire, and
    confirmation is refused if either that impact or the policy changes. Ordinary
    site metadata remains; credentials stay excluded.
-4. Analysis, ingestion, retry, and cancellation: include scope, estimated work,
-   duplicate-job checks, and a sensitive-action confirmation.
+4. Analysis, ingestion, retry, and cancellation now include scope, current-work
+   estimates, duplicate-job checks, and a sensitive-action confirmation. Job
+   starts bind to the active durable job ids. Pipeline retries bind batch/site
+   status, failed stage, and retry count. Cancellation binds every unfinished
+   site's status, stage, and ingestion/analysis job-run ids.
 5. Add out-of-band MCP action receipts only after the dashboard proposal set is
    complete and audited.
 

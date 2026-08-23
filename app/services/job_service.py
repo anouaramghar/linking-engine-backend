@@ -126,6 +126,43 @@ class JobCapacityError(DuplicateJobError):
         Exception.__init__(self, f"tenant {tenant_id} already has {limit} active jobs")
 
 
+def active_job_run_ids(
+    db: Session,
+    site_ids: int | list[int],
+    kinds: str | tuple[str, ...],
+) -> list[int]:
+    """Return the durable active-job snapshot used by previews and confirms."""
+
+    selected_sites = [site_ids] if isinstance(site_ids, int) else site_ids
+    selected_kinds = (kinds,) if isinstance(kinds, str) else kinds
+    if not selected_sites:
+        return []
+    return sorted(
+        db.scalars(
+            select(JobRun.id).where(
+                JobRun.site_id.in_(selected_sites),
+                JobRun.kind.in_(selected_kinds),
+                JobRun.status.in_(("queued", "running")),
+            )
+        ).all()
+    )
+
+
+def require_active_job_snapshot(
+    db: Session,
+    *,
+    site_ids: int | list[int],
+    kinds: str | tuple[str, ...],
+    expected_ids: list[int],
+) -> None:
+    """Reject a staged start when active jobs changed after its preview."""
+
+    if active_job_run_ids(db, site_ids, kinds) != expected_ids:
+        raise ValueError(
+            "active jobs changed after this action was previewed; refresh before confirming"
+        )
+
+
 class NonRetryableTaskError(RuntimeError):
     """A terminal task failure that RQ must not schedule again."""
 
