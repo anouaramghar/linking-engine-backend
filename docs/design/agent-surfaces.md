@@ -1,9 +1,11 @@
 # Agent surfaces
 
-LinkMesh exposes one read-only action set to two agent-facing surfaces: an
+LinkMesh exposes one read-only tool set to two agent-facing surfaces: an
 MCP server for external clients (Claude Code, Cursor, any MCP host) and a
-chat assistant embedded in the dashboard. This note records what they may
-touch, why the boundary sits where it sits, and how to operate them.
+chat assistant embedded in the dashboard. Some tools stage exact editor action
+proposals, but no tool mutates application state. This note records what they
+may touch, why the boundary sits where it sits, and how to operate them. The
+action classes and rollout live in [agent-action-safety.md](agent-action-safety.md).
 
 ## The single registry
 
@@ -14,11 +16,13 @@ REST route functions directly (`count_suggestions`,
 agent's answer is computed by exactly the code path the dashboard uses,
 including tenant scoping and site authorization.
 
-Every tool reads. Nothing in the registry approves, rejects, publishes,
-crawls, or enqueues. That line is deliberate: suggestions carry untrusted
-crawled text, and a manipulated model with write access would be an
-injection path into customer sites. Review actions stay human-only; the
-review workflow's success gates were designed for people, not prompts.
+Every tool reads. A tool may stage a typed proposal, but it cannot approve,
+reject, publish, crawl, or enqueue. That line is deliberate: suggestions carry
+untrusted crawled text, and a manipulated model with write access would be an
+injection path into customer sites. In the dashboard, the editor's Confirm
+click sends an allowlisted proposal to the ordinary audited REST route. Over
+MCP, the tool returns the exact proposal and a dashboard URL; the external
+client cannot execute it.
 
 ## MCP server (`/mcp`)
 

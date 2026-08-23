@@ -151,6 +151,13 @@ BulkRuleStatus = Literal["approved", "rejected"]
 class SuggestionReview(BaseModel):
     status: ReviewStatus
     rejection_reason: RejectionReason | None = None
+    expected_status: ReviewStatus | None = Field(
+        None,
+        description=(
+            "Only review the suggestion if it still has this status. Agent-staged "
+            "actions use this as an optimistic-concurrency guard."
+        ),
+    )
 
     @model_validator(mode="after")
     def reason_only_applies_to_rejection(self) -> "SuggestionReview":

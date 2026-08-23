@@ -75,6 +75,9 @@ class TestPreviewBulkReview:
         assert result["sample"][0]["similarity_percent"] == 92
 
         proposal = result["proposal"]
+        assert proposal["kind"] == "bulk_review"
+        assert proposal["risk"] == "reversible"
+        assert proposal["method"] == "POST"
         assert proposal["endpoint"] == "/api/v1/suggestions/bulk-review-by-filter"
         assert proposal["payload"]["status"] == "approved"
         assert proposal["payload"]["threshold_percent"] == 85
@@ -115,6 +118,62 @@ class TestPreviewBulkReview:
         assert scoped == {"error": "admin access required", "status": 403} or (
             scoped.get("status") == 403
         )
+
+
+class TestPreviewSuggestionReview:
+    def test_stages_one_exact_decision_without_mutating(self, db, site, pending_suggestion):
+        result = call_tool(
+            db,
+            _admin(),
+            "preview_suggestion_review",
+            {"suggestion_id": pending_suggestion.id, "action": "approve"},
+        )
+
+        assert result["suggestion"]["id"] == pending_suggestion.id
+        assert result["suggestion"]["current_status"] == "pending"
+        assert result["proposal"] == {
+            "kind": "review_suggestion",
+            "risk": "reversible",
+            "method": "PUT",
+            "endpoint": f"/api/v1/suggestions/{pending_suggestion.id}",
+            "payload": {
+                "status": "approved",
+                "expected_status": "pending",
+                "rejection_reason": None,
+            },
+        }
+        db.expire(pending_suggestion)
+        assert pending_suggestion.status == "pending"
+
+    def test_rejection_requires_a_reason(self, db, pending_suggestion):
+        result = call_tool(
+            db,
+            _admin(),
+            "preview_suggestion_review",
+            {"suggestion_id": pending_suggestion.id, "action": "reject"},
+        )
+        assert result["status"] == 422
+
+    def test_stale_confirmation_cannot_replace_a_newer_decision(
+        self, client, db, pending_suggestion
+    ):
+        first = client.put(
+            f"/api/v1/suggestions/{pending_suggestion.id}",
+            json={"status": "approved", "expected_status": "pending"},
+        )
+        assert first.status_code == 200
+
+        stale = client.put(
+            f"/api/v1/suggestions/{pending_suggestion.id}",
+            json={
+                "status": "rejected",
+                "expected_status": "pending",
+                "rejection_reason": "not_relevant",
+            },
+        )
+        assert stale.status_code == 409
+        db.expire(pending_suggestion)
+        assert pending_suggestion.status == "approved"
 
 
 class TestExplainSuggestion:

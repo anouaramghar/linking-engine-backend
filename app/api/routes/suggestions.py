@@ -290,10 +290,14 @@ def _review_ids(
     *,
     actor: str | None = None,
     rejection_reason: str | None = None,
+    expected_status: str | None = None,
 ) -> set[int]:
+    conditions = [Suggestion.id.in_(suggestion_ids)]
+    if expected_status is not None:
+        conditions.append(Suggestion.status == expected_status)
     return _review_matching(
         db,
-        [Suggestion.id.in_(suggestion_ids)],
+        conditions,
         status,
         actor=actor,
         rejection_reason=rejection_reason,
@@ -1363,8 +1367,12 @@ def review_suggestion(
         payload.status,
         actor=actor,
         rejection_reason=payload.rejection_reason,
+        expected_status=payload.expected_status,
     ):
-        raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
+        detail = f"suggestion {suggestion_id} is no longer reviewable"
+        if payload.expected_status is not None:
+            detail += f" with status {payload.expected_status}"
+        raise HTTPException(409, detail)
     db.commit()
     logger.info(
         "suggestion review trace_id=%s actor=%s mode=single status=%s",

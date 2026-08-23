@@ -1,4 +1,4 @@
-"""The one read-only action registry behind both agent surfaces.
+"""The one read-only tool registry behind both agent surfaces.
 
 The MCP server (``app.mcp_server``) and the dashboard assistant
 (``POST /api/v1/agent/chat``) both execute *these* handlers — there is no
@@ -7,9 +7,10 @@ answer an agent gives is computed by exactly the code path the REST API uses,
 including tenant scoping and site authorization, because most handlers below
 call the route functions themselves rather than re-deriving their queries.
 
-Every tool here reads. Nothing in this file may approve, reject, publish,
-crawl, or enqueue: agents answer questions about work, they do not perform it.
-The review workflow's success gates are human-only by design.
+Every tool here reads. A tool may stage an exact, typed proposal, but it never
+executes that proposal: the dashboard renders a confirmation affordance and
+the editor performs the audited REST mutation. Publication, credential, and
+destructive operations are not staged at all.
 
 Handlers return plain JSON-safe dicts. Failures are returned as ``{"error":
 ..., "status": ...}`` rather than raised, because the chat loop reads outcomes
@@ -273,6 +274,33 @@ class PreviewBulkReviewArgs(BaseModel):
             raise ValueError("set site_id, or all_sites=true to review every site at once")
         if self.site_id is not None and self.all_sites:
             raise ValueError("site_id and all_sites=true contradict each other")
+        if self.action == "reject" and self.rejection_reason is None:
+            raise ValueError("rejection_reason is required when action is reject")
+        if self.rejection_reason is not None and self.action != "reject":
+            raise ValueError("rejection_reason is only valid when action is reject")
+        return self
+
+
+class PreviewSuggestionReviewArgs(BaseModel):
+    """One editorial decision the operator may confirm; this tool only stages."""
+
+    suggestion_id: int = Field(ge=1, description="The suggestion shown in the review queue.")
+    action: Literal["approve", "reject"]
+    rejection_reason: (
+        Literal[
+            "not_relevant",
+            "wrong_target",
+            "bad_anchor",
+            "bad_placement",
+            "already_covered",
+            "duplicate",
+            "other",
+        ]
+        | None
+    ) = Field(None, description="Required when action=reject.")
+
+    @model_validator(mode="after")
+    def _decision_must_be_executable(self) -> "PreviewSuggestionReviewArgs":
         if self.action == "reject" and self.rejection_reason is None:
             raise ValueError("rejection_reason is required when action is reject")
         if self.rejection_reason is not None and self.action != "reject":
@@ -1347,6 +1375,60 @@ def _ops_digest(db: Session, principal: Principal, args: OpsDigestArgs) -> dict[
 BULK_REVIEW_SAMPLE_ROWS = 3
 
 
+def _preview_suggestion_review(
+    db: Session, principal: Principal, args: PreviewSuggestionReviewArgs
+) -> dict[str, Any]:
+    """Stage one exact review decision without changing the suggestion.
+
+    The proposal carries ``expected_status=pending``. If another editor acts
+    before Confirm is clicked, the ordinary review endpoint returns 409 rather
+    than silently replacing that newer decision.
+    """
+    suggestion = db.get(
+        Suggestion,
+        args.suggestion_id,
+        options=[joinedload(Suggestion.source_article), joinedload(Suggestion.target_article)],
+    )
+    if suggestion is None:
+        raise HTTPException(404, f"suggestion {args.suggestion_id} not found")
+    authorize_site(db, principal, suggestion.site_id)
+    if suggestion.status != "pending":
+        raise HTTPException(
+            409,
+            f"suggestion {suggestion.id} is {suggestion.status}, not pending; refresh before acting",
+        )
+
+    status = "approved" if args.action == "approve" else "rejected"
+    target_title = (
+        suggestion.target_article.title
+        if suggestion.target_article is not None
+        else suggestion.external_title or suggestion.external_url
+    )
+    return {
+        "action": args.action,
+        "suggestion": {
+            "id": suggestion.id,
+            "site_id": suggestion.site_id,
+            "current_status": suggestion.status,
+            "rank_percent": round(suggestion.rank_score * 100),
+            "source_title": suggestion.source_article.title,
+            "target_title": target_title,
+        },
+        **_urls(review_url=_queue_url(site_id=suggestion.site_id, status="pending")),
+        "proposal": {
+            "kind": "review_suggestion",
+            "risk": "reversible",
+            "method": "PUT",
+            "endpoint": f"/api/v1/suggestions/{suggestion.id}",
+            "payload": {
+                "status": status,
+                "expected_status": "pending",
+                "rejection_reason": args.rejection_reason,
+            },
+        },
+    }
+
+
 def _preview_bulk_review(
     db: Session, principal: Principal, args: PreviewBulkReviewArgs
 ) -> dict[str, Any]:
@@ -1426,6 +1508,9 @@ def _preview_bulk_review(
             )
         ),
         "proposal": {
+            "kind": "bulk_review",
+            "risk": "reversible",
+            "method": "POST",
             "endpoint": "/api/v1/suggestions/bulk-review-by-filter",
             "payload": payload,
         },
@@ -1445,6 +1530,17 @@ REGISTRY: dict[str, AgentTool] = {
             ),
             args_model=ExplainSuggestionArgs,
             handler=_explain_suggestion,
+        ),
+        AgentTool(
+            name="preview_suggestion_review",
+            title="Preview suggestion review",
+            description=(
+                "Stage approval or rejection of one pending suggestion after examining it with "
+                "explain_suggestion. Returns an exact reversible proposal that the editor must "
+                "confirm; this tool never changes the suggestion. Rejection requires a reason."
+            ),
+            args_model=PreviewSuggestionReviewArgs,
+            handler=_preview_suggestion_review,
         ),
         AgentTool(
             name="get_ops_digest",
