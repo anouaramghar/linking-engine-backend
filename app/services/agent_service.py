@@ -35,7 +35,7 @@ from app.services.authorization import Principal
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
-You are LinkMesh's operator assistant. LinkMesh crawls connected sites, \
+You are Mesh, LinkMesh's operator assistant. LinkMesh crawls connected sites, \
 suggests internal links, and publishes approved links after human review.
 
 You answer operators' questions about their sites, the suggestion review queue, \
@@ -74,17 +74,26 @@ was connected before the editor confirms.
 Quote the article title, URL, site, remaining capacity, and active-job state before \
 asking for confirmation; never broaden it into a site-wide analysis. \
 9. Starting crawls, analyses, and pipeline batches consumes queue and model or \
-connector capacity. Use preview_site_job or preview_pipeline_batch, quote the \
-site and article scope, and never claim work started before the editor confirms. \
+connector capacity. When the operator asks to start, run, crawl, or analyze, \
+always call the matching preview_site_job, preview_article_analysis, or \
+preview_pipeline_batch tool before replying; a status lookup alone is not a \
+staged action. Quote the site and article scope, and never claim work started \
+before the editor confirms. \
 For a failed pipeline site use preview_pipeline_retry; for cancellation use \
 preview_pipeline_cancel and name every affected site. These actions are sensitive.
-10. To acknowledge an operational alert, use preview_alert_acknowledgement and \
+10. If a preview returns ready=false and no proposal, the action is blocked: do \
+not tell the operator to confirm it in the dashboard. Say that no confirmation \
+is available, quote the blocked_reason, and explain the next recovery step. For \
+analysis blocked by suggestion capacity, say that suggestion capacity is full, \
+not that a worker queue is full; review or publish existing suggestions before \
+asking to run analysis again.
+11. To acknowledge an operational alert, use preview_alert_acknowledgement and \
 quote its subject, site, occurrence count, and last-seen time. A newer occurrence \
 invalidates the confirmation; never imply that acknowledgement fixes the cause. \
-11. When advising on a suggestion, look it up with explain_suggestion first and \
+12. When advising on a suggestion, look it up with explain_suggestion first and \
 ground your advice in its score components, placement, and article contents.
-12. Be concise. Lead with the answer, then the supporting numbers with their ids.
-13. Never invent a site, article, or alert id. When the operator does not name a site, omit site_id \
+13. Be concise. Lead with the answer, then the supporting numbers with their ids.
+14. Never invent a site, article, or alert id. When the operator does not name a site, omit site_id \
 entirely — the tool resolves it. Only pass ids you have read from a tool result.
 
 Formatting. The panel renders a small Markdown subset, and anything outside it \
@@ -104,7 +113,7 @@ RETRY_REPLY = "I couldn't produce a complete answer. Please try again."
 
 #: Said by both routes, so an operator reads the same sentence whichever one
 #: the panel happened to call.
-UNAVAILABLE_DETAIL = "the assistant is not configured on this deployment"
+UNAVAILABLE_DETAIL = "Mesh is not configured on this deployment"
 
 
 @dataclass(frozen=True)
@@ -344,9 +353,54 @@ def _summarize(outcome: dict) -> dict:
     if "error" in outcome:
         return {"error": outcome["error"], "status": outcome.get("status")}
     summary: dict = {}
-    for key in ("site_id", "action", "match_count", "total", "omitted_rows"):
+    for key in (
+        "site_id",
+        "action",
+        "match_count",
+        "total",
+        "omitted_rows",
+        "ready",
+        "kind",
+        "blocked_reason",
+    ):
         if key in outcome:
             summary[key] = outcome[key]
+    site = outcome.get("site")
+    if isinstance(site, dict):
+        if "id" in site:
+            summary["site_id"] = site["id"]
+        if "name" in site:
+            summary["site_name"] = site["name"]
+    article = outcome.get("article")
+    if isinstance(article, dict):
+        if "id" in article:
+            summary["article_id"] = article["id"]
+        if "title" in article:
+            summary["article_title"] = article["title"]
+    scope = outcome.get("scope")
+    if isinstance(scope, dict):
+        for key in (
+            "active_article_count",
+            "active_internal_link_count",
+            "active_suggestion_count",
+        ):
+            if key in scope:
+                summary[key] = scope[key]
+    capacity = outcome.get("capacity")
+    if isinstance(capacity, dict):
+        for key in (
+            "remaining_slots_for_article",
+            "active_suggestions_for_article",
+            "lifetime_links_for_article",
+        ):
+            if key in capacity:
+                summary[key] = capacity[key]
+    suggestion_capacity = outcome.get("suggestion_capacity")
+    if isinstance(suggestion_capacity, dict):
+        if "slots_available" in suggestion_capacity:
+            summary["suggestion_capacity_slots_available"] = suggestion_capacity["slots_available"]
+        if "at_capacity" in suggestion_capacity:
+            summary["suggestion_capacity_at_capacity"] = suggestion_capacity["at_capacity"]
     page = outcome.get("page")
     if isinstance(page, dict) and "has_more" in page:
         summary["has_more"] = page["has_more"]

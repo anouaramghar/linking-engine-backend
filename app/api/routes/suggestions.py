@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session, aliased, joinedload
 from app.api.csv_stream import CSV_FETCH_BATCH, csv_escape_formula, csv_response
 from app.api.deps import get_audit_actor, get_db, require_api_key, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
+from app.api.routes.sites import _site_counts
+from app.config import settings
 from app.ml.llm import openrouter
 from app.ml.llm.openrouter import OpenRouterError, OpenRouterNotConfigured
 from app.models import (
@@ -1174,6 +1176,21 @@ def trigger_analysis(
             )
         except ValueError as error:
             raise HTTPException(409, str(error)) from error
+    active_article_counts, _, active_suggestion_counts = _site_counts(db, [site.id])
+    active_article_count = active_article_counts.get(site.id, 0)
+    active_suggestion_count = active_suggestion_counts.get(site.id, 0)
+    if active_article_count == 0:
+        raise HTTPException(409, "site has no active articles; crawl it before generating more")
+    site_capacity = min(
+        active_article_count * settings.hybrid_max_suggestions_per_article,
+        settings.hybrid_max_active_suggestions_per_site,
+    )
+    if active_suggestion_count >= site_capacity:
+        raise HTTPException(
+            409,
+            "site suggestion capacity is full; review or publish existing suggestions "
+            "before generating more",
+        )
     try:
         run = enqueue_job(db, site.id, "analysis", analyze_site, job_timeout=7200)
     except DuplicateJobError as e:

@@ -1075,17 +1075,47 @@ def _preview_site_job(
 
     active_ids = active_job_run_ids(db, site.id, args.kind)
     scope = _site_work_scope(db, site)
+    site_out = get_site(site=site, db=db) if args.kind == "analysis" else None
+    suggestion_capacity = (
+        {
+            "slots_available": site_out.suggestion_slots_available,
+            "at_capacity": site_out.suggestion_slots_available == 0,
+        }
+        if site_out is not None
+        else None
+    )
     result: dict[str, Any] = {
         "site": {"id": site.id, "name": site.name, "platform": site.platform},
         "kind": args.kind,
         "scope": scope,
         "active_same_kind_job_run_ids": active_ids,
-        "ready": not active_ids,
-        **_urls(sites_url=_dashboard_url("/sites", q=site.name)),
+        "ready": (
+            not active_ids
+            and (args.kind != "analysis" or scope["active_article_count"] > 0)
+            and not (suggestion_capacity or {}).get("at_capacity", False)
+        ),
+        **({"suggestion_capacity": suggestion_capacity} if suggestion_capacity else {}),
+        **_urls(
+            sites_url=_dashboard_url("/sites", q=site.name),
+            queue_url=_queue_url(site_id=site.id, status="pending")
+            if args.kind == "analysis"
+            else None,
+        ),
     }
     if active_ids:
         result["blocked_reason"] = (
             f"an {args.kind} job is already queued or running; wait for it or inspect its status"
+        )
+        return result
+
+    if args.kind == "analysis" and scope["active_article_count"] == 0:
+        result["blocked_reason"] = "the site has no active articles; crawl it before generating more"
+        return result
+
+    if args.kind == "analysis" and suggestion_capacity and suggestion_capacity["at_capacity"]:
+        result["blocked_reason"] = (
+            "the site's suggestion capacity is full; review or publish existing suggestions "
+            "before generating more"
         )
         return result
 

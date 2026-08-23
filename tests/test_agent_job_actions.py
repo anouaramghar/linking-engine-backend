@@ -5,6 +5,7 @@ import uuid
 from sqlalchemy import delete, func, select
 
 from app.agent_tools import call_tool
+from app.config import settings
 from app.models import Article, JobRun, PipelineBatch, PipelineSiteRun, Site, Suggestion
 from app.services.authorization import Principal
 
@@ -95,6 +96,60 @@ def test_site_job_preview_does_not_stage_duplicate_work(db, site):
     assert preview["ready"] is False
     assert preview["active_same_kind_job_run_ids"] == [run.id]
     assert "proposal" not in preview
+
+
+def test_site_analysis_preview_explains_full_suggestion_capacity(client, db, site, monkeypatch):
+    monkeypatch.setattr(settings, "hybrid_max_active_suggestions_per_site", 3)
+    source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/full-source",
+        title="Full source",
+        content_text="source",
+    )
+    targets = [
+        Article(
+            site_id=site.id,
+            url=f"{site.base_url}/full-target-{index}",
+            title=f"Target {index}",
+            content_text="target",
+        )
+        for index in range(3)
+    ]
+    db.add_all([source, *targets])
+    db.flush()
+    db.add_all(
+        [
+            Suggestion(
+                site_id=site.id,
+                source_article_id=source.id,
+                target_article_id=target.id,
+                method="baseline_cosine",
+                score=0.8,
+                rank_score=0.8,
+                status="pending",
+            )
+            for target in targets
+        ]
+    )
+    db.commit()
+
+    preview = call_tool(
+        db,
+        _admin(),
+        "preview_site_job",
+        {"site_id": site.id, "kind": "analysis"},
+    )
+
+    assert preview["ready"] is False
+    assert preview["suggestion_capacity"] == {"slots_available": 0, "at_capacity": True}
+    assert "suggestion capacity is full" in preview["blocked_reason"]
+    assert "proposal" not in preview
+
+    endpoint = f"/api/v1/suggestions/{site.id}"
+    for payload in (None, {"expected_active_job_run_ids": []}):
+        response = client.post(endpoint, json=payload) if payload is not None else client.post(endpoint)
+        assert response.status_code == 409
+        assert "suggestion capacity is full" in response.json()["detail"]
 
 
 def test_article_analysis_preview_is_exact_and_article_drift_is_refused(client, db, site):

@@ -452,6 +452,25 @@ class TestTraceSummary:
         # the assertion, because a fourth number here is the old ambiguity back.
         assert summary["site_counts"] == "hipcollection: 49/1/147"
 
+    def test_a_blocked_preview_keeps_action_state_and_capacity(self):
+        summary = agent_service._summarize(
+            {
+                "site": {"id": 1, "name": "hipcollection"},
+                "kind": "analysis",
+                "scope": {"active_suggestion_count": 171},
+                "suggestion_capacity": {"slots_available": 0, "at_capacity": True},
+                "ready": False,
+                "blocked_reason": "the site's suggestion capacity is full",
+            }
+        )
+        assert self._flat(summary), summary
+        assert summary["site_id"] == 1
+        assert summary["site_name"] == "hipcollection"
+        assert summary["ready"] is False
+        assert summary["suggestion_capacity_slots_available"] == 0
+        assert summary["suggestion_capacity_at_capacity"] is True
+        assert summary["blocked_reason"] == "the site's suggestion capacity is full"
+
     def test_a_failure_summarizes_to_its_message(self):
         summary = agent_service._summarize({"error": "nope", "status": 422})
         assert self._flat(summary)

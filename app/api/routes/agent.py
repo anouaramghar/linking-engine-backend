@@ -41,7 +41,7 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 
 #: Said to the operator when the provider fails. The provider's own words stay
 #: in the log, because they can carry key and account detail.
-PROVIDER_FAILED_DETAIL = "the assistant is temporarily unavailable"
+PROVIDER_FAILED_DETAIL = "Mesh is temporarily unavailable"
 
 
 @router.get("/status", response_model=AgentStatusResponse)
