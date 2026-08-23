@@ -80,6 +80,7 @@ def test_end_to_end_only_the_approved_bytes_are_ever_written(client, db, site, w
         target_article_id=target.id,
         method="baseline_cosine",
         score=0.9,
+        rank_score=0.9,
         status="approved",
         anchor_text="solar panel",
     )

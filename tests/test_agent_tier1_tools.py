@@ -47,6 +47,7 @@ def pending_suggestion(db, site, pair):
         target_article_id=pair[1].id,
         method=QUEUE_METHOD,
         score=0.92,
+        rank_score=0.92,
         status="pending",
         score_components={"bm25": 12.5},
         anchor_text="good anchor",
@@ -69,7 +70,9 @@ class TestPreviewBulkReview:
         )
         assert result["match_count"] == 1
         assert result["sample"][0]["id"] == pending_suggestion.id
-        assert result["sample"][0]["score_percent"] == 92
+        # The bulk threshold selects on the rank score, so the sample reports it.
+        assert result["sample"][0]["rank_percent"] == 92
+        assert result["sample"][0]["similarity_percent"] == 92
 
         proposal = result["proposal"]
         assert proposal["endpoint"] == "/api/v1/suggestions/bulk-review-by-filter"

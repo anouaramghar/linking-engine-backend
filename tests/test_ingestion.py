@@ -497,6 +497,7 @@ def test_recrawl_expires_inactive_article_suggestions(db, site, client, monkeypa
             target_article_id=articles["2"].id,
             method="baseline_cosine",
             score=0.9,
+            rank_score=0.9,
             status=status,
         )
         for status in ("pending", "approved", "applying", "applied")

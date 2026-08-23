@@ -31,6 +31,7 @@ def _decision(db, site, score: float, status: str, index: int) -> None:
             target_article_id=target.id,
             method="hybrid_bm25",
             score=score,
+            rank_score=score,
             status=status,
         )
     )

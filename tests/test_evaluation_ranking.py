@@ -162,6 +162,7 @@ def test_a_target_the_source_already_links_to_is_still_ranked(db):
                 target_article_id=target.id,
                 method="hybrid_bm25",
                 score=0.8,
+                rank_score=0.8,
                 status="pending",
             ),
         ]

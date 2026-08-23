@@ -60,6 +60,7 @@ def suggestion(db, site):
         target_article_id=target.id,
         method="baseline_cosine",
         score=0.8,
+        rank_score=0.8,
     )
     db.add(row)
     db.commit()
@@ -381,6 +382,7 @@ def test_the_drawer_passes_the_anchors_siblings_already_took(
         target_article_id=suggestion.target_article_id,
         method="baseline_cosine",
         score=0.7,
+        rank_score=0.7,
         anchor_text="fewer acids",
         status="approved",
     )
@@ -408,6 +410,7 @@ def test_a_rejected_sibling_does_not_hold_its_anchor(
             target_article_id=suggestion.target_article_id,
             method="baseline_cosine",
             score=0.7,
+            rank_score=0.7,
             anchor_text="fewer acids",
             status="rejected",
         )

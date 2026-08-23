@@ -136,6 +136,7 @@ def _add_suggestion(db, site, source, target, *, status, method="baseline_cosine
         target_article_id=target.id,
         method=method,
         score=score,
+        rank_score=score,
         status=status,
     )
     db.add(row)

@@ -35,6 +35,7 @@ def _suggest(db, site, source, target, score, status="pending"):
         target_article_id=target.id,
         method="baseline_cosine",
         score=score,
+        rank_score=score,
         status=status,
     )
     db.add(suggestion)
@@ -306,7 +307,7 @@ def test_filtered_queue_still_pages_by_cursor(client, db, site):
         if page["next_cursor"] is None:
             break
         cursor = {
-            "after_score": page["next_cursor"]["score"],
+            "after_rank_score": page["next_cursor"]["rank_score"],
             "after_id": page["next_cursor"]["id"],
         }
 

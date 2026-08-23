@@ -291,6 +291,7 @@ def test_non_wordpress_export_streams_only_verified_approved_plans(client, db, s
         target_article_id=target.id,
         method="baseline_cosine",
         score=0.9,
+        rank_score=0.9,
         status="approved",
         anchor_text="target",
         placement_context="source context",

@@ -8,6 +8,12 @@ toolset. Suggestions carry untrusted crawled text, so the system prompt tells
 the model to treat tool output as data; read-only tools make that instruction's
 failure mode survivable.
 
+There is one loop, reported two ways. ``stream_answer`` yields each tool as it
+returns and each fragment of the reply as the model writes it; ``answer_question``
+runs the same code and keeps only the last event. They stay one function on
+purpose: a second copy of a tool-calling loop is a second place for the round
+cap, the transcript bound, and the proposal handling to drift apart.
+
 There is one answer path: every question reaches the model. An earlier version
 short-circuited plain count questions with hand-written replies, which forced a
 regex to decide whether a question was one of the few it could express — and it
@@ -18,11 +24,12 @@ instead (``agent_tools._compact_site``), which is where that guarantee belongs.
 
 import json
 import logging
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 
 from app.agent_tools import call_tool, openai_tool_specs
 from app.config import settings
-from app.ml.llm.agent import chat_with_tools, is_configured
+from app.ml.llm.agent import chat_with_tools, is_configured, stream_chat_with_tools
 from app.services.authorization import Principal
 
 logger = logging.getLogger(__name__)
@@ -66,12 +73,23 @@ both markers: a bullet that also carries a number reads as both and is neither.
 
 RETRY_REPLY = "I couldn't produce a complete answer. Please try again."
 
+#: Said by both routes, so an operator reads the same sentence whichever one
+#: the panel happened to call.
+UNAVAILABLE_DETAIL = "the assistant is not configured on this deployment"
+
 
 @dataclass(frozen=True)
 class ToolInvocation:
     name: str
     arguments: dict
     outcome: dict
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    """A fragment of the reply, as the model writes it."""
+
+    text: str
 
 
 @dataclass(frozen=True)
@@ -82,6 +100,13 @@ class AssistantReply:
     #: payload to the audited REST endpoint only after the operator confirms;
     #: the model itself never executes one.
     proposals: list[dict] = field(default_factory=list)
+
+
+#: What one run reports as it happens. A ``ToolInvocation`` lands when its tool
+#: returns and a ``TextDelta`` as the model writes, so the panel can show work
+#: in progress; the ``AssistantReply`` closes every run and is the authority on
+#: what was said — a turn that streamed nothing still ends with one.
+AgentEvent = ToolInvocation | TextDelta | AssistantReply
 
 
 class AgentUnavailable(RuntimeError):
@@ -129,33 +154,49 @@ def _bounded_json(outcome: dict) -> str:
     return blob
 
 
-def _record_tool(
-    db,
-    principal: Principal,
-    used: list[ToolInvocation],
-    name: str,
-    arguments: dict,
-) -> dict:
-    outcome = call_tool(db, principal, name, arguments)
-    used.append(ToolInvocation(name=name, arguments=arguments, outcome=_summarize(outcome)))
-    return outcome
-
-
 def _nonempty_reply(content: object) -> str:
     if isinstance(content, str) and content.strip():
         return content
     return RETRY_REPLY
 
 
-def answer_question(
+def _streamed_turn(
+    messages: list[dict],
+    specs: list[dict],
+) -> Generator[TextDelta, None, dict]:
+    """One streamed model turn: report each fragment, hand back the message.
+
+    The client yields raw text and returns the assembled message, so the two
+    halves are separated here — the fragments become events for the panel, and
+    ``yield from`` gives the loop the same message the blocking client returns.
+    Catching ``StopIteration`` is what reads a generator's return value; letting
+    it escape a generator would become a ``RuntimeError`` instead (PEP 479).
+    """
+    fragments = stream_chat_with_tools(messages=messages, tools=specs)
+    try:
+        while True:
+            yield TextDelta(next(fragments))
+    except StopIteration as finished:
+        return finished.value
+
+
+def _run(
     db,
     principal: Principal,
     question: str,
-    history: list[dict[str, str]] | None = None,
-) -> AssistantReply:
-    """Answer one operator question, executing tool calls against the registry."""
+    history: list[dict[str, str]] | None,
+    *,
+    stream_deltas: bool,
+) -> Iterator[AgentEvent]:
+    """The loop both routes run, reporting each step as it happens.
+
+    ``stream_deltas`` chooses the transport for a model turn, and nothing else:
+    the rounds, the bounds, the tool execution and the reply are identical
+    either way. A blocking run simply has no fragment to report until its turn
+    is over.
+    """
     if not is_configured():
-        raise AgentUnavailable("the assistant is not configured on this deployment")
+        raise AgentUnavailable(UNAVAILABLE_DETAIL)
 
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     for turn in history or []:
@@ -168,14 +209,18 @@ def answer_question(
     proposals: list[dict] = []
 
     for _round in range(settings.agent_max_tool_rounds):
-        message = chat_with_tools(messages=messages, tools=specs)
+        if stream_deltas:
+            message = yield from _streamed_turn(messages, specs)
+        else:
+            message = chat_with_tools(messages=messages, tools=specs)
         calls = message.get("tool_calls") or []
         if not calls:
-            return AssistantReply(
+            yield AssistantReply(
                 reply=_nonempty_reply(message.get("content")),
                 tools_used=used,
                 proposals=proposals,
             )
+            return
 
         messages.append(message)
         for call in calls:
@@ -189,10 +234,8 @@ def answer_question(
                 logger.warning("assistant malformed tool call: %s", exc)
                 outcome = {"error": f"malformed tool call: {exc}", "status": 400}
                 name, arguments = "unknown", {}
-                recorded = False
             else:
-                outcome = _record_tool(db, principal, used, name, arguments)
-                recorded = True
+                outcome = call_tool(db, principal, name, arguments)
 
             # A preview tool's proposal rides to the panel verbatim; the panel
             # renders the Confirm affordance that actually executes it.
@@ -201,10 +244,12 @@ def answer_question(
                     {"tool": name, **outcome["proposal"], "match_count": outcome.get("match_count")}
                 )
 
-            if not recorded:
-                used.append(
-                    ToolInvocation(name=name, arguments=arguments, outcome=_summarize(outcome))
-                )
+            # Reported the moment the tool returns, which is the whole point of
+            # the streamed route: "consulting search_queue" is a truthful thing
+            # to show while the model is still deciding what to say about it.
+            invocation = ToolInvocation(name=name, arguments=arguments, outcome=_summarize(outcome))
+            used.append(invocation)
+            yield invocation
             messages.append(
                 {
                     "role": "tool",
@@ -215,12 +260,47 @@ def answer_question(
 
     # The round cap hit without a final answer. Ask once more with tools taken
     # away so the model must speak from what it gathered rather than stall.
-    final = chat_with_tools(messages=messages, tools=[])
-    return AssistantReply(
+    if stream_deltas:
+        final = yield from _streamed_turn(messages, [])
+    else:
+        final = chat_with_tools(messages=messages, tools=[])
+    yield AssistantReply(
         reply=_nonempty_reply(final.get("content")),
         tools_used=used,
         proposals=proposals,
     )
+
+
+def answer_question(
+    db,
+    principal: Principal,
+    question: str,
+    history: list[dict[str, str]] | None = None,
+) -> AssistantReply:
+    """Answer one operator question, executing tool calls against the registry."""
+    # The run always ends with an ``AssistantReply``; the fallback stands in for
+    # the case that cannot happen rather than returning ``None`` if it does.
+    reply = AssistantReply(reply=RETRY_REPLY)
+    for event in _run(db, principal, question, history, stream_deltas=False):
+        if isinstance(event, AssistantReply):
+            reply = event
+    return reply
+
+
+def stream_answer(
+    db,
+    principal: Principal,
+    question: str,
+    history: list[dict[str, str]] | None = None,
+) -> Iterator[AgentEvent]:
+    """The same answer, reported while it is being produced.
+
+    Nothing here is buffered, so the caller must be something that can send as
+    it reads — the SSE route. The last event is always the ``AssistantReply``
+    the blocking route would have returned, which is what makes a stream that
+    dropped a fragment recoverable: the finished text arrives with it.
+    """
+    return _run(db, principal, question, history, stream_deltas=True)
 
 
 def _summarize(outcome: dict) -> dict:

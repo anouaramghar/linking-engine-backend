@@ -168,6 +168,7 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
                 target_site_name=target_site_name,
                 method=suggestion.method,
                 score=suggestion.score,
+                rank_score=suggestion.rank_score,
                 score_components=score_components or None,
                 provider=suggestion.provider,
                 provider_request_id=suggestion.provider_request_id,
@@ -490,8 +491,8 @@ def _has_stronger_reverse_pair():
     entirely, so this matches only the weaker direction — the stronger one
     survives and the pair costs one review decision instead of two.
 
-    Ordered by (score, id) to match the queue's own ordering, which makes the
-    surviving direction the one the editor would have reached first anyway.
+    Ordered by (rank_score, id) to match the queue's own ordering, which makes
+    the surviving direction the one the editor would have reached first anyway.
     """
     reverse = aliased(Suggestion)
     return exists(
@@ -499,16 +500,16 @@ def _has_stronger_reverse_pair():
             reverse.source_article_id == Suggestion.target_article_id,
             reverse.target_article_id == Suggestion.source_article_id,
             reverse.status != "expired",
-            tuple_(reverse.score, reverse.id) > tuple_(Suggestion.score, Suggestion.id),
+            tuple_(reverse.rank_score, reverse.id) > tuple_(Suggestion.rank_score, Suggestion.id),
         )
     )
 
 
 def _percent_boundary(percent: int) -> float:
-    """Raw-score boundary equivalent to JavaScript's Math.round(score * 100).
+    """Raw boundary equivalent to JavaScript's Math.round(rank_score * 100).
 
-    Scores are non-negative, so Math.round(score * 100) >= P is exactly
-    score >= (P - 0.5) / 100. Comparing the indexed column with that constant
+    Rank scores are non-negative, so Math.round(v * 100) >= P is exactly
+    v >= (P - 0.5) / 100. Comparing the indexed column with that constant
     preserves index scans and avoids PostgreSQL's different half-rounding rule.
     """
 
@@ -556,9 +557,9 @@ def _queue_conditions(
     if method is not None:
         conditions.append(Suggestion.method == method)
     if min_percent is not None:
-        conditions.append(Suggestion.score >= _percent_boundary(min_percent))
+        conditions.append(Suggestion.rank_score >= _percent_boundary(min_percent))
     if max_percent is not None:
-        conditions.append(Suggestion.score < _percent_boundary(max_percent))
+        conditions.append(Suggestion.rank_score < _percent_boundary(max_percent))
     # A search of only whitespace is the same as no search; it must not collapse
     # to '%%' and quietly match the whole queue.
     if q is not None and q.strip():
@@ -1081,7 +1082,7 @@ def list_suggestion_page(
     q: str | None = Query(None, max_length=MAX_SEARCH_TERM),
     target_origin: TargetOrigin | None = None,
     exclude_reciprocal: bool = False,
-    after_score: float | None = Query(None, ge=0, le=1),
+    after_rank_score: float | None = Query(None, ge=0, le=1),
     after_id: int | None = Query(None, ge=1),
     include_total: bool = False,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
@@ -1111,24 +1112,24 @@ def list_suggestion_page(
     if offset is not None:
         raise HTTPException(
             422,
-            "offset pagination is not supported; continue with after_score and after_id",
+            "offset pagination is not supported; continue with after_rank_score and after_id",
         )
-    if (after_score is None) != (after_id is None):
-        raise HTTPException(422, "after_score and after_id must be provided together")
+    if (after_rank_score is None) != (after_id is None):
+        raise HTTPException(422, "after_rank_score and after_id must be provided together")
 
     page_conditions = list(conditions)
-    if after_score is not None and after_id is not None:
+    if after_rank_score is not None and after_id is not None:
         # Both sort keys descend, so the next page is strictly below the last
         # tuple returned. Removing or inserting rows above it cannot shift this
         # boundary as it can with OFFSET.
         page_conditions.append(
-            tuple_(Suggestion.score, Suggestion.id) < tuple_(after_score, after_id)
+            tuple_(Suggestion.rank_score, Suggestion.id) < tuple_(after_rank_score, after_id)
         )
     items = db.scalars(
         select(Suggestion)
         .where(*page_conditions)
         .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
-        .order_by(Suggestion.score.desc(), Suggestion.id.desc())
+        .order_by(Suggestion.rank_score.desc(), Suggestion.id.desc())
         # One look-ahead row tells the client whether another request is useful
         # without paying for COUNT(*) on every page.
         .limit(limit + 1)
@@ -1138,7 +1139,7 @@ def list_suggestion_page(
     serialized_items = _suggestion_outputs(db, items)
     next_cursor = None
     if has_more and items:
-        next_cursor = SuggestionCursor(score=items[-1].score, id=items[-1].id)
+        next_cursor = SuggestionCursor(rank_score=items[-1].rank_score, id=items[-1].id)
     total = None
     if include_total:
         total = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
@@ -1218,7 +1219,7 @@ def list_suggestions(
         select(Suggestion)
         .where(Suggestion.site_id == site.id)
         .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
-        .order_by(Suggestion.score.desc())
+        .order_by(Suggestion.rank_score.desc())
     )
     if status:
         query = query.where(Suggestion.status == status)

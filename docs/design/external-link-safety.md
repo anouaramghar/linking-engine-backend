@@ -117,6 +117,12 @@ that semantic score, using Tavily rank only as a deterministic tie-breaker, and
 stores no more than the number of open slots. `provider_score` remains separate
 provider trace data; it is never presented as LinkMesh semantic confidence.
 
+A web-search row's `rank_score` is that same cosine similarity. The provider's
+relevance is a different quantity on a coincidentally similar scale, so it is
+never rescaled into the queue's percentage. See
+[Global Hybrid standard](global-hybrid-ranking.md) for what `rank_score` means
+across the other methods.
+
 ## URL identity and storage
 
 External URLs are normalized before storage: scheme and host case, IDN host,

@@ -106,10 +106,10 @@ class SearchQueueArgs(BaseModel):
     q: str | None = Field(None, max_length=MAX_SEARCH_TERM, description="Title/URL text filter.")
     method: SuggestionMethodName | None = Field(None, description="Suggestion method filter.")
     min_percent: int | None = Field(
-        None, ge=0, le=100, description="Only rows at or above this whole-percent similarity."
+        None, ge=0, le=100, description="Only rows at or above this whole-percent rank score."
     )
     max_percent: int | None = Field(
-        None, ge=0, le=100, description="Only rows below this whole-percent similarity."
+        None, ge=0, le=100, description="Only rows below this whole-percent rank score."
     )
     target_origin: Literal["internal", "content_pool", "web_search"] | None = Field(
         None, description="Where the link target came from."
@@ -236,8 +236,10 @@ class PreviewBulkReviewArgs(BaseModel):
         ge=0,
         le=100,
         description=(
-            "Whole-percent similarity boundary. approve = match pending rows at "
-            "or above it; reject = match pending rows below it."
+            "Whole-percent rank-score boundary — the same number the queue is "
+            "ordered by and the dashboard card shows, not cosine similarity. "
+            "approve = match pending rows at or above it; reject = match "
+            "pending rows below it."
         ),
     )
     rejection_reason: (
@@ -622,26 +624,26 @@ def _queue_counts(db: Session, principal: Principal, args: QueueCountsArgs) -> d
 
 
 def _parse_cursor(cursor: str) -> tuple[float, int]:
-    """Read a ``score:id`` continuation token.
+    """Read a ``rank_score:id`` continuation token.
 
     The route takes the two sort keys as separate parameters that are only
     valid together — a pairing a model gets wrong half the time. One opaque
     string it copies back verbatim cannot be half-supplied.
     """
-    score_text, _, id_text = cursor.partition(":")
+    rank_text, _, id_text = cursor.partition(":")
     try:
-        score, suggestion_id = float(score_text), int(id_text)
+        rank_score, suggestion_id = float(rank_text), int(id_text)
     except ValueError:
         raise HTTPException(
             422, f"malformed cursor {cursor!r}; pass next_cursor unchanged"
         ) from None
-    if not 0 <= score <= 1 or suggestion_id < 1:
+    if not 0 <= rank_score <= 1 or suggestion_id < 1:
         raise HTTPException(422, f"cursor {cursor!r} is out of range")
-    return score, suggestion_id
+    return rank_score, suggestion_id
 
 
 def _search_queue(db: Session, principal: Principal, args: SearchQueueArgs) -> dict[str, Any]:
-    after_score, after_id = _parse_cursor(args.cursor) if args.cursor else (None, None)
+    after_rank_score, after_id = _parse_cursor(args.cursor) if args.cursor else (None, None)
     page = list_suggestion_page(
         site_id=args.site_id,
         status=args.status,
@@ -651,7 +653,7 @@ def _search_queue(db: Session, principal: Principal, args: SearchQueueArgs) -> d
         q=args.q,
         target_origin=args.target_origin,
         exclude_reciprocal=args.exclude_reciprocal,
-        after_score=after_score,
+        after_rank_score=after_rank_score,
         after_id=after_id,
         # Count the whole match once, on the first page. Continuations ride the
         # route's look-ahead row instead, which is what the cursor is for.
@@ -668,6 +670,11 @@ def _search_queue(db: Session, principal: Principal, args: SearchQueueArgs) -> d
             "site_id": item.site_id,
             "status": item.status,
             "method": item.method,
+            # Two different questions, so two fields. `rank_percent` is what
+            # ordered this page and what the dashboard card shows;
+            # `similarity_percent` is cosine, which on a real corpus barely
+            # varies and must not be mistaken for the ranking.
+            "rank_percent": round(item.rank_score * 100),
             "score": round(item.score, 4),
             "similarity_percent": round(item.score * 100),
             "source_title": item.source_article.title,
@@ -691,7 +698,7 @@ def _search_queue(db: Session, principal: Principal, args: SearchQueueArgs) -> d
         result["match_count"] = page.total
     result["page"] = {"has_more": page.next_cursor is not None}
     if page.next_cursor is not None:
-        result["page"]["next_cursor"] = f"{page.next_cursor.score}:{page.next_cursor.id}"
+        result["page"]["next_cursor"] = f"{page.next_cursor.rank_score}:{page.next_cursor.id}"
     # The view these rows came from, so the answer ends somewhere the operator
     # can act rather than at a list of ids.
     result.update(
@@ -1193,7 +1200,11 @@ def _explain_suggestion(
         "site_id": suggestion.site_id,
         "status": suggestion.status,
         "method": suggestion.method,
-        # The queue percentage is score*100; give the model both forms.
+        # Two separate readings, both in raw and percent form. The queue is
+        # ordered by rank_score and the dashboard card shows rank_percent;
+        # cosine is reported beside it, never in place of it.
+        "rank_score": round(suggestion.rank_score, 4),
+        "rank_percent": round(suggestion.rank_score * 100),
         "score": round(suggestion.score, 4),
         "similarity_percent": round(suggestion.score * 100),
         "score_components": suggestion.score_components,
@@ -1215,6 +1226,7 @@ def _explain_suggestion(
             "retrieval_version": suggestion.retrieval_version,
             "ranking_version": suggestion.ranking_version,
             "final_rank": suggestion.final_rank,
+            "rank_score": round(suggestion.rank_score, 4),
         },
         "source_article": article_brief(source),
         **_urls(
@@ -1367,13 +1379,14 @@ def _preview_bulk_review(
         select(Suggestion)
         .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
         .where(*conditions)
-        .order_by(Suggestion.score.desc(), Suggestion.id.desc())
+        .order_by(Suggestion.rank_score.desc(), Suggestion.id.desc())
         .limit(BULK_REVIEW_SAMPLE_ROWS)
     ).all()
     sample = [
         {
             "id": row.id,
-            "score_percent": round(row.score * 100),
+            "rank_percent": round(row.rank_score * 100),
+            "similarity_percent": round(row.score * 100),
             "source_title": row.source_article.title,
             "target_title": (
                 row.target_article.title if row.target_article else row.external_title
@@ -1490,8 +1503,8 @@ REGISTRY: dict[str, AgentTool] = {
             name="search_queue",
             title="Search review queue",
             description=(
-                "Search review-queue suggestions, highest score first. Filter by site, "
-                "status, text, method, target origin, and a similarity band "
+                "Search review-queue suggestions, highest rank score first. Filter by "
+                "site, status, text, method, target origin, and a rank-score band "
                 "(min_percent/max_percent) — use the band to size a threshold before "
                 "calling preview_bulk_review. `match_count` is how many rows match the "
                 'filters in total; answer "how many" from it, never from the length of '

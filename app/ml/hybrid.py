@@ -52,9 +52,23 @@ HYBRID_POOL_SIZE = DENSE_POOL_SIZE + LEXICAL_POOL_SIZE
 #: Names carried in the stored score components so a row can be traced back to
 #: the exact recipe that produced it.
 LEXICAL_RECIPE_NAME = "structured_t3_tax2_c512"
+
+
 def fusion_name() -> str:
     weight = f"{settings.hybrid_dense_rrf_weight:g}".replace(".", "")
     return f"wrrf_d{weight}_l100_k{RRF_RANK_CONSTANT}"
+
+
+def max_fusion_score() -> float:
+    """The ceiling a weighted-RRF score can reach: first place in both pools.
+
+    Computed rather than frozen because it moves with the configured dense
+    weight. A deployment that reweights the fusion must not leave rows already
+    normalized against the old ceiling looking stronger than the new ones.
+    """
+    return (settings.hybrid_dense_rrf_weight + LEXICAL_RRF_WEIGHT) / (RRF_RANK_CONSTANT + 1)
+
+
 COMPONENTS_VERSION = "hybrid_bm25_v1"
 
 #: Rows ordered by the fusion score carry their own recipe label, so a stored
@@ -75,11 +89,15 @@ class CorpusArticle:
 class RankedCandidate:
     """One suggestion-to-be, with every number that explains its position.
 
-    `semantic_score` is what gets persisted as `Suggestion.score`, so the
-    dashboard percentage, its thresholds, and the global queue keep the single
-    meaning they have always had: cosine similarity. `bm25_score` is what
-    actually chose and ordered this row, and it is reported separately rather
-    than rescaled into something that looks like a confidence.
+    `semantic_score` is what gets persisted as `Suggestion.score`, so cosine
+    similarity keeps the single meaning it has always had wherever that column
+    is read. `bm25_score` is reported as it comes out of the ranker rather than
+    rescaled into something that looks like a confidence: Okapi BM25 has no
+    ceiling, so there is no honest percentage to make of it.
+
+    `normalized_fusion_score` is the exception, and it is what the queue orders
+    on. Weighted RRF *is* bounded, so dividing by that bound gives a number
+    that means the same thing on every row.
     """
 
     target_id: int
@@ -89,6 +107,20 @@ class RankedCandidate:
     fusion_score: float = 0.0
     dense_rank: int | None = None
     lexical_rank: int | None = None
+
+    @property
+    def normalized_fusion_score(self) -> float:
+        """This row's fusion score as a 0-1 fraction of the reachable ceiling.
+
+        1.0 means both retrievers put this target first. Callers must only read
+        this when the fusion actually decided the order — on a BM25-ordered or
+        cosine-ordered row the fusion score is either irrelevant or absent, and
+        the fraction would describe a ranking that never happened.
+        """
+        ceiling = max_fusion_score()
+        if ceiling <= 0:
+            return 0.0
+        return min(1.0, max(0.0, self.fusion_score / ceiling))
 
     def score_components(self) -> dict:
         return {
@@ -109,9 +141,14 @@ class RankedCandidate:
                 "dense_weight": settings.hybrid_dense_rrf_weight,
                 "lexical_weight": LEXICAL_RRF_WEIGHT,
                 "rank_constant": RRF_RANK_CONSTANT,
+                # The divisor behind `rank_score`, stored so an old row can be
+                # re-derived after the weights change rather than re-normalized
+                # against whatever the ceiling happens to be at read time.
+                "ceiling": max_fusion_score(),
             },
             "fusion_rank": self.fusion_rank,
             "fusion_score": self.fusion_score,
+            "normalized_fusion_score": self.normalized_fusion_score,
             # None means the other retriever never proposed this target.
             "dense_rank": self.dense_rank,
             "lexical_rank": self.lexical_rank,

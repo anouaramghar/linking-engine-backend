@@ -244,6 +244,7 @@ def eligibility_corpus(db, site):
             target_article_id=targets["decided"].id,
             method="baseline_cosine",
             score=0.5,
+            rank_score=0.5,
             status="rejected",
         )
     )
@@ -632,10 +633,19 @@ def test_pilot_rows_store_cosine_as_the_score_and_bm25_in_the_components(
         "dense_weight": 1.0,
         "lexical_weight": 1.0,
         "rank_constant": 10,
+        # Recorded with the row so a later reweighting cannot make historic
+        # rows look stronger than the ones normalized against the new ceiling.
+        "ceiling": pytest.approx(2 / 11),
     }
     assert components["fusion_rank"] >= 1
     assert components["fusion_score"] > 0.0
     assert components["lexical_rank"] >= 1
+    # The stored rank score is that fusion score as a fraction of the ceiling.
+    assert components["normalized_fusion_score"] == pytest.approx(
+        components["fusion_score"] / components["fusion"]["ceiling"]
+    )
+    assert row.rank_score == pytest.approx(components["normalized_fusion_score"])
+    assert 0.0 <= row.rank_score <= 1.0
 
 
 def test_comparison_rows_store_no_components(db, site):

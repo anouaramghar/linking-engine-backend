@@ -416,6 +416,10 @@ def fill_external_suggestion_gap(
             search_query=response.query,
             method="external_search",
             score=semantic_score,
+            # The provider's own relevance is not on the fusion's scale, so a
+            # web-search row queues on the one bounded number it shares with
+            # every other method.
+            rank_score=semantic_score,
             score_components=feature_snapshot,
             retrieval_version="external_search_v1",
             ranking_version="external_search_provider_v1",

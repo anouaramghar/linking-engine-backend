@@ -28,6 +28,7 @@ def _suggestion(db, site, source: Article, target: Article, **overrides) -> Sugg
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.8,
+        rank_score=0.8,
         status="pending",
         created_at=datetime.now(UTC) - timedelta(minutes=5),
         **overrides,

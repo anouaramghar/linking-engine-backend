@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from app.config import settings
 from app.ml.hybrid import RankedCandidate
 from app.models import GraphSnapshot
 from app.services.editorial_feedback import (
@@ -32,6 +33,7 @@ class OrderedCandidate:
 
     candidate: RankedCandidate
     final_rank: int
+    rank_score: float
     score_components: dict | None
     retrieval_version: str
     ranking_version: str
@@ -63,6 +65,26 @@ def _ranking_versions(
     )
     ranking_version = f"{method}:graph={graph_mode}:feedback={'on' if feedback_enabled else 'off'}"
     return retrieval_version, ranking_version
+
+
+def _rank_score(candidate: RankedCandidate, *, method: str) -> float:
+    """The 0-1 strength of whatever signal decided this row's place in the queue.
+
+    The queue orders on this, so it has to exist for every method and mean one
+    thing across all of them: how strongly the ranker that chose this row
+    preferred it, on a scale where 1.0 is the best that ranker can say.
+
+    Only the weighted fusion is bounded, so only the fusion is rescaled. BM25
+    has no ceiling and the external provider's relevance is a different
+    quantity on a coincidentally similar scale; for both, cosine similarity
+    stands in. It is bounded, it is already stored, and it is what the queue
+    ordered on before this column existed — so those rows keep exactly the
+    position they used to have instead of being assigned a made-up one.
+    """
+
+    if method == "hybrid_bm25" and settings.hybrid_final_order == "fusion":
+        return candidate.normalized_fusion_score
+    return candidate.semantic_score
 
 
 def _graph_component(
@@ -187,6 +209,7 @@ def order_candidates(
             OrderedCandidate(
                 candidate=candidate,
                 final_rank=final_rank,
+                rank_score=_rank_score(candidate, method=method),
                 score_components=score_components,
                 retrieval_version=retrieval_version,
                 ranking_version=ranking_version,

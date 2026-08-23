@@ -6,6 +6,7 @@ chat-completions, and both used to read one pair of settings. That made
 without moving placement — a production feature — onto it as well.
 """
 
+import contextlib
 import logging
 
 import pytest
@@ -166,3 +167,134 @@ class TestDevelopmentOnlyProviders:
         with caplog.at_level(logging.WARNING):
             agent_client.log_provider_notice()
         assert caplog.text == ""
+
+
+class TestTheStreamedTurn:
+    """The same turn, read frame by frame.
+
+    A streamed turn is only useful if it ends where the blocking one does: the
+    panel renders the fragments, but the loop still needs one assistant message
+    with its tool calls assembled, and a provider sends those in pieces.
+    """
+
+    @pytest.fixture(autouse=True)
+    def a_provider(self, shared_account):
+        return shared_account
+
+    @pytest.fixture
+    def transport(self, monkeypatch):
+        """Answer one streamed request from a scripted list of SSE lines."""
+        captured: dict = {}
+
+        def scripted(lines, *, status_code=200, body=b""):
+            class Response:
+                def __init__(self):
+                    self.status_code = status_code
+
+                @staticmethod
+                def read():
+                    return body
+
+                @staticmethod
+                def iter_lines():
+                    yield from lines
+
+            class Client:
+                def __init__(self, **kwargs):
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exception):
+                    return False
+
+                def stream(self, method, url, **kwargs):
+                    captured.update(method=method, url=url, **kwargs)
+                    return contextlib.nullcontext(Response())
+
+            monkeypatch.setattr(agent_client.httpx, "Client", Client)
+            return captured
+
+        return scripted
+
+    @staticmethod
+    def _turn(**kwargs):
+        """Run a turn to the end: every fragment, then the finished message."""
+        fragments = []
+        stream = agent_client.stream_chat_with_tools(**kwargs)
+        try:
+            while True:
+                fragments.append(next(stream))
+        except StopIteration as finished:
+            return fragments, finished.value
+
+    def test_text_arrives_in_pieces_and_ends_as_one_message(self, transport):
+        sent = transport(
+            [
+                ": OPENROUTER PROCESSING",
+                'data: {"choices":[{"delta":{"content":"The queue "}}]}',
+                "",
+                'data: {"choices":[{"delta":{"content":"is empty."}}]}',
+                "data: [DONE]",
+            ]
+        )
+
+        fragments, message = self._turn(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        # The keep-alive comment and the terminator are the provider's own
+        # punctuation, not words the operator was meant to read.
+        assert fragments == ["The queue ", "is empty."]
+        assert message == {"role": "assistant", "content": "The queue is empty."}
+        assert sent["json"]["stream"] is True
+        assert sent["headers"]["Accept"] == "text/event-stream"
+
+    def test_a_tool_call_split_across_frames_is_reassembled(self, transport):
+        transport(
+            [
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1",'
+                '"function":{"name":"search_queue","arguments":"{\\"site_id\\":"}}]}}]}',
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+                '"function":{"arguments":"7}"}}]}}]}',
+                "data: [DONE]",
+            ]
+        )
+
+        fragments, message = self._turn(messages=[], tools=[{"type": "function"}])
+
+        # Nothing to show an operator: this turn is the model deciding to look
+        # something up, and the arguments only parse once the last frame is in.
+        assert fragments == []
+        assert message["content"] is None
+        assert message["tool_calls"] == [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "search_queue", "arguments": '{"site_id":7}'},
+            }
+        ]
+
+    def test_an_error_frame_inside_a_200_stream_is_a_failure(self, transport):
+        """A rate limit reached mid-turn arrives as a frame, not as a status.
+
+        Without this the reply simply stops wherever the error interrupted it,
+        and a half-sentence about the queue reads like a finished answer.
+        """
+        transport(
+            [
+                'data: {"choices":[{"delta":{"content":"The queue "}}]}',
+                'data: {"error":{"message":"rate limit exceeded","code":429}}',
+            ]
+        )
+
+        with pytest.raises(agent_client.OpenRouterError) as failure:
+            self._turn(messages=[], tools=[])
+        assert "rate limit exceeded" in str(failure.value)
+
+    def test_a_refused_stream_names_the_host_and_its_reason(self, transport):
+        transport([], status_code=429, body=b"slow down")
+
+        with pytest.raises(agent_client.OpenRouterError) as failure:
+            self._turn(messages=[], tools=[])
+        assert "openrouter.ai" in str(failure.value)
+        assert "slow down" in str(failure.value)

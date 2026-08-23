@@ -199,6 +199,7 @@ def test_policy_update_expires_blocked_suggestions_and_records_trace(client, db,
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.9,
+        rank_score=0.9,
         status="pending",
     )
     db.add(suggestion)

@@ -123,6 +123,7 @@ def _suggestion(db, site: Site, status: str = "pending") -> Suggestion:
         target_article_id=articles[1].id,
         method=ISOLATION_METHOD,
         score=0.9,
+        rank_score=0.9,
         status=status,
     )
     db.add(suggestion)

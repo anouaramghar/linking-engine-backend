@@ -505,6 +505,9 @@ def generate_suggestions(
                             # Cosine similarity for both methods, so one number keeps
                             # one meaning across the mixed queue.
                             score=candidate.semantic_score,
+                            # What the queue orders and filters on: the strength
+                            # of the signal that actually chose this row.
+                            rank_score=ordered_candidate.rank_score,
                             score_components=ordered_candidate.score_components,
                             retrieval_version=ordered_candidate.retrieval_version,
                             ranking_version=ordered_candidate.ranking_version,

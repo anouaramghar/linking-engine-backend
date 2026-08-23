@@ -27,6 +27,7 @@ def _suggestion(db, site) -> Suggestion:
         target_article_id=target.id,
         method="baseline_cosine",
         score=0.82,
+        rank_score=0.82,
         status="pending",
     )
     db.add(suggestion)

@@ -97,6 +97,7 @@ def test_site_response_includes_active_counts_and_latest_crawl(client, db, site)
             target_article_id=target.id,
             method="baseline_cosine",
             score=0.8,
+            rank_score=0.8,
             status="pending",
         )
     )

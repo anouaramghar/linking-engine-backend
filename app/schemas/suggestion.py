@@ -85,6 +85,14 @@ class SuggestionOut(BaseModel):
     method: str
     #: Cosine semantic similarity, whichever method selected the row.
     score: float
+    #: How strongly the ranker that selected this row preferred it, 0-1, where
+    #: 1 is the strongest that ranker can say. The queue orders, cursors and
+    #: filters on this, and it is the percentage on the review card.
+    #:
+    #: Not interchangeable with `score`: for a fusion-ordered hybrid row this
+    #: is the weighted-RRF score over its reachable ceiling, and only where no
+    #: bounded ordering signal exists does it fall back to cosine.
+    rank_score: float
     #: How this row was chosen, when the method records it. For `hybrid_bm25`:
     #: the BM25 score that ordered it, its fusion and per-retriever ranks, and
     #: the recipe names. Null for `baseline_cosine`, whose score already is its
@@ -175,7 +183,7 @@ class SuggestionExposureResult(BaseModel):
 class SuggestionCursor(BaseModel):
     """The last ordered row from a page, used to continue strictly below it."""
 
-    score: float
+    rank_score: float
     id: int
 
 

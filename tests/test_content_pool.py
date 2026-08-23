@@ -831,6 +831,7 @@ def test_revoking_pool_source_expires_active_customer_suggestions(client, db):
             target_article_id=target.id,
             method="hybrid_bm25",
             score=0.8,
+            rank_score=0.8,
             status=status,
         )
         for status in ("pending", "approved", "rejected")
@@ -911,6 +912,7 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.8,
+        rank_score=0.8,
         status="pending",
     )
     already_approved = Suggestion(
@@ -919,6 +921,7 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
         target_article_id=target.id,
         method="baseline_cosine",
         score=0.7,
+        rank_score=0.7,
         status="approved",
     )
     db.add_all([suggestion, already_approved])
@@ -1212,6 +1215,7 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
         target_article_id=internal_target.id,
         method="baseline_cosine",
         score=0.9,
+        rank_score=0.9,
     )
     external = Suggestion(
         site_id=site.id,
@@ -1219,6 +1223,7 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
         target_article_id=pool_target.id,
         method="hybrid_bm25",
         score=0.8,
+        rank_score=0.8,
     )
     db.add_all([internal, external])
     db.commit()
@@ -1317,6 +1322,7 @@ def test_pool_reconciliation_expires_customer_suggestions_to_missing_targets(db,
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.8,
+        rank_score=0.8,
         status="pending",
     )
     run = IngestionRun(site_id=pool.id, status="running")

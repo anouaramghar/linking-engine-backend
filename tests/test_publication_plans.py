@@ -55,6 +55,7 @@ def _suggestion(db, site, src, tgt, status="approved", score=0.9):
         target_article_id=tgt.id,
         method="baseline_cosine",
         score=score,
+        rank_score=score,
         status=status,
     )
     db.add(row)

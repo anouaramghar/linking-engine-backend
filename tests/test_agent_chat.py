@@ -16,6 +16,43 @@ def _chat(client: TestClient, message: str, history=None):
     return client.post("/api/v1/agent/chat", json={"message": message, "history": history or []})
 
 
+def _stream(client: TestClient, message: str, history=None):
+    return client.post(
+        "/api/v1/agent/chat/stream", json={"message": message, "history": history or []}
+    )
+
+
+def _frames(response) -> list[tuple[str, dict]]:
+    """The (event, data) pairs in an SSE body, in order.
+
+    Comment frames are dropped: they are the connection talking, not the run.
+    """
+    events = []
+    for frame in response.text.split("\n\n"):
+        lines = [line for line in frame.splitlines() if line]
+        name = next((line[len("event:") :].strip() for line in lines if line[:6] == "event:"), None)
+        data = next((line[len("data:") :].strip() for line in lines if line[:5] == "data:"), None)
+        if name is not None and data is not None:
+            events.append((name, json.loads(data)))
+    return events
+
+
+def _scripted_stream(turns):
+    """Stand in for the provider: play one scripted turn per call, in order.
+
+    A turn is ``(fragments, message)`` — what the provider streams, and the
+    assistant message the client assembles out of it.
+    """
+    remaining = list(turns)
+
+    def stream(*, messages, tools):
+        fragments, message = remaining.pop(0)
+        yield from fragments
+        return message
+
+    return stream
+
+
 @pytest.fixture
 def unconfigured(monkeypatch):
     """No key on either account.
@@ -205,6 +242,116 @@ def test_a_model_failure_is_a_503_not_a_500(monkeypatch, client):
 
     assert response.status_code == 503
     assert "429" not in response.json()["detail"]
+
+
+class TestStreamedChat:
+    """The same run as `/chat`, readable while it happens.
+
+    A turn is several model calls long, and the panel used to have nothing to
+    show for any of it but a spinner. What is asserted here is the *order*:
+    a tool appears when it returns, text appears as it is written, and the
+    finished answer still arrives whole at the end.
+    """
+
+    @pytest.fixture(autouse=True)
+    def configured(self, monkeypatch):
+        monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+
+    def test_it_is_refused_before_the_stream_opens_without_a_key(self, client, unconfigured):
+        # Once a body has started the status line is already sent, so the one
+        # refusal that can be known in advance is made in advance.
+        response = _stream(client, "how many pending suggestions are there?")
+        assert response.status_code == 503
+
+    def test_a_tool_lands_as_it_runs_and_text_as_it_is_written(self, monkeypatch, client):
+        monkeypatch.setattr(
+            agent_service,
+            "stream_chat_with_tools",
+            _scripted_stream(
+                [
+                    (
+                        [],
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "function": {"name": "get_queue_counts", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                    ),
+                    (["The queue ", "is empty."], {"content": "The queue is empty."}),
+                ]
+            ),
+        )
+
+        events = _frames(_stream(client, "any pending suggestions?"))
+
+        assert [name for name, _ in events] == ["tool", "delta", "delta", "done"]
+        assert events[0][1]["name"] == "get_queue_counts"
+        assert events[0][1]["outcome"]["total"] == 0
+        assert [data["text"] for name, data in events if name == "delta"] == [
+            "The queue ",
+            "is empty.",
+        ]
+
+    def test_the_last_event_is_the_body_the_other_route_returns(self, monkeypatch, client):
+        """What makes a dropped fragment survivable, and a silent provider too.
+
+        Not every model streams its text — some send one final chunk — so the
+        panel cannot be left assembling the answer itself.
+        """
+        monkeypatch.setattr(
+            agent_service,
+            "stream_chat_with_tools",
+            _scripted_stream([(["Two sites."], {"content": "Two sites."})]),
+        )
+
+        events = _frames(_stream(client, "how many sites?"))
+
+        name, done = events[-1]
+        assert name == "done"
+        assert done == {"reply": "Two sites.", "tools_used": [], "proposals": []}
+
+    def test_a_provider_failure_mid_stream_arrives_as_an_error_event(self, monkeypatch, client):
+        """503 is gone by then: the first frame already committed a 200."""
+
+        def fails(*, messages, tools):
+            yield "The queue "
+            raise OpenRouterError("OpenRouter returned 429: rate limit exceeded")
+
+        monkeypatch.setattr(agent_service, "stream_chat_with_tools", fails)
+
+        response = _stream(client, "how busy is the queue?")
+        events = _frames(response)
+
+        assert response.status_code == 200
+        assert [name for name, _ in events] == ["delta", "error"]
+        # The provider's own words stay in the log: they can carry key and
+        # account detail.
+        assert "429" not in events[-1][1]["detail"]
+
+    def test_a_blank_streamed_reply_still_ends_with_the_honest_retry(self, monkeypatch, client):
+        monkeypatch.setattr(
+            agent_service,
+            "stream_chat_with_tools",
+            _scripted_stream([([], {"role": "assistant", "content": None, "tool_calls": []})]),
+        )
+
+        events = _frames(_stream(client, "say hello"))
+
+        assert events == [
+            (
+                "done",
+                {
+                    "reply": "I couldn't produce a complete answer. Please try again.",
+                    "tools_used": [],
+                    "proposals": [],
+                },
+            )
+        ]
 
 
 class TestToolResultBudget:

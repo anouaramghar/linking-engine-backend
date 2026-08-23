@@ -101,6 +101,7 @@ def test_list_sites_exposes_the_dashboard_count_semantics(db, site):
             target_article_id=target.id,
             method="baseline_cosine",
             score=0.8,
+            rank_score=0.8,
             status="pending",
         )
     )
@@ -139,6 +140,7 @@ def test_a_full_site_keeps_its_count_apart_from_its_capacity(db, site, monkeypat
             target_article_id=target.id,
             method="baseline_cosine",
             score=0.8,
+            rank_score=0.8,
             status="pending",
         )
     )
@@ -242,6 +244,7 @@ class TestSearchQueueFilters:
                 target_article_id=articles[1].id,
                 method="hybrid_bm25",
                 score=score,
+                rank_score=score,
                 status="pending",
             )
             for score in (0.95, 0.80, 0.65, 0.50)
@@ -354,6 +357,7 @@ class TestSiteStatus:
             target_article_id=articles[1].id,
             method="hybrid_bm25",
             score=0.9,
+            rank_score=0.9,
             status="pending",
         )
         db.add(suggestion)
@@ -592,6 +596,7 @@ def pending_history(db, site):
         target_article_id=articles[1].id,
         method="hybrid_bm25",
         score=0.91,
+        rank_score=0.91,
         status="pending",
     )
     db.add(suggestion)
@@ -1109,6 +1114,7 @@ class TestDeclaredOutputSchemas:
                 target_article_id=target.id,
                 method="hybrid_bm25",
                 score=0.9 - index / 100,
+                rank_score=0.9 - index / 100,
                 status="pending",
             )
             for index, target in enumerate(targets)

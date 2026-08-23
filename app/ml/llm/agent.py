@@ -3,11 +3,16 @@
 A second client next to ``openrouter.py``, for the same reason that module
 exists in the singular: a thin, readable client is easier to reason about than
 a general SDK. The shape it adds is exactly one — a multi-message conversation
-that may carry tool definitions and may answer with tool calls. Streaming is
-deliberately absent; the side panel renders complete turns.
+that may carry tool definitions and may answer with tool calls, in a blocking
+form and a streamed one. The two send the same request and end with the same
+assistant message; the streamed one only makes the text available while it is
+still being written, which is what lets the panel show a sentence rather than a
+spinner for the half-minute a turn can take.
 """
 
+import json
 import logging
+from collections.abc import Generator
 from typing import Any
 from urllib.parse import urlparse
 
@@ -69,6 +74,25 @@ def log_provider_notice() -> None:
         )
 
 
+def _request(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    """The body both clients send. One turn, one shape."""
+    payload: dict[str, Any] = {
+        "model": settings.agent_model,
+        "messages": messages,
+        # The assistant reports operational counts and ids. Keep sampling off so
+        # a free routed model is less likely to rewrite a number after a tool call.
+        "temperature": 0.0,
+        "max_tokens": settings.agent_max_output_tokens,
+    }
+    if tools:
+        payload["tools"] = tools
+    return payload
+
+
+def _headers(api_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}", "X-Title": "LinkMesh"}
+
+
 def chat_with_tools(
     *,
     messages: list[dict[str, Any]],
@@ -84,21 +108,7 @@ def chat_with_tools(
     if not api_key:
         raise OpenRouterError("no API key is set for the assistant")
 
-    payload = {
-        "model": settings.agent_model,
-        "messages": messages,
-        # The assistant reports operational counts and ids. Keep sampling off so
-        # a free routed model is less likely to rewrite a number after a tool call.
-        "temperature": 0.0,
-        "max_tokens": settings.agent_max_output_tokens,
-    }
-    if tools:
-        payload["tools"] = tools
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "X-Title": "LinkMesh",
-    }
+    payload = _request(messages, tools)
     url = f"{base_url}/chat/completions"
 
     with httpx.Client(timeout=settings.agent_timeout_seconds) as http:
@@ -109,7 +119,7 @@ def chat_with_tools(
                 url,
                 max_bytes=1_000_000,
                 json=payload,
-                headers=headers,
+                headers=_headers(api_key),
             )
         except (httpx.HTTPError, ResponseTooLargeError) as exc:
             raise OpenRouterError(f"{provider_host()} request failed: {exc}") from exc
@@ -124,3 +134,139 @@ def chat_with_tools(
         return body["choices"][0]["message"]
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise OpenRouterError(f"unexpected response shape from {provider_host()}: {exc}") from exc
+
+
+#: How much of one streamed turn will be read before it is treated as a runaway
+#: response. The same cap the blocking client puts on a whole body, applied to
+#: the pieces — a stream is not a reason to accept an unbounded one.
+STREAM_BYTE_BUDGET = 1_000_000
+
+
+def stream_chat_with_tools(
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+) -> Generator[str, None, dict[str, Any]]:
+    """Run one model turn over SSE. Yields text as it arrives; returns the message.
+
+    The return value is the same assistant message `chat_with_tools` hands back
+    — ``tool_calls`` to execute, or ``content`` as the final answer — so the
+    loop above does not care which client produced its turn. What the yields add
+    is timing: the panel can render a sentence while the rest of it is still
+    being written.
+
+    The generator owns the connection for as long as it is iterated, and closing
+    it early closes the response. Raises `OpenRouterError` for transport
+    failures, non-2xx responses, and frames that cannot be read.
+    """
+    base_url, api_key = provider()
+    if not api_key:
+        raise OpenRouterError("no API key is set for the assistant")
+
+    payload = _request(messages, tools)
+    payload["stream"] = True
+    url = f"{base_url}/chat/completions"
+
+    content: list[str] = []
+    #: Tool calls arrive in fragments addressed by ``index``; this assembles them.
+    calls: dict[int, dict[str, Any]] = {}
+    read = 0
+
+    with httpx.Client(timeout=settings.agent_timeout_seconds) as http:
+        try:
+            with http.stream(
+                "POST",
+                url,
+                json=payload,
+                headers={**_headers(api_key), "Accept": "text/event-stream"},
+            ) as response:
+                if response.status_code >= 400:
+                    # The body is the useful half of a provider error and it is
+                    # small, but it has not been read yet on a streamed request.
+                    detail = response.read().decode("utf-8", "replace")[:500]
+                    raise OpenRouterError(
+                        f"{provider_host()} returned {response.status_code}: {detail}"
+                    )
+                for line in response.iter_lines():
+                    read += len(line)
+                    if read > STREAM_BYTE_BUDGET:
+                        raise OpenRouterError(
+                            f"{provider_host()} streamed past the {STREAM_BYTE_BUDGET}-byte limit"
+                        )
+                    # Everything that is not a data frame is the provider's own
+                    # punctuation: blank separators, and comment lines it sends
+                    # as keep-alives while a model warms up (OpenRouter's
+                    # ": OPENROUTER PROCESSING").
+                    if not line.startswith("data:"):
+                        continue
+                    frame = line[len("data:") :].strip()
+                    if frame == "[DONE]":
+                        break
+                    text = _fold_frame(_parse_frame(frame), content, calls)
+                    if text:
+                        yield text
+        except (httpx.HTTPError, ResponseTooLargeError) as exc:
+            raise OpenRouterError(f"{provider_host()} request failed: {exc}") from exc
+
+    # ``content`` stays absent rather than empty when the turn was only tool
+    # calls: that is the shape the blocking client returns, and the shape the
+    # provider expects to see again in the next request's transcript.
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(content) or None}
+    if calls:
+        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    return message
+
+
+def _parse_frame(frame: str) -> dict[str, Any]:
+    try:
+        chunk = json.loads(frame)
+    except ValueError as exc:
+        raise OpenRouterError(f"unreadable stream frame from {provider_host()}: {exc}") from exc
+    if not isinstance(chunk, dict):
+        raise OpenRouterError(f"unexpected stream frame from {provider_host()}: {frame[:200]}")
+    # A provider may fail *inside* a 200 stream — a rate limit reached mid-turn
+    # arrives as a frame, not as a status code. Treat it as the failure it is
+    # rather than ending the reply wherever the error interrupted it.
+    error = chunk.get("error")
+    if isinstance(error, dict):
+        raise OpenRouterError(f"{provider_host()} stream error: {error.get('message', error)}")
+    return chunk
+
+
+def _fold_frame(
+    chunk: dict[str, Any],
+    content: list[str],
+    calls: dict[int, dict[str, Any]],
+) -> str:
+    """Fold one frame into the message being assembled; return its new text.
+
+    Tool-call fragments are merged by index rather than appended as they come:
+    the id and the function name ride the first fragment for a call, and its
+    JSON arguments accumulate across every following one, so a call is only
+    complete once the stream is.
+    """
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        # Usage-only and metadata frames carry no choices at all.
+        return ""
+    delta = choices[0].get("delta") or {}
+
+    for fragment in delta.get("tool_calls") or []:
+        index = fragment.get("index", 0)
+        call = calls.setdefault(
+            index,
+            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+        )
+        if fragment.get("id"):
+            call["id"] = fragment["id"]
+        function = fragment.get("function") or {}
+        if function.get("name"):
+            call["function"]["name"] = function["name"]
+        if function.get("arguments"):
+            call["function"]["arguments"] += function["arguments"]
+
+    text = delta.get("content")
+    if not isinstance(text, str) or not text:
+        return ""
+    content.append(text)
+    return text

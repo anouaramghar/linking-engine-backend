@@ -92,16 +92,37 @@ Connect a client with:
 }
 ```
 
-## Dashboard assistant (`POST /api/v1/agent/chat`)
+## Dashboard assistant (`POST /api/v1/agent/chat[/stream]`)
 
 A small tool-calling loop over OpenRouter (`app/services/agent_service.py`)
 with the same registry as its toolset. Bounds: `AGENT_MAX_TOOL_ROUNDS`
 model turns that may carry calls, a final no-tools turn if the cap hits,
-and `AGENT_MAX_HISTORY_TURNS` on the client-supplied transcript. The panel
-(`src/components/agent/AgentPanel.tsx`) renders complete turns plus a chip
-per tool consulted; there is no streaming by design.
+and `AGENT_MAX_HISTORY_TURNS` on the client-supplied transcript.
 
-An empty key disables chat only (503 from `/agent/chat`, honest status from
+One loop, read two ways. `answer_question` returns the finished turn;
+`stream_answer` yields the same run as it happens — a `ToolInvocation` when
+each tool returns, a `TextDelta` per fragment the model writes, and the
+`AssistantReply` last. `/chat` serializes the first, `/chat/stream` frames the
+second as Server-Sent Events (`tool`, `delta`, `done`, `error`). They are one
+function on purpose: a second copy of the loop is a second place for the round
+cap, the transcript bound and the proposals to drift apart.
+
+The panel (`src/components/agent/AgentPanel.tsx`) reads the stream. A chip
+appears when its tool returns rather than after the answer, so "consulting
+`search_queue`" is shown while it is true, and the reply is written into the
+log as the model writes it. The `done` event carries exactly the `/chat` body,
+which is what makes a provider that streams nothing — or a turn that ends on
+the retry line — render the same as one that streams every word.
+
+Two rules follow from a stream having spent its status line on the 200 that
+opened it. Anything knowable in advance is refused in advance (an unconfigured
+deployment gets its 503 before the first byte), and anything that fails after
+that is an `error` event, not a truncated body — a reply that simply stops
+reads like a short answer rather than a failure. The response carries
+`X-Accel-Buffering: no`, without which nginx would buffer the whole answer and
+hand it over at once: a slower `/chat`.
+
+An empty key disables chat only (503 from both chat routes, honest status from
 `/agent/status`). MCP tools keep working without it — they answer from the
 database, not from a model.
 

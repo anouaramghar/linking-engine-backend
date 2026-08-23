@@ -49,6 +49,7 @@ def _suggestion(db, site, src, tgt, status="approved", score=0.9, anchor_text="a
         target_article_id=tgt.id,
         method="baseline_cosine",
         score=score,
+        rank_score=score,
         status=status,
         anchor_text=anchor_text,
     )
@@ -197,6 +198,7 @@ def test_policy_retired_tavily_target_stales_plan_before_network_access(
         provider="tavily",
         method="external_search",
         score=0.9,
+        rank_score=0.9,
         status="approved",
         anchor_text="anchor",
     )
