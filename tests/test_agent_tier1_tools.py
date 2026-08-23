@@ -176,6 +176,69 @@ class TestPreviewSuggestionReview:
         assert pending_suggestion.status == "approved"
 
 
+class TestEditorialRankingPolicyTools:
+    def test_reads_and_stages_a_full_policy_without_mutating(self, db, site):
+        current = call_tool(
+            db,
+            _admin(),
+            "get_editorial_ranking_policy",
+            {"site_id": site.id},
+        )
+        assert current["policy"] == {
+            "enabled": False,
+            "min_score_percent": 0,
+            "feedback_weight": 0.2,
+            "min_samples": 10,
+        }
+
+        preview = call_tool(
+            db,
+            _admin(),
+            "preview_editorial_ranking_policy",
+            {
+                "site_id": site.id,
+                "enabled": True,
+                "min_score_percent": 70,
+                "feedback_weight": 0.35,
+                "min_samples": 25,
+            },
+        )
+        assert preview["already_current"] is False
+        assert preview["changes"]["enabled"] == {"from": False, "to": True}
+        assert preview["proposal"] == {
+            "kind": "editorial_ranking_policy",
+            "risk": "reversible",
+            "method": "PUT",
+            "endpoint": f"/api/v1/sites/{site.id}/editorial-ranking-policy",
+            "payload": {
+                "enabled": True,
+                "min_score_percent": 70,
+                "feedback_weight": 0.35,
+                "min_samples": 25,
+                "expected": current["policy"],
+            },
+        }
+        db.expire(site)
+        assert site.editorial_feedback_enabled is False
+
+    def test_an_unchanged_policy_does_not_create_a_confirmable_action(self, db, site):
+        result = call_tool(
+            db,
+            _admin(),
+            "preview_editorial_ranking_policy",
+            {
+                "site_id": site.id,
+                "enabled": False,
+                "min_score_percent": 0,
+                "feedback_weight": 0.2,
+                "min_samples": 10,
+            },
+        )
+        assert result["already_current"] is True
+        assert result["changes"] == {}
+        assert "proposal" not in result
+
+
 class TestExplainSuggestion:
     def test_full_context_for_one_row(self, client, db, site, pending_suggestion):
         result = call_tool(

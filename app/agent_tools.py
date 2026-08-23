@@ -149,6 +149,20 @@ class SiteStatusArgs(BaseModel):
     )
 
 
+class EditorialRankingPolicyArgs(BaseModel):
+    site_id: int | None = Field(
+        None,
+        description="Which managed site's policy. Omit it when only one site is connected.",
+    )
+
+
+class PreviewEditorialRankingPolicyArgs(EditorialRankingPolicyArgs):
+    enabled: bool = Field(description="Whether editorial feedback may affect ranking.")
+    min_score_percent: int = Field(ge=0, le=100)
+    feedback_weight: float = Field(ge=0.0, le=1.0)
+    min_samples: int = Field(ge=1, le=10_000)
+
+
 class SuggestionHistoryArgs(BaseModel):
     """Identify the suggestion either way round.
 
@@ -631,6 +645,75 @@ def _site_status(db: Session, principal: Principal, args: SiteStatusArgs) -> dic
         "queue": counts,
         "suggestion_capacity": capacity,
     }
+
+
+def _editorial_policy_values(site: Site) -> dict[str, Any]:
+    return {
+        "enabled": site.editorial_feedback_enabled,
+        "min_score_percent": site.editorial_min_score_percent,
+        "feedback_weight": site.editorial_feedback_weight,
+        "min_samples": site.editorial_feedback_min_samples,
+    }
+
+
+def _managed_policy_site(
+    db: Session,
+    principal: Principal,
+    site_id: int | None,
+    *,
+    write: bool,
+) -> Site:
+    resolved = _resolve_site_id(db, principal, site_id)
+    site = (
+        authorize_site(db, principal, resolved)
+        if write
+        else authorize_site_read(db, principal, resolved)
+    )
+    if site.platform == POOL_PLATFORM:
+        raise HTTPException(409, "editorial ranking policies belong to managed sites")
+    return site
+
+
+def _get_editorial_ranking_policy(
+    db: Session, principal: Principal, args: EditorialRankingPolicyArgs
+) -> dict[str, Any]:
+    site = _managed_policy_site(db, principal, args.site_id, write=False)
+    return {
+        "site": {"id": site.id, "name": site.name},
+        "policy": _editorial_policy_values(site),
+        **_urls(sites_url=_dashboard_url("/sites", q=site.name)),
+    }
+
+
+def _preview_editorial_ranking_policy(
+    db: Session, principal: Principal, args: PreviewEditorialRankingPolicyArgs
+) -> dict[str, Any]:
+    """Stage a full policy replacement, bound to the current policy snapshot."""
+    site = _managed_policy_site(db, principal, args.site_id, write=True)
+    current = _editorial_policy_values(site)
+    desired = args.model_dump(exclude={"site_id"})
+    changes = {
+        field: {"from": current[field], "to": value}
+        for field, value in desired.items()
+        if value != current[field]
+    }
+    result: dict[str, Any] = {
+        "site": {"id": site.id, "name": site.name},
+        "current": current,
+        "desired": desired,
+        "changes": changes,
+        "already_current": not changes,
+        **_urls(sites_url=_dashboard_url("/sites", q=site.name)),
+    }
+    if changes:
+        result["proposal"] = {
+            "kind": "editorial_ranking_policy",
+            "risk": "reversible",
+            "method": "PUT",
+            "endpoint": f"/api/v1/sites/{site.id}/editorial-ranking-policy",
+            "payload": {**desired, "expected": current},
+        }
+    return result
 
 
 def _queue_counts(db: Session, principal: Principal, args: QueueCountsArgs) -> dict[str, Any]:
@@ -1587,6 +1670,28 @@ REGISTRY: dict[str, AgentTool] = {
             ),
             args_model=SiteStatusArgs,
             handler=_site_status,
+        ),
+        AgentTool(
+            name="get_editorial_ranking_policy",
+            title="Editorial ranking policy",
+            description=(
+                "Read one managed site's editorial-feedback ranking policy: whether it is "
+                "enabled, its candidate score floor, feedback weight, and minimum decision "
+                "sample. Use before recommending a change."
+            ),
+            args_model=EditorialRankingPolicyArgs,
+            handler=_get_editorial_ranking_policy,
+        ),
+        AgentTool(
+            name="preview_editorial_ranking_policy",
+            title="Preview editorial ranking policy",
+            description=(
+                "Stage a complete replacement for one managed site's editorial-feedback "
+                "ranking policy. Returns the exact before/after fields and a reversible "
+                "proposal the editor must confirm; returns no proposal when already current."
+            ),
+            args_model=PreviewEditorialRankingPolicyArgs,
+            handler=_preview_editorial_ranking_policy,
         ),
         AgentTool(
             name="get_queue_counts",

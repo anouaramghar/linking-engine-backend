@@ -518,6 +518,14 @@ def update_editorial_ranking_policy(
     db: Session = Depends(get_db),
 ) -> EditorialRankingPolicyOut:
     _managed_site_or_409(site)
+    current = _editorial_policy_out(site)
+    if payload.expected is not None:
+        current_values = current.model_dump(exclude={"site_id"})
+        if current_values != payload.expected.model_dump():
+            raise HTTPException(
+                409,
+                "editorial ranking policy changed since it was previewed; refresh before saving",
+            )
     site.editorial_feedback_enabled = payload.enabled
     site.editorial_min_score_percent = payload.min_score_percent
     site.editorial_feedback_weight = payload.feedback_weight

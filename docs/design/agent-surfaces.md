@@ -24,6 +24,11 @@ click sends an allowlisted proposal to the ordinary audited REST route. Over
 MCP, the tool returns the exact proposal and a dashboard URL; the external
 client cannot execute it.
 
+The staged set currently covers individual and filtered-bulk suggestion review,
+plus complete editorial-ranking-policy replacement. Policy proposals include
+the current policy as `expected`; a dashboard edit made after preview turns the
+confirmation into `409` rather than being overwritten.
+
 ## MCP server (`/mcp`)
 
 Streamable HTTP at `/mcp/`, stateless, JSON responses (no SSE). Two layers:

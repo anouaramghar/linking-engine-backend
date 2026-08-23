@@ -204,7 +204,7 @@ class SiteOut(BaseModel):
     last_crawl_at: datetime | None = None
 
 
-class EditorialRankingPolicyUpdate(BaseModel):
+class EditorialRankingPolicyValues(BaseModel):
     #: Required, not defaulted: switching feedback reranking on is a deliberate
     #: act while it is unproven, so an omitted field must not turn it on as a
     #: side effect of editing the thresholds beside it.
@@ -214,7 +214,17 @@ class EditorialRankingPolicyUpdate(BaseModel):
     min_samples: int = Field(ge=1, le=10_000)
 
 
-class EditorialRankingPolicyOut(EditorialRankingPolicyUpdate):
+class EditorialRankingPolicyUpdate(EditorialRankingPolicyValues):
+    expected: EditorialRankingPolicyValues | None = Field(
+        None,
+        description=(
+            "Only save if the current policy still equals this snapshot. "
+            "Agent-staged changes use it as an optimistic-concurrency guard."
+        ),
+    )
+
+
+class EditorialRankingPolicyOut(EditorialRankingPolicyValues):
     site_id: int
 
 

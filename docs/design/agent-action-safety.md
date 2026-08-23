@@ -9,7 +9,7 @@ how much human intent each action needs before it runs.
 | Class | Examples | Agent behavior |
 | --- | --- | --- |
 | Read | Search queues, inspect sites, explain suggestions, view jobs | Run immediately. |
-| Reversible | Approve or reject pending suggestions, update non-secret editorial policy | Stage the exact REST request, show its effect, and require Confirm. Include an expected-state precondition and an undo path. |
+| Reversible | Approve or reject pending suggestions, update non-secret editorial policy | Stage the exact REST request, show its effect, and require Confirm. Include an expected-state precondition and a clear reversal path. |
 | Sensitive | Bulk changes, start ingestion or analysis, retry or cancel a batch | Preview scope and cost, then require Confirm. Bind confirmation to the exact payload and current resource version. |
 | Critical | Publish, approve publication artifacts, change credentials or roles, revoke users, permanently delete a site | Do not expose to the agent. The agent may explain the blocker and deep-link to the dashboard. |
 
@@ -53,8 +53,11 @@ must never be mintable by another MCP tool.
    status, explicit rejection reason.
 2. Bulk review: already staged and undoable; add the common proposal metadata
    and keep its `match_status=pending` race guard.
-3. Editorial policies and site metadata: add versioned previews and typed
-   dashboard confirmations; credentials remain excluded.
+3. Editorial policies and site metadata: editorial ranking now has a full
+   before/after preview, expected-policy guard, and typed dashboard confirmation.
+   External-link policy and ordinary site metadata remain; credentials stay
+   excluded. External-link tightening is sensitive because it can immediately
+   expire approved suggestions.
 4. Analysis, ingestion, retry, and cancellation: include scope, estimated work,
    duplicate-job checks, and a sensitive-action confirmation.
 5. Add out-of-band MCP action receipts only after the dashboard proposal set is
