@@ -1,7 +1,7 @@
 from app.db import Base
 from app.models.alert import Alert
 from app.models.article import Article, ArticleTaxonomy, Embedding, Taxonomy
-from app.models.dashboard import DashboardSession, DashboardUser, LoginNonce
+from app.models.dashboard import AgentActionReceipt, DashboardSession, DashboardUser, LoginNonce
 from app.models.evaluation import EvaluationSnapshot
 from app.models.external_policy import ExternalLinkPolicy
 from app.models.external_search_audit import ExternalSearchAuditEvent
@@ -24,6 +24,7 @@ from app.models.tenant import ApiKey, Tenant
 __all__ = [
     "Base",
     "Alert",
+    "AgentActionReceipt",
     "ApiKey",
     "Article",
     "ArticleTaxonomy",

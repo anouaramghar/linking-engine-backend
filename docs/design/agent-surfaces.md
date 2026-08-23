@@ -1,10 +1,11 @@
 # Agent surfaces
 
-LinkMesh exposes one read-only tool set to two agent-facing surfaces: an
+LinkMesh exposes one read-only registry to two agent-facing surfaces: an
 MCP server for external clients (Claude Code, Cursor, any MCP host) and a
 chat assistant embedded in the dashboard. Some tools stage exact editor action
-proposals, but no tool mutates application state. This note records what they
-may touch, why the boundary sits where it sits, and how to operate them. The
+proposals. The MCP server additionally exposes one receipt-only execution
+adapter outside that registry. This note records what they may touch, why the
+boundary sits where it sits, and how to operate them. The
 action classes and rollout live in [agent-action-safety.md](agent-action-safety.md).
 
 ## The single registry
@@ -21,8 +22,9 @@ reject, publish, crawl, or enqueue. That line is deliberate: suggestions carry
 untrusted crawled text, and a manipulated model with write access would be an
 injection path into customer sites. In the dashboard, the editor's Confirm
 click sends an allowlisted proposal to the ordinary audited REST route. Over
-MCP, the tool returns the exact proposal and a dashboard URL; the external
-client cannot execute it.
+MCP, the tool returns the exact proposal and a signed dashboard URL. The
+external client cannot mint authority: an authenticated editor reviews the
+current rerun and may copy back a short-lived receipt.
 
 The staged set currently covers individual and filtered-bulk suggestion review,
 complete editorial-ranking-policy replacement, sensitive external-link policy
@@ -66,9 +68,9 @@ Streamable HTTP at `/mcp/`, stateless, JSON responses (no SSE). Two layers:
 Fleet-wide tools (`get_evaluation_metrics`) enforce the same admin-only
 rule as their REST router.
 
-Two things the protocol carries that prose cannot:
+Three things the protocol carries that prose cannot:
 
-- **Annotations.** Every tool ships `readOnlyHint: true`,
+- **Annotations.** Every registry tool ships `readOnlyHint: true`,
   `destructiveHint: false`, `openWorldHint: false`. A host that can only read
   this note has to prompt for each call; one that reads the annotation can
   auto-approve a surface that provably changes nothing. The hints are set once
@@ -77,6 +79,11 @@ Two things the protocol carries that prose cannot:
   `test_registry_is_read_only_by_construction` is what keeps that true.
   `idempotentHint` is not declared: the specification gives it meaning only
   when `readOnlyHint` is false.
+- **One receipt adapter.** `execute_action_receipt` sits outside the shared
+  registry and declares `readOnlyHint: false`, `destructiveHint: true`. It
+  accepts only an opaque receipt—never an endpoint or payload—and atomically
+  spends it before calling the closed dispatcher. Dashboard chat cannot see or
+  call this tool.
 - **Result schemas.** Five tools publish an `outputSchema`: `search_queue`,
   `find_articles`, `get_site_jobs`, `get_suggestion_history`,
   `get_ingestion_diagnostics` — the ones that return a count beside a list,
@@ -343,6 +350,12 @@ from a bug in the engine, and follows the link either way. The keys are
 *absent* when unbuildable, never null, because a null link reads to a model as
 "there is no link for this", which it then says out loud.
 
+Staging tools additionally return `#mcp-action=<signed-envelope>` on the Sites
+URL. The fragment is not sent in HTTP requests or referrers; the Mesh panel
+removes it from browser history before asking the authenticated API to rerun
+the exact preview. The editor sees that current proposal, not trusted model
+prose.
+
 ## Publication state
 
 `get_publication_status` answers "what is blocking publication" by keeping
@@ -382,6 +395,8 @@ failure of it.
 | `AGENT_MAX_OUTPUT_TOKENS` | `1500` | Per turn |
 | `AGENT_MAX_HISTORY_TURNS` | `20` | Transcript bound at the API edge |
 | `DASHBOARD_BASE_URL` | *(empty)* | Dashboard origin for result links; empty omits them |
+| `AGENT_ACTION_ENVELOPE_TTL_SECONDS` | `600` | Lifetime of a signed MCP dashboard-review link |
+| `AGENT_ACTION_RECEIPT_TTL_SECONDS` | `300` | Lifetime of a one-time human-issued MCP receipt |
 
 `TOOL_RESULT_BUDGET` (12,000 characters) is a module constant in
 `agent_service`, not deployment configuration: it is a property of how much of
@@ -391,7 +406,7 @@ Chat falls back to `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL` when the two `AG
 
 ## Adding a tool
 
-Add it to the registry in `app/agent_tools.py`: an args pydantic model, a
+Add read and staging tools to the registry in `app/agent_tools.py`: an args pydantic model, a
 handler returning JSON-safe dicts, a `title`, and a description written for a
 model. Both surfaces pick it up automatically; add tests to
 `tests/test_agent_tools.py`. Keep it read-only, or open a design discussion

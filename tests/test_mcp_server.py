@@ -121,6 +121,11 @@ def test_tools_declare_the_read_only_contract(monkeypatch, client):
     assert listed
     for tool in listed:
         annotations = tool["annotations"]
+        if tool["name"] == "execute_action_receipt":
+            assert annotations["readOnlyHint"] is False
+            assert annotations["destructiveHint"] is True
+            assert annotations["openWorldHint"] is False
+            continue
         assert annotations["readOnlyHint"] is True, tool["name"]
         assert annotations["destructiveHint"] is False, tool["name"]
         assert annotations["openWorldHint"] is False, tool["name"]

@@ -108,6 +108,11 @@ class Settings(BaseSettings):
     # this is deployment configuration. Empty means links are simply omitted —
     # every tool still answers, and no deployment has to set it.
     dashboard_base_url: str = ""
+    # MCP action links carry only signed, compressed preview inputs. The browser
+    # must review them promptly, and the opaque receipt it issues is intentionally
+    # even shorter-lived so copied credentials do not become standing authority.
+    agent_action_envelope_ttl_seconds: int = Field(default=600, ge=60, le=3_600)
+    agent_action_receipt_ttl_seconds: int = Field(default=300, ge=30, le=1_800)
 
     # Best-effort operations alerting; empty logs alerts locally.
     alert_webhook_url: str = ""

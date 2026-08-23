@@ -37,15 +37,27 @@ newer human or worker action.
 
 ## MCP boundary
 
-External MCP clients can read and stage proposals, but cannot confirm them yet.
-Tool annotations are useful host hints, not proof of human approval: a model can
-call a second tool and repeat any token returned by the first.
+External MCP clients can read and stage proposals. A successful staging call
+also returns a signed, compressed dashboard fragment containing its validated
+inputs and originating principal binding. It writes no pending row and carries
+no execution authority. The fragment is removed from browser history as soon as
+the authenticated dashboard opens it.
 
-When MCP execution is added, confirmation must arrive through a separate
-authenticated human channel and create a short-lived, one-time action receipt
-bound to the operator, tenant, action kind, canonical payload hash, and resource
-version. The execution tool may consume that receipt exactly once. A receipt
-must never be mintable by another MCP tool.
+The dashboard reruns the preview under that bound principal, so the editor sees
+current scope and current optimistic guards. Only an approved dashboard session
+can mint the opaque receipt; admin-only proposals also require the confirming
+person to remain a dashboard admin. Receipt issuance binds the exact canonical
+proposal hash, originating API-key/operator scope, confirming Telegram identity,
+and a short expiry.
+
+`execute_action_receipt` is the sole mutating MCP adapter and deliberately does
+not belong to the shared read-only registry. It accepts no endpoint or payload.
+It atomically marks the receipt consumed before dispatch, verifies the same MCP
+identity and still-approved human, and then calls a closed mapping of the
+existing audited route functions. Success, guarded failure, and the human actor
+are persisted. A failed or interrupted attempt remains spent; the recovery is a
+fresh preview and human confirmation, never replay. Publication, credentials,
+roles, user revocation, and deletion have no dispatcher entry.
 
 ## Rollout
 
@@ -76,8 +88,10 @@ must never be mintable by another MCP tool.
    pool approval, revocation, and reactivation are admin-only and bind the
    exact lifecycle state; revocation additionally binds every pending or
    approved suggestion that would expire. Pool deletion stays excluded.
-8. Add out-of-band MCP action receipts only after the dashboard proposal set is
-   complete and audited.
+8. Out-of-band MCP action receipts now cover the complete staged proposal set.
+   Signed preview links remain read-only; a live dashboard session issues a
+   five-minute, one-time, identity-bound receipt, and one MCP-only tool spends it
+   through the closed action dispatcher.
 
 Publication preparation may eventually be staged, but approving publication
 plans and queuing publication remain critical human-only actions.

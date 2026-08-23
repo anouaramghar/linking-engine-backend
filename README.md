@@ -9,11 +9,12 @@ jobs.
 
 ## Agent surfaces
 
-A read-only MCP tool server at `/mcp/` (for Claude Code, Cursor, and any MCP
-client) and an optional chat assistant in the dashboard share one action
-registry that reuses the REST route functions, tenant scoping included. Tools
-never write: review and publication stay human-only. Configuration, the tool
-list, and the security boundary are documented in
+A read-only MCP registry at `/mcp/` (for Claude Code, Cursor, and any MCP
+client) and an optional chat assistant in the dashboard reuse the REST route
+functions, tenant scoping included. MCP staging tools can hand an authenticated
+editor a signed review link; the one MCP-only writer accepts only the resulting
+short-lived, one-time, identity-bound receipt. Publication stays human-only.
+Configuration, the tool list, and the security boundary are documented in
 [docs/design/agent-surfaces.md](docs/design/agent-surfaces.md).
 
 ## Review reliability and traceability
