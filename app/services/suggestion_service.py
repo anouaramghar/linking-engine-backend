@@ -5,8 +5,10 @@ import hashlib
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from sqlalchemy import and_, func, select, update
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import SessionLocal, engine
@@ -38,6 +40,71 @@ _LIFETIME_STATUSES = (*_ACTIVE_STATUSES, "applied")
 _ANALYSIS_LOCK_NAMESPACE = 0x4C4D
 _DIMENSION_PROBE_INPUT = "LinkMesh dimension probe"
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ArticleSuggestionCapacity:
+    active_for_article: int
+    lifetime_for_article: int
+    active_for_site: int
+    remaining: int
+
+
+def article_suggestion_capacity(
+    db: Session,
+    *,
+    site_id: int,
+    article_id: int,
+) -> ArticleSuggestionCapacity:
+    """Return the same three capacity bounds enforced by suggestion generation."""
+
+    active_for_article = (
+        db.scalar(
+            select(func.count())
+            .select_from(Suggestion)
+            .where(
+                Suggestion.source_article_id == article_id,
+                Suggestion.status.in_(_ACTIVE_STATUSES),
+            )
+        )
+        or 0
+    )
+    lifetime_for_article = (
+        db.scalar(
+            select(func.count())
+            .select_from(Suggestion)
+            .where(
+                Suggestion.source_article_id == article_id,
+                Suggestion.status.in_(_LIFETIME_STATUSES),
+            )
+        )
+        or 0
+    )
+    active_for_site = (
+        db.scalar(
+            select(func.count())
+            .select_from(Suggestion)
+            .where(
+                Suggestion.site_id == site_id,
+                Suggestion.status.in_(_ACTIVE_STATUSES),
+            )
+        )
+        or 0
+    )
+    remaining = max(
+        0,
+        min(
+            settings.hybrid_max_suggestions_per_article - active_for_article,
+            settings.hybrid_max_lifetime_links_per_article - lifetime_for_article,
+            settings.hybrid_max_active_suggestions_per_site - active_for_site,
+        ),
+    )
+    return ArticleSuggestionCapacity(
+        active_for_article=active_for_article,
+        lifetime_for_article=lifetime_for_article,
+        active_for_site=active_for_site,
+        remaining=remaining,
+    )
 
 
 @contextmanager

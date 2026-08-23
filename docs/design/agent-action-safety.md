@@ -68,7 +68,10 @@ must never be mintable by another MCP tool.
    expected absence of its URL; guarded bulk creation binds the exact sorted URL
    set and is atomic, so any duplicate or eligibility drift returns `409` rather
    than partially creating the proposal.
-6. Add out-of-band MCP action receipts only after the dashboard proposal set is
+6. One-article analysis binds the exact active article and the site's active
+   analysis-job snapshot. It is offered only while the article and site retain
+   suggestion capacity; confirmation never broadens into site-wide analysis.
+7. Add out-of-band MCP action receipts only after the dashboard proposal set is
    complete and audited.
 
 Publication preparation may eventually be staged, but approving publication

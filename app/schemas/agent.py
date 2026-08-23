@@ -38,6 +38,7 @@ class AgentProposal(BaseModel):
     endpoint: str
     payload: dict
     match_count: int | None = None
+    context: dict | None = None
     impact: dict | None = None
 
 

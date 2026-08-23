@@ -76,6 +76,7 @@ from app.services.external_link_policy import (
     policy_state,
 )
 from app.services.job_service import active_job_run_ids
+from app.services.suggestion_service import article_suggestion_capacity
 from app.services.pool_source_policy import (
     PoolSourcePolicyError,
     pbn_conflict_reason,
@@ -243,6 +244,13 @@ class PreviewSiteJobArgs(BaseModel):
     )
     kind: Literal["ingestion", "analysis"] = Field(
         description="Ingestion crawls and refreshes content; analysis generates suggestions."
+    )
+
+
+class PreviewArticleAnalysisArgs(BaseModel):
+    article_id: int = Field(
+        ge=1,
+        description="The exact active source article that should receive suggestions.",
     )
 
 
@@ -1081,6 +1089,83 @@ def _preview_site_job(
         "endpoint": endpoint,
         "payload": {"expected_active_job_run_ids": active_ids},
         "impact": {"site_count": 1, **scope},
+    }
+    return result
+
+
+def _preview_article_analysis(
+    db: Session, principal: Principal, args: PreviewArticleAnalysisArgs
+) -> dict[str, Any]:
+    """Stage suggestion generation for one active source article."""
+
+    article = db.get(Article, args.article_id)
+    if article is None:
+        raise HTTPException(404, f"article {args.article_id} not found")
+    site = authorize_site(db, principal, article.site_id)
+    if site.platform == POOL_PLATFORM:
+        raise HTTPException(409, "content-pool sources cannot generate suggestions")
+
+    active_ids = active_job_run_ids(db, site.id, "analysis")
+    capacity = article_suggestion_capacity(
+        db,
+        site_id=site.id,
+        article_id=article.id,
+    )
+    remaining_slots = capacity.remaining
+    result: dict[str, Any] = {
+        "site": {"id": site.id, "name": site.name, "platform": site.platform},
+        "article": {
+            "id": article.id,
+            "title": article.title,
+            "url": article.url,
+            "is_active": article.is_active,
+        },
+        "capacity": {
+            "active_suggestions_for_article": capacity.active_for_article,
+            "lifetime_links_for_article": capacity.lifetime_for_article,
+            "remaining_slots_for_article": remaining_slots,
+        },
+        "active_analysis_job_run_ids": active_ids,
+        "ready": article.is_active and remaining_slots > 0 and not active_ids,
+        **_urls(queue_url=_queue_url(site_id=site.id, q=article.title)),
+    }
+    if not article.is_active:
+        result["blocked_reason"] = "the article is no longer active in the site's content snapshot"
+        return result
+    if remaining_slots == 0:
+        result["blocked_reason"] = (
+            "the article or site has no remaining suggestion capacity; review or publish existing "
+            "suggestions before generating more"
+        )
+        return result
+    if active_ids:
+        result["blocked_reason"] = (
+            "an analysis job is already queued or running for this site; wait for it to finish"
+        )
+        return result
+
+    result["proposal"] = {
+        "kind": "article_analysis_start",
+        "risk": "sensitive",
+        "method": "POST",
+        "endpoint": f"/api/v1/articles/{article.id}/suggestions",
+        "payload": {
+            "expected_active_job_run_ids": active_ids,
+            "expected_article_is_active": True,
+        },
+        "context": {
+            "site_id": site.id,
+            "site_name": site.name,
+            "article_id": article.id,
+            "article_title": article.title,
+            "article_url": article.url,
+        },
+        "impact": {
+            "site_count": 1,
+            "source_article_count": 1,
+            "site_active_article_count": _site_work_scope(db, site)["active_article_count"],
+            "remaining_slots_for_article": remaining_slots,
+        },
     }
     return result
 
@@ -2212,6 +2297,18 @@ REGISTRY: dict[str, AgentTool] = {
             ),
             args_model=PreviewSiteJobArgs,
             handler=_preview_site_job,
+        ),
+        AgentTool(
+            name="preview_article_analysis",
+            title="Preview one-article suggestion generation",
+            description=(
+                "Stage suggestion generation for one exact active source article. Resolves and "
+                "authorizes its site, reports per-article capacity and active analysis work, and "
+                "returns a sensitive proposal only while the article is active, has room, and the "
+                "site has no analysis queued or running. This tool never starts the job."
+            ),
+            args_model=PreviewArticleAnalysisArgs,
+            handler=_preview_article_analysis,
         ),
         AgentTool(
             name="preview_pipeline_batch",

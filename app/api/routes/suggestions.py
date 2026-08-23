@@ -23,7 +23,7 @@ from app.models import (
     SuggestionEvent,
 )
 from app.models import PublicationPlan
-from app.schemas.job import JobAccepted, JobStartGuard
+from app.schemas.job import ArticleAnalysisStartGuard, JobAccepted, JobStartGuard
 from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
     MAX_BULK_REVIEW,
@@ -55,6 +55,7 @@ from app.services.authorization import (
 )
 from app.services.job_service import DuplicateJobError, enqueue_job, require_active_job_snapshot
 from app.services.graph_service import current_feature_map
+from app.services.suggestion_service import article_suggestion_capacity
 from app.tasks.analysis import analyze_article, analyze_site, compare_site
 
 logger = logging.getLogger(__name__)
@@ -1183,7 +1184,7 @@ def trigger_analysis(
 @router.post("/articles/{article_id}/suggestions", status_code=202, response_model=JobAccepted)
 def trigger_article_analysis(
     article_id: int,
-    payload: JobStartGuard | None = None,
+    payload: ArticleAnalysisStartGuard | None = None,
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
@@ -1195,6 +1196,21 @@ def trigger_article_analysis(
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
     if payload is not None:
+        if not article.is_active:
+            raise HTTPException(
+                409,
+                "article availability changed after this action was previewed; refresh first",
+            )
+        if article_suggestion_capacity(
+            db,
+            site_id=site.id,
+            article_id=article.id,
+        ).remaining == 0:
+            raise HTTPException(
+                409,
+                "article or site suggestion capacity changed after this action was previewed; "
+                "refresh first",
+            )
         try:
             require_active_job_snapshot(
                 db,

@@ -5,7 +5,7 @@ import uuid
 from sqlalchemy import delete, func, select
 
 from app.agent_tools import call_tool
-from app.models import Article, JobRun, PipelineBatch, PipelineSiteRun, Site
+from app.models import Article, JobRun, PipelineBatch, PipelineSiteRun, Site, Suggestion
 from app.services.authorization import Principal
 
 
@@ -95,6 +95,123 @@ def test_site_job_preview_does_not_stage_duplicate_work(db, site):
     assert preview["ready"] is False
     assert preview["active_same_kind_job_run_ids"] == [run.id]
     assert "proposal" not in preview
+
+
+def test_article_analysis_preview_is_exact_and_article_drift_is_refused(client, db, site):
+    article = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/one-source",
+        title="One exact source",
+        content_text="source article content",
+    )
+    db.add(article)
+    db.commit()
+    db.refresh(article)
+
+    preview = call_tool(
+        db,
+        _admin(),
+        "preview_article_analysis",
+        {"article_id": article.id},
+    )
+
+    assert preview["ready"] is True
+    assert preview["article"] == {
+        "id": article.id,
+        "title": article.title,
+        "url": article.url,
+        "is_active": True,
+    }
+    assert preview["capacity"]["remaining_slots_for_article"] > 0
+    assert preview["proposal"] == {
+        "kind": "article_analysis_start",
+        "risk": "sensitive",
+        "method": "POST",
+        "endpoint": f"/api/v1/articles/{article.id}/suggestions",
+        "payload": {
+            "expected_active_job_run_ids": [],
+            "expected_article_is_active": True,
+        },
+        "context": {
+            "site_id": site.id,
+            "site_name": site.name,
+            "article_id": article.id,
+            "article_title": article.title,
+            "article_url": article.url,
+        },
+        "impact": {
+            "site_count": 1,
+            "source_article_count": 1,
+            "site_active_article_count": 1,
+            "remaining_slots_for_article": preview["capacity"][
+                "remaining_slots_for_article"
+            ],
+        },
+    }
+
+    article.is_active = False
+    db.commit()
+    stale = client.post(
+        f"/api/v1/articles/{article.id}/suggestions",
+        json=preview["proposal"]["payload"],
+    )
+    assert stale.status_code == 409
+    assert "article availability changed" in stale.json()["detail"]
+
+
+def test_article_analysis_refuses_an_article_at_open_suggestion_capacity(client, db, site):
+    source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/full-source",
+        title="Full source",
+        content_text="source",
+    )
+    targets = [
+        Article(
+            site_id=site.id,
+            url=f"{site.base_url}/full-target-{index}",
+            title=f"Target {index}",
+            content_text="target",
+        )
+        for index in range(3)
+    ]
+    db.add_all([source, *targets])
+    db.flush()
+    db.add_all(
+        [
+            Suggestion(
+                site_id=site.id,
+                source_article_id=source.id,
+                target_article_id=target.id,
+                method="baseline_cosine",
+                score=0.8,
+                rank_score=0.8,
+                status="pending",
+            )
+            for target in targets
+        ]
+    )
+    db.commit()
+
+    preview = call_tool(
+        db,
+        _admin(),
+        "preview_article_analysis",
+        {"article_id": source.id},
+    )
+    assert preview["ready"] is False
+    assert preview["capacity"]["remaining_slots_for_article"] == 0
+    assert "proposal" not in preview
+
+    response = client.post(
+        f"/api/v1/articles/{source.id}/suggestions",
+        json={
+            "expected_active_job_run_ids": [],
+            "expected_article_is_active": True,
+        },
+    )
+    assert response.status_code == 409
+    assert "suggestion capacity changed" in response.json()["detail"]
 
 
 def test_pipeline_batch_preview_binds_all_selected_sites_to_idle_state(client, db, site):

@@ -27,8 +27,11 @@ client cannot execute it.
 The staged set currently covers individual and filtered-bulk suggestion review,
 complete editorial-ranking-policy replacement, sensitive external-link policy
 replacement, site crawl/analysis starts, multi-site pipeline starts, failed
-pipeline-stage retries, pipeline cancellation, and credential-free managed-site
-creation. Site proposals accept only WordPress and HTML records, never content-
+pipeline-stage retries, pipeline cancellation, credential-free managed-site
+creation, and suggestion generation for one exact source article. One-article
+analysis binds both the active article and the site's current analysis-job ids,
+and reports its remaining suggestion capacity. Site proposals accept only
+WordPress and HTML records, never content-
 pool sources, and bind the exact normalized URL set expected to be absent. A
 guarded bulk confirmation is atomic. Policy proposals include the current policy
 as `expected`; a dashboard edit made after preview turns the confirmation into

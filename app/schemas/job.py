@@ -32,6 +32,12 @@ class JobStartGuard(BaseModel):
         return value
 
 
+class ArticleAnalysisStartGuard(JobStartGuard):
+    """Bind a staged one-article analysis to an article that is still active."""
+
+    expected_article_is_active: Literal[True]
+
+
 class JobStatus(BaseModel):
     job_id: str
     # Stable API vocabulary, independent of whether Redis still has the RQ job.
