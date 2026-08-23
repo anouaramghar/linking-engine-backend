@@ -34,7 +34,7 @@ class AgentProposal(BaseModel):
     tool: str
     kind: str
     risk: Literal["reversible", "sensitive"]
-    method: Literal["POST", "PUT"]
+    method: Literal["POST", "PUT", "DELETE"]
     endpoint: str
     payload: dict
     match_count: int | None = None

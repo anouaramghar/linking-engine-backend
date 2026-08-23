@@ -99,6 +99,33 @@ class SiteCredentials(BaseModel):
         return self
 
 
+class PoolSourceExpectedState(BaseModel):
+    """The mutable pool-source fields a staged lifecycle action binds."""
+
+    approved: bool
+    quarantined: bool
+    consecutive_failures: int = Field(ge=0)
+    quarantined_at: datetime | None
+
+
+class PoolSourceActionGuard(BaseModel):
+    """Optional race guard for approval, revocation, and reactivation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    expected: PoolSourceExpectedState | None = None
+    expected_expiring_suggestion_ids: list[int] | None = None
+
+    @field_validator("expected_expiring_suggestion_ids")
+    @classmethod
+    def sorted_unique_positive_ids(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None and (
+            any(item < 1 for item in value) or value != sorted(set(value))
+        ):
+            raise ValueError("expected_expiring_suggestion_ids must be sorted, unique, and positive")
+        return value
+
+
 class SiteBulkRow(BaseModel):
     """One inbound row of a bulk import.
 

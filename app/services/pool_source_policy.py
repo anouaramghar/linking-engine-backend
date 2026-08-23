@@ -147,6 +147,40 @@ def require_approved_pool_source(site: Site) -> None:
     require_allowed_pool_domain(site.base_url)
 
 
+def pool_source_state(site: Site) -> dict[str, object]:
+    """JSON-safe lifecycle state shared by previews and guarded mutations."""
+
+    return {
+        "approved": site.pool_source_approved,
+        "quarantined": site.pool_source_quarantined,
+        "consecutive_failures": site.pool_source_consecutive_failures,
+        "quarantined_at": (
+            site.pool_source_quarantined_at.isoformat()
+            if site.pool_source_quarantined_at is not None
+            else None
+        ),
+    }
+
+
+def pool_target_suggestion_ids(
+    db: Session, site_id: int, *, reason: Literal["revoked", "quarantined"]
+) -> list[int]:
+    """Exact suggestion rows a pool-source disablement would expire."""
+
+    statuses = ("pending", "approved") if reason == "revoked" else ("pending",)
+    target_ids = select(Article.id).where(Article.site_id == site_id)
+    return list(
+        db.scalars(
+            select(Suggestion.id)
+            .where(
+                Suggestion.target_article_id.in_(target_ids),
+                Suggestion.status.in_(statuses),
+            )
+            .order_by(Suggestion.id)
+        )
+    )
+
+
 def expire_pool_target_suggestions(
     db: Session, site_id: int, *, reason: Literal["revoked", "quarantined"]
 ) -> int:
@@ -162,14 +196,12 @@ def expire_pool_target_suggestions(
     three times says nothing about the target article, so discarding a decision
     an editor already made would cost more than it protects.
     """
-    statuses = ("pending", "approved") if reason == "revoked" else ("pending",)
-    target_ids = select(Article.id).where(Article.site_id == site_id)
+    suggestion_ids = pool_target_suggestion_ids(db, site_id, reason=reason)
+    if not suggestion_ids:
+        return 0
     result = db.execute(
         update(Suggestion)
-        .where(
-            Suggestion.target_article_id.in_(target_ids),
-            Suggestion.status.in_(statuses),
-        )
+        .where(Suggestion.id.in_(suggestion_ids))
         .values(status="expired")
     )
     return result.rowcount or 0

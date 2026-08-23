@@ -71,7 +71,12 @@ must never be mintable by another MCP tool.
 6. One-article analysis binds the exact active article and the site's active
    analysis-job snapshot. It is offered only while the article and site retain
    suggestion capacity; confirmation never broadens into site-wide analysis.
-7. Add out-of-band MCP action receipts only after the dashboard proposal set is
+7. Alert acknowledgement binds the unread occurrence count and last-seen time,
+   so a recurrence cannot be hidden by an older confirmation. Shared content-
+   pool approval, revocation, and reactivation are admin-only and bind the
+   exact lifecycle state; revocation additionally binds every pending or
+   approved suggestion that would expire. Pool deletion stays excluded.
+8. Add out-of-band MCP action receipts only after the dashboard proposal set is
    complete and audited.
 
 Publication preparation may eventually be staged, but approving publication

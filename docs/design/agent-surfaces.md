@@ -42,6 +42,12 @@ count; cancellations bind every unfinished site's status, stage, and job ids.
 Queue or worker drift therefore turns confirmation into `409`, so a warning
 cannot silently become broader or newer work.
 
+The staged set also covers alert acknowledgement and shared content-pool
+lifecycle changes. An alert proposal binds its occurrence count and last-seen
+time. Pool approval, revocation, and reactivation are admin-only; each binds
+the exact approval/quarantine state, and revocation binds the exact suggestion
+ids it would expire. Content-pool deletion remains destructive and unavailable.
+
 ## MCP server (`/mcp`)
 
 Streamable HTTP at `/mcp/`, stateless, JSON responses (no SSE). Two layers:

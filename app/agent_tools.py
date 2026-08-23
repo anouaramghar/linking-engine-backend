@@ -80,7 +80,10 @@ from app.services.suggestion_service import article_suggestion_capacity
 from app.services.pool_source_policy import (
     PoolSourcePolicyError,
     pbn_conflict_reason,
+    pool_source_state,
+    pool_target_suggestion_ids,
     require_approved_pool_source,
+    require_allowed_pool_domain,
 )
 
 logger = logging.getLogger(__name__)
@@ -252,6 +255,15 @@ class PreviewArticleAnalysisArgs(BaseModel):
         ge=1,
         description="The exact active source article that should receive suggestions.",
     )
+
+
+class PreviewAlertAcknowledgementArgs(BaseModel):
+    alert_id: int = Field(ge=1, description="The exact unread alert to mark acknowledged.")
+
+
+class PreviewPoolSourceActionArgs(BaseModel):
+    site_id: int = Field(ge=1, description="The exact content-pool source to change.")
+    action: Literal["approve", "revoke", "reactivate"]
 
 
 class PreviewPipelineBatchArgs(BaseModel):
@@ -1167,6 +1179,168 @@ def _preview_article_analysis(
             "remaining_slots_for_article": remaining_slots,
         },
     }
+    return result
+
+
+def _preview_alert_acknowledgement(
+    db: Session, principal: Principal, args: PreviewAlertAcknowledgementArgs
+) -> dict[str, Any]:
+    """Stage acknowledgement against the exact unread alert occurrence."""
+
+    alert = db.get(Alert, args.alert_id)
+    if alert is None:
+        raise HTTPException(404, f"alert {args.alert_id} not found")
+    site_name: str | None = None
+    if alert.site_id is not None:
+        site = authorize_site(db, principal, alert.site_id)
+        site_name = site.name
+    elif not principal.is_admin:
+        raise HTTPException(403, "access denied for this alert")
+
+    result: dict[str, Any] = {
+        "alert": {
+            "id": alert.id,
+            "kind": alert.kind,
+            "subject": alert.subject,
+            "site_id": alert.site_id,
+            "site_name": site_name,
+            "occurrences": alert.occurrences,
+            "last_seen_at": alert.last_seen_at.isoformat(),
+            "acknowledged_at": (
+                alert.acknowledged_at.isoformat() if alert.acknowledged_at is not None else None
+            ),
+        },
+        "ready": alert.acknowledged_at is None,
+        **_urls(sites_url=_dashboard_url("/sites", q=site_name) if site_name else None),
+    }
+    if alert.acknowledged_at is not None:
+        result["blocked_reason"] = "the alert is already acknowledged"
+        return result
+
+    result["proposal"] = {
+        "kind": "alert_acknowledgement",
+        "risk": "sensitive",
+        "method": "POST",
+        "endpoint": f"/api/v1/alerts/{alert.id}/acknowledge",
+        "payload": {
+            "expected_unacknowledged": True,
+            "expected_occurrences": alert.occurrences,
+            "expected_last_seen_at": alert.last_seen_at.isoformat(),
+        },
+        "context": {
+            "alert_id": alert.id,
+            "alert_subject": alert.subject,
+            "alert_kind": alert.kind,
+            "site_id": alert.site_id,
+            "site_name": site_name,
+        },
+        "impact": {"alert_count": 1, "occurrence_count": alert.occurrences},
+    }
+    return result
+
+
+def _preview_pool_source_action(
+    db: Session, principal: Principal, args: PreviewPoolSourceActionArgs
+) -> dict[str, Any]:
+    """Stage one shared pool-source lifecycle transition and its exact impact."""
+
+    site = authorize_site(db, principal, args.site_id)
+    if site.platform != POOL_PLATFORM:
+        raise HTTPException(409, f"site {site.id} is not a content-pool source")
+
+    expected = pool_source_state(site)
+    result: dict[str, Any] = {
+        "site": {
+            "id": site.id,
+            "name": site.name,
+            "base_url": site.base_url,
+            "platform": site.platform,
+        },
+        "action": args.action,
+        "current_state": expected,
+        "ready": False,
+        **_urls(sites_url=_dashboard_url("/content-pool", q=site.name)),
+    }
+
+    if args.action == "approve":
+        if site.pool_source_approved:
+            result["blocked_reason"] = "the content-pool source is already approved"
+            return result
+        try:
+            require_allowed_pool_domain(site.base_url)
+        except PoolSourcePolicyError as error:
+            result["blocked_reason"] = str(error)
+            return result
+        if conflict := pbn_conflict_reason(db, site.base_url, as_pool=True):
+            result["blocked_reason"] = conflict
+            return result
+        endpoint = f"/api/v1/sites/{site.id}/pool-source/approval"
+        method = "POST"
+        expiring_ids: list[int] = []
+    elif args.action == "revoke":
+        if not site.pool_source_approved:
+            result["blocked_reason"] = "the content-pool source is already revoked"
+            return result
+        endpoint = f"/api/v1/sites/{site.id}/pool-source/approval"
+        method = "DELETE"
+        expiring_ids = pool_target_suggestion_ids(db, site.id, reason="revoked")
+    else:
+        if not site.pool_source_approved:
+            result["blocked_reason"] = "the content-pool source must be approved before reactivation"
+            return result
+        if not site.pool_source_quarantined:
+            result["blocked_reason"] = "the content-pool source is not quarantined"
+            return result
+        try:
+            require_allowed_pool_domain(site.base_url)
+        except PoolSourcePolicyError as error:
+            result["blocked_reason"] = str(error)
+            return result
+        endpoint = f"/api/v1/sites/{site.id}/pool-source/reactivate"
+        method = "POST"
+        expiring_ids = []
+
+    counts = {"pending": 0, "approved": 0}
+    if expiring_ids:
+        counts.update(
+            dict(
+                db.execute(
+                    select(Suggestion.status, func.count())
+                    .where(Suggestion.id.in_(expiring_ids))
+                    .group_by(Suggestion.status)
+                ).all()
+            )
+        )
+    payload: dict[str, Any] = {"expected": expected}
+    if args.action == "revoke":
+        payload["expected_expiring_suggestion_ids"] = expiring_ids
+    impact = {
+        "site_count": 1,
+        "expiring_suggestion_count": len(expiring_ids),
+        "pending_count": counts["pending"],
+        "approved_count": counts["approved"],
+        "consecutive_failure_count": site.pool_source_consecutive_failures,
+    }
+    result.update(
+        {
+            "ready": True,
+            "impact": impact,
+            "proposal": {
+                "kind": "pool_source_action",
+                "risk": "sensitive",
+                "method": method,
+                "endpoint": endpoint,
+                "payload": payload,
+                "context": {
+                    "site_id": site.id,
+                    "site_name": site.name,
+                    "site_url": site.base_url,
+                    "action": args.action,
+                },
+                "impact": impact,
+            },
+        }
+    )
     return result
 
 
@@ -2239,6 +2413,17 @@ REGISTRY: dict[str, AgentTool] = {
             handler=_ops_digest,
         ),
         AgentTool(
+            name="preview_alert_acknowledgement",
+            title="Preview alert acknowledgement",
+            description=(
+                "Stage acknowledgement of one exact unread operational alert. Binds the alert's "
+                "occurrence count and last-seen timestamp so a newer recurrence cannot be hidden "
+                "by an older confirmation. This tool never marks the alert read itself."
+            ),
+            args_model=PreviewAlertAcknowledgementArgs,
+            handler=_preview_alert_acknowledgement,
+        ),
+        AgentTool(
             name="preview_bulk_review",
             title="Preview bulk review",
             description=(
@@ -2309,6 +2494,18 @@ REGISTRY: dict[str, AgentTool] = {
             ),
             args_model=PreviewArticleAnalysisArgs,
             handler=_preview_article_analysis,
+        ),
+        AgentTool(
+            name="preview_pool_source_action",
+            title="Preview content-pool lifecycle action",
+            description=(
+                "Admin-only preview for approving, revoking, or reactivating one exact shared "
+                "content-pool source. Binds its lifecycle state; revocation also binds every "
+                "pending or approved suggestion that would expire. This tool never changes it."
+            ),
+            args_model=PreviewPoolSourceActionArgs,
+            handler=_preview_pool_source_action,
+            admin_only=True,
         ),
         AgentTool(
             name="preview_pipeline_batch",

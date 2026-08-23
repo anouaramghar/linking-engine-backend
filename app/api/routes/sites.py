@@ -45,6 +45,7 @@ from app.schemas.site import (
     EditorialRankingPolicyUpdate,
     PoolSourceValidationRequest,
     PoolSourceValidationResult,
+    PoolSourceActionGuard,
     SiteBulkCreated,
     SiteBulkFailure,
     SiteBulkRequest,
@@ -67,6 +68,8 @@ from app.services.pool_source_policy import (
     PoolSourceFetchError,
     PoolSourcePolicyError,
     expire_pool_target_suggestions,
+    pool_source_state,
+    pool_target_suggestion_ids,
     require_allowed_pool_domain,
     require_no_pbn_conflict,
 )
@@ -80,6 +83,29 @@ DUPLICATE_REASON = "a site with this base_url already exists"
 #: sentence that names the cause, short enough that 250 failed sites do not
 #: turn one page into a megabyte of tracebacks.
 MAX_ROW_ERROR_CHARS = 300
+
+
+def _guard_pool_source_action(
+    db: Session,
+    site: Site,
+    guard: PoolSourceActionGuard | None,
+    *,
+    include_expiring_suggestions: bool = False,
+) -> None:
+    """Lock and compare the exact state a staged proposal displayed."""
+
+    db.refresh(site, with_for_update=True)
+    if guard is None or guard.expected is None:
+        return
+    if guard.expected.model_dump(mode="json") != pool_source_state(site):
+        raise HTTPException(409, "pool source state changed after preview; refresh before acting")
+    if include_expiring_suggestions:
+        current_ids = pool_target_suggestion_ids(db, site.id, reason="revoked")
+        if guard.expected_expiring_suggestion_ids != current_ids:
+            raise HTTPException(
+                409,
+                "pool source suggestion impact changed after preview; refresh before revoking",
+            )
 
 
 def _row_error(message: str | None) -> str | None:
@@ -676,12 +702,14 @@ def get_site(
 
 @router.post("/{site_id}/pool-source/approval", response_model=SiteOut)
 def approve_pool_source(
+    payload: PoolSourceActionGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
     operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
     if site.platform != "pool":
         raise HTTPException(409, f"site {site.id} is not a content-pool source")
+    _guard_pool_source_action(db, site, payload)
     try:
         require_allowed_pool_domain(site.base_url)
         require_no_pbn_conflict(db, site.base_url, as_pool=True)
@@ -698,12 +726,14 @@ def approve_pool_source(
 
 @router.delete("/{site_id}/pool-source/approval", response_model=SiteOut)
 def revoke_pool_source_approval(
+    payload: PoolSourceActionGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
     operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
     if site.platform != "pool":
         raise HTTPException(409, f"site {site.id} is not a content-pool source")
+    _guard_pool_source_action(db, site, payload, include_expiring_suggestions=True)
     site.pool_source_approved = False
     site.pool_source_approved_at = None
     site.pool_source_approved_by = None
@@ -716,12 +746,14 @@ def revoke_pool_source_approval(
 
 @router.post("/{site_id}/pool-source/reactivate", response_model=SiteOut)
 def reactivate_pool_source(
+    payload: PoolSourceActionGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
     operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
     if site.platform != "pool":
         raise HTTPException(409, f"site {site.id} is not a content-pool source")
+    _guard_pool_source_action(db, site, payload)
     if not site.pool_source_approved:
         raise HTTPException(409, f"pool source site {site.id} must be approved first")
     try:
