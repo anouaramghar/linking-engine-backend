@@ -67,6 +67,15 @@ class SiteCreate(BaseModel):
         return self
 
 
+class SiteCreateRequest(SiteCreate):
+    """Site creation plus the absence guard carried by staged proposals."""
+
+    expected_absent: Literal[True] | None = Field(
+        None,
+        description="When true, creation is confirmed only while this tenant has no matching URL.",
+    )
+
+
 class SiteCredentials(BaseModel):
     """A WordPress account for a site that already exists.
 
@@ -122,6 +131,22 @@ class SiteBulkRow(BaseModel):
 
 class SiteBulkRequest(BaseModel):
     sites: list[SiteBulkRow] = Field(min_length=1, max_length=MAX_BULK_SITES)
+    expected_absent_base_urls: list[str] | None = Field(
+        None,
+        min_length=1,
+        max_length=MAX_BULK_SITES,
+        description=(
+            "Optional exact normalized URL set for an atomic staged bulk creation. "
+            "Ordinary CSV imports omit it and retain partial-success behavior."
+        ),
+    )
+
+    @field_validator("expected_absent_base_urls")
+    @classmethod
+    def sorted_unique_expected_urls(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and value != sorted(set(value)):
+            raise ValueError("expected_absent_base_urls must be sorted and unique")
+        return value
 
 
 class SiteBulkCreated(BaseModel):

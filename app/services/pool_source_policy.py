@@ -88,6 +88,31 @@ def _same_property(left: str, right: str) -> bool:
     return left == right or left.endswith(f".{right}") or right.endswith(f".{left}")
 
 
+def pbn_conflict_reason(db: Session, base_url: str, *, as_pool: bool) -> str | None:
+    """Describe a current PBN conflict without locking or changing state."""
+
+    domain = pool_source_domain(base_url)
+    query = (
+        select(Site.base_url).where(Site.platform != "pool")
+        if as_pool
+        else select(Site.base_url).where(
+            Site.platform == "pool", Site.pool_source_approved.is_(True)
+        )
+    )
+    for other_url in db.scalars(query):
+        try:
+            other_domain = pool_source_domain(other_url)
+        except PoolSourcePolicyError:
+            continue  # a malformed stored URL is not evidence of a conflict
+        if _same_property(domain, other_domain):
+            held_by = "a client site" if as_pool else "an approved content-pool source"
+            return (
+                f"domain {domain!r} is already {held_by} ({other_domain!r}); "
+                "linking it from other clients would form a private blog network"
+            )
+    return None
+
+
 def require_no_pbn_conflict(db: Session, base_url: str, *, as_pool: bool) -> None:
     """A domain we manage for a client may never also be a link target (PBN rule).
 
@@ -105,25 +130,8 @@ def require_no_pbn_conflict(db: Session, base_url: str, *, as_pool: bool) -> Non
     write it protects lands.
     """
     db.execute(select(func.pg_advisory_xact_lock(_PBN_LOCK_NAMESPACE, _PBN_LOCK_KEY)))
-    domain = pool_source_domain(base_url)
-    query = (
-        select(Site.base_url).where(Site.platform != "pool")
-        if as_pool
-        else select(Site.base_url).where(
-            Site.platform == "pool", Site.pool_source_approved.is_(True)
-        )
-    )
-    for other_url in db.scalars(query):
-        try:
-            other_domain = pool_source_domain(other_url)
-        except PoolSourcePolicyError:
-            continue  # a malformed stored URL is not evidence of a conflict
-        if _same_property(domain, other_domain):
-            held_by = "a client site" if as_pool else "an approved content-pool source"
-            raise PoolSourcePolicyError(
-                f"domain {domain!r} is already {held_by} ({other_domain!r}); "
-                "linking it from other clients would form a private blog network"
-            )
+    if reason := pbn_conflict_reason(db, base_url, as_pool=as_pool):
+        raise PoolSourcePolicyError(reason)
 
 
 def require_approved_pool_source(site: Site) -> None:

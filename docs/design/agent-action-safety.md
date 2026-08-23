@@ -10,7 +10,7 @@ how much human intent each action needs before it runs.
 | --- | --- | --- |
 | Read | Search queues, inspect sites, explain suggestions, view jobs | Run immediately. |
 | Reversible | Approve or reject pending suggestions, update non-secret editorial policy | Stage the exact REST request, show its effect, and require Confirm. Include an expected-state precondition and a clear reversal path. |
-| Sensitive | Bulk changes, start ingestion or analysis, retry or cancel a batch | Preview scope and cost, then require Confirm. Bind confirmation to the exact payload and current resource version. |
+| Sensitive | Create managed sites, make bulk changes, start ingestion or analysis, retry or cancel a batch | Preview scope and cost, then require Confirm. Bind confirmation to the exact payload and current resource version. |
 | Critical | Publish, approve publication artifacts, change credentials or roles, revoke users, permanently delete a site | Do not expose to the agent. The agent may explain the blocker and deep-link to the dashboard. |
 
 An action is classified by its highest-risk effect. Being technically
@@ -63,7 +63,12 @@ must never be mintable by another MCP tool.
    starts bind to the active durable job ids. Pipeline retries bind batch/site
    status, failed stage, and retry count. Cancellation binds every unfinished
    site's status, stage, and ingestion/analysis job-run ids.
-5. Add out-of-band MCP action receipts only after the dashboard proposal set is
+5. Managed-site creation stages normalized WordPress or HTML site records only.
+   Credentials and content-pool sources are excluded. Single creation binds the
+   expected absence of its URL; guarded bulk creation binds the exact sorted URL
+   set and is atomic, so any duplicate or eligibility drift returns `409` rather
+   than partially creating the proposal.
+6. Add out-of-band MCP action receipts only after the dashboard proposal set is
    complete and audited.
 
 Publication preparation may eventually be staged, but approving publication

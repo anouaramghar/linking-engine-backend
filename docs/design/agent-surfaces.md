@@ -27,14 +27,17 @@ client cannot execute it.
 The staged set currently covers individual and filtered-bulk suggestion review,
 complete editorial-ranking-policy replacement, sensitive external-link policy
 replacement, site crawl/analysis starts, multi-site pipeline starts, failed
-pipeline-stage retries, and pipeline cancellation. Policy proposals include the
-current policy as `expected`; a dashboard edit made after preview turns the
-confirmation into `409` rather than being overwritten. External-link proposals
-additionally bind the exact pending and approved suggestion ids predicted to
-expire. Job starts bind active durable job ids; retries bind batch/site status,
-stage, and retry count; cancellations bind every unfinished site's status,
-stage, and job ids. Queue or worker drift therefore turns confirmation into
-`409`, so a warning cannot silently become broader or newer work.
+pipeline-stage retries, pipeline cancellation, and credential-free managed-site
+creation. Site proposals accept only WordPress and HTML records, never content-
+pool sources, and bind the exact normalized URL set expected to be absent. A
+guarded bulk confirmation is atomic. Policy proposals include the current policy
+as `expected`; a dashboard edit made after preview turns the confirmation into
+`409` rather than being overwritten. External-link proposals additionally bind
+the exact pending and approved suggestion ids predicted to expire. Job starts
+bind active durable job ids; retries bind batch/site status, stage, and retry
+count; cancellations bind every unfinished site's status, stage, and job ids.
+Queue or worker drift therefore turns confirmation into `409`, so a warning
+cannot silently become broader or newer work.
 
 ## MCP server (`/mcp`)
 

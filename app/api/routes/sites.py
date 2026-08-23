@@ -50,6 +50,7 @@ from app.schemas.site import (
     SiteBulkRequest,
     SiteBulkResult,
     SiteCreate,
+    SiteCreateRequest,
     SiteCredentials,
     SiteOut,
 )
@@ -246,7 +247,7 @@ def _site_out(
 
 @router.post("", status_code=201, response_model=SiteOut)
 def create_site(
-    payload: SiteCreate,
+    payload: SiteCreateRequest,
     tenant_id: int | None = Query(None, ge=1),
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
@@ -267,7 +268,7 @@ def create_site(
             require_no_pbn_conflict(db, payload.base_url, as_pool=False)
         except PoolSourcePolicyError as error:
             raise HTTPException(409, str(error)) from error
-    site = Site(**payload.model_dump(), tenant_id=owner_tenant_id)
+    site = Site(**payload.model_dump(exclude={"expected_absent"}), tenant_id=owner_tenant_id)
     db.add(site)
     db.commit()
     db.refresh(site)
@@ -283,20 +284,54 @@ def bulk_create_sites(
 ) -> SiteBulkResult:
     """Create many sites in one request, reporting the outcome of every row.
 
-    Partial success is the contract: a row that fails validation or collides with an
-    existing site is reported and skipped, and the rest of the upload still lands. Each
-    insert runs in its own savepoint so one collision cannot poison the batch.
+    Ordinary imports use partial success: a bad or duplicate row is reported while the
+    rest still lands. A staged proposal supplies ``expected_absent_base_urls`` and uses
+    an atomic contract instead; any validation, eligibility, or availability drift
+    rejects the entire confirmation with 409.
     """
     created: list[SiteBulkCreated] = []
     skipped: list[SiteBulkFailure] = []
     rejected: list[SiteBulkFailure] = []
     seen: set[str] = set()
     owner_tenant_id = resolve_create_tenant_id(db, principal, tenant_id=tenant_id)
+    guarded = payload.expected_absent_base_urls is not None
+    if guarded:
+        try:
+            guarded_rows = [SiteCreate.model_validate(row.model_dump()) for row in payload.sites]
+        except ValidationError as exc:
+            raise HTTPException(
+                409,
+                "site creation inputs changed since preview; refresh before confirming",
+            ) from exc
+        normalized_urls = sorted(item.base_url for item in guarded_rows)
+        if normalized_urls != payload.expected_absent_base_urls:
+            raise HTTPException(
+                409,
+                "site creation scope changed since preview; refresh before confirming",
+            )
+        existing_urls = sorted(
+            db.scalars(
+                select(Site.base_url).where(
+                    Site.tenant_id == owner_tenant_id,
+                    Site.base_url.in_(normalized_urls),
+                )
+            ).all()
+        )
+        if existing_urls:
+            raise HTTPException(
+                409,
+                "site creation availability changed since preview; refresh before confirming",
+            )
 
     for index, row in enumerate(payload.sites, start=1):
         try:
             item = SiteCreate.model_validate(row.model_dump())
         except ValidationError as exc:
+            if guarded:
+                raise HTTPException(
+                    409,
+                    "site creation inputs changed since preview; refresh before confirming",
+                ) from exc
             rejected.append(
                 SiteBulkFailure(row=index, base_url=row.base_url, reason=_first_error(exc))
             )
@@ -310,6 +345,11 @@ def bulk_create_sites(
 
         # `item.base_url` is normalized by SiteCreate, so both checks compare like for like.
         if item.base_url in seen:
+            if guarded:
+                raise HTTPException(
+                    409,
+                    "site creation scope changed since preview; refresh before confirming",
+                )
             skipped.append(
                 SiteBulkFailure(
                     row=index,
@@ -326,6 +366,11 @@ def bulk_create_sites(
                 Site.tenant_id == owner_tenant_id,
             )
         ):
+            if guarded:
+                raise HTTPException(
+                    409,
+                    "site creation availability changed since preview; refresh before confirming",
+                )
             skipped.append(
                 SiteBulkFailure(row=index, base_url=item.base_url, reason=DUPLICATE_REASON)
             )
@@ -335,6 +380,11 @@ def bulk_create_sites(
             try:
                 require_no_pbn_conflict(db, item.base_url, as_pool=False)
             except PoolSourcePolicyError as error:
+                if guarded:
+                    raise HTTPException(
+                        409,
+                        "site creation eligibility changed since preview; refresh before confirming",
+                    ) from error
                 rejected.append(
                     SiteBulkFailure(row=index, base_url=item.base_url, reason=str(error))
                 )
@@ -346,6 +396,11 @@ def bulk_create_sites(
                 db.add(site)
                 db.flush()
         except IntegrityError:  # a concurrent import claimed the same base_url
+            if guarded:
+                raise HTTPException(
+                    409,
+                    "site creation availability changed since preview; refresh before confirming",
+                )
             skipped.append(
                 SiteBulkFailure(row=index, base_url=item.base_url, reason=DUPLICATE_REASON)
             )

@@ -27,7 +27,7 @@ from urllib.parse import urlencode
 from typing import Any, Callable, Literal
 
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import exists, func, select
 from sqlalchemy.orm import Session, joinedload
 
@@ -47,6 +47,7 @@ from app.api.routes.suggestions import (
 from app.api.routes.publish import pending_publication_sites, publication_status
 from app.api.routes.sites import _site_counts, get_site, list_sites
 from app.schemas.external_policy import ExternalLinkPolicyValues
+from app.schemas.site import SiteCreate
 from app.models import (
     Alert,
     Article,
@@ -58,12 +59,14 @@ from app.models import (
     PublicationPlan,
     Site,
     Suggestion,
+    Tenant,
 )
 from app.services.authorization import (
     POOL_PLATFORM,
     Principal,
     authorize_site,
     authorize_site_read,
+    require_creatable_platform,
     require_admin_principal,
     tenant_site_filter,
 )
@@ -73,7 +76,11 @@ from app.services.external_link_policy import (
     policy_state,
 )
 from app.services.job_service import active_job_run_ids
-from app.services.pool_source_policy import PoolSourcePolicyError, require_approved_pool_source
+from app.services.pool_source_policy import (
+    PoolSourcePolicyError,
+    pbn_conflict_reason,
+    require_approved_pool_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +164,48 @@ class SiteStatusArgs(BaseModel):
         None,
         description="Which site to report on. Omit it to use the only connected site.",
     )
+
+
+class PreviewSiteCreationItem(BaseModel):
+    """Credential-free managed-site input, normalized through ``SiteCreate``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=255)
+    base_url: str = Field(min_length=1, max_length=2048)
+    platform: Literal["wordpress", "html"]
+
+    @field_validator("name")
+    @classmethod
+    def nonblank_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("name must contain visible characters")
+        return value
+
+    @model_validator(mode="after")
+    def normalize_like_the_creation_route(self) -> "PreviewSiteCreationItem":
+        normalized = SiteCreate.model_validate(self.model_dump())
+        self.base_url = normalized.base_url
+        return self
+
+
+class PreviewSiteCreationArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sites: list[PreviewSiteCreationItem] = Field(
+        min_length=1,
+        max_length=100,
+        description="One or more managed sites to connect, without credentials.",
+    )
+
+    @field_validator("sites")
+    @classmethod
+    def unique_urls(cls, value: list[PreviewSiteCreationItem]) -> list[PreviewSiteCreationItem]:
+        urls = [site.base_url for site in value]
+        if len(urls) != len(set(urls)):
+            raise ValueError("sites must not contain duplicate base_url values")
+        return value
 
 
 class EditorialRankingPolicyArgs(BaseModel):
@@ -885,6 +934,109 @@ def _site_work_scope(db: Session, site: Site) -> dict[str, int]:
         "active_internal_link_count": link_counts.get(site.id, 0),
         "active_suggestion_count": suggestion_counts.get(site.id, 0),
     }
+
+
+def _site_creation_tenant_id(db: Session, principal: Principal) -> int | None:
+    """Resolve the existing owner without letting a preview create a tenant."""
+
+    if not principal.is_admin:
+        if principal.tenant_id is None:
+            raise HTTPException(403, "tenant credentials required")
+        return principal.tenant_id
+    # No default tenant also means there can be no tenant-local URL conflict.
+    # The ordinary creation route will create it when the editor confirms; the
+    # preview remains side-effect free and can still stage that first site.
+    return db.scalar(select(Tenant.id).where(Tenant.slug == "default"))
+
+
+def _preview_site_creation(
+    db: Session, principal: Principal, args: PreviewSiteCreationArgs
+) -> dict[str, Any]:
+    """Stage credential-free managed-site creation against exact URL absence."""
+
+    tenant_id = _site_creation_tenant_id(db, principal)
+    desired = [
+        {
+            "name": item.name,
+            "base_url": item.base_url,
+            "platform": item.platform,
+            "crawl_frequency": "manual",
+        }
+        for item in args.sites
+    ]
+    for item in desired:
+        require_creatable_platform(principal, item["platform"])
+        if reason := pbn_conflict_reason(db, item["base_url"], as_pool=False):
+            raise HTTPException(409, reason)
+
+    urls = sorted(item["base_url"] for item in desired)
+    conflicts = (
+        list(
+            db.execute(
+                select(Site.id, Site.name, Site.base_url).where(
+                    Site.tenant_id == tenant_id,
+                    Site.base_url.in_(urls),
+                )
+            ).mappings()
+        )
+        if tenant_id is not None
+        else []
+    )
+    result: dict[str, Any] = {
+        "tenant_id": tenant_id,
+        "sites": desired,
+        "conflicts": [dict(row) for row in conflicts],
+        "ready": not conflicts,
+        "credentials_included": False,
+        **_urls(sites_url=_dashboard_url("/sites")),
+    }
+    if conflicts:
+        result["blocked_reason"] = (
+            "one or more normalized base URLs already exists; choose a different site or URL"
+        )
+        return result
+
+    impact = {
+        "site_count": len(desired),
+        "wordpress_count": sum(item["platform"] == "wordpress" for item in desired),
+        "html_count": sum(item["platform"] == "html" for item in desired),
+    }
+    if len(desired) == 1:
+        proposal = {
+            "kind": "site_create",
+            "risk": "sensitive",
+            "method": "POST",
+            "endpoint": "/api/v1/sites",
+            "payload": {
+                "name": desired[0]["name"],
+                "base_url": desired[0]["base_url"],
+                "platform": desired[0]["platform"],
+                "expected_absent": True,
+            },
+            "impact": impact,
+        }
+    else:
+        proposal = {
+            "kind": "site_bulk_create",
+            "risk": "sensitive",
+            "method": "POST",
+            "endpoint": "/api/v1/sites/bulk",
+            "payload": {
+                "sites": [
+                    {
+                        "name": item["name"],
+                        "base_url": item["base_url"],
+                        "platform": item["platform"],
+                    }
+                    for item in desired
+                ],
+                "expected_absent_base_urls": urls,
+            },
+            "impact": impact,
+        }
+    result["impact"] = impact
+    result["proposal"] = proposal
+    return result
 
 
 def _preview_site_job(
@@ -2023,6 +2175,18 @@ REGISTRY: dict[str, AgentTool] = {
             ),
             args_model=ListSitesArgs,
             handler=_sites,
+        ),
+        AgentTool(
+            name="preview_site_creation",
+            title="Preview site creation",
+            description=(
+                "Stage one or up to 100 managed WordPress/HTML sites for creation. "
+                "Normalizes and validates URLs, checks tenant-local duplicates and pool-network "
+                "conflicts, and never accepts credentials or content-pool sources. Returns a "
+                "sensitive exact-scope proposal only while every URL is available."
+            ),
+            args_model=PreviewSiteCreationArgs,
+            handler=_preview_site_creation,
         ),
         AgentTool(
             name="get_site_status",
