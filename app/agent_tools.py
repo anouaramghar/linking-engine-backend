@@ -45,6 +45,7 @@ from app.api.routes.suggestions import (
 )
 from app.api.routes.publish import pending_publication_sites, publication_status
 from app.api.routes.sites import _site_counts, get_site, list_sites
+from app.schemas.external_policy import ExternalLinkPolicyValues
 from app.models import (
     Alert,
     Article,
@@ -63,6 +64,11 @@ from app.services.authorization import (
     authorize_site_read,
     require_admin_principal,
     tenant_site_filter,
+)
+from app.services.external_link_policy import (
+    PolicyState,
+    ineligible_external_suggestions,
+    policy_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -161,6 +167,20 @@ class PreviewEditorialRankingPolicyArgs(EditorialRankingPolicyArgs):
     min_score_percent: int = Field(ge=0, le=100)
     feedback_weight: float = Field(ge=0.0, le=1.0)
     min_samples: int = Field(ge=1, le=10_000)
+
+
+class ExternalLinkPolicyArgs(BaseModel):
+    site_id: int | None = Field(
+        None,
+        description="Which managed site's policy. Omit it when only one site is connected.",
+    )
+
+
+class PreviewExternalLinkPolicyArgs(ExternalLinkPolicyValues):
+    site_id: int | None = Field(
+        None,
+        description="Which managed site's policy. Omit it when only one site is connected.",
+    )
 
 
 class SuggestionHistoryArgs(BaseModel):
@@ -662,6 +682,7 @@ def _managed_policy_site(
     site_id: int | None,
     *,
     write: bool,
+    policy_name: str = "editorial ranking",
 ) -> Site:
     resolved = _resolve_site_id(db, principal, site_id)
     site = (
@@ -670,7 +691,7 @@ def _managed_policy_site(
         else authorize_site_read(db, principal, resolved)
     )
     if site.platform == POOL_PLATFORM:
-        raise HTTPException(409, "editorial ranking policies belong to managed sites")
+        raise HTTPException(409, f"{policy_name} policies belong to managed sites")
     return site
 
 
@@ -713,6 +734,111 @@ def _preview_editorial_ranking_policy(
             "endpoint": f"/api/v1/sites/{site.id}/editorial-ranking-policy",
             "payload": {**desired, "expected": current},
         }
+    return result
+
+
+def _external_policy_values(db: Session, site_id: int) -> dict[str, Any]:
+    values = policy_state(db, site_id).as_payload()
+    values.pop("site_id")
+    return values
+
+
+def _external_policy_state(site_id: int, values: dict[str, Any]) -> PolicyState:
+    return PolicyState(
+        site_id=site_id,
+        external_links_enabled=values["external_links_enabled"],
+        require_https=values["require_https"],
+        min_trust_score=values["min_trust_score"],
+        min_domain_age_days=values["min_domain_age_days"],
+        trusted_tlds=tuple(values["trusted_tlds"]),
+        allowlist_domains=tuple(values["allowlist_domains"]),
+        blocklist_domains=tuple(values["blocklist_domains"]),
+        competitor_domains=tuple(values["competitor_domains"]),
+    )
+
+
+def _get_external_link_policy(
+    db: Session, principal: Principal, args: ExternalLinkPolicyArgs
+) -> dict[str, Any]:
+    site = _managed_policy_site(
+        db, principal, args.site_id, write=False, policy_name="external-link"
+    )
+    return {
+        "site": {"id": site.id, "name": site.name},
+        "policy": _external_policy_values(db, site.id),
+        "owned_domain_protection": True,
+        **_urls(sites_url=_dashboard_url("/sites", q=site.name)),
+    }
+
+
+def _preview_external_link_policy(
+    db: Session, principal: Principal, args: PreviewExternalLinkPolicyArgs
+) -> dict[str, Any]:
+    """Stage a sensitive policy replacement and bind it to its exact impact."""
+    site = _managed_policy_site(
+        db, principal, args.site_id, write=True, policy_name="external-link"
+    )
+    current = _external_policy_values(db, site.id)
+    desired = args.model_dump(exclude={"site_id"})
+    changes = {
+        field: {"from": current[field], "to": value}
+        for field, value in desired.items()
+        if value != current[field]
+    }
+    result: dict[str, Any] = {
+        "site": {"id": site.id, "name": site.name},
+        "current": current,
+        "desired": desired,
+        "changes": changes,
+        "already_current": not changes,
+        "owned_domain_protection": "always_on",
+        **_urls(sites_url=_dashboard_url("/sites", q=site.name)),
+    }
+    if not changes:
+        return result
+
+    affected = ineligible_external_suggestions(
+        db,
+        site,
+        policy=_external_policy_state(site.id, desired),
+    )
+    affected_ids = sorted(suggestion.id for suggestion, _evaluation, _key in affected)
+    by_status = {
+        status: sum(suggestion.status == status for suggestion, _evaluation, _key in affected)
+        for status in ("pending", "approved")
+    }
+    impact = {
+        "expiring_count": len(affected),
+        "pending_count": by_status["pending"],
+        "approved_count": by_status["approved"],
+        "sample": [
+            {
+                "id": suggestion.id,
+                "status": suggestion.status,
+                "source_title": suggestion.source_article.title,
+                "target_title": (
+                    suggestion.target_article.title
+                    if suggestion.target_article is not None
+                    else suggestion.external_title or suggestion.external_url
+                ),
+                "reasons": list(evaluation.reasons),
+            }
+            for suggestion, evaluation, _key in affected[:5]
+        ],
+    }
+    result["impact"] = impact
+    result["proposal"] = {
+        "kind": "external_link_policy",
+        "risk": "sensitive",
+        "method": "PUT",
+        "endpoint": f"/api/v1/sites/{site.id}/external-link-policy",
+        "payload": {
+            **desired,
+            "expected": current,
+            "expected_expiring_suggestion_ids": affected_ids,
+        },
+        "impact": {key: value for key, value in impact.items() if key != "sample"},
+    }
     return result
 
 
@@ -1692,6 +1818,29 @@ REGISTRY: dict[str, AgentTool] = {
             ),
             args_model=PreviewEditorialRankingPolicyArgs,
             handler=_preview_editorial_ranking_policy,
+        ),
+        AgentTool(
+            name="get_external_link_policy",
+            title="External-link policy",
+            description=(
+                "Read one managed site's outgoing external-link safety policy. Includes the "
+                "enable switch, HTTPS/trust/age thresholds and domain lists. Owned-domain "
+                "protection is always on and cannot be changed."
+            ),
+            args_model=ExternalLinkPolicyArgs,
+            handler=_get_external_link_policy,
+        ),
+        AgentTool(
+            name="preview_external_link_policy",
+            title="Preview external-link policy",
+            description=(
+                "Stage a complete outgoing external-link policy replacement. This is sensitive: "
+                "the preview calculates the exact pending and approved suggestions that would "
+                "expire, and confirmation is refused if either policy or impact changes. The "
+                "editor must explicitly confirm; this tool never changes policy or suggestions."
+            ),
+            args_model=PreviewExternalLinkPolicyArgs,
+            handler=_preview_external_link_policy,
         ),
         AgentTool(
             name="get_queue_counts",

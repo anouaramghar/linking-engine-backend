@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.domain_policy import normalized_unique_domains, normalized_unique_tlds
 
 
-class ExternalLinkPolicyUpdate(BaseModel):
+class ExternalLinkPolicyValues(BaseModel):
     external_links_enabled: bool = False
     require_https: bool = True
     min_trust_score: int = Field(default=60, ge=0, le=100)
@@ -26,7 +26,7 @@ class ExternalLinkPolicyUpdate(BaseModel):
         return normalized_unique_domains(value)
 
     @model_validator(mode="after")
-    def reject_conflicting_domains(self) -> "ExternalLinkPolicyUpdate":
+    def reject_conflicting_domains(self) -> "ExternalLinkPolicyValues":
         blocked = set(self.blocklist_domains) | set(self.competitor_domains)
         conflicts = sorted(set(self.allowlist_domains) & blocked)
         if conflicts:
@@ -34,7 +34,34 @@ class ExternalLinkPolicyUpdate(BaseModel):
         return self
 
 
-class ExternalLinkPolicyOut(ExternalLinkPolicyUpdate):
+class ExternalLinkPolicyUpdate(ExternalLinkPolicyValues):
+    expected: ExternalLinkPolicyValues | None = Field(
+        None,
+        description=(
+            "Only save if the current effective policy still equals this snapshot. "
+            "Agent-staged changes use it as an optimistic-concurrency guard."
+        ),
+    )
+    expected_expiring_suggestion_ids: list[int] | None = Field(
+        None,
+        max_length=10_000,
+        description=(
+            "Only save if applying this policy would expire exactly these pending or "
+            "approved suggestions. Sensitive agent proposals bind confirmation to this impact."
+        ),
+    )
+
+    @field_validator("expected_expiring_suggestion_ids")
+    @classmethod
+    def normalize_expected_ids(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return None
+        if any(suggestion_id < 1 for suggestion_id in value):
+            raise ValueError("suggestion ids must be positive")
+        return sorted(set(value))
+
+
+class ExternalLinkPolicyOut(ExternalLinkPolicyValues):
     model_config = ConfigDict(from_attributes=True)
 
     site_id: int

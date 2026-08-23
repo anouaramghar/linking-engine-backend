@@ -54,7 +54,9 @@ from app.schemas.site import (
     SiteOut,
 )
 from app.services.external_link_policy import (
+    PolicyState,
     expire_ineligible_external_suggestions,
+    ineligible_external_suggestions,
     policy_state,
     source_evaluations,
 )
@@ -466,6 +468,39 @@ def update_external_link_policy(
     operator_id: str = Depends(get_audit_actor),
 ) -> ExternalLinkPolicyOut:
     _managed_site_or_409(site)
+    current_values = policy_state(db, site.id).as_payload()
+    current_values.pop("site_id")
+    if payload.expected is not None and current_values != payload.expected.model_dump():
+        raise HTTPException(
+            409,
+            "external link policy changed since it was previewed; refresh before saving",
+        )
+    special = {"expected", "expected_expiring_suggestion_ids"}
+    updates = payload.model_dump(exclude_unset=True, exclude=special)
+    desired = {**current_values, **updates}
+    proposed_policy = PolicyState(
+        site_id=site.id,
+        external_links_enabled=desired["external_links_enabled"],
+        require_https=desired["require_https"],
+        min_trust_score=desired["min_trust_score"],
+        min_domain_age_days=desired["min_domain_age_days"],
+        trusted_tlds=tuple(desired["trusted_tlds"]),
+        allowlist_domains=tuple(desired["allowlist_domains"]),
+        blocklist_domains=tuple(desired["blocklist_domains"]),
+        competitor_domains=tuple(desired["competitor_domains"]),
+    )
+    if payload.expected_expiring_suggestion_ids is not None:
+        actual_expiring_ids = sorted(
+            suggestion.id
+            for suggestion, _evaluation, _details_key in ineligible_external_suggestions(
+                db, site, policy=proposed_policy
+            )
+        )
+        if actual_expiring_ids != payload.expected_expiring_suggestion_ids:
+            raise HTTPException(
+                409,
+                "external link policy impact changed since it was previewed; refresh before saving",
+            )
     policy = db.get(ExternalLinkPolicy, site.id)
     if policy is None:
         policy = ExternalLinkPolicy(site_id=site.id)
@@ -473,7 +508,7 @@ def update_external_link_policy(
     # The policy surface accepts partial updates in practice.  Do not turn an
     # omitted field into its schema default: an existing explicitly enabled
     # policy must remain enabled when an operator changes only a domain rule.
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    for field, value in updates.items():
         setattr(policy, field, value)
     policy.updated_by = operator_id
     db.flush()

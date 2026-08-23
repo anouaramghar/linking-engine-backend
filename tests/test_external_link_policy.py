@@ -3,12 +3,18 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+from app.agent_tools import call_tool
 from app.models import Article, ExternalLinkPolicy, Site, Suggestion, SuggestionEvent
+from app.services.authorization import Principal
 from app.services.external_link_policy import (
     PolicyState,
     evaluate_external_url,
     external_target_context,
 )
+
+
+def _admin() -> Principal:
+    return Principal(is_admin=True, source="legacy_env")
 
 
 def _article(db, site: Site, *, url: str, title: str = "Article") -> Article:
@@ -110,6 +116,36 @@ def test_policy_rejects_conflicting_domain_lists(client, site):
     )
     assert response.status_code == 422
     assert "both allowed and blocked" in response.text
+
+
+def test_external_policy_expected_snapshot_prevents_a_stale_overwrite(client, site):
+    expected = {
+        "external_links_enabled": False,
+        "require_https": True,
+        "min_trust_score": 60,
+        "min_domain_age_days": 0,
+        "trusted_tlds": [],
+        "allowlist_domains": [],
+        "blocklist_domains": [],
+        "competitor_domains": [],
+    }
+    changed = client.put(
+        f"/api/v1/sites/{site.id}/external-link-policy",
+        json={"min_trust_score": 70},
+    )
+    assert changed.status_code == 200
+
+    stale = client.put(
+        f"/api/v1/sites/{site.id}/external-link-policy",
+        json={
+            **expected,
+            "external_links_enabled": True,
+            "expected": expected,
+            "expected_expiring_suggestion_ids": [],
+        },
+    )
+    assert stale.status_code == 409
+    assert "changed since it was previewed" in stale.json()["detail"]
 
 
 def test_trust_score_uses_https_tld_age_allowlist_and_approval(db, site):
@@ -223,6 +259,135 @@ def test_policy_update_expires_blocked_suggestions_and_records_trace(client, db,
     )
     assert event.event_type == "policy_expired"
     assert event.details["external_trust"]["eligible"] is False
+
+    db.delete(pool)
+    db.commit()
+
+
+def test_agent_stages_external_policy_with_exact_sensitive_impact(client, db, site):
+    pool = _pool(db)
+    source = _article(db, site, url=f"{site.base_url}/agent-policy-source", title="Source")
+    suggestions = []
+    for index, status in enumerate(("pending", "approved"), start=1):
+        target = _article(
+            db,
+            pool,
+            url=f"https://competitor.example/report-{index}",
+            title=f"Target {index}",
+        )
+        suggestion = Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="hybrid_bm25",
+            score=0.9,
+            rank_score=0.9,
+            status=status,
+        )
+        db.add(suggestion)
+        suggestions.append(suggestion)
+    db.commit()
+
+    current = call_tool(db, _admin(), "get_external_link_policy", {"site_id": site.id})
+    assert current["owned_domain_protection"] is True
+    preview = call_tool(
+        db,
+        _admin(),
+        "preview_external_link_policy",
+        {
+            "site_id": site.id,
+            "external_links_enabled": True,
+            "require_https": True,
+            "min_trust_score": 0,
+            "min_domain_age_days": 0,
+            "trusted_tlds": [],
+            "allowlist_domains": [],
+            "blocklist_domains": [],
+            "competitor_domains": ["competitor.example"],
+        },
+    )
+
+    assert preview["impact"]["expiring_count"] == 2
+    assert preview["impact"]["pending_count"] == 1
+    assert preview["impact"]["approved_count"] == 1
+    proposal = preview["proposal"]
+    assert proposal["kind"] == "external_link_policy"
+    assert proposal["risk"] == "sensitive"
+    assert proposal["method"] == "PUT"
+    assert proposal["payload"]["expected"] == current["policy"]
+    assert proposal["payload"]["expected_expiring_suggestion_ids"] == sorted(
+        suggestion.id for suggestion in suggestions
+    )
+    for suggestion in suggestions:
+        db.expire(suggestion)
+        assert suggestion.status in ("pending", "approved")
+
+    confirmed = client.put(
+        f"/api/v1/sites/{site.id}/external-link-policy",
+        json=proposal["payload"],
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["expired_suggestions"] == 2
+    for suggestion in suggestions:
+        db.expire(suggestion)
+        assert suggestion.status == "expired"
+
+    db.delete(pool)
+    db.commit()
+
+
+def test_sensitive_policy_confirmation_refuses_when_impact_has_changed(client, db, site):
+    pool = _pool(db)
+    source = _article(db, site, url=f"{site.base_url}/impact-source", title="Source")
+
+    def add_suggestion(index: int) -> Suggestion:
+        target = _article(
+            db,
+            pool,
+            url=f"https://competitor.example/new-{index}",
+            title=f"Target {index}",
+        )
+        suggestion = Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="hybrid_bm25",
+            score=0.9,
+            rank_score=0.9,
+            status="pending",
+        )
+        db.add(suggestion)
+        db.commit()
+        return suggestion
+
+    first = add_suggestion(1)
+    preview = call_tool(
+        db,
+        _admin(),
+        "preview_external_link_policy",
+        {
+            "site_id": site.id,
+            "external_links_enabled": True,
+            "require_https": True,
+            "min_trust_score": 0,
+            "min_domain_age_days": 0,
+            "trusted_tlds": [],
+            "allowlist_domains": [],
+            "blocklist_domains": [],
+            "competitor_domains": ["competitor.example"],
+        },
+    )
+    second = add_suggestion(2)
+
+    stale = client.put(
+        f"/api/v1/sites/{site.id}/external-link-policy",
+        json=preview["proposal"]["payload"],
+    )
+    assert stale.status_code == 409
+    assert "impact changed" in stale.json()["detail"]
+    db.expire_all()
+    assert db.get(Suggestion, first.id).status == "pending"
+    assert db.get(Suggestion, second.id).status == "pending"
 
     db.delete(pool)
     db.commit()

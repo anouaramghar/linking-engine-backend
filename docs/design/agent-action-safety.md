@@ -53,11 +53,11 @@ must never be mintable by another MCP tool.
    status, explicit rejection reason.
 2. Bulk review: already staged and undoable; add the common proposal metadata
    and keep its `match_status=pending` race guard.
-3. Editorial policies and site metadata: editorial ranking now has a full
-   before/after preview, expected-policy guard, and typed dashboard confirmation.
-   External-link policy and ordinary site metadata remain; credentials stay
-   excluded. External-link tightening is sensitive because it can immediately
-   expire approved suggestions.
+3. Editorial policies: editorial ranking has a full before/after preview and
+   expected-policy guard. External-link policy is sensitive: its preview names
+   the exact pending and approved suggestion ids that would expire, and
+   confirmation is refused if either that impact or the policy changes. Ordinary
+   site metadata remains; credentials stay excluded.
 4. Analysis, ingestion, retry, and cancellation: include scope, estimated work,
    duplicate-job checks, and a sensitive-action confirmation.
 5. Add out-of-band MCP action receipts only after the dashboard proposal set is

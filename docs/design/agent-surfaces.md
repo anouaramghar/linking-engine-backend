@@ -25,9 +25,12 @@ MCP, the tool returns the exact proposal and a dashboard URL; the external
 client cannot execute it.
 
 The staged set currently covers individual and filtered-bulk suggestion review,
-plus complete editorial-ranking-policy replacement. Policy proposals include
-the current policy as `expected`; a dashboard edit made after preview turns the
-confirmation into `409` rather than being overwritten.
+complete editorial-ranking-policy replacement, and sensitive external-link
+policy replacement. Policy proposals include the current policy as `expected`;
+a dashboard edit made after preview turns the confirmation into `409` rather
+than being overwritten. External-link proposals additionally bind the exact
+pending and approved suggestion ids predicted to expire. Queue drift also turns
+confirmation into `409`, so a warning cannot silently become a broader action.
 
 ## MCP server (`/mcp`)
 
