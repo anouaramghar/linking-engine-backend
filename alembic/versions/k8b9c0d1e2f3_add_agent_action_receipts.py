@@ -30,7 +30,12 @@ def upgrade() -> None:
             sa.ForeignKey("dashboard_users.id", ondelete="SET NULL"),
         ),
         sa.Column("confirmed_by_telegram_id", sa.String(32), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("consumed_at", sa.DateTime(timezone=True)),
         sa.Column("execution_status", sa.String(16), nullable=False, server_default="issued"),
