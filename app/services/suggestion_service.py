@@ -118,14 +118,34 @@ def _site_analysis_lock(site_id: int) -> Iterator[None]:
         yield
 
 
+def _active_article_counts(db, site_ids: list[int]) -> dict[int, int]:
+    """Active articles per site, in one query, for the encoding stage's total."""
+    if not site_ids:
+        return {}
+    rows = db.execute(
+        select(Article.site_id, func.count())
+        .where(Article.site_id.in_(site_ids), Article.is_active.is_(True))
+        .group_by(Article.site_id)
+    ).all()
+    return {site_id: count for site_id, count in rows}
+
+
 def _embed_missing(
     db,
     site_id: int,
     model: str,
     job_run_id: int | None = None,
     encoded_offset: int = 0,
+    scanned_offset: int = 0,
+    total: int | None = None,
 ) -> int:
-    """Encode active articles whose model-specific embedding is missing or stale."""
+    """Encode active articles whose model-specific embedding is missing or stale.
+
+    `scanned_offset` and `total` describe the whole encoding stage rather than
+    this one call. A site with a content pool attached is encoded in several
+    passes, and a bar that restarted at each of them would tell the operator the
+    job had gone backwards. Left unset, a site is the whole of its own stage.
+    """
     active_count = db.scalar(
         select(func.count())
         .select_from(Article)
@@ -136,8 +156,10 @@ def _embed_missing(
             f"analysis article count exceeded {settings.analysis_max_articles_per_site} "
             f"for site {site_id}"
         )
+    denominator = active_count if total is None else total
 
     encoded = 0
+    scanned = 0
     last_article_id = 0
     while True:
         rows = db.execute(
@@ -165,6 +187,7 @@ def _embed_missing(
         if not rows:
             return encoded
         last_article_id = rows[-1][0]
+        scanned += len(rows)
         batch = []
         for (
             article_id,
@@ -188,40 +211,47 @@ def _embed_missing(
                 or stored_vector_size != EMBEDDING_DIM
             ):
                 batch.append((article_id, encode_input, fingerprint, embedding_id))
-        if not batch:
-            continue
-        from app.ml.embeddings import encode  # lazy — heavy import
+        if batch:
+            from app.ml.embeddings import encode  # lazy — heavy import
 
-        vectors = list(encode([encode_input for _, encode_input, _, _ in batch]))
-        if len(vectors) != len(batch):
-            raise ValueError(
-                f"Embedding configuration error for model {model!r}: produced "
-                f"{len(vectors)} vectors for {len(batch)} inputs"
-            )
-        for vector in vectors:
-            produced_size = len(vector)
-            if produced_size != EMBEDDING_DIM:
+            vectors = list(encode([encode_input for _, encode_input, _, _ in batch]))
+            if len(vectors) != len(batch):
                 raise ValueError(
-                    f"Embedding configuration error for model {model!r}: produced dimension "
-                    f"{produced_size}, storage dimension {EMBEDDING_DIM}"
+                    f"Embedding configuration error for model {model!r}: produced "
+                    f"{len(vectors)} vectors for {len(batch)} inputs"
                 )
+            for vector in vectors:
+                produced_size = len(vector)
+                if produced_size != EMBEDDING_DIM:
+                    raise ValueError(
+                        f"Embedding configuration error for model {model!r}: produced dimension "
+                        f"{produced_size}, storage dimension {EMBEDDING_DIM}"
+                    )
 
-        for (article_id, _, fingerprint, embedding_id), vector in zip(batch, vectors):
-            values = {
-                "vector": vector,
-                "content_fingerprint": fingerprint,
-                "input_recipe_version": INPUT_RECIPE_VERSION,
-                "vector_size": len(vector),
-            }
-            if embedding_id is None:
-                db.add(Embedding(article_id=article_id, model=model, **values))
-            else:
-                db.execute(update(Embedding).where(Embedding.id == embedding_id).values(**values))
-        encoded += len(batch)
+            for (article_id, _, fingerprint, embedding_id), vector in zip(batch, vectors):
+                values = {
+                    "vector": vector,
+                    "content_fingerprint": fingerprint,
+                    "input_recipe_version": INPUT_RECIPE_VERSION,
+                    "vector_size": len(vector),
+                }
+                if embedding_id is None:
+                    db.add(Embedding(article_id=article_id, model=model, **values))
+                else:
+                    db.execute(
+                        update(Embedding).where(Embedding.id == embedding_id).values(**values)
+                    )
+            encoded += len(batch)
+        # Reported for every page, not only the ones that had work to do. A
+        # re-analysis re-reads articles whose embedding is already current, and
+        # skipping those pages left the operator watching a job that showed no
+        # number at all until the first changed article appeared.
         record_progress(
             db,
             job_run_id,
             stage="encoding",
+            processed=min(scanned_offset + scanned, denominator),
+            total=denominator,
             encoded=encoded_offset + encoded,
         )
         db.commit()
@@ -310,7 +340,31 @@ def generate_suggestions(
             allowed_target_ids, external_trust = external_target_context(db, site)
             model = settings.embedding_model
             _validate_embedding_dimension(model)
-            encoded = _embed_missing(db, site_id, model, job_run_id)
+            # Read before the first pass rather than after it: the encoding
+            # stage's denominator is every article it will walk, and a bar that
+            # learned about the pool only once it got there would jump.
+            pool_site_ids = db.scalars(
+                select(Article.site_id)
+                .where(
+                    Article.id.in_(allowed_target_ids),
+                    Article.site_id != site_id,
+                )
+                .distinct()
+                .order_by(Article.site_id)
+            ).all()
+            encoding_counts = _active_article_counts(db, [site_id, *pool_site_ids])
+            encoding_total = sum(encoding_counts.values())
+            encoded = _embed_missing(
+                db,
+                site_id,
+                model,
+                job_run_id,
+                total=encoding_total,
+            )
+            # A finished pass has walked exactly the active articles it counted,
+            # so the next pass starts where this one stopped without needing the
+            # figure handed back to it.
+            scanned = encoding_counts.get(site_id, 0)
             graph_snapshot, graph_created = ensure_graph_snapshot(db, site_id)
             # The snapshot is a derived observation of the accepted article/link
             # state. Persist it before candidate generation so every suggestion
@@ -321,15 +375,6 @@ def generate_suggestions(
             else:
                 db.commit()
             graph_features = snapshot_features(db, graph_snapshot.id)
-            pool_site_ids = db.scalars(
-                select(Article.site_id)
-                .where(
-                    Article.id.in_(allowed_target_ids),
-                    Article.site_id != site_id,
-                )
-                .distinct()
-                .order_by(Article.site_id)
-            ).all()
             for pool_site_id in pool_site_ids:
                 # Different customer analyses may share the same pool. Reuse the
                 # analysis advisory lock so they cannot both insert one missing
@@ -341,7 +386,10 @@ def generate_suggestions(
                         model,
                         job_run_id,
                         encoded_offset=encoded,
+                        scanned_offset=scanned,
+                        total=encoding_total,
                     )
+                scanned += encoding_counts.get(pool_site_id, 0)
             ranking_mode = _ranking_mode(
                 ranking_mode_override,
             )
@@ -427,7 +475,7 @@ def generate_suggestions(
             external_credits_used = 0
             external_filtered: dict[str, int] = {}
             graph_reordered_sources = 0
-            for article_id in article_ids:
+            for source_index, article_id in enumerate(article_ids, start=1):
                 if ranking_mode == "hybrid" and site_capacity <= 0:
                     break
                 remaining = min(
@@ -611,6 +659,11 @@ def generate_suggestions(
                     db,
                     job_run_id,
                     stage="suggesting",
+                    # Source articles, not suggestions: `created` has no ceiling
+                    # the dashboard could draw a bar against, and this stage is
+                    # the longer half of an analysis.
+                    processed=source_index,
+                    total=len(article_ids),
                     created=created,
                     ranking_mode=ranking_mode,
                     hybrid_fallback_sources=fallback_sources,
