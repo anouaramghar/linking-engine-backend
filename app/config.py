@@ -323,6 +323,12 @@ class Settings(BaseSettings):
     pool_poll_interval_seconds: int = Field(default=86400, ge=60)
     pool_poll_repeat_count: int = Field(default=3650, ge=1)
 
+    # The coordinator is one repeating job for every managed site schedule.
+    # Keep its cursor in PostgreSQL so a deployment does not need one Redis
+    # repeat job per site.
+    site_schedule_poll_interval_seconds: int = Field(default=60, ge=60)
+    site_schedule_repeat_count: int = Field(default=5_256_000, ge=1)
+
     # One durable observation per managed site and day. Historical orphan-page
     # counts cannot be reconstructed after a crawl, so the evaluation dashboard
     # records them prospectively instead of inventing a pre-deployment trend.

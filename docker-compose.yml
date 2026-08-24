@@ -58,6 +58,20 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
+  site-scheduler-init:
+    <<: *app-service
+    # Register one coordinator for all managed-site schedules. The script is
+    # idempotent, so redeployments reuse the existing repeating job.
+    command: ["python", "scripts/schedule_site_automation.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   api:
     <<: *app-service
     build:
@@ -98,6 +112,8 @@ services:
       migrate:
         condition: service_completed_successfully
       pool-scheduler-init:
+        condition: service_completed_successfully
+      site-scheduler-init:
         condition: service_completed_successfully
     volumes:
       - hf_cache:/home/linkmesh/.cache/huggingface

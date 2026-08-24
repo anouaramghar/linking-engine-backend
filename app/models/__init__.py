@@ -13,6 +13,7 @@ from app.models.pool_audit import PoolSourceAuditEvent
 from app.models.pipeline import PipelineBatch, PipelineSiteRun
 from app.models.publication_plan import PublicationPlan
 from app.models.site import IngestionRun, Site
+from app.models.site_schedule import SiteSchedule
 from app.models.suggestion import (
     BulkReviewOperation,
     BulkReviewOperationItem,
@@ -48,6 +49,7 @@ __all__ = [
     "PipelineSiteRun",
     "PublicationPlan",
     "Site",
+    "SiteSchedule",
     "Suggestion",
     "SuggestionEvent",
     "Taxonomy",

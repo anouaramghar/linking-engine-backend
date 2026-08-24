@@ -18,6 +18,7 @@ from app.api.routes import (
     pipelines,
     publish,
     sites,
+    site_schedules,
     suggestions,
 )
 from app.mcp_server import authenticated_mcp_app, mcp_lifespan
@@ -48,6 +49,7 @@ app.include_router(agent_actions.router, prefix="/api/v1")
 # Add every new protected router inside this loop; routers registered elsewhere are unauthenticated.
 for router in [
     sites.router,
+    site_schedules.router,
     ingestion.router,
     suggestions.router,
     publish.router,

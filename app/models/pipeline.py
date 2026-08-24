@@ -10,6 +10,9 @@ class PipelineBatch(Base):
     __tablename__ = "pipeline_batches"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    schedule_id: Mapped[int | None] = mapped_column(
+        ForeignKey("site_schedules.id", ondelete="SET NULL"), index=True
+    )
     status: Mapped[str] = mapped_column(String(30), default="queued", server_default="queued")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
