@@ -33,9 +33,7 @@ depends_on = None
 # is not a queue read and does not follow this move.
 def _queue_indexes(column: str) -> None:
     op.create_index("ix_suggestions_queue", "suggestions", ["status", column, "id"])
-    op.create_index(
-        "ix_suggestions_site_queue", "suggestions", ["site_id", "status", column, "id"]
-    )
+    op.create_index("ix_suggestions_site_queue", "suggestions", ["site_id", "status", column, "id"])
     op.create_index(
         "ix_suggestions_active_queue",
         "suggestions",

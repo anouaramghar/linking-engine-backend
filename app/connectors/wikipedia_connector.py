@@ -164,7 +164,6 @@ class WikipediaConnector(ContentConnector):
             return [page for page in pages.values() if str(page.get("extract") or "").strip()]
 
         for request_number in range(max_requests):
-
             params = {
                 "action": "query",
                 "format": "json",

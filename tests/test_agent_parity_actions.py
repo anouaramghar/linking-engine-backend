@@ -22,9 +22,7 @@ def _remove_created_pool_sources(db):
     before = set(db.scalars(select(Site.id).where(Site.name.like("Agent pool %"))))
     yield
     created = list(
-        db.scalars(
-            select(Site.id).where(Site.name.like("Agent pool %"), Site.id.not_in(before))
-        )
+        db.scalars(select(Site.id).where(Site.name.like("Agent pool %"), Site.id.not_in(before)))
     )
     if created:
         db.execute(delete(PoolSourceAuditEvent).where(PoolSourceAuditEvent.site_id.in_(created)))

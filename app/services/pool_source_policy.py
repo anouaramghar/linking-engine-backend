@@ -200,8 +200,6 @@ def expire_pool_target_suggestions(
     if not suggestion_ids:
         return 0
     result = db.execute(
-        update(Suggestion)
-        .where(Suggestion.id.in_(suggestion_ids))
-        .values(status="expired")
+        update(Suggestion).where(Suggestion.id.in_(suggestion_ids)).values(status="expired")
     )
     return result.rowcount or 0

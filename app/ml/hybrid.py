@@ -130,9 +130,7 @@ class RankedCandidate:
                 else FUSION_COMPONENTS_VERSION
             ),
             # Named so a reader never has to infer which number ordered the row.
-            "final_order": (
-                "wrrf" if settings.hybrid_final_order == "fusion" else "bm25_512"
-            ),
+            "final_order": ("wrrf" if settings.hybrid_final_order == "fusion" else "bm25_512"),
             "score_is": "cosine_semantic_similarity",
             "recipe": LEXICAL_RECIPE_NAME,
             "bm25_score": self.bm25_score,

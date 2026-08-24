@@ -77,10 +77,9 @@ def test_graph_network_returns_all_active_articles_and_edges(client, db, site):
         target.id,
         orphan.id,
     }
-    assert {
-        (edge["source_article_id"], edge["target_article_id"])
-        for edge in body["edges"]
-    } == {(source.id, target.id)}
+    assert {(edge["source_article_id"], edge["target_article_id"]) for edge in body["edges"]} == {
+        (source.id, target.id)
+    }
     features = {node["article_id"]: node for node in body["nodes"]}
     assert features[orphan.id]["orphan"] is True
     assert body["orphan_count"] == sum(node["orphan"] for node in body["nodes"])
@@ -193,8 +192,7 @@ def test_graph_neighborhood_returns_focus_edges_and_one_hop_context(client, db, 
         neighbor.id,
     }
     assert {
-        (edge["source_article_id"], edge["target_article_id"])
-        for edge in body["existing_edges"]
+        (edge["source_article_id"], edge["target_article_id"]) for edge in body["existing_edges"]
     } == {(source.id, neighbor.id), (neighbor.id, distant.id)}
     assert [edge["status"] for edge in body["proposed_edges"]] == [
         "new",

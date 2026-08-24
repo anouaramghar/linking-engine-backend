@@ -119,10 +119,10 @@ class PoolSourceActionGuard(BaseModel):
     @field_validator("expected_expiring_suggestion_ids")
     @classmethod
     def sorted_unique_positive_ids(cls, value: list[int] | None) -> list[int] | None:
-        if value is not None and (
-            any(item < 1 for item in value) or value != sorted(set(value))
-        ):
-            raise ValueError("expected_expiring_suggestion_ids must be sorted, unique, and positive")
+        if value is not None and (any(item < 1 for item in value) or value != sorted(set(value))):
+            raise ValueError(
+                "expected_expiring_suggestion_ids must be sorted, unique, and positive"
+            )
         return value
 
 

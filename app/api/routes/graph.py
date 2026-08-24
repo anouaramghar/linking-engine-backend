@@ -232,9 +232,7 @@ def get_graph_neighborhood(
             f"{inactive_count} suggestion(s) target inactive or missing articles and were excluded."
         )
     if duplicate_count:
-        warnings.append(
-            f"{duplicate_count} selected link(s) already exist in the current graph."
-        )
+        warnings.append(f"{duplicate_count} selected link(s) already exist in the current graph.")
     if truncated:
         warnings.append(
             f"Showing the selected articles and the {neighbor_capacity} strongest nearby articles; "

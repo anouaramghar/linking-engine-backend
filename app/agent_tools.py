@@ -1109,7 +1109,9 @@ def _preview_site_job(
         return result
 
     if args.kind == "analysis" and scope["active_article_count"] == 0:
-        result["blocked_reason"] = "the site has no active articles; crawl it before generating more"
+        result["blocked_reason"] = (
+            "the site has no active articles; crawl it before generating more"
+        )
         return result
 
     if args.kind == "analysis" and suggestion_capacity and suggestion_capacity["at_capacity"]:
@@ -1316,7 +1318,9 @@ def _preview_pool_source_action(
         expiring_ids = pool_target_suggestion_ids(db, site.id, reason="revoked")
     else:
         if not site.pool_source_approved:
-            result["blocked_reason"] = "the content-pool source must be approved before reactivation"
+            result["blocked_reason"] = (
+                "the content-pool source must be approved before reactivation"
+            )
             return result
         if not site.pool_source_quarantined:
             result["blocked_reason"] = "the content-pool source is not quarantined"

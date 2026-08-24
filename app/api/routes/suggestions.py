@@ -1218,11 +1218,14 @@ def trigger_article_analysis(
                 409,
                 "article availability changed after this action was previewed; refresh first",
             )
-        if article_suggestion_capacity(
-            db,
-            site_id=site.id,
-            article_id=article.id,
-        ).remaining == 0:
+        if (
+            article_suggestion_capacity(
+                db,
+                site_id=site.id,
+                article_id=article.id,
+            ).remaining
+            == 0
+        ):
             raise HTTPException(
                 409,
                 "article or site suggestion capacity changed after this action was previewed; "

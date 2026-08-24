@@ -147,7 +147,9 @@ def test_site_analysis_preview_explains_full_suggestion_capacity(client, db, sit
 
     endpoint = f"/api/v1/suggestions/{site.id}"
     for payload in (None, {"expected_active_job_run_ids": []}):
-        response = client.post(endpoint, json=payload) if payload is not None else client.post(endpoint)
+        response = (
+            client.post(endpoint, json=payload) if payload is not None else client.post(endpoint)
+        )
         assert response.status_code == 409
         assert "suggestion capacity is full" in response.json()["detail"]
 
@@ -198,9 +200,7 @@ def test_article_analysis_preview_is_exact_and_article_drift_is_refused(client, 
             "site_count": 1,
             "source_article_count": 1,
             "site_active_article_count": 1,
-            "remaining_slots_for_article": preview["capacity"][
-                "remaining_slots_for_article"
-            ],
+            "remaining_slots_for_article": preview["capacity"]["remaining_slots_for_article"],
         },
     }
 

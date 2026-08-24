@@ -328,12 +328,15 @@ def test_the_delivered_order_is_the_fusion_order():
     bm25 = {7: 0.1, 8: 0.2, 9: 9.0}
     semantic = {7: 0.9, 8: 0.8, 9: 0.7}
 
-    fusion_order = [c.target_id for c in rank_hybrid_candidates(
-        dense_ids, lexical_ids, bm25, semantic, limit=3)]
+    fusion_order = [
+        c.target_id for c in rank_hybrid_candidates(dense_ids, lexical_ids, bm25, semantic, limit=3)
+    ]
 
     with patch.object(settings, "hybrid_final_order", "bm25"):
-        bm25_order = [c.target_id for c in rank_hybrid_candidates(
-            dense_ids, lexical_ids, bm25, semantic, limit=3)]
+        bm25_order = [
+            c.target_id
+            for c in rank_hybrid_candidates(dense_ids, lexical_ids, bm25, semantic, limit=3)
+        ]
 
     assert bm25_order == [9, 8, 7], "the previous recipe ordered by BM25 alone"
     assert fusion_order == [7, 8, 9], "both retrievers agree, so their agreement wins"
