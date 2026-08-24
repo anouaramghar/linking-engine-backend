@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    database_url: str = "postgresql+psycopg://linkmesh:linkmesh@localhost:5432/linkmesh"
+    database_url: str
     redis_url: str = "redis://localhost:6379/0"
 
     environment: str = "development"
@@ -343,6 +343,13 @@ class Settings(BaseSettings):
     def require_api_key_outside_development(self) -> Self:
         if self.environment != "development" and not (self.api_key or self.operator_api_keys):
             raise ValueError("API_KEY or OPERATOR_API_KEYS must be set outside development")
+        return self
+
+    @model_validator(mode="after")
+    def require_secure_dashboard_url_outside_development(self) -> Self:
+        base_url = self.dashboard_base_url.strip()
+        if self.environment != "development" and base_url and not base_url.lower().startswith("https://"):
+            raise ValueError("DASHBOARD_BASE_URL must use HTTPS outside development")
         return self
 
     @model_validator(mode="after")

@@ -438,6 +438,7 @@ class TestDashboardLinks:
 
         from app.config import settings
 
+        monkeypatch.setattr(settings, "environment", "production")
         monkeypatch.setattr(settings, "dashboard_base_url", "https://dash.example.com/")
         result = call_tool(
             db,
@@ -456,6 +457,15 @@ class TestDashboardLinks:
             "q": ["privacy"],
             "min": ["90"],
         }
+
+    def test_production_http_base_is_treated_as_unset(self, db, site, monkeypatch):
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "environment", "production")
+        monkeypatch.setattr(settings, "dashboard_base_url", "http://dash.example.com/")
+        result = call_tool(db, _admin(), "search_queue", {"site_id": site.id})
+
+        assert "dashboard_url" not in result
 
     def test_bulk_preview_links_to_the_rule_the_operator_must_confirm(self, db, site, monkeypatch):
         from urllib.parse import parse_qs, urlparse

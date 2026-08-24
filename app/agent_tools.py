@@ -583,7 +583,10 @@ def _dashboard_url(path: str, **params: Any) -> str | None:
     config from a bug in the engine, and follows it either way.
     """
     base = settings.dashboard_base_url.strip().rstrip("/")
-    if not base.startswith(("http://", "https://")):
+    scheme = base.split(":", 1)[0].lower() if ":" in base else ""
+    if scheme not in {"http", "https"}:
+        return None
+    if settings.environment != "development" and scheme != "https":
         return None
     query = {key: str(value) for key, value in params.items() if value is not None and value != ""}
     return f"{base}{path}?{urlencode(query)}" if query else f"{base}{path}"

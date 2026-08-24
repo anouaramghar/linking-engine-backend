@@ -43,6 +43,38 @@ def test_api_key_required_outside_development():
         Settings(environment="production", api_key="", _env_file=None)
 
 
+def test_database_url_has_no_committed_default(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    with pytest.raises(ValueError, match="database_url"):
+        Settings(_env_file=None)
+
+
+def test_dashboard_base_url_requires_https_outside_development():
+    encryption_key = SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=")
+
+    with pytest.raises(ValueError, match="DASHBOARD_BASE_URL must use HTTPS"):
+        Settings(
+            environment="production",
+            database_url="postgresql+psycopg://localhost/test",
+            api_key="sekret",
+            api_key_pepper="test-pepper",
+            credential_encryption_key=encryption_key,
+            dashboard_base_url="http://dash.example.com",
+            _env_file=None,
+        )
+
+
+def test_development_may_use_http_dashboard_url():
+    configured = Settings(
+        database_url="postgresql+psycopg://localhost/test",
+        dashboard_base_url="http://localhost:5173",
+        _env_file=None,
+    )
+
+    assert configured.dashboard_base_url == "http://localhost:5173"
+
+
 def test_operator_key_can_access_protected_routes(monkeypatch):
     monkeypatch.setattr(settings, "operator_api_keys", {"alice": SecretStr("alice-key")})
     client = _real_auth_client()
@@ -84,6 +116,7 @@ def test_production_hashes_refuse_the_development_pepper(monkeypatch, hash_funct
 def test_production_accepts_both_required_keys():
     configured = Settings(
         environment="production",
+        database_url="postgresql+psycopg://localhost/test",
         api_key="sekret",
         api_key_pepper="test-pepper",
         credential_encryption_key=SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="),
