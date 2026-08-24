@@ -64,7 +64,8 @@ def _bounded_history(payload: AgentChatRequest) -> list[dict[str, str]]:
     around it with a long tail of tiny turns.
     """
     history = [{"role": turn.role, "content": turn.content} for turn in payload.history]
-    return history[-settings.agent_max_history_turns :]
+    max_history_messages = settings.agent_max_history_turns * 2
+    return history[-max_history_messages:] if max_history_messages else []
 
 
 def _body(result: AssistantReply) -> AgentChatResponse:

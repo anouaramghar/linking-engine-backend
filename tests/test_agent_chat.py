@@ -118,6 +118,44 @@ def test_chat_executes_tool_then_answers(monkeypatch, client):
     assert calls[-1][-1] == "tool"
 
 
+def test_history_limit_counts_complete_user_assistant_turns(monkeypatch, client):
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    captured = []
+
+    def scripted(messages, tools):
+        captured.append(messages)
+        return {"content": "The anchor is LANTERN-42."}
+
+    monkeypatch.setattr(agent_service, "chat_with_tools", scripted)
+    history = [
+        {"role": role, "content": f"turn-{turn}-{role}"}
+        for turn in range(1, 12)
+        for role in ("user", "assistant")
+    ]
+
+    response = _chat(client, "What is the anchor?", history)
+
+    assert response.status_code == 200
+    assert captured[0][1:-1] == history
+
+
+def test_zero_history_turns_discard_all_history(monkeypatch, client):
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_max_history_turns", 0)
+    captured = []
+
+    def scripted(messages, tools):
+        captured.append(messages)
+        return {"content": "A fresh answer."}
+
+    monkeypatch.setattr(agent_service, "chat_with_tools", scripted)
+
+    response = _chat(client, "Start fresh.", [{"role": "user", "content": "old context"}])
+
+    assert response.status_code == 200
+    assert captured[0][1:-1] == []
+
+
 def test_a_count_question_reaches_the_model_with_an_unambiguous_payload(
     monkeypatch, client, db, site
 ):
