@@ -13,7 +13,7 @@ from sqlalchemy import select
 import app.services.job_service as job_service
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Alert, IngestionRun, JobRun, Site
+from app.models import Alert, Article, IngestionRun, JobRun, Site
 from app.schemas.job import JobRunOut
 from app.services import alerts as alert_service
 from app.services.job_service import (
@@ -117,7 +117,18 @@ def test_duplicate_trigger_rejected_while_active(client, db, site, cleanup_rq):
     assert second.status_code == 409
     assert "already queued" in second.json()["detail"]
 
-    # a different kind is not blocked by an active ingestion
+    # a different kind is not blocked by an active ingestion. Analysis also
+    # refuses a site with nothing crawled yet, so give it one active article.
+    db.add(
+        Article(
+            site_id=site.id,
+            url=f"{site.base_url}/seed",
+            title="Seed article",
+            content_text="seed",
+        )
+    )
+    db.commit()
+
     analysis = client.post(f"/api/v1/suggestions/{site.id}")
     assert analysis.status_code == 202
     cleanup_rq.append(analysis.json()["job_id"])
