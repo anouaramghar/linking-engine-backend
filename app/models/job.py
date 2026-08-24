@@ -15,11 +15,21 @@ JobKind = Enum(
     native_enum=False,
     length=32,
 )
-# queued -> running -> succeeded | failed; a failed attempt goes back to running on RQ retry.
+# queued -> running -> succeeded | failed | cancelled; a failed attempt goes back to
+# running on RQ retry. Cancellation first becomes cancel_requested so workers can
+# stop cooperatively before the terminal state is written.
 # Rows are created at enqueue time, so a job Redis loses is still visible as 'queued'
 # and reconciled to 'failed' on the next enqueue attempt (Phase 0, finding 7).
 JobRunStatus = Enum(
-    "queued", "running", "succeeded", "failed", name="job_run_status", native_enum=False, length=20
+    "queued",
+    "running",
+    "cancel_requested",
+    "succeeded",
+    "failed",
+    "cancelled",
+    name="job_run_status",
+    native_enum=False,
+    length=20,
 )
 
 

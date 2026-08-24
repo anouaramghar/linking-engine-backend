@@ -26,7 +26,7 @@ from app.models import (
     Taxonomy,
 )
 from app.services.crawl_snapshot import CrawlSnapshot, normalize_url
-from app.services.job_service import record_progress_durably
+from app.services.job_service import JobCancelled, check_job_cancellation, record_progress_durably
 from app.services.pool_source_policy import PoolSourceFetchError
 
 # Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C42 PBN domain
@@ -369,6 +369,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                 raise PoolSourceFetchError(str(error)) from error
             raise
         while True:
+            check_job_cancellation(job_run_id)
             check_crawl_deadline(crawl_started_at)
             try:
                 art = next(articles_iterator)
@@ -420,6 +421,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
 
         articles = snapshot.article_count
 
+        check_job_cancellation(job_run_id)
         try:
             snapshot.validate_completeness(db)
         except ValueError as error:
@@ -428,21 +430,29 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             raise
 
         # Resolve links once all articles are known (forward references)
+        check_job_cancellation(job_run_id)
         record_progress_durably(job_run_id, stage="resolving_links")
         resolve_internal_url = getattr(connector, "resolve_internal_url", None)
+
+        def check_crawl_interruption() -> None:
+            check_job_cancellation(job_run_id)
+            check_crawl_deadline(crawl_started_at)
+
         links = snapshot.resolve_links(
             db,
             resolve_internal_url=resolve_internal_url,
-            check_deadline=lambda: check_crawl_deadline(crawl_started_at),
+            check_deadline=check_crawl_interruption,
         )
 
         # Reconciliation is success-gated after link resolution (Phase 0, finding 3).
+        check_job_cancellation(job_run_id)
         record_progress_durably(
             job_run_id,
             stage="reconciling",
             articles=articles,
             links=links,
         )
+        check_job_cancellation(job_run_id)
         snapshot.promote(db)
         run.status = "succeeded"
         run.articles_upserted = articles
@@ -451,6 +461,15 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
         return {"articles": articles, "links": links}
+    except JobCancelled as e:
+        db.rollback()
+        run.status = "cancelled"
+        run.error = str(e)[:2000]
+        if connector is not None:
+            snapshot.persist_diagnostics(db, run, connector)
+        run.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        raise
     except Exception as e:
         db.rollback()
         run.status = "failed"
@@ -476,10 +495,15 @@ def run_ingestion(site_id: int, job_run_id: int | None = None) -> dict:
             raise
         db = SessionLocal()
         try:
+            status = "failed"
+            try:
+                check_job_cancellation(job_run_id)
+            except JobCancelled:
+                status = "cancelled"
             run = IngestionRun(
                 site_id=site_id,
                 job_run_id=job_run_id,
-                status="failed",
+                status=status,
                 error=str(error)[:2000],
                 finished_at=datetime.now(timezone.utc),
             )

@@ -20,7 +20,9 @@ from app.db import Base
 from app.db_types import EncryptedCredential
 
 Platform = Enum("wordpress", "html", "pool", name="platform", native_enum=False, length=20)
-RunStatus = Enum("running", "succeeded", "failed", name="run_status", native_enum=False, length=20)
+RunStatus = Enum(
+    "running", "succeeded", "failed", "cancelled", name="run_status", native_enum=False, length=20
+)
 
 
 class Site(Base):

@@ -5,16 +5,13 @@ from time import monotonic
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from rq.command import send_stop_job_command
-from rq.exceptions import NoSuchJobError
-from rq.job import Job
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_audit_actor, get_db, require_api_key
 from app.db import SessionLocal
-from app.models import JobRun, PipelineBatch, PipelineSiteRun, Site
+from app.models import PipelineBatch, PipelineSiteRun, Site
 from app.schemas.pipeline import (
     PipelineBatchCreate,
     PipelineBatchOut,
@@ -26,6 +23,8 @@ from app.schemas.pipeline import (
 from app.services.authorization import Principal, authorize_site
 from app.services.job_service import (
     DuplicateJobError,
+    JobCancellationConflict,
+    cancel_job_run,
     enqueue_job,
     require_active_job_snapshot,
 )
@@ -35,7 +34,6 @@ from app.services.pipeline_service import (
     update_pipeline_site,
 )
 from app.tasks.pipeline import analyze_pipeline_site, ingest_pipeline_site
-from app.tasks.queues import redis_conn
 
 
 router = APIRouter(prefix="/pipelines", tags=["pipelines"])
@@ -267,24 +265,18 @@ def stream_pipeline_batch(
 def _stop_queue_job(db: Session, job_run_id: int | None, reason: str) -> None:
     if job_run_id is None:
         return
-    run = db.get(JobRun, job_run_id)
-    if run is None or not run.queue_job_id:
-        return
     try:
-        job = Job.fetch(run.queue_job_id, connection=redis_conn)
-        status = job.get_status(refresh=True)
-        if status in {"queued", "deferred", "scheduled"}:
-            job.cancel()
-        elif status == "started":
-            send_stop_job_command(redis_conn, job.id)
-    except NoSuchJobError:
-        pass
+        cancel_job_run(
+            db,
+            job_run_id,
+            reason,
+            commit=False,
+            allow_terminal=True,
+        )
+    except (JobCancellationConflict, LookupError):
+        return
     except Exception:
-        logger.exception("could not stop RQ job %s during pipeline cancellation", run.queue_job_id)
-    if run.status in {"queued", "running"}:
-        run.status = "failed"
-        run.error = reason
-        run.finished_at = datetime.now(UTC)
+        logger.exception("could not cancel job run %s during pipeline cancellation", job_run_id)
 
 
 @router.post("/batches/{batch_id}/cancel", response_model=PipelineBatchOut)

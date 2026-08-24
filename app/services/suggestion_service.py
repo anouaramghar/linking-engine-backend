@@ -19,7 +19,7 @@ from app.ml.candidate_ordering import order_candidates
 from app.ml.external.base import ExternalSearchProvider
 from app.ml.hybrid import HybridRanker, RankedCandidate
 from app.services.external_suggestion_service import fill_external_suggestion_gap
-from app.services.job_service import record_progress
+from app.services.job_service import JobCancelled, check_job_cancellation, record_progress
 from app.services.external_link_policy import external_target_context
 from app.services.editorial_feedback import (
     FEEDBACK_CANDIDATE_POOL,
@@ -162,6 +162,7 @@ def _embed_missing(
     scanned = 0
     last_article_id = 0
     while True:
+        check_job_cancellation(job_run_id)
         rows = db.execute(
             select(
                 Article.id,
@@ -212,9 +213,11 @@ def _embed_missing(
             ):
                 batch.append((article_id, encode_input, fingerprint, embedding_id))
         if batch:
+            check_job_cancellation(job_run_id)
             from app.ml.embeddings import encode  # lazy — heavy import
 
             vectors = list(encode([encode_input for _, encode_input, _, _ in batch]))
+            check_job_cancellation(job_run_id)
             if len(vectors) != len(batch):
                 raise ValueError(
                     f"Embedding configuration error for model {model!r}: produced "
@@ -254,6 +257,7 @@ def _embed_missing(
             total=denominator,
             encoded=encoded_offset + encoded,
         )
+        check_job_cancellation(job_run_id)
         db.commit()
 
 
@@ -332,6 +336,7 @@ def generate_suggestions(
     with _site_analysis_lock(site_id):
         db = SessionLocal()
         try:
+            check_job_cancellation(job_run_id)
             site = db.get(Site, site_id)
             if site is None:
                 raise ValueError(f"site {site_id} not found")
@@ -340,6 +345,7 @@ def generate_suggestions(
             allowed_target_ids, external_trust = external_target_context(db, site)
             model = settings.embedding_model
             _validate_embedding_dimension(model)
+            check_job_cancellation(job_run_id)
             # Read before the first pass rather than after it: the encoding
             # stage's denominator is every article it will walk, and a bar that
             # learned about the pool only once it got there would jump.
@@ -376,6 +382,7 @@ def generate_suggestions(
                 db.commit()
             graph_features = snapshot_features(db, graph_snapshot.id)
             for pool_site_id in pool_site_ids:
+                check_job_cancellation(job_run_id)
                 # Different customer analyses may share the same pool. Reuse the
                 # analysis advisory lock so they cannot both insert one missing
                 # article/model embedding at the same time.
@@ -476,6 +483,7 @@ def generate_suggestions(
             external_filtered: dict[str, int] = {}
             graph_reordered_sources = 0
             for source_index, article_id in enumerate(article_ids, start=1):
+                check_job_cancellation(job_run_id)
                 if ranking_mode == "hybrid" and site_capacity <= 0:
                     break
                 remaining = min(
@@ -562,6 +570,8 @@ def generate_suggestions(
                             )
                             shadow_exact_matches += baseline_ids == hybrid_ids
                             candidate_rows = baseline_rows[:remaining] if has_capacity else []
+                    except JobCancelled:
+                        raise
                     except Exception:
                         # Ranking runs before this source adds suggestions or
                         # progress. Rolling back is therefore safe, and required
@@ -635,6 +645,7 @@ def generate_suggestions(
                 external_for_source = 0
                 external_missing = remaining - len(candidate_rows)
                 if external_missing > 0 and has_capacity and not comparison_only:
+                    check_job_cancellation(job_run_id)
                     article = db.get(Article, article_id)
                     if article is None:
                         raise ValueError(f"source article {article_id} disappeared during analysis")
@@ -672,6 +683,7 @@ def generate_suggestions(
                     external_credits_used=external_credits_used,
                     external_filtered=external_filtered,
                 )
+                check_job_cancellation(job_run_id)
                 db.commit()
             result = {
                 "articles_encoded": encoded,

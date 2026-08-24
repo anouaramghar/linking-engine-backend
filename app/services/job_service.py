@@ -12,6 +12,7 @@ import logging
 from inspect import Parameter, signature
 
 from rq import Retry, get_current_job
+from rq.command import send_stop_job_command
 from rq.exceptions import AbandonedJobError, NoSuchJobError
 from rq.job import Callback, Job
 from sqlalchemy import func, select
@@ -41,6 +42,7 @@ _QUEUES = {
 }
 _RQ_ACTIVE_STATUSES = {"queued", "started", "deferred", "scheduled"}
 _RQ_TERMINAL_FAILURE_STATUSES = {"failed", "stopped", "canceled"}
+_RQ_CANCELLED_STATUSES = {"stopped", "canceled", "cancelled"}
 _PUBLIC_JOB_STATUSES = {
     "queued": "queued",
     "deferred": "queued",
@@ -50,10 +52,11 @@ _PUBLIC_JOB_STATUSES = {
     "finished": "succeeded",
     "succeeded": "succeeded",
     "failed": "failed",
-    "stopped": "failed",
-    "canceled": "failed",
-    "cancelled": "failed",
+    "stopped": "cancelled",
+    "canceled": "cancelled",
+    "cancelled": "cancelled",
 }
+_DURABLE_ACTIVE_STATUSES = ("queued", "running", "cancel_requested")
 _UNASSIGNED_QUEUE_ID_GRACE_SECONDS = 30
 
 logger = logging.getLogger(__name__)
@@ -119,6 +122,18 @@ class DuplicateJobError(Exception):
         super().__init__(f"{run.kind} job already {run.status} for site {run.site_id}")
 
 
+class JobCancelled(Exception):
+    """Raised by a task at a cooperative cancellation checkpoint."""
+
+
+class JobCancellationConflict(Exception):
+    """Raised when a terminal job cannot be cancelled anymore."""
+
+    def __init__(self, run: JobRun):
+        self.run = run
+        super().__init__(f"job run {run.id} is already {run.status}")
+
+
 class JobCapacityError(DuplicateJobError):
     def __init__(self, tenant_id: int, limit: int):
         self.tenant_id = tenant_id
@@ -142,7 +157,7 @@ def active_job_run_ids(
             select(JobRun.id).where(
                 JobRun.site_id.in_(selected_sites),
                 JobRun.kind.in_(selected_kinds),
-                JobRun.status.in_(("queued", "running")),
+                JobRun.status.in_(_DURABLE_ACTIVE_STATUSES),
             )
         ).all()
     )
@@ -191,7 +206,40 @@ def _still_in_queue(run: JobRun) -> bool:
     return job.get_status() in _RQ_ACTIVE_STATUSES
 
 
+def _mark_run_cancelled(
+    run: JobRun,
+    error: str | None = None,
+    *,
+    now: datetime | None = None,
+) -> None:
+    run.status = "cancelled"
+    run.result = {"cancelled": True}
+    if error:
+        run.error = error[:2000]
+    run.finished_at = now or datetime.now(timezone.utc)
+
+
+def check_job_cancellation(job_run_id: int | None) -> None:
+    """Raise when the API has requested cancellation for this durable run.
+
+    The task's working session can hold a long transaction, so this checkpoint
+    deliberately reads through a fresh session and observes the API commit.
+    """
+    if job_run_id is None:
+        return
+    db = SessionLocal()
+    try:
+        status = db.scalar(select(JobRun.status).where(JobRun.id == job_run_id))
+    finally:
+        db.close()
+    if status in {"cancel_requested", "cancelled"}:
+        raise JobCancelled("job cancellation requested")
+
+
 def _mark_run_lost(run: JobRun) -> None:
+    if run.status == "cancel_requested":
+        _mark_run_cancelled(run, run.error or "job cancellation requested")
+        return
     run.status = "failed"
     run.error = "lost from queue before completion"
     run.finished_at = datetime.now(timezone.utc)
@@ -247,7 +295,7 @@ def reconcile_active_job_runs(db: Session, runs: list[JobRun]) -> list[JobRun]:
         # terminal state. Refresh after checking RQ so a completion racing this
         # request is not mislabeled as a lost job from our earlier query snapshot.
         db.refresh(run)
-        if run.status not in ("queued", "running"):
+        if run.status not in _DURABLE_ACTIVE_STATUSES:
             continue
         _mark_run_lost(run)
         changed = True
@@ -272,15 +320,15 @@ def _enqueue_job_locked(
         select(JobRun).where(
             JobRun.site_id == site_id,
             JobRun.kind == kind,
-            JobRun.status.in_(["queued", "running"]),
+            JobRun.status.in_(_DURABLE_ACTIVE_STATUSES),
         )
     ).all()
     for run in active:
         if not _still_in_queue(run):  # finding 7's exact failure: the job disappeared
             db.refresh(run)
-            if run.status in ("queued", "running"):
+            if run.status in _DURABLE_ACTIVE_STATUSES:
                 _mark_run_lost(run)
-    still_active = [run for run in active if run.status in ("queued", "running")]
+    still_active = [run for run in active if run.status in _DURABLE_ACTIVE_STATUSES]
     if still_active:
         db.commit()  # keep the reconciliations
         raise DuplicateJobError(still_active[0])
@@ -290,7 +338,7 @@ def _enqueue_job_locked(
         .join(Site, Site.id == JobRun.site_id)
         .where(
             Site.tenant_id == tenant_id,
-            JobRun.status.in_(["queued", "running"]),
+            JobRun.status.in_(_DURABLE_ACTIVE_STATUSES),
         )
     ).all()
     tenant_active = reconcile_active_job_runs(db, list(tenant_active))
@@ -312,6 +360,77 @@ def _enqueue_job_locked(
     run.queue_job_id = job.id
     db.commit()
     db.refresh(run)
+    return run
+
+
+def cancel_job_run(
+    db: Session,
+    job_run_id: int,
+    reason: str = "Cancelled by operator",
+    *,
+    commit: bool = True,
+    allow_terminal: bool = False,
+) -> JobRun:
+    """Request and, when possible, complete cancellation of one durable run.
+
+    ``cancel_requested`` is committed before the RQ command is sent so a worker
+    that is already inside a task can observe the request. Started jobs remain in
+    that state until a cooperative checkpoint or the RQ stop callback reaches the
+    terminal ``cancelled`` state. Queued jobs have no useful checkpoint, so they
+    are finalized immediately after RQ removes them.
+    """
+    run = db.get(JobRun, job_run_id, with_for_update=True)
+    if run is None:
+        raise LookupError(f"job run {job_run_id} not found")
+    if run.status == "cancelled":
+        return run
+    if run.status not in _DURABLE_ACTIVE_STATUSES:
+        if allow_terminal:
+            return run
+        raise JobCancellationConflict(run)
+
+    reason = reason[:2000]
+    run.status = "cancel_requested"
+    run.error = reason
+    run.finished_at = None
+    run.result = None
+    if commit:
+        db.commit()
+
+    if not run.queue_job_id:
+        _mark_run_cancelled(run, reason)
+        if commit:
+            db.commit()
+        return run
+
+    try:
+        job = Job.fetch(run.queue_job_id, connection=redis_conn)
+        rq_status = job.get_status(refresh=True)
+        rq_status = getattr(rq_status, "value", rq_status)
+        if rq_status in {"queued", "deferred", "scheduled"}:
+            job.cancel()
+            _mark_run_cancelled(run, reason)
+        elif rq_status == "started":
+            send_stop_job_command(redis_conn, job.id)
+        elif rq_status in _RQ_CANCELLED_STATUSES:
+            _mark_run_cancelled(run, reason)
+        elif rq_status in {"finished", "succeeded"}:
+            # If the wrapper has not committed success yet, the cancellation
+            # request wins when its final row lock is acquired.
+            _mark_run_cancelled(run, reason)
+    except NoSuchJobError:
+        # An explicitly cancelled job that is already gone from Redis cannot
+        # execute any more work, so the durable row can safely settle here.
+        _mark_run_cancelled(run, reason)
+    except Exception:
+        # The durable request is still useful if Redis is temporarily down. The
+        # worker's fresh-session checkpoints, or a later retry of this action,
+        # can finish the transition.
+        logger.exception("could not send cancellation for RQ job %s", run.queue_job_id)
+
+    if commit:
+        db.commit()
+        db.refresh(run)
     return run
 
 
@@ -417,6 +536,10 @@ def run_durably(job_run_id: int | None, fn, site_id: int, **task_kwargs) -> dict
     try:
         run = db.get(JobRun, job_run_id) if job_run_id is not None else None
         if run is not None:
+            if run.status in {"cancel_requested", "cancelled"}:
+                _mark_run_cancelled(run, run.error)
+                db.commit()
+                return {"cancelled": True}
             run.status = "running"
             run.attempts += 1
             run.started_at = datetime.now(timezone.utc)
@@ -425,8 +548,24 @@ def run_durably(job_run_id: int | None, fn, site_id: int, **task_kwargs) -> dict
             db.commit()
         try:
             result = _run_task_body(fn, site_id, job_run_id, task_kwargs)
+        except JobCancelled as error:
+            if run is not None:
+                current = db.get(JobRun, run.id, with_for_update=True, populate_existing=True)
+                if current is not None and current.status != "succeeded":
+                    _mark_run_cancelled(current, current.error or str(error))
+                    db.commit()
+            return {"cancelled": True}
         except Exception as e:
             error = str(e)[:2000]
+            current = (
+                db.get(JobRun, run.id, with_for_update=True, populate_existing=True)
+                if run is not None
+                else None
+            )
+            if current is not None and current.status in {"cancel_requested", "cancelled"}:
+                _mark_run_cancelled(current, current.error or error)
+                db.commit()
+                return {"cancelled": True}
             current_job = get_current_job()
             retries_left = getattr(current_job, "retries_left", None)
             non_retryable = isinstance(e, NonRetryableTaskError)
@@ -436,8 +575,9 @@ def run_durably(job_run_id: int | None, fn, site_id: int, **task_kwargs) -> dict
             final_attempt = (
                 non_retryable or current_job is None or retries_left is None or retries_left <= 0
             )
-            if run is not None:
+            if current is not None:
                 now = datetime.now(timezone.utc)
+                run = current
                 if run.kind == "publication":
                     # Publication progress commits through an independent session,
                     # while this wrapper retains its JobRun identity for the attempt.
@@ -474,12 +614,22 @@ def run_durably(job_run_id: int | None, fn, site_id: int, **task_kwargs) -> dict
                 )
             raise
         if run is not None:
-            run.status = "succeeded"
-            run.result = result
-            run.error = None  # clear any earlier attempt's failure
-            run.finished_at = datetime.now(timezone.utc)
+            run = db.get(JobRun, run.id, with_for_update=True, populate_existing=True)
+            if run is not None and (
+                run.status in {"cancel_requested", "cancelled"}
+                or (isinstance(result, dict) and result.get("cancelled") is True)
+            ):
+                _mark_run_cancelled(run, run.error)
+                db.commit()
+                return {"cancelled": True}
+            if run is not None:
+                run.status = "succeeded"
+                run.result = result
+                run.error = None  # clear any earlier attempt's failure
+                run.finished_at = datetime.now(timezone.utc)
             db.commit()
-            _record_completed_job_alert(run, result)
+            if run is not None:
+                _record_completed_job_alert(run, result)
         return result
     finally:
         db.close()
@@ -525,10 +675,13 @@ def _reconcile_interrupted_job(
         if run is None:
             return
 
+        cancellation_requested = run.status == "cancel_requested" or alert_kind == "job_cancelled"
+        if cancellation_requested:
+            will_retry = False
         if will_retry is None:
             retries_left = getattr(job, "retries_left", None)
             will_retry = retries_left is not None and retries_left > 0
-        if run.status == "failed":
+        if run.status in {"failed", "cancelled"}:
             return
         if run.status == "succeeded" and not will_retry:
             # run_durably commits success only after the task's application work
@@ -546,6 +699,7 @@ def _reconcile_interrupted_job(
         # INSERT. Never guess by site or timestamp. Under normal execution there is
         # one running row; updating all running rows also closes any stale attempt
         # from the same RQ job without touching another logical job.
+        transition_error = run.error if cancellation_requested and run.error else error
         if run.kind == "ingestion" and run.started_at is not None:
             ingestion_runs = db.scalars(
                 select(IngestionRun)
@@ -557,12 +711,14 @@ def _reconcile_interrupted_job(
                 .with_for_update()
             ).all()
             for ingestion_run in ingestion_runs:
-                ingestion_run.status = "failed"
-                ingestion_run.error = error
+                ingestion_run.status = "cancelled" if cancellation_requested else "failed"
+                ingestion_run.error = transition_error
                 ingestion_run.finished_at = now
 
-        run.status = "queued" if will_retry else "failed"
-        run.error = error
+        run.status = (
+            "cancelled" if cancellation_requested else ("queued" if will_retry else "failed")
+        )
+        run.error = transition_error
         run.finished_at = None if will_retry else now
         if run.kind == "publication":
             _mark_job_failure_progress(
@@ -573,7 +729,7 @@ def _reconcile_interrupted_job(
         # This includes the narrow case where the child died after committing
         # durable success but before RQ recorded FINISHED. Do not expose a stale
         # successful result while RQ retries, or after an intentional stop.
-        run.result = None
+        run.result = {"cancelled": True} if cancellation_requested else None
 
         if not will_retry:
             alert_subject = f"LinkMesh {run.kind} job {alert_verb}"
@@ -582,7 +738,7 @@ def _reconcile_interrupted_job(
                 "kind": run.kind,
                 "job_run_id": run.id,
                 "attempts": run.attempts,
-                "error": error,
+                "error": transition_error,
             }
         db.commit()
     except Exception:
@@ -645,15 +801,15 @@ def handle_abandoned_job(job: Job, exc_type, exc_value, traceback) -> bool:
 
 
 def handle_job_stopped(job: Job, connection) -> None:
-    """Mark an intentionally stopped RQ job terminal; this callback never raises."""
+    """Mark an intentionally stopped RQ job cancelled; this callback never raises."""
     del connection
     try:
         _reconcile_interrupted_job(
             job,
             "job stopped intentionally",
             will_retry=False,
-            alert_kind="job_stopped",
-            alert_verb="stopped",
+            alert_kind="job_cancelled",
+            alert_verb="cancelled",
         )
     except Exception:
         logger.exception(
@@ -695,6 +851,15 @@ def get_job_status(job_id: str) -> dict | None:
         progress_at = run.progress_at if run is not None else None
         durable_error = run.error if run is not None else None
         durable_result = run.result if run is not None and run.status == "succeeded" else None
+        if run is not None and run.status in {"cancel_requested", "cancelled"}:
+            return {
+                "job_id": job_id,
+                "status": run.status,
+                "result": run.result,
+                "progress": progress,
+                "progress_at": progress_at,
+                "error": run.error,
+            }
         if (
             run is not None
             and run.status == "succeeded"

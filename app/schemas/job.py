@@ -3,7 +3,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-JobStatusValue = Literal["queued", "running", "succeeded", "failed"]
+JobStatusValue = Literal[
+    "queued",
+    "running",
+    "cancel_requested",
+    "succeeded",
+    "failed",
+    "cancelled",
+]
 
 
 class JobAccepted(BaseModel):

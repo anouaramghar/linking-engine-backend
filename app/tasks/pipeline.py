@@ -30,6 +30,18 @@ def _mark_stage_failure(pipeline_site_run_id: int, stage: str, error: Exception)
         db.commit()
 
 
+def _mark_stage_cancelled(pipeline_site_run_id: int, stage: str) -> None:
+    with SessionLocal() as db:
+        update_pipeline_site(
+            db,
+            pipeline_site_run_id,
+            status="cancelled",
+            stage=stage,
+            error="Cancelled by operator",
+        )
+        db.commit()
+
+
 def _require_pipeline_site(pipeline_site_run_id: int, site_id: int) -> bool:
     with SessionLocal() as db:
         item = db.get(PipelineSiteRun, pipeline_site_run_id)
@@ -65,6 +77,9 @@ def ingest_pipeline_site(
     except Exception as error:
         _mark_stage_failure(batch_site_run_id, "ingestion", error)
         raise
+    if result.get("cancelled") is True:
+        _mark_stage_cancelled(batch_site_run_id, "ingestion")
+        return result
 
     if not _require_pipeline_site(batch_site_run_id, site_id):
         return {**result, "cancelled": True}
@@ -128,6 +143,9 @@ def analyze_pipeline_site(
     except Exception as error:
         _mark_stage_failure(batch_site_run_id, "analysis", error)
         raise
+    if result.get("cancelled") is True:
+        _mark_stage_cancelled(batch_site_run_id, "analysis")
+        return result
     if not _require_pipeline_site(batch_site_run_id, site_id):
         return {**result, "cancelled": True}
     with SessionLocal() as db:
