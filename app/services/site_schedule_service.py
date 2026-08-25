@@ -15,12 +15,27 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import PipelineBatch, PipelineSiteRun, Site, SiteSchedule
-from app.schemas.site_schedule import SiteScheduleOut, SiteScheduleUpdate
+from app.schemas.site_schedule import SiteScheduleExpected, SiteScheduleOut, SiteScheduleUpdate
 from app.services.job_service import active_job_run_ids, enqueue_job
 
 
 class ScheduledPipelineBusyError(RuntimeError):
     """A site already has crawl or analysis work that must finish first."""
+
+
+def schedule_state(schedule: SiteSchedule | None) -> dict[str, object | None]:
+    """Return the small, JSON-safe state used by guarded schedule updates."""
+
+    if schedule is None:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "enabled": schedule.enabled,
+        "cadence": schedule.cadence,
+        "weekday": schedule.weekday,
+        "local_time": schedule.local_time.isoformat(),
+        "timezone": schedule.timezone,
+    }
 
 
 def _utc(value: datetime) -> datetime:
@@ -68,6 +83,7 @@ def save_schedule(
     payload: SiteScheduleUpdate,
     *,
     now: datetime | None = None,
+    updated_by: str | None = None,
 ) -> SiteSchedule:
     """Upsert one schedule and move its durable cursor to the next occurrence."""
 
@@ -77,6 +93,13 @@ def save_schedule(
     schedule = db.scalar(
         select(SiteSchedule).where(SiteSchedule.site_id == site.id).with_for_update()
     )
+    if payload.expected is not None:
+        current = SiteScheduleExpected.model_validate(schedule_state(schedule))
+        if payload.expected != current:
+            raise ValueError(
+                "site schedule changed after this action was previewed; refresh before confirming"
+            )
+
     if schedule is None:
         schedule = SiteSchedule(site_id=site.id)
         db.add(schedule)
@@ -97,6 +120,10 @@ def save_schedule(
         if payload.enabled
         else None
     )
+    if updated_by is not None:
+        if schedule.created_by is None:
+            schedule.created_by = updated_by[:255]
+        schedule.updated_by = updated_by[:255]
     db.commit()
     db.refresh(schedule)
     return schedule
@@ -270,4 +297,6 @@ def schedule_output(db: Session, schedule: SiteSchedule) -> SiteScheduleOut:
         last_run_error=site_run.error
         if site_run and batch and batch.status != "succeeded"
         else None,
+        created_by=schedule.created_by,
+        updated_by=schedule.updated_by,
     )

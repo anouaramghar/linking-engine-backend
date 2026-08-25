@@ -13,7 +13,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.orm import Session
 
-from app.api.routes import alerts, ingestion, pipelines, sites, suggestions
+from app.api.routes import alerts, ingestion, pipelines, site_schedules, sites, suggestions
 from app.schemas.alert import AlertAcknowledgeGuard
 from app.schemas.external_policy import ExternalLinkPolicyUpdate
 from app.schemas.job import ArticleAnalysisStartGuard, JobStartGuard
@@ -24,6 +24,7 @@ from app.schemas.site import (
     SiteBulkRequest,
     SiteCreateRequest,
 )
+from app.schemas.site_schedule import SiteScheduleUpdate
 from app.schemas.suggestion import BulkReviewFilter, SuggestionReview
 from app.services.authorization import Principal, authorize_site
 
@@ -160,6 +161,23 @@ def execute_proposal(
                 raise HTTPException(400, "unsupported confirmed site job")
             return {
                 "message": f"Started {label} job #{result.job_run_id}.",
+                "result": _json(result),
+            }
+
+        matched = _match(
+            proposal,
+            tool="preview_site_schedule",
+            kind="site_schedule_update",
+            method="PUT",
+            path=r"/api/v1/sites/(\d+)/schedule",
+        )
+        if matched:
+            site = authorize_site(db, principal, int(matched[1]))
+            result = site_schedules.update_site_schedule(
+                SiteScheduleUpdate.model_validate(payload), site, db, actor
+            )
+            return {
+                "message": f"Updated refresh schedule for site #{site.id}.",
                 "result": _json(result),
             }
 

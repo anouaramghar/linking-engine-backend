@@ -30,7 +30,7 @@ The staged set currently covers individual and filtered-bulk suggestion review,
 complete editorial-ranking-policy replacement, sensitive external-link policy
 replacement, site crawl/analysis starts, multi-site pipeline starts, failed
 pipeline-stage retries, pipeline cancellation, credential-free managed-site
-creation, and suggestion generation for one exact source article. One-article
+creation, recurring managed-site refresh schedules, and suggestion generation for one exact source article. One-article
 analysis binds both the active article and the site's current analysis-job ids,
 and reports its remaining suggestion capacity. Site proposals accept only
 WordPress and HTML records, never content-
@@ -43,6 +43,13 @@ bind active durable job ids; retries bind batch/site status, stage, and retry
 count; cancellations bind every unfinished site's status, stage, and job ids.
 Queue or worker drift therefore turns confirmation into `409`, so a warning
 cannot silently become broader or newer work.
+
+Schedule proposals are limited to the existing managed-site crawl-then-analysis
+pipeline. `get_site_schedule` reads one site's durable configuration, while
+`preview_site_schedule` normalizes the requested cadence, local time, and IANA
+timezone, computes the next run, and binds the `PUT /sites/{id}/schedule`
+confirmation to the exact current configuration. Schedule changes record the
+dashboard actor; they do not publish, change credentials, or run immediately.
 
 The staged set also covers alert acknowledgement and shared content-pool
 lifecycle changes. An alert proposal binds its occurrence count and last-seen

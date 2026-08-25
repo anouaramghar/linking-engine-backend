@@ -146,7 +146,7 @@ def stream_chat_with_tools(
     *,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
-) -> Generator[str, None, dict[str, Any]]:
+) -> Generator[str | None, None, dict[str, Any]]:
     """Run one model turn over SSE. Yields text as it arrives; returns the message.
 
     The return value is the same assistant message `chat_with_tools` hands back
@@ -193,10 +193,14 @@ def stream_chat_with_tools(
                         raise OpenRouterError(
                             f"{provider_host()} streamed past the {STREAM_BYTE_BUDGET}-byte limit"
                         )
-                    # Everything that is not a data frame is the provider's own
-                    # punctuation: blank separators, and comment lines it sends
-                    # as keep-alives while a model warms up (OpenRouter's
-                    # ": OPENROUTER PROCESSING").
+                    # Blank separators are punctuation. Comment lines are
+                    # provider keep-alives (OpenRouter's
+                    # ": OPENROUTER PROCESSING"): preserve those as a
+                    # transport-only heartbeat so the dashboard can reset its
+                    # idle timer while the model is warming up.
+                    if line.startswith(":"):
+                        yield None
+                        continue
                     if not line.startswith("data:"):
                         continue
                     frame = line[len("data:") :].strip()

@@ -242,12 +242,25 @@ class TestTheStreamedTurn:
 
         fragments, message = self._turn(messages=[{"role": "user", "content": "hi"}], tools=[])
 
-        # The keep-alive comment and the terminator are the provider's own
-        # punctuation, not words the operator was meant to read.
-        assert fragments == ["The queue ", "is empty."]
+        # The keep-alive is carried separately from the operator's words so
+        # the dashboard can keep the connection alive without displaying it.
+        assert fragments == [None, "The queue ", "is empty."]
         assert message == {"role": "assistant", "content": "The queue is empty."}
         assert sent["json"]["stream"] is True
         assert sent["headers"]["Accept"] == "text/event-stream"
+
+    def test_a_provider_keepalive_is_exposed_without_becoming_text(self, transport):
+        transport(
+            [
+                ": OPENROUTER PROCESSING",
+                "data: [DONE]",
+            ]
+        )
+
+        fragments, message = self._turn(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        assert fragments == [None]
+        assert message == {"role": "assistant", "content": None}
 
     def test_a_tool_call_split_across_frames_is_reassembled(self, transport):
         transport(

@@ -176,6 +176,25 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  frontend:
+    build:
+      context: ../linking-engine-frontend
+      dockerfile: Dockerfile
+    image: ${LINKMESH_DASHBOARD_IMAGE:-linkmesh-dashboard:local}
+    environment:
+      # The nginx proxy talks to the API over the shared Compose network. The
+      # frontend receives the same credential the API validates as API_KEY,
+      # but keeps the browser unaware of it.
+      BACKEND_URL: http://api:8000
+      LINKMESH_API_KEY: ${LINKMESH_API_KEY:-${API_KEY:-}}
+      LINKMESH_SERVER_NAMES: ${LINKMESH_SERVER_NAMES:-}
+    ports:
+      - "127.0.0.1:${DASHBOARD_HOST_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:

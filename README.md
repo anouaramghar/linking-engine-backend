@@ -7,6 +7,22 @@ jobs.
 
 ## Local stack
 
+Keep the backend and frontend repositories as sibling directories, as in this
+workspace, then run the full application stack from the backend repository:
+
+```bash
+docker compose up -d --build
+```
+
+This builds the backend image and the frontend nginx image, runs the migration,
+and starts the API, workers, Telegram bot, and dashboard. The dashboard is
+available at `http://127.0.0.1:8080` by default and reaches the API through the
+internal `api:8000` Compose address. The Compose frontend maps `API_KEY` to the
+frontend proxy's `LINKMESH_API_KEY`; the key is never sent to the browser.
+
+Set a non-empty `API_KEY` in `.env` before starting the dashboard. Change
+`DASHBOARD_HOST_PORT` if port 8080 is already occupied.
+
 ## Agent surfaces
 
 A read-only MCP registry at `/mcp/` (for Claude Code, Cursor, and any MCP

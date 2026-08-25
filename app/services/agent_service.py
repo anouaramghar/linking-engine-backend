@@ -81,19 +81,26 @@ staged action. Quote the site and article scope, and never claim work started \
 before the editor confirms. \
 For a failed pipeline site use preview_pipeline_retry; for cancellation use \
 preview_pipeline_cancel and name every affected site. These actions are sensitive.
-10. If a preview returns ready=false and no proposal, the action is blocked: do \
+10. For recurring managed-site refreshes, use get_site_schedule to inspect the \
+current configuration, then preview_site_schedule with the exact desired \
+cadence, local time, and IANA timezone. This only schedules the normal crawl-then-\
+analysis pipeline; it never publishes, changes credentials, or runs immediately. \
+Quote the next run and never claim the schedule was saved before the editor \
+confirms. A schedule confirmation is bound to the current configuration and must \
+be refreshed if it becomes stale. \
+11. If a preview returns ready=false and no proposal, the action is blocked: do \
 not tell the operator to confirm it in the dashboard. Say that no confirmation \
 is available, quote the blocked_reason, and explain the next recovery step. For \
 analysis blocked by suggestion capacity, say that suggestion capacity is full, \
 not that a worker queue is full; review or publish existing suggestions before \
 asking to run analysis again.
-11. To acknowledge an operational alert, use preview_alert_acknowledgement and \
+12. To acknowledge an operational alert, use preview_alert_acknowledgement and \
 quote its subject, site, occurrence count, and last-seen time. A newer occurrence \
 invalidates the confirmation; never imply that acknowledgement fixes the cause. \
-12. When advising on a suggestion, look it up with explain_suggestion first and \
+13. When advising on a suggestion, look it up with explain_suggestion first and \
 ground your advice in its score components, placement, and article contents.
-13. Be concise. Lead with the answer, then the supporting numbers with their ids.
-14. Never invent a site, article, or alert id. When the operator does not name a site, omit site_id \
+14. Be concise. Lead with the answer, then the supporting numbers with their ids.
+15. Never invent a site, article, or alert id. When the operator does not name a site, omit site_id \
 entirely — the tool resolves it. Only pass ids you have read from a tool result.
 
 Formatting. The panel renders a small Markdown subset, and anything outside it \
@@ -110,6 +117,108 @@ both markers: a bullet that also carries a number reads as both and is neither.
 """
 
 RETRY_REPLY = "I couldn't produce a complete answer. Please try again."
+
+# The panel can only render a confirmation control from a proposal returned by
+# a preview tool.  A model sometimes says "staged" after doing only a status
+# lookup, so keep that natural-language claim from becoming a false affordance.
+STAGED_CLAIM_REPAIR_PROMPT = """Your previous reply claimed that an action was staged, but no structured preview proposal was returned.
+Re-check the operator's request now. If it asks to start, run, crawl, analyze,
+or otherwise change something, call the matching preview tool before replying.
+Only say that an action is staged if the tool result contains a `proposal`.
+If the preview is blocked, explain that no confirmation is available and quote
+the blocking reason. Do not repeat a staging or dashboard-confirmation claim
+without a structured proposal."""
+
+STAGED_CLAIM_FALLBACK = (
+    "I couldn't produce a valid confirmation proposal for that action. "
+    "Nothing was started. Please ask me to prepare it again with the exact site or scope."
+)
+
+_STAGED_CLAIM_MARKERS = (
+    "proposal is staged",
+    "proposal has been staged",
+    "staged proposal",
+    "action is staged",
+    "action has been staged",
+    "staged for your confirmation",
+    "ready for your confirmation",
+    "confirm in the dashboard",
+    "confirm in dashboard",
+)
+
+_EXPLICIT_JOB_ACTION_WORDS = (
+    "start",
+    "run",
+    "crawl",
+    "analyze",
+    "analyse",
+    "launch",
+    "begin",
+)
+
+
+def _claims_staged_action(reply: str) -> bool:
+    """Recognize the narrow claim that must be backed by a proposal.
+
+    This is deliberately not a general intent classifier. It catches the
+    wording that tells the operator a dashboard confirmation exists, while
+    leaving ordinary status and blocked-action explanations alone.
+    """
+    text = reply.casefold()
+    if any(
+        phrase in text
+        for phrase in (
+            "no confirmation",
+            "confirmation is unavailable",
+            "nothing was started",
+            "not staged",
+            "couldn't stage",
+            "could not stage",
+        )
+    ):
+        return False
+    return any(marker in text for marker in _STAGED_CLAIM_MARKERS)
+
+
+def _requests_explicit_site_job(question: str) -> bool:
+    """Tell an action request from a question about the current state.
+
+    This is only a routing hint for tool availability, not permission to act:
+    the preview remains read-only and the editor still has to confirm it. The
+    negative phrases keep questions such as "should we run analysis?" on the
+    normal explanatory path.
+    """
+    text = question.casefold()
+    if "article" in text or "pipeline" in text:
+        return False
+    if any(
+        phrase in text
+        for phrase in (
+            "should i",
+            "should we",
+            "could i",
+            "could we",
+            "can i",
+            "can we",
+            "would it",
+            "what if",
+            "what is",
+            "what's",
+            "status",
+        )
+    ):
+        return False
+    return any(word in text for word in _EXPLICIT_JOB_ACTION_WORDS)
+
+
+def _preview_site_job_specs(specs: list[dict]) -> list[dict]:
+    """Limit a known-site action turn to its required preview tool."""
+    preview = [
+        spec
+        for spec in specs
+        if spec.get("function", {}).get("name") == "preview_site_job"
+    ]
+    return preview or specs
 
 #: Said by both routes, so an operator reads the same sentence whichever one
 #: the panel happened to call.
@@ -131,6 +240,11 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class StreamKeepAlive:
+    """A transport heartbeat, never shown as assistant text."""
+
+
+@dataclass(frozen=True)
 class AssistantReply:
     reply: str
     tools_used: list[ToolInvocation] = field(default_factory=list)
@@ -142,9 +256,10 @@ class AssistantReply:
 
 #: What one run reports as it happens. A ``ToolInvocation`` lands when its tool
 #: returns and a ``TextDelta`` as the model writes, so the panel can show work
-#: in progress; the ``AssistantReply`` closes every run and is the authority on
-#: what was said — a turn that streamed nothing still ends with one.
-AgentEvent = ToolInvocation | TextDelta | AssistantReply
+#: in progress; ``StreamKeepAlive`` keeps a slow provider turn from looking
+#: idle; the ``AssistantReply`` closes every run and is the authority on what
+#: was said — a turn that streamed nothing still ends with one.
+AgentEvent = ToolInvocation | TextDelta | StreamKeepAlive | AssistantReply
 
 
 class AgentUnavailable(RuntimeError):
@@ -201,7 +316,7 @@ def _nonempty_reply(content: object) -> str:
 def _streamed_turn(
     messages: list[dict],
     specs: list[dict],
-) -> Generator[TextDelta, None, dict]:
+) -> Generator[TextDelta | StreamKeepAlive, None, dict]:
     """One streamed model turn: report each fragment, hand back the message.
 
     The client yields raw text and returns the assembled message, so the two
@@ -213,7 +328,8 @@ def _streamed_turn(
     fragments = stream_chat_with_tools(messages=messages, tools=specs)
     try:
         while True:
-            yield TextDelta(next(fragments))
+            fragment = next(fragments)
+            yield StreamKeepAlive() if fragment is None else TextDelta(fragment)
     except StopIteration as finished:
         return finished.value
 
@@ -245,16 +361,35 @@ def _run(
     specs = openai_tool_specs()
     used: list[ToolInvocation] = []
     proposals: list[dict] = []
+    repair_attempted = False
+    explicit_site_job = _requests_explicit_site_job(question)
+    known_site_id: int | None = None
 
     for _round in range(settings.agent_max_tool_rounds):
+        turn_specs = (
+            _preview_site_job_specs(specs)
+            if explicit_site_job and known_site_id is not None and not proposals
+            else specs
+        )
         if stream_deltas:
-            message = yield from _streamed_turn(messages, specs)
+            message = yield from _streamed_turn(messages, turn_specs)
         else:
-            message = chat_with_tools(messages=messages, tools=specs)
+            message = chat_with_tools(messages=messages, tools=turn_specs)
         calls = message.get("tool_calls") or []
         if not calls:
+            reply = _nonempty_reply(message.get("content"))
+            if not proposals and _claims_staged_action(reply):
+                if not repair_attempted:
+                    repair_attempted = True
+                    messages.append({"role": "assistant", "content": reply})
+                    messages.append({"role": "user", "content": STAGED_CLAIM_REPAIR_PROMPT})
+                    continue
+                # The bounded repair also failed to produce a real preview.
+                # Keep the final wire response honest: no proposal means no
+                # dashboard confirmation, regardless of what the model said.
+                reply = STAGED_CLAIM_FALLBACK
             yield AssistantReply(
-                reply=_nonempty_reply(message.get("content")),
+                reply=reply,
                 tools_used=used,
                 proposals=proposals,
             )
@@ -274,6 +409,11 @@ def _run(
                 name, arguments = "unknown", {}
             else:
                 outcome = call_tool(db, principal, name, arguments)
+
+            if explicit_site_job and name == "get_site_status":
+                candidate_site_id = arguments.get("site_id") or outcome.get("site_id")
+                if isinstance(candidate_site_id, int):
+                    known_site_id = candidate_site_id
 
             # A preview tool's proposal rides to the panel verbatim; the panel
             # renders the Confirm affordance that actually executes it.
@@ -302,8 +442,11 @@ def _run(
         final = yield from _streamed_turn(messages, [])
     else:
         final = chat_with_tools(messages=messages, tools=[])
+    final_reply = _nonempty_reply(final.get("content"))
+    if not proposals and _claims_staged_action(final_reply):
+        final_reply = STAGED_CLAIM_FALLBACK
     yield AssistantReply(
-        reply=_nonempty_reply(final.get("content")),
+        reply=final_reply,
         tools_used=used,
         proposals=proposals,
     )

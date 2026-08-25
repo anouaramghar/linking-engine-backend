@@ -22,7 +22,7 @@ an MCP ``isError`` result carrying the same text.
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from urllib.parse import urlencode
 from typing import Any, Callable, Literal
 
@@ -48,6 +48,7 @@ from app.api.routes.publish import pending_publication_sites, publication_status
 from app.api.routes.sites import _site_counts, get_site, list_sites
 from app.schemas.external_policy import ExternalLinkPolicyValues
 from app.schemas.site import SiteCreate
+from app.schemas.site_schedule import ScheduleCadence, SiteScheduleUpdate
 from app.models import (
     Alert,
     Article,
@@ -84,6 +85,12 @@ from app.services.pool_source_policy import (
     pool_target_suggestion_ids,
     require_approved_pool_source,
     require_allowed_pool_domain,
+)
+from app.services.site_schedule_service import (
+    load_schedule,
+    next_schedule_run_at,
+    schedule_output,
+    schedule_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,6 +175,48 @@ class SiteStatusArgs(BaseModel):
         None,
         description="Which site to report on. Omit it to use the only connected site.",
     )
+
+
+class SiteScheduleArgs(BaseModel):
+    site_id: int | None = Field(
+        None,
+        description="Which managed site to inspect. Omit it when only one site is connected.",
+    )
+
+
+class PreviewSiteScheduleArgs(BaseModel):
+    """The desired recurring managed-site refresh configuration."""
+
+    site_id: int | None = Field(
+        None,
+        description="Which managed site to schedule. Omit it when only one site is connected.",
+    )
+    enabled: bool = Field(description="Whether the recurring crawl-then-analysis refresh runs.")
+    cadence: ScheduleCadence = Field(description="Run every day or every week.")
+    weekday: int | None = Field(
+        None,
+        ge=0,
+        le=6,
+        description="Monday=0 through Sunday=6; required for weekly schedules.",
+    )
+    local_time: time = Field(description="Local wall-clock time in HH:MM format.")
+    timezone: str = Field(description="IANA timezone, such as Africa/Casablanca.")
+
+    @model_validator(mode="after")
+    def normalize_calendar(self) -> "PreviewSiteScheduleArgs":
+        normalized = SiteScheduleUpdate.model_validate(
+            {
+                "enabled": self.enabled,
+                "cadence": self.cadence,
+                "weekday": self.weekday,
+                "local_time": self.local_time,
+                "timezone": self.timezone,
+            }
+        )
+        self.weekday = normalized.weekday
+        self.local_time = normalized.local_time
+        self.timezone = normalized.timezone
+        return self
 
 
 class PreviewSiteCreationItem(BaseModel):
@@ -1059,6 +1108,102 @@ def _preview_site_creation(
         }
     result["impact"] = impact
     result["proposal"] = proposal
+    return result
+
+
+def _get_site_schedule(
+    db: Session, principal: Principal, args: SiteScheduleArgs
+) -> dict[str, Any]:
+    """Read one managed site's durable recurring refresh configuration."""
+
+    site = authorize_site_read(db, principal, _resolve_site_id(db, principal, args.site_id))
+    if site.platform == POOL_PLATFORM:
+        raise HTTPException(409, "content-pool sources use their own daily ingestion schedule")
+    schedule = load_schedule(db, site.id)
+    return {
+        "site": {"id": site.id, "name": site.name, "platform": site.platform},
+        "configured": schedule is not None,
+        "schedule": (
+            schedule_output(db, schedule).model_dump(mode="json") if schedule is not None else None
+        ),
+        **_urls(sites_url=_dashboard_url("/sites", q=site.name)),
+    }
+
+
+def _preview_site_schedule(
+    db: Session, principal: Principal, args: PreviewSiteScheduleArgs
+) -> dict[str, Any]:
+    """Stage one exact recurring refresh configuration for editor confirmation."""
+
+    site = authorize_site(db, principal, _resolve_site_id(db, principal, args.site_id))
+    if site.platform == POOL_PLATFORM:
+        raise HTTPException(409, "content-pool sources use their own daily ingestion schedule")
+
+    desired_payload = SiteScheduleUpdate.model_validate(args.model_dump())
+    schedule = load_schedule(db, site.id)
+    current = schedule_state(schedule)
+    desired_exists = desired_payload.enabled or schedule is not None
+    desired = (
+        {
+            "exists": True,
+            "enabled": desired_payload.enabled,
+            "cadence": desired_payload.cadence,
+            "weekday": desired_payload.weekday,
+            "local_time": desired_payload.local_time.isoformat(),
+            "timezone": desired_payload.timezone,
+        }
+        if desired_exists
+        else {"exists": False}
+    )
+    changes = {
+        field: {"from": current.get(field), "to": desired.get(field)}
+        for field in ("exists", "enabled", "cadence", "weekday", "local_time", "timezone")
+        if current.get(field) != desired.get(field)
+    }
+    next_run_at = (
+        next_schedule_run_at(
+            cadence=desired_payload.cadence,
+            local_time=desired_payload.local_time,
+            timezone=desired_payload.timezone,
+            weekday=desired_payload.weekday,
+            after=datetime.now(UTC),
+        ).isoformat()
+        if desired_payload.enabled
+        else None
+    )
+    result: dict[str, Any] = {
+        "site": {"id": site.id, "name": site.name, "platform": site.platform},
+        "current": current,
+        "desired": desired,
+        "changes": changes,
+        "next_run_at": next_run_at,
+        "already_current": not changes,
+        "ready": True,
+        **_urls(sites_url=_dashboard_url("/sites", q=site.name)),
+    }
+    if not changes:
+        return result
+
+    result["proposal"] = {
+        "kind": "site_schedule_update",
+        "risk": "sensitive",
+        "method": "PUT",
+        "endpoint": f"/api/v1/sites/{site.id}/schedule",
+        "payload": {
+            "enabled": desired_payload.enabled,
+            "cadence": desired_payload.cadence,
+            "weekday": desired_payload.weekday,
+            "local_time": desired_payload.local_time.isoformat(),
+            "timezone": desired_payload.timezone,
+            "expected": current,
+        },
+        "context": {
+            "site_id": site.id,
+            "site_name": site.name,
+            "next_run_at": next_run_at,
+        },
+        "impact": {"site_count": 1},
+    }
     return result
 
 
@@ -2507,6 +2652,30 @@ REGISTRY: dict[str, AgentTool] = {
             ),
             args_model=SiteStatusArgs,
             handler=_site_status,
+        ),
+        AgentTool(
+            name="get_site_schedule",
+            title="Site refresh schedule",
+            description=(
+                "Read one managed site's recurring crawl-then-analysis schedule, including its "
+                "timezone, next run, last scheduler attempt, latest pipeline result, and who "
+                "last changed it. Content-pool sources use a separate daily schedule."
+            ),
+            args_model=SiteScheduleArgs,
+            handler=_get_site_schedule,
+        ),
+        AgentTool(
+            name="preview_site_schedule",
+            title="Preview site refresh schedule",
+            description=(
+                "Stage enabling, changing, or pausing one managed site's recurring crawl-then-"
+                "analysis refresh. The preview computes the next run in the requested IANA "
+                "timezone and binds confirmation to the exact current schedule; the editor must "
+                "confirm and stale confirmations are refused. This never publishes, changes "
+                "credentials, or runs work immediately."
+            ),
+            args_model=PreviewSiteScheduleArgs,
+            handler=_preview_site_schedule,
         ),
         AgentTool(
             name="preview_site_job",

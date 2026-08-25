@@ -37,10 +37,11 @@ def update_site_schedule(
     payload: SiteScheduleUpdate,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
+    actor: str = Depends(get_audit_actor),
 ) -> SiteScheduleOut:
     _managed_site(site)
     try:
-        schedule = save_schedule(db, site, payload)
+        schedule = save_schedule(db, site, payload, updated_by=actor)
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
     return schedule_output(db, schedule)

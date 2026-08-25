@@ -10,7 +10,7 @@ how much human intent each action needs before it runs.
 | --- | --- | --- |
 | Read | Search queues, inspect sites, explain suggestions, view jobs | Run immediately. |
 | Reversible | Approve or reject pending suggestions, update non-secret editorial policy | Stage the exact REST request, show its effect, and require Confirm. Include an expected-state precondition and a clear reversal path. |
-| Sensitive | Create managed sites, make bulk changes, start ingestion or analysis, retry or cancel a batch | Preview scope and cost, then require Confirm. Bind confirmation to the exact payload and current resource version. |
+| Sensitive | Create managed sites, make bulk changes, start ingestion or analysis, schedule refreshes, retry or cancel a batch | Preview scope and cost, then require Confirm. Bind confirmation to the exact payload and current resource version. |
 | Critical | Publish, approve publication artifacts, change credentials or roles, revoke users, permanently delete a site | Do not expose to the agent. The agent may explain the blocker and deep-link to the dashboard. |
 
 An action is classified by its highest-risk effect. Being technically
@@ -88,7 +88,12 @@ roles, user revocation, and deletion have no dispatcher entry.
    pool approval, revocation, and reactivation are admin-only and bind the
    exact lifecycle state; revocation additionally binds every pending or
    approved suggestion that would expire. Pool deletion stays excluded.
-8. Out-of-band MCP action receipts now cover the complete staged proposal set.
+8. Managed-site refresh schedules use the existing durable coordinator and
+   normal crawl-then-analysis pipeline. The preview binds the exact current
+   schedule configuration, computes the next run in the requested timezone,
+   records the dashboard actor, and refuses stale confirmations. Scheduling
+   never publishes, changes credentials, or runs immediately.
+9. Out-of-band MCP action receipts now cover the complete staged proposal set.
    Signed preview links remain read-only; a live dashboard session issues a
    five-minute, one-time, identity-bound receipt, and one MCP-only tool spends it
    through the closed action dispatcher.

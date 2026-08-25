@@ -14,6 +14,8 @@ event that carries exactly the body ``/chat`` would have returned.
 
 import json
 import logging
+import queue
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -21,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_api_key
 from app.config import settings
+from app.db import SessionLocal
 from app.ml.llm.openrouter import OpenRouterError
 from app.schemas.agent import AgentChatRequest, AgentChatResponse, AgentStatusResponse
 from app.services.agent_service import (
@@ -28,6 +31,7 @@ from app.services.agent_service import (
     AgentEvent,
     AgentUnavailable,
     AssistantReply,
+    StreamKeepAlive,
     TextDelta,
     ToolInvocation,
     answer_question,
@@ -42,6 +46,10 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 #: Said to the operator when the provider fails. The provider's own words stay
 #: in the log, because they can carry key and account detail.
 PROVIDER_FAILED_DETAIL = "Mesh is temporarily unavailable"
+
+# A provider may hold a request while a model warms up without sending its own
+# SSE comment. Keep the dashboard's idle timer alive from the engine side too.
+STREAM_HEARTBEAT_SECONDS = 15.0
 
 
 @router.get("/status", response_model=AgentStatusResponse)
@@ -108,6 +116,8 @@ def _frame(name: str, data: dict) -> str:
 
 
 def _event_frame(event: AgentEvent) -> str:
+    if isinstance(event, StreamKeepAlive):
+        return ": keep-alive\n\n"
     if isinstance(event, TextDelta):
         return _frame("delta", {"text": event.text})
     if isinstance(event, ToolInvocation):
@@ -142,9 +152,38 @@ def chat_stream(
         # A comment frame first: it commits the response through any proxy that
         # would otherwise hold the headers waiting for a body.
         yield ": open\n\n"
+
+        # The model client is synchronous and can block inside one `next()` for
+        # longer than the browser's idle budget. Run it on its own thread and
+        # let this generator send transport heartbeats while it waits. The
+        # stream gets its own SQLAlchemy session because the request dependency
+        # session belongs to the authentication thread.
+        pending: queue.Queue[tuple[str, object | None]] = queue.Queue()
+
+        def produce() -> None:
+            with SessionLocal() as stream_db:
+                try:
+                    for event in stream_answer(stream_db, principal, message, history):
+                        pending.put(("event", event))
+                except Exception as exc:
+                    pending.put(("error", exc))
+                finally:
+                    pending.put(("end", None))
+
+        threading.Thread(target=produce, name="mesh-agent-stream", daemon=True).start()
         try:
-            for event in stream_answer(db, principal, message, history):
-                yield _event_frame(event)
+            while True:
+                try:
+                    kind, value = pending.get(timeout=STREAM_HEARTBEAT_SECONDS)
+                except queue.Empty:
+                    yield ": keep-alive\n\n"
+                    continue
+                if kind == "event":
+                    yield _event_frame(value)  # type: ignore[arg-type]
+                elif kind == "error":
+                    raise value  # type: ignore[misc]
+                else:
+                    break
         except (AgentUnavailable, OpenRouterError) as exc:
             logger.warning("assistant stream failed: %s", exc)
             yield _frame("error", {"detail": PROVIDER_FAILED_DETAIL})

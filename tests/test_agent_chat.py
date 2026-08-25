@@ -1,11 +1,13 @@
 """The dashboard assistant: status, availability gating, and the tool loop."""
 
 import json
+import time
 
 import pytest
 
 from fastapi.testclient import TestClient
 
+from app.api.routes import agent as agent_route
 from app.config import settings
 from app.ml.llm.openrouter import OpenRouterError
 from app.models import Article, InternalLink
@@ -116,6 +118,106 @@ def test_chat_executes_tool_then_answers(monkeypatch, client):
     assert trace["outcome"]["total"] == 0
     # The tool result came back to the model as a tool-role message.
     assert calls[-1][-1] == "tool"
+
+
+def test_a_staged_claim_is_repaired_until_a_structured_proposal_exists(
+    monkeypatch, client, site
+):
+    """Natural-language staging claims cannot bypass the proposal contract."""
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    calls = []
+    tool_names_by_call = []
+    proposal = {
+        "kind": "site_job_start",
+        "risk": "sensitive",
+        "method": "POST",
+        "endpoint": f"/api/v1/suggestions/{site.id}",
+        "payload": {"expected_active_job_run_ids": []},
+        "impact": {
+            "site_count": 1,
+            "active_article_count": 2,
+            "active_internal_link_count": 1,
+            "active_suggestion_count": 0,
+        },
+    }
+
+    def scripted_tool(_db, _principal, name, arguments):
+        if name == "get_site_status":
+            return {"site": {"id": site.id, "name": site.name}, "ready": True}
+        assert name == "preview_site_job"
+        assert arguments == {"site_id": site.id, "kind": "analysis"}
+        return {
+            "site": {"id": site.id, "name": site.name},
+            "kind": "analysis",
+            "ready": True,
+            "scope": {
+                "active_article_count": 2,
+                "active_internal_link_count": 1,
+                "active_suggestion_count": 0,
+            },
+            "proposal": proposal,
+        }
+
+    def scripted_model(messages, tools):
+        calls.append(messages)
+        tool_names_by_call.append([spec["function"]["name"] for spec in tools])
+        if len(calls) == 1:
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "status-1",
+                        "function": {
+                            "name": "get_site_status",
+                            "arguments": json.dumps({"site_id": site.id}),
+                        },
+                    }
+                ],
+            }
+        if len(calls) == 2:
+            return {
+                "role": "assistant",
+                "content": "The proposal is staged. Confirm in the dashboard to start analysis.",
+                "tool_calls": [],
+            }
+        if len(calls) == 3:
+            assert messages[-1]["role"] == "user"
+            return {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "preview-1",
+                        "function": {
+                            "name": "preview_site_job",
+                            "arguments": json.dumps({"site_id": site.id, "kind": "analysis"}),
+                        },
+                    }
+                ],
+            }
+        return {
+            "role": "assistant",
+            "content": "Analysis is staged for your confirmation.",
+            "tool_calls": [],
+        }
+
+    monkeypatch.setattr(agent_service, "call_tool", scripted_tool)
+    monkeypatch.setattr(agent_service, "chat_with_tools", scripted_model)
+
+    response = _chat(client, f"run analysis for site {site.id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reply"] == "Analysis is staged for your confirmation."
+    assert [trace["name"] for trace in body["tools_used"]] == [
+        "get_site_status",
+        "preview_site_job",
+    ]
+    assert body["proposals"] == [
+        {"tool": "preview_site_job", **proposal, "match_count": None, "context": None}
+    ]
+    assert tool_names_by_call[2] == ["preview_site_job"]
 
 
 def test_history_limit_counts_complete_user_assistant_turns(monkeypatch, client):
@@ -352,6 +454,39 @@ class TestStreamedChat:
         name, done = events[-1]
         assert name == "done"
         assert done == {"reply": "Two sites.", "tools_used": [], "proposals": []}
+
+    def test_a_provider_keepalive_reaches_the_dashboard_stream(self, monkeypatch, client):
+        """Provider warm-up comments keep the browser from timing out mid-turn."""
+        monkeypatch.setattr(
+            agent_service,
+            "stream_chat_with_tools",
+            _scripted_stream([([None], {"content": "The queue is ready."})]),
+        )
+
+        response = _stream(client, "check the queue")
+
+        assert ": keep-alive\n\n" in response.text
+        assert _frames(response)[-1] == (
+            "done",
+            {"reply": "The queue is ready.", "tools_used": [], "proposals": []},
+        )
+
+    def test_the_engine_sends_keepalives_while_a_provider_turn_is_blocked(
+        self, monkeypatch, client
+    ):
+        """A provider that sends no comments must not trip the browser idle timer."""
+        monkeypatch.setattr(agent_route, "STREAM_HEARTBEAT_SECONDS", 0.01)
+
+        def delayed(_db, _principal, _message, _history):
+            time.sleep(0.03)
+            yield agent_service.AssistantReply(reply="The queue is ready.")
+
+        monkeypatch.setattr(agent_route, "stream_answer", delayed)
+
+        response = _stream(client, "check the queue")
+
+        assert ": keep-alive\n\n" in response.text
+        assert _frames(response)[-1][0] == "done"
 
     def test_a_provider_failure_mid_stream_arrives_as_an_error_event(self, monkeypatch, client):
         """503 is gone by then: the first frame already committed a 200."""
