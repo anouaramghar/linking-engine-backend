@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.models import PipelineBatch, PipelineSiteRun, Site, SiteSchedule
 from app.schemas.site_schedule import SiteScheduleExpected, SiteScheduleOut, SiteScheduleUpdate
-from app.services.job_service import active_job_run_ids, enqueue_job
+from app.services.job_service import active_job_run_ids, enqueue_job_locked, enqueue_locks
 
 
 class ScheduledPipelineBusyError(RuntimeError):
@@ -44,6 +44,42 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _local_occurrence(candidate_date: date, local_time: time, zone: ZoneInfo) -> datetime:
+    """Resolve one local wall time with explicit daylight-saving semantics.
+
+    A nonexistent wall time is shifted forward by the transition gap: a
+    requested 02:30 during a spring-forward transition runs at the next valid
+    instant, which is normally 03:30. When a wall time occurs twice during a
+    fall-back transition, the first occurrence wins (``fold=0``), so one
+    scheduled occurrence never runs twice.
+    """
+    naive = datetime.combine(candidate_date, local_time.replace(tzinfo=None))
+    candidates = [naive.replace(tzinfo=zone, fold=fold) for fold in (0, 1)]
+
+    def round_trip_local(candidate: datetime) -> datetime:
+        # Converting through UTC is required here. ``astimezone(zone)`` alone
+        # may return the same ZoneInfo object without normalizing a nonexistent
+        # wall time.
+        return candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None)
+
+    valid = [candidate for candidate in candidates if round_trip_local(candidate) == naive]
+    if valid:
+        # The earlier UTC instant is fold=0 for an ambiguous wall time, and is
+        # identical for an ordinary wall time.
+        return min(valid, key=lambda candidate: candidate.astimezone(UTC))
+
+    # ZoneInfo represents a gap with one candidate before the transition and
+    # one after it. Pick the first candidate whose round-trip local time is
+    # later than requested, i.e. the next valid wall-clock instant.
+    future = [candidate for candidate in candidates if round_trip_local(candidate) > naive]
+    if not future:
+        raise ValueError(f"could not resolve local time {naive.isoformat()} in timezone {zone.key}")
+    return min(
+        future,
+        key=round_trip_local,
+    )
+
+
 def next_schedule_run_at(
     *,
     cadence: str,
@@ -52,28 +88,28 @@ def next_schedule_run_at(
     weekday: int | None,
     after: datetime,
 ) -> datetime:
-    """Return the next strictly-future UTC occurrence in the site's timezone."""
+    """Return the next strictly-future UTC occurrence in the site's timezone.
+
+    See :func:`_local_occurrence` for the explicit DST gap and fold policy.
+    """
 
     zone = ZoneInfo(timezone)
     local_after = _utc(after).astimezone(zone)
     candidate_date: date = local_after.date()
 
     if cadence == "daily":
-        candidate = datetime.combine(candidate_date, local_time, tzinfo=zone)
-        if candidate <= local_after:
-            candidate += timedelta(days=1)
+        candidate = _local_occurrence(candidate_date, local_time, zone)
+        if _utc(candidate) <= _utc(local_after):
+            candidate = _local_occurrence(candidate_date + timedelta(days=1), local_time, zone)
         return candidate.astimezone(UTC)
 
     if cadence != "weekly" or weekday is None:
         raise ValueError("weekly schedules require a weekday")
     days_until = (weekday - local_after.weekday()) % 7
-    candidate = datetime.combine(
-        candidate_date + timedelta(days=days_until),
-        local_time,
-        tzinfo=zone,
-    )
-    if candidate <= local_after:
-        candidate += timedelta(days=7)
+    candidate_date += timedelta(days=days_until)
+    candidate = _local_occurrence(candidate_date, local_time, zone)
+    if _utc(candidate) <= _utc(local_after):
+        candidate = _local_occurrence(candidate_date + timedelta(days=7), local_time, zone)
     return candidate.astimezone(UTC)
 
 
@@ -212,53 +248,58 @@ def start_site_pipeline(
         if schedule is None or schedule.site_id != site_id:
             raise ValueError("schedule does not belong to this site")
 
-    active_ids = active_job_run_ids(db, site_id, ("ingestion", "analysis"))
-    if active_ids:
-        raise ScheduledPipelineBusyError(
-            f"site {site_id} already has crawl or analysis work queued or running"
-        )
-
-    batch = PipelineBatch(schedule_id=schedule_id)
-    db.add(batch)
-    db.flush()
-    item = PipelineSiteRun(batch_id=batch.id, site_id=site_id)
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-
     # Import lazily: the pipeline task imports pipeline_service for its stage
     # state transitions, so importing it at module load would create a cycle.
     from app.tasks.pipeline import ingest_pipeline_site
 
-    try:
-        run = enqueue_job(
-            db,
-            site_id,
-            "ingestion",
-            ingest_pipeline_site,
-            job_timeout=3600,
-            task_kwargs={"batch_site_run_id": item.id},
-            requested_by=requested_by,
-        )
-    except Exception:
-        db.rollback()
-        from app.services.pipeline_service import update_pipeline_site
+    # The active-job check, batch creation, and durable enqueue must share the
+    # same lock. Otherwise two simultaneous Run now requests can both create a
+    # batch before the later enqueue lock rejects one of their jobs.
+    with enqueue_locks(site_id, site.tenant_id):
+        active_ids = active_job_run_ids(db, site_id, ("ingestion", "analysis"))
+        if active_ids:
+            raise ScheduledPipelineBusyError(
+                f"site {site_id} already has crawl or analysis work queued or running"
+            )
 
-        update_pipeline_site(
-            db,
-            item.id,
-            status="failed",
-            stage="ingestion",
-            error="could not enqueue scheduled pipeline",
-        )
+        batch = PipelineBatch(schedule_id=schedule_id)
+        db.add(batch)
+        db.flush()
+        item = PipelineSiteRun(batch_id=batch.id, site_id=site_id)
+        db.add(item)
         db.commit()
-        raise
+        db.refresh(item)
 
-    db.refresh(item)
-    item.ingestion_job_run_id = run.id
-    db.commit()
-    db.refresh(batch)
-    return batch, item
+        try:
+            run = enqueue_job_locked(
+                db,
+                site_id,
+                site.tenant_id,
+                "ingestion",
+                ingest_pipeline_site,
+                job_timeout=3600,
+                task_kwargs={"batch_site_run_id": item.id},
+                requested_by=requested_by,
+            )
+        except Exception:
+            db.rollback()
+            from app.services.pipeline_service import update_pipeline_site
+
+            update_pipeline_site(
+                db,
+                item.id,
+                status="failed",
+                stage="ingestion",
+                error="could not enqueue scheduled pipeline",
+            )
+            db.commit()
+            raise
+
+        db.refresh(item)
+        item.ingestion_job_run_id = run.id
+        db.commit()
+        db.refresh(batch)
+        return batch, item
 
 
 def schedule_output(db: Session, schedule: SiteSchedule) -> SiteScheduleOut:

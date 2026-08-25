@@ -1,11 +1,14 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time
+from threading import Event, Lock
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select
 
-from app.models import JobRun, SiteSchedule
+from app.db import SessionLocal
+from app.models import JobRun, PipelineBatch, PipelineSiteRun, SiteSchedule
 from app.schemas.site_schedule import SiteScheduleUpdate
 from app.services.site_schedule_service import (
     ScheduledPipelineBusyError,
@@ -31,6 +34,53 @@ def test_next_daily_occurrence_uses_the_site_timezone():
     local = result.astimezone(ZoneInfo("Africa/Casablanca"))
     assert local.hour == 2
     assert local.minute == 30
+
+
+def test_next_occurrence_moves_a_spring_forward_gap_to_the_next_valid_time():
+    result = next_schedule_run_at(
+        cadence="daily",
+        local_time=time(2, 30),
+        timezone="America/New_York",
+        weekday=None,
+        after=datetime(2026, 3, 8, 0, 0, tzinfo=UTC),
+    )
+
+    assert result == datetime(2026, 3, 8, 7, 30, tzinfo=UTC)
+    local = result.astimezone(ZoneInfo("America/New_York"))
+    assert (local.hour, local.minute) == (3, 30)
+
+
+def test_next_occurrence_uses_the_first_fall_back_time():
+    result = next_schedule_run_at(
+        cadence="daily",
+        local_time=time(1, 30),
+        timezone="America/New_York",
+        weekday=None,
+        after=datetime(2026, 11, 1, 0, 0, tzinfo=UTC),
+    )
+
+    assert result == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+    local = result.astimezone(ZoneInfo("America/New_York"))
+    assert (local.hour, local.minute, local.fold) == (1, 30, 0)
+
+    after_second_occurrence = next_schedule_run_at(
+        cadence="daily",
+        local_time=time(1, 30),
+        timezone="America/New_York",
+        weekday=None,
+        after=datetime(2026, 11, 1, 6, 0, tzinfo=UTC),
+    )
+    assert after_second_occurrence == datetime(2026, 11, 2, 6, 30, tzinfo=UTC)
+
+
+def test_schedule_rejects_an_unknown_timezone():
+    with pytest.raises(ValueError, match="unknown timezone"):
+        SiteScheduleUpdate(
+            enabled=True,
+            cadence="daily",
+            local_time="02:30",
+            timezone="Not/ARealTimezone",
+        )
 
 
 def test_weekly_schedule_requires_weekday():
@@ -155,3 +205,87 @@ def test_scheduled_pipeline_refuses_overlap(db, site):
 
     with pytest.raises(ScheduledPipelineBusyError, match="already has crawl or analysis"):
         start_site_pipeline(db, site.id)
+
+
+def test_concurrent_run_now_creates_one_batch_and_one_job(db, site, monkeypatch):
+    first_enqueue_entered = Event()
+    release_first_enqueue = Event()
+    second_enqueue_entered = Event()
+    second_started = Event()
+    call_lock = Lock()
+    enqueue_calls = 0
+
+    def fake_enqueue_job_locked(
+        session,
+        site_id,
+        tenant_id,
+        kind,
+        fn,
+        job_timeout,
+        task_kwargs=None,
+        requested_by=None,
+    ):
+        nonlocal enqueue_calls
+        with call_lock:
+            enqueue_calls += 1
+            call_number = enqueue_calls
+        if call_number == 1:
+            first_enqueue_entered.set()
+            assert release_first_enqueue.wait(timeout=5)
+        else:
+            second_enqueue_entered.set()
+        run = JobRun(
+            site_id=site_id,
+            kind=kind,
+            requested_by=requested_by,
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        return run
+
+    monkeypatch.setattr(
+        "app.services.site_schedule_service.enqueue_job_locked",
+        fake_enqueue_job_locked,
+    )
+
+    def run_now(label):
+        if label == "second":
+            second_started.set()
+        session = SessionLocal()
+        try:
+            batch, item = start_site_pipeline(session, site.id)
+            return "success", batch.id, item.id
+        except Exception as error:  # noqa: BLE001 - assert the losing request below
+            return "error", error
+        finally:
+            session.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(run_now, "first")
+        assert first_enqueue_entered.wait(timeout=5)
+        second = executor.submit(run_now, "second")
+        assert second_started.wait(timeout=5)
+        assert not second_enqueue_entered.wait(timeout=0.5)
+        release_first_enqueue.set()
+        results = [first.result(timeout=5), second.result(timeout=5)]
+
+    successes = [result for result in results if result[0] == "success"]
+    errors = [result for result in results if result[0] == "error"]
+    assert len(successes) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0][1], ScheduledPipelineBusyError)
+
+    db.rollback()
+    db.expire_all()
+    items = db.scalars(select(PipelineSiteRun).where(PipelineSiteRun.site_id == site.id)).all()
+    batches = db.scalars(
+        select(PipelineBatch).where(PipelineBatch.id.in_([item.batch_id for item in items]))
+    ).all()
+    runs = db.scalars(select(JobRun).where(JobRun.site_id == site.id)).all()
+    assert len(batches) == 1
+    assert len(items) == 1
+    assert len(runs) == 1
+    assert batches[0].status == "queued"
+    assert items[0].status == "queued"
+    assert items[0].ingestion_job_run_id == runs[0].id

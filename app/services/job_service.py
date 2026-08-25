@@ -183,7 +183,7 @@ class NonRetryableTaskError(RuntimeError):
 
 
 @contextmanager
-def _enqueue_locks(site_id: int, tenant_id: int) -> Iterator[None]:
+def enqueue_locks(site_id: int, tenant_id: int) -> Iterator[None]:
     # The work session commits the durable row before enqueueing. A dedicated
     # transaction keeps the per-site advisory lock across both work commits.
     with engine.begin() as lock_connection:
@@ -363,6 +363,35 @@ def _enqueue_job_locked(
     return run
 
 
+def enqueue_job_locked(
+    db: Session,
+    site_id: int,
+    tenant_id: int,
+    kind: str,
+    fn,
+    job_timeout: int,
+    task_kwargs: dict | None = None,
+    requested_by: str | None = None,
+) -> JobRun:
+    """Enqueue while the caller holds :func:`enqueue_locks`.
+
+    Pipeline creation needs to make its active-job check and batch row creation
+    under the same advisory lock as the durable job enqueue. Keeping this small
+    seam separate avoids taking the same PostgreSQL advisory lock again from a
+    second connection, which would deadlock the caller.
+    """
+    return _enqueue_job_locked(
+        db,
+        site_id,
+        tenant_id,
+        kind,
+        fn,
+        job_timeout,
+        task_kwargs=task_kwargs,
+        requested_by=requested_by,
+    )
+
+
 def cancel_job_run(
     db: Session,
     job_run_id: int,
@@ -446,8 +475,8 @@ def enqueue_job(
     tenant_id = db.scalar(select(Site.tenant_id).where(Site.id == site_id))
     if tenant_id is None:
         raise ValueError(f"site {site_id} not found")
-    with _enqueue_locks(site_id, tenant_id):
-        return _enqueue_job_locked(
+    with enqueue_locks(site_id, tenant_id):
+        return enqueue_job_locked(
             db,
             site_id,
             tenant_id,
