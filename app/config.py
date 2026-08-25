@@ -8,6 +8,33 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     database_url: str
+    # Connections the engine keeps, and how many more it may open under a burst.
+    #
+    # These are headroom, not a throughput fix. It is tempting to match the AnyIO
+    # thread pool that serves every sync route (forty threads) against the
+    # SQLAlchemy defaults (5 + 10) and call the difference a bottleneck. Measured
+    # under twenty concurrent queue reads, one API process held about nine
+    # connections and four processes held thirty-seven: the ceiling was never
+    # what limited it. Python's GIL serializes the request work long before the
+    # pool runs out, which is why WEB_CONCURRENCY, not this number, is the dial
+    # that changes throughput.
+    #
+    # What the defaults do buy is a burst of genuinely IO-bound requests not
+    # queueing on `pool_timeout`, which is invisible when it happens — it reads
+    # as a slow database rather than an exhausted pool.
+    #
+    # Budget before raising either. Each uvicorn worker builds its own pool, so
+    # the API's ceiling is WEB_CONCURRENCY x (pool_size + max_overflow), and the
+    # fleet also has the RQ workers and the bot. All of it has to fit inside
+    # PostgreSQL's `max_connections`, which is 100 by default.
+    db_pool_size: int = Field(default=10, ge=1, le=200)
+    db_max_overflow: int = Field(default=10, ge=0, le=200)
+    # Seconds a request waits for a connection before failing. The default of 30
+    # turns exhaustion into a stall long enough that the caller times out first.
+    db_pool_timeout: int = Field(default=10, ge=1, le=120)
+    # Recycle before a connection can go stale on the server side. With this set,
+    # `pool_pre_ping` is a backstop for abrupt loss rather than the only defence.
+    db_pool_recycle: int = Field(default=1800, ge=-1)
     redis_url: str = "redis://localhost:6379/0"
 
     environment: str = "development"
@@ -354,7 +381,11 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def require_secure_dashboard_url_outside_development(self) -> Self:
         base_url = self.dashboard_base_url.strip()
-        if self.environment != "development" and base_url and not base_url.lower().startswith("https://"):
+        if (
+            self.environment != "development"
+            and base_url
+            and not base_url.lower().startswith("https://")
+        ):
             raise ValueError("DASHBOARD_BASE_URL must use HTTPS outside development")
         return self
 

@@ -73,6 +73,27 @@ UNREVIEWABLE = ("applying", "applied", "expired")
 CLAIMS_AN_ANCHOR = ("pending", "approved", "applying", "applied")
 
 
+def _brief_article_options():
+    """Eager-load both endpoint articles with only the columns a brief renders.
+
+    `Article.content_text` and `content_html` hold the whole post — up to
+    `crawl_max_article_chars` each — and a plain `joinedload` fetches both for
+    every row on the page. `_suggestion_outputs` reads id, title and url (the
+    three fields of `ArticleBrief`) plus the target's `site_id`, so a 50-row
+    page was moving up to a hundred article bodies across the wire to render
+    none of them.
+
+    Only for read paths that stop at a brief. `get_suggestion_placement` passes
+    the source article to the placement service, which reads `content_text`;
+    narrowing that query would turn one join into a lazy load per request.
+    """
+    columns = (Article.id, Article.title, Article.url, Article.site_id)
+    return (
+        joinedload(Suggestion.source_article).load_only(*columns),
+        joinedload(Suggestion.target_article).load_only(*columns),
+    )
+
+
 def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[SuggestionOut]:
     """Serialize suggestions with each target's ownership made explicit.
 
@@ -1135,7 +1156,7 @@ def list_suggestion_page(
     items = db.scalars(
         select(Suggestion)
         .where(*page_conditions)
-        .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
+        .options(*_brief_article_options())
         .order_by(Suggestion.rank_score.desc(), Suggestion.id.desc())
         # One look-ahead row tells the client whether another request is useful
         # without paying for COUNT(*) on every page.
@@ -1291,7 +1312,7 @@ def list_suggestions(
     query = (
         select(Suggestion)
         .where(Suggestion.site_id == site.id)
-        .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
+        .options(*_brief_article_options())
         .order_by(Suggestion.rank_score.desc())
     )
     if status:
@@ -1419,7 +1440,7 @@ def review_suggestion(
     suggestion = db.get(
         Suggestion,
         suggestion_id,
-        options=[joinedload(Suggestion.source_article), joinedload(Suggestion.target_article)],
+        options=list(_brief_article_options()),
     )
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")

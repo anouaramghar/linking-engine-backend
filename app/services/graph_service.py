@@ -313,12 +313,24 @@ def ensure_graph_snapshot(db: Session, site_id: int) -> tuple[GraphSnapshot, boo
     return snapshot, True
 
 
-def snapshot_features(db: Session, snapshot_id: int) -> dict[int, GraphFeatureData]:
-    rows = db.scalars(
-        select(GraphFeatureRow)
-        .where(GraphFeatureRow.snapshot_id == snapshot_id)
-        .order_by(GraphFeatureRow.article_id)
-    ).all()
+def snapshot_features(
+    db: Session, snapshot_id: int, article_ids: Sequence[int] | None = None
+) -> dict[int, GraphFeatureData]:
+    """Feature rows for a snapshot, optionally only the articles asked for.
+
+    The bound belongs in SQL rather than in the caller. A snapshot holds one row
+    per article, so a site at the analysis ceiling has 10 000 of them; the queue
+    page that reads this wants the two dozen on the page. Filtering afterwards
+    read the whole table on every request. `uq_graph_features_snapshot_article`
+    covers the narrowed predicate.
+    """
+    query = select(GraphFeatureRow).where(GraphFeatureRow.snapshot_id == snapshot_id)
+    if article_ids is not None:
+        wanted = set(article_ids)
+        if not wanted:
+            return {}
+        query = query.where(GraphFeatureRow.article_id.in_(wanted))
+    rows = db.scalars(query.order_by(GraphFeatureRow.article_id)).all()
     return {
         row.article_id: GraphFeatureData(
             article_id=row.article_id,
@@ -343,13 +355,7 @@ def current_feature_map(
     snapshot = latest_snapshot(db, site_id)
     if snapshot is None:
         return None, {}
-    features = snapshot_features(db, snapshot.id)
-    if article_ids is not None:
-        wanted = set(article_ids)
-        features = {
-            article_id: feature for article_id, feature in features.items() if article_id in wanted
-        }
-    return snapshot, features
+    return snapshot, snapshot_features(db, snapshot.id, article_ids)
 
 
 def deterministic_rerank(

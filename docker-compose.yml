@@ -1,11 +1,18 @@
+# These override the same names in the env file, which points at the host ports
+# a developer uses outside Docker. A service that needs to add one variable must
+# merge this mapping (`<<: *app-env`) rather than write its own `environment:`
+# block: the service-level key replaces the anchor's wholesale, and silently
+# dropping DATABASE_URL sends the container at 127.0.0.1 instead of `db`.
+x-app-env: &app-env
+  DATABASE_URL: ${LINKMESH_DATABASE_URL:-postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh}
+  REDIS_URL: ${LINKMESH_REDIS_URL:-redis://redis:6379/0}
+  BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+
 x-app-service: &app-service
   image: ${LINKMESH_IMAGE:-linkmesh-engine:local}
   env_file:
     - ${LINKMESH_ENV_FILE:-.env}
-  environment:
-    DATABASE_URL: ${LINKMESH_DATABASE_URL:-postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh}
-    REDIS_URL: ${LINKMESH_REDIS_URL:-redis://redis:6379/0}
-    BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+  environment: *app-env
 
 services:
   db:
@@ -79,6 +86,29 @@ services:
       dockerfile: Dockerfile
       args:
         BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
+    environment:
+      <<: *app-env
+      # uvicorn reads --workers from this. Every route is a sync `def` served on
+      # the thread pool, so one process serializes their Python work on the GIL:
+      # measured, one queue read took 18 ms and twenty concurrent ones took
+      # 336 ms each — almost exactly twenty times one, which is what "serial"
+      # looks like. Processes are what add parallelism here, not threads and not
+      # connections. Four of them: 336 ms -> 111 ms median, 55 -> 137 req/s.
+      #
+      # It buys nothing for a lone user; one request is 18 ms either way. It is
+      # for overlap — several editors on the queue, or one editor's polls landing
+      # on top of a page load.
+      #
+      # The costs, both measured under the same load: memory 135 MiB -> 571 MiB,
+      # because each process imports the app separately and copy-on-write does
+      # not survive Python's reference counting; and PostgreSQL connections
+      # 10 -> 22. Do not raise this above the host's core count (parallelism
+      # stops, memory does not), and see `Settings.db_pool_size` for the
+      # connection budget before going higher.
+      #
+      # Safe for the MCP app mounted at /mcp only because it is stateless_http.
+      # A stateful session mode there would break across processes.
+      WEB_CONCURRENCY: ${LINKMESH_API_WORKERS:-4}
     ports:
       - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     depends_on:

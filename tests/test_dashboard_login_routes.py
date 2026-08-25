@@ -166,6 +166,37 @@ def test_session_reports_the_logged_in_user(client, db):
     assert body["user"]["status"] == "approved"
 
 
+def test_session_probe_requires_a_cookie(client):
+    assert client.get("/api/v1/auth/session/probe").status_code == 401
+
+
+def test_session_probe_admits_a_logged_in_user_with_an_empty_body(client, db):
+    _login_as(client, db, telegram_id=4242)
+
+    body = client.get("/api/v1/auth/session/probe")
+
+    assert body.status_code == 204
+    # The proxy's auth_request discards the body, and nginx will not reuse a
+    # keepalive connection with an undrained response on it. Emptiness is the
+    # whole reason this route exists next to /session.
+    assert body.content == b""
+
+
+def test_session_probe_and_session_agree_on_who_is_admitted(client, db):
+    """The proxy gates every /api/ call on the probe, so a divergence here would
+    admit or refuse traffic that /session would not."""
+    assert client.get("/api/v1/auth/session").status_code == 401
+    assert client.get("/api/v1/auth/session/probe").status_code == 401
+
+    _login_as(client, db)
+    assert client.get("/api/v1/auth/session").status_code == 200
+    assert client.get("/api/v1/auth/session/probe").status_code == 204
+
+    client.post("/api/v1/auth/logout")
+    assert client.get("/api/v1/auth/session").status_code == 401
+    assert client.get("/api/v1/auth/session/probe").status_code == 401
+
+
 def test_logout_ends_the_session(client, db):
     _login_as(client, db)
     assert client.get("/api/v1/auth/session").status_code == 200
