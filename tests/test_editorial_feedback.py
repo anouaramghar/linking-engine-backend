@@ -77,3 +77,23 @@ def test_per_site_editorial_policy_api(client, site):
         "feedback_weight": 0.35,
         "min_samples": 25,
     }
+
+
+def test_a_new_site_does_not_get_feedback_reranking_by_default(db, site):
+    """Off until an operator asks for it, per site.
+
+    Ten mixed decisions used to be enough to give approve/reject history 20% of
+    the ranking weight on every site at once. That history is not evidence yet —
+    it counts a bulk rule the same as a considered decision and has never been
+    measured against a held-out set — so nothing switches it on for an operator.
+    """
+    assert site.editorial_feedback_enabled is False
+    for index in range(12):
+        _decision(db, site, 0.85, "approved" if index % 2 else "rejected", index)
+    db.commit()
+
+    assert load_editorial_feedback(db, site) is None
+
+    site.editorial_feedback_enabled = True
+    db.commit()
+    assert load_editorial_feedback(db, site) is not None

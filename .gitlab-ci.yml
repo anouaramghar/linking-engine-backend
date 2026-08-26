@@ -14,6 +14,7 @@ lint:
   script:
     - uv lock --check
     - uv run ruff check .
+    - uv run ruff format --check .
 
 test:
   extends: .python-job
@@ -30,6 +31,8 @@ test:
     DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh_test
     TEST_DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh_test
     REDIS_URL: redis://redis:6379/0
+    # Tests must never inherit a live external-search credential.
+    TAVILY_API_KEY: ""
   script:
     - |
       uv run python - <<'PY'
@@ -62,7 +65,9 @@ test:
       wait_for("Redis", redis.ping)
       PY
     - uv run alembic upgrade head
-    - uv run pytest -q
+    - uv run --with pytest-cov pytest -q --cov=app --cov-report=term-missing
+    - uv export --frozen --no-dev --no-emit-project --format requirements.txt --output-file /tmp/linkmesh-runtime-requirements.txt
+    - uv run --no-project --with pip-audit pip-audit -r /tmp/linkmesh-runtime-requirements.txt --strict
     - uv run alembic check
 
 build:

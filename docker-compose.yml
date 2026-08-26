@@ -1,24 +1,25 @@
 x-app-service: &app-service
-  image: linkmesh-engine:local
+  image: ${LINKMESH_IMAGE:-linkmesh-engine:local}
   env_file:
-    - .env
+    - ${LINKMESH_ENV_FILE:-.env}
   environment:
-    DATABASE_URL: postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh
-    REDIS_URL: redis://redis:6379/0
+    DATABASE_URL: ${LINKMESH_DATABASE_URL:-postgresql+psycopg://linkmesh:linkmesh@db:5432/linkmesh}
+    REDIS_URL: ${LINKMESH_REDIS_URL:-redis://redis:6379/0}
+    BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
 
 services:
   db:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_USER: linkmesh
-      POSTGRES_PASSWORD: linkmesh
-      POSTGRES_DB: linkmesh
+      POSTGRES_USER: ${POSTGRES_USER:-linkmesh}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-linkmesh}
+      POSTGRES_DB: ${POSTGRES_DB:-linkmesh}
     ports:
-      - "127.0.0.1:15432:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-15432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U linkmesh"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -26,7 +27,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -43,13 +44,29 @@ services:
         condition: service_healthy
     restart: "no"
 
+  pool-scheduler-init:
+    <<: *app-service
+    # Register the unique repeating coordinator on every deployment. The
+    # script is idempotent, so an existing schedule is reused, not duplicated.
+    command: ["python", "scripts/schedule_pool_ingestion.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
   api:
     <<: *app-service
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        BUILD_COMMIT: ${BUILD_COMMIT:-unknown}
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -80,12 +97,18 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      pool-scheduler-init:
+        condition: service_completed_successfully
     volumes:
       - hf_cache:/home/linkmesh/.cache/huggingface
 
   worker-analysis:
     <<: *app-service
-    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "analysis"]
+    # --with-scheduler is required: RQ parks delayed retries in
+    # rq:scheduled:analysis, and only a worker running a scheduler promotes them
+    # back onto the ready queue. Without it a retried job stays "scheduled"
+    # forever, which the API reports to the dashboard as "analysis queued".
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "analysis"]
     depends_on:
       db:
         condition: service_healthy
@@ -98,7 +121,8 @@ services:
 
   worker-publication:
     <<: *app-service
-    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "publication"]
+    # See worker-analysis: a queue with no scheduler never drains its retries.
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "publication"]
     depends_on:
       db:
         condition: service_healthy
@@ -111,7 +135,8 @@ services:
     <<: *app-service
     # Live reads and placement generation cannot occupy API or publication
     # capacity. Scale this service across sites; per-site duplicate guards remain.
-    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--url", "redis://redis:6379/0", "publication-preparation"]
+    # See worker-analysis: a queue with no scheduler never drains its retries.
+    command: ["rq", "worker", "--worker-class", "app.worker.LinkMeshWorker", "--with-scheduler", "--url", "redis://redis:6379/0", "publication-preparation"]
     depends_on:
       db:
         condition: service_healthy

@@ -118,11 +118,11 @@ os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 # Only now is importing the application safe: app.db reads settings.database_url at
 # import time, and the assignment above is what that read resolves to.
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import event, select  # noqa: E402
+from sqlalchemy import event, select, text  # noqa: E402
 
 from app.api.deps import require_api_key  # noqa: E402
 from app.config import settings  # noqa: E402
-from app.db import SessionLocal, engine  # noqa: E402
+from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Site, Tenant  # noqa: E402
 from app.services import telegram  # noqa: E402
@@ -175,6 +175,25 @@ def engine_is_bound_to_the_test_database():
     yield
 
 
+@pytest.fixture(scope="session", autouse=True)
+def reset_test_database(engine_is_bound_to_the_test_database):
+    """Start every suite against a clean schema-owned disposable database.
+
+    The database name guard above makes this bounded destructive setup safe. A
+    previous run can leave pool sites, jobs, or suggestions that are not owned
+    by a function fixture; those rows change pagination and quota outcomes even
+    though the current test is correct. Reset only mapped application tables,
+    preserving Alembic's version table so the fixture never becomes a migration
+    substitute.
+    """
+    table_names = [table.name for table in Base.metadata.sorted_tables]
+    if table_names:
+        quoted = ", ".join(f'"{name}"' for name in table_names)
+        with engine.begin() as connection:
+            connection.execute(text(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE"))
+    yield
+
+
 @pytest.fixture(autouse=True)
 def disable_api_key(monkeypatch):
     # Keep unrelated endpoint tests focused on their own behavior while auth
@@ -201,7 +220,7 @@ def disable_api_key(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def offline_publication_defaults(monkeypatch):
-    """Two things a publication run does to the outside world that tests must not.
+    """External calls a test run must not make unless it opts in explicitly.
 
     The inter-article pause exists to be polite to a customer's host; against a
     mock transport it only adds real seconds. Preflight placement generation
@@ -213,6 +232,18 @@ def offline_publication_defaults(monkeypatch):
     """
     monkeypatch.setattr(settings, "publish_request_delay_seconds", 0.0)
     monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
+    monkeypatch.setattr(settings, "tavily_api_key", "")
+
+
+@pytest.fixture(autouse=True)
+def offline_tavily(monkeypatch):
+    """Never let an unrelated test spend Tavily credits.
+
+    Developer ``.env`` files may contain a live key.  Ranking tests that do not
+    exercise the external-search provider must stay deterministic and offline;
+    provider unit tests pass an explicit fake key and a mock HTTP transport.
+    """
+    monkeypatch.setattr(settings, "tavily_api_key", "")
 
 
 @pytest.fixture(autouse=True)

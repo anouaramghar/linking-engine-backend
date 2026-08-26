@@ -892,6 +892,39 @@ def test_live_terminal_rq_status_prefers_committed_durable_success(
     assert listed["result"] == body["result"]
 
 
+def test_live_finished_job_uses_durable_result_before_rq_result_is_visible(
+    client, db, site, monkeypatch
+):
+    result = {"site_id": site.id, "plans": [{"id": 55}]}
+    run = JobRun(
+        site_id=site.id,
+        kind="publication_preparation",
+        status="succeeded",
+        queue_job_id="finished-before-rq-result",
+        attempts=1,
+        result=result,
+        started_at=datetime.now(timezone.utc),
+        finished_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    live_job = SimpleNamespace(
+        get_status=lambda: "finished",
+        latest_result=lambda: None,
+        return_value=lambda: None,
+    )
+    monkeypatch.setattr(
+        job_service.Job,
+        "fetch",
+        staticmethod(lambda _job_id, connection: live_job),
+    )
+
+    body = client.get(f"/api/v1/jobs/{run.queue_job_id}").json()
+
+    assert body["status"] == "succeeded"
+    assert body["result"] == result
+
+
 def test_live_failure_is_not_masked_without_durable_success(client, db, site, monkeypatch):
     run = JobRun(
         site_id=site.id,

@@ -1,15 +1,15 @@
-import csv
-import io
 import json
 import logging
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import exists, func, insert, literal, or_, select, text, tuple_, update
 from sqlalchemy.orm import Session, aliased, joinedload
 
+from app.api.csv_stream import CSV_FETCH_BATCH, csv_escape_formula, csv_response
 from app.api.deps import get_audit_actor, get_db, require_api_key, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
 from app.ml.llm import openrouter
@@ -36,6 +36,8 @@ from app.schemas.suggestion import (
     SuggestionCounts,
     SuggestionCursor,
     SuggestionEventOut,
+    SuggestionExposure,
+    SuggestionExposureResult,
     SuggestionOut,
     SuggestionPage,
     SuggestionReview,
@@ -52,7 +54,8 @@ from app.services.authorization import (
     require_admin_principal,
 )
 from app.services.job_service import DuplicateJobError, enqueue_job
-from app.tasks.analysis import analyze_site, compare_site
+from app.services.graph_service import current_feature_map
+from app.tasks.analysis import analyze_article, analyze_site, compare_site
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +73,7 @@ CLAIMS_AN_ANCHOR = ("pending", "approved", "applying", "applied")
 def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[SuggestionOut]:
     """Serialize suggestions with each target's ownership made explicit.
 
-    A normal customer suggestion targets an article from the same site. Pool
+    An ordinary suggestion targets an article from the same site. Pool
     articles are deliberately allowed as targets, so the target article's
     owning site is the source of truth for the dashboard label.
     """
@@ -86,6 +89,21 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
             select(Site.id, Site.name, Site.platform).where(Site.id.in_(target_site_ids))
         )
     }
+    graph_features_by_site: dict[int, dict[int, object]] = {}
+    graph_snapshots_by_site = {}
+    article_ids_by_site: dict[int, set[int]] = {}
+    for suggestion in suggestions:
+        ids = article_ids_by_site.setdefault(suggestion.site_id, set())
+        ids.add(suggestion.source_article_id)
+        if (
+            suggestion.target_article is not None
+            and suggestion.target_article.site_id == suggestion.site_id
+        ):
+            ids.add(suggestion.target_article.id)
+    for site_id, article_ids in article_ids_by_site.items():
+        snapshot, features = current_feature_map(db, site_id, article_ids)
+        graph_snapshots_by_site[site_id] = snapshot
+        graph_features_by_site[site_id] = features
     outputs = []
     for suggestion in suggestions:
         if suggestion.target_article is None:
@@ -100,6 +118,45 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
             target_site_name, target_platform = target_sites[suggestion.target_article.site_id]
             target = SuggestionTargetBrief.model_validate(suggestion.target_article)
             target_origin = "content_pool" if target_platform == "pool" else "internal"
+        score_components = (
+            dict(suggestion.score_components)
+            if isinstance(suggestion.score_components, dict)
+            else {}
+        )
+        source_feature = graph_features_by_site.get(suggestion.site_id, {}).get(
+            suggestion.source_article_id
+        )
+        target_feature = (
+            graph_features_by_site.get(suggestion.site_id, {}).get(suggestion.target_article.id)
+            if suggestion.target_article is not None
+            and suggestion.target_article.site_id == suggestion.site_id
+            else None
+        )
+        if (
+            source_feature is not None
+            and target_feature is not None
+            and "graph" not in score_components
+        ):
+            snapshot = graph_snapshots_by_site.get(suggestion.site_id)
+            score_components["graph"] = {
+                "algorithm_version": snapshot.algorithm_version if snapshot else None,
+                "snapshot_id": snapshot.id if snapshot else None,
+                "graph_version": snapshot.graph_version if snapshot else None,
+                "source_out_degree": source_feature.out_degree,
+                "source_hub": source_feature.hub,
+                "source_saturated": source_feature.saturated,
+                "target_in_degree": target_feature.in_degree,
+                "target_orphan": target_feature.orphan,
+                "target_underlinked": target_feature.underlinked,
+                "target_hub": target_feature.hub,
+                "target_saturated": target_feature.saturated,
+                "target_hub_score": target_feature.hub_score,
+                "target_saturation_score": target_feature.saturation_score,
+                "opportunity": 0.0,
+                "adjustment": 0.0,
+                "applied": False,
+                "mode": "context_only",
+            }
         outputs.append(
             SuggestionOut(
                 id=suggestion.id,
@@ -111,7 +168,7 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
                 target_site_name=target_site_name,
                 method=suggestion.method,
                 score=suggestion.score,
-                score_components=suggestion.score_components,
+                score_components=score_components or None,
                 provider=suggestion.provider,
                 provider_request_id=suggestion.provider_request_id,
                 provider_score=suggestion.provider_score,
@@ -122,6 +179,14 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
                 publish_outcome=suggestion.publish_outcome,
                 publish_attempts=suggestion.publish_attempts,
                 publish_error=suggestion.publish_error,
+                shown_at=suggestion.shown_at,
+                last_shown_at=suggestion.last_shown_at,
+                exposure_count=suggestion.exposure_count,
+                reviewer_id=suggestion.reviewer_id,
+                rejection_reason=suggestion.rejection_reason,
+                retrieval_version=suggestion.retrieval_version,
+                ranking_version=suggestion.ranking_version,
+                final_rank=suggestion.final_rank,
                 created_at=suggestion.created_at,
             )
         )
@@ -144,7 +209,12 @@ def _bound_to_an_approved_plan():
     )
 
 
-def _review_values(status: str) -> dict:
+def _review_values(
+    status: str,
+    *,
+    actor: str | None = None,
+    rejection_reason: str | None = None,
+) -> dict:
     """What a review writes, whichever path issued it.
 
     Undoing a decision returns the suggestion to the unreviewed state, so the
@@ -166,10 +236,19 @@ def _review_values(status: str) -> dict:
         "publish_attempts": 0,
         "publish_error": None,
         "publication_plan_id": None,
+        "reviewer_id": actor[:255] if actor and status != "pending" else None,
+        "rejection_reason": rejection_reason if status == "rejected" else None,
     }
 
 
-def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]:
+def _review_matching(
+    db: Session,
+    conditions: Sequence,
+    status: str,
+    *,
+    actor: str | None = None,
+    rejection_reason: str | None = None,
+) -> set[int]:
     """Move every reviewable row matching ``conditions`` to ``status``; returns the
     ids that actually moved.
 
@@ -190,15 +269,34 @@ def _review_matching(db: Session, conditions: Sequence, status: str) -> set[int]
                 Suggestion.status.notin_(UNREVIEWABLE),
                 ~_bound_to_an_approved_plan(),
             )
-            .values(**_review_values(status))
+            .values(
+                **_review_values(
+                    status,
+                    actor=actor,
+                    rejection_reason=rejection_reason,
+                )
+            )
             .returning(Suggestion.id)
             .execution_options(synchronize_session=False)
         )
     )
 
 
-def _review_ids(db: Session, suggestion_ids: Sequence[int], status: str) -> set[int]:
-    return _review_matching(db, [Suggestion.id.in_(suggestion_ids)], status)
+def _review_ids(
+    db: Session,
+    suggestion_ids: Sequence[int],
+    status: str,
+    *,
+    actor: str | None = None,
+    rejection_reason: str | None = None,
+) -> set[int]:
+    return _review_matching(
+        db,
+        [Suggestion.id.in_(suggestion_ids)],
+        status,
+        actor=actor,
+        rejection_reason=rejection_reason,
+    )
 
 
 def _set_audit_actor(db: Session, actor: str) -> None:
@@ -209,11 +307,49 @@ def _set_audit_actor(db: Session, actor: str) -> None:
     )
 
 
+def _set_review_context(
+    db: Session,
+    actor: str,
+    *,
+    review_kind: str,
+    rejection_reason: str | None = None,
+) -> None:
+    """Pass decision metadata to the lifecycle trigger for this transaction."""
+    context = {
+        "review_kind": review_kind,
+        "rejection_reason": rejection_reason,
+    }
+    db.execute(
+        text(
+            """
+            SELECT
+                set_config('linkmesh.audit_actor', :actor, true),
+                set_config('linkmesh.review_context', :context, true)
+            """
+        ),
+        {
+            "actor": actor[:255],
+            "context": json.dumps(
+                {key: value for key, value in context.items() if value is not None}
+            ),
+        },
+    )
+
+
+def _set_exposure_context(db: Session, surface: str) -> None:
+    db.execute(
+        text("SELECT set_config('linkmesh.exposure_context', :context, true)"),
+        {"context": json.dumps({"surface": surface})},
+    )
+
+
 def _review_matching_counts(
     db: Session,
     conditions: Sequence,
     status: str,
     operation_id: str | None = None,
+    actor: str | None = None,
+    rejection_reason: str | None = None,
 ) -> tuple[int, int, list[int] | None]:
     """Summarize one stable candidate cohort and update its reviewable rows.
 
@@ -242,7 +378,13 @@ def _review_matching_counts(
             # instead of vanishing from the rule's own count.
             ~_bound_to_an_approved_plan(),
         )
-        .values(**_review_values(status))
+        .values(
+            **_review_values(
+                status,
+                actor=actor,
+                rejection_reason=rejection_reason,
+            )
+        )
         .returning(Suggestion.id)
         .execution_options(synchronize_session=False)
         .cte("reviewed_rows")
@@ -552,8 +694,43 @@ def list_trace_events(
 
 
 def _csv_safe(value: object) -> str:
-    rendered = json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else str(value or "")
-    return f"'{rendered}" if rendered.startswith(("=", "+", "-", "@")) else rendered
+    rendered = (
+        json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else str(value or "")
+    )
+    return csv_escape_formula(rendered)
+
+
+TRACE_EXPORT_HEADER = (
+    "event_id",
+    "trace_id",
+    "suggestion_id",
+    "site",
+    "source_title",
+    "target_title",
+    "event_type",
+    "actor",
+    "current_status",
+    "created_at",
+    "publish_error",
+    "details",
+)
+
+
+def _trace_export_row(item: TraceEventOut) -> list[str]:
+    return [
+        _csv_safe(item.id),
+        _csv_safe(item.trace_id),
+        _csv_safe(item.suggestion_id),
+        _csv_safe(item.site_name),
+        _csv_safe(item.source_title),
+        _csv_safe(item.target_title),
+        _csv_safe(item.event_type),
+        _csv_safe(item.actor),
+        _csv_safe(item.suggestion_status),
+        _csv_safe(item.created_at.isoformat()),
+        _csv_safe(item.publish_error),
+        _csv_safe(item.details),
+    ]
 
 
 @router.get("/suggestion-events/export.csv")
@@ -567,7 +744,14 @@ def export_trace_events_csv(
     date_to: datetime | None = None,
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
-) -> Response:
+) -> StreamingResponse:
+    """Stream the filtered lifecycle stream as CSV.
+
+    `suggestion_events` is append-only and the largest table in the schema, and
+    an export with no filters selects all of it. The rows are read in batches and
+    written straight to the response, so neither the result set nor the finished
+    file is ever held whole.
+    """
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from must be before date_to")
     if site_id is not None:
@@ -582,55 +766,67 @@ def export_trace_events_csv(
             tenant_id=_tenant_scope(principal),
             date_from=date_from,
             date_to=date_to,
-        ).order_by(SuggestionEvent.created_at.desc(), SuggestionEvent.id.desc())
-    ).all()
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(
-        [
-            "event_id",
-            "trace_id",
-            "suggestion_id",
-            "site",
-            "source_title",
-            "target_title",
-            "event_type",
-            "actor",
-            "current_status",
-            "created_at",
-            "publish_error",
-            "details",
-        ]
-    )
-    for row in rows:
-        item = _trace_event_out(row)
-        writer.writerow(
-            [
-                _csv_safe(item.id),
-                _csv_safe(item.trace_id),
-                _csv_safe(item.suggestion_id),
-                _csv_safe(item.site_name),
-                _csv_safe(item.source_title),
-                _csv_safe(item.target_title),
-                _csv_safe(item.event_type),
-                _csv_safe(item.actor),
-                _csv_safe(item.suggestion_status),
-                _csv_safe(item.created_at.isoformat()),
-                _csv_safe(item.publish_error),
-                _csv_safe(item.details),
-            ]
         )
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="linkmesh-traceability.csv"'},
+        .order_by(SuggestionEvent.created_at.desc(), SuggestionEvent.id.desc())
+        .execution_options(yield_per=CSV_FETCH_BATCH)
     )
+    return csv_response(
+        TRACE_EXPORT_HEADER,
+        (_trace_export_row(_trace_event_out(row)) for row in rows),
+        filename="linkmesh-traceability.csv",
+    )
+
+
 def _tenant_scope(principal: Principal) -> int | None:
     if principal.is_admin:
         return None
     if principal.tenant_id is None:
         raise HTTPException(403, "tenant credentials required")
     return principal.tenant_id
+
+
+# declared before /suggestions/{site_id} so "exposure" is not parsed as a site id
+@router.post("/suggestions/exposure", response_model=SuggestionExposureResult)
+def mark_suggestions_exposed(
+    payload: SuggestionExposure,
+    actor: str = Depends(get_audit_actor),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> SuggestionExposureResult:
+    """Record that the dashboard rendered a bounded set of suggestions.
+
+    Exposure is idempotent at the audit level: the first render writes
+    ``shown_at`` and emits one lifecycle event, while later renders refresh the
+    last-seen timestamp and count without manufacturing more training labels.
+    """
+    rows = list(
+        db.execute(
+            select(Suggestion.id, Site.tenant_id)
+            .join(Site, Site.id == Suggestion.site_id)
+            .where(Suggestion.id.in_(payload.suggestion_ids))
+        ).all()
+    )
+    for _suggestion_id, tenant_id in rows:
+        check_site_access(principal, tenant_id)
+    existing_ids = {suggestion_id for suggestion_id, _tenant_id in rows}
+    if not existing_ids:
+        return SuggestionExposureResult(exposed=0)
+
+    now = datetime.now(timezone.utc)
+    _set_audit_actor(db, actor)
+    _set_exposure_context(db, payload.surface)
+    db.execute(
+        update(Suggestion)
+        .where(Suggestion.id.in_(existing_ids))
+        .values(
+            shown_at=func.coalesce(Suggestion.shown_at, now),
+            last_shown_at=now,
+            exposure_count=Suggestion.exposure_count + 1,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return SuggestionExposureResult(exposed=len(existing_ids))
 
 
 # declared before /suggestions/{site_id} so "bulk-review" isn't parsed as a site id
@@ -662,11 +858,22 @@ def bulk_review(
     existing = {suggestion_id for suggestion_id, _tenant_id in rows}
     for _suggestion_id, tenant_id in rows:
         check_site_access(principal, tenant_id)
-    _set_audit_actor(db, actor)
+    _set_review_context(
+        db,
+        actor,
+        review_kind="bulk",
+        rejection_reason=payload.rejection_reason,
+    )
     # Review the ids this join actually authorized, not the raw request. A
     # suggestion whose site row is missing cannot be ownership-checked, so it
     # must not be swept along by an `IN` over the caller's list.
-    reviewed = _review_ids(db, sorted(existing), payload.status)
+    reviewed = _review_ids(
+        db,
+        sorted(existing),
+        payload.status,
+        actor=actor,
+        rejection_reason=payload.rejection_reason,
+    )
     db.commit()
     logger.info(
         "suggestion review actor=%s mode=explicit status=%s reviewed=%s skipped=%s",
@@ -720,12 +927,19 @@ def bulk_review_by_filter(
     )
     db.add(operation)
     db.flush()
-    _set_audit_actor(db, actor)
+    _set_review_context(
+        db,
+        actor,
+        review_kind="bulk",
+        rejection_reason=payload.rejection_reason,
+    )
     matched, reviewed, reviewed_ids = _review_matching_counts(
         db,
         conditions,
         payload.status,
         operation_id=operation.id,
+        actor=actor,
+        rejection_reason=payload.rejection_reason,
     )
     undo_operation_id: str | None = operation.id
     if reviewed:
@@ -767,9 +981,7 @@ def undo_filtered_bulk_review(
     the counts recorded by the first undo.
     """
     operation = db.scalar(
-        select(BulkReviewOperation)
-        .where(BulkReviewOperation.id == operation_id)
-        .with_for_update()
+        select(BulkReviewOperation).where(BulkReviewOperation.id == operation_id).with_for_update()
     )
     if operation is None:
         raise HTTPException(status_code=404, detail="bulk review operation not found")
@@ -796,14 +1008,14 @@ def undo_filtered_bulk_review(
     cohort = select(BulkReviewOperationItem.suggestion_id).where(
         BulkReviewOperationItem.operation_id == operation.id
     )
-    _set_audit_actor(db, actor)
+    _set_review_context(db, actor, review_kind="undo")
     restored = db.execute(
         update(Suggestion)
         .where(
             Suggestion.id.in_(cohort),
             Suggestion.status == operation.to_status,
         )
-        .values(**_review_values(operation.from_status))
+        .values(**_review_values(operation.from_status, actor=actor))
         .execution_options(synchronize_session=False)
     ).rowcount
     skipped = operation.reviewed_count - restored
@@ -952,6 +1164,33 @@ def trigger_analysis(
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
+@router.post("/articles/{article_id}/suggestions", status_code=202, response_model=JobAccepted)
+def trigger_article_analysis(
+    article_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> JobAccepted:
+    """Generate the normal suggestion set for one source article only."""
+    article = db.get(Article, article_id)
+    if article is None:
+        raise HTTPException(404, f"article {article_id} not found")
+    site = authorize_site(db, principal, article.site_id)
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    try:
+        run = enqueue_job(
+            db,
+            site.id,
+            "analysis",
+            analyze_article,
+            job_timeout=7200,
+            task_kwargs={"article_id": article.id},
+        )
+    except DuplicateJobError as error:
+        raise HTTPException(409, str(error)) from error
+    return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
+
+
 @router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)
 def trigger_analysis_comparison(
     site: Site = Depends(require_site_access),
@@ -1056,7 +1295,9 @@ def get_suggestion_placement(
             # retries rather than inheriting a failure as a permanent verdict.
             logger.warning("placement generation failed for suggestion %s: %s", suggestion_id, e)
             raise HTTPException(502, "the placement model is unavailable; try again") from e
-        placement_service.store(db, suggestion_id, placement)
+        # `store` keeps the first generation, so a drawer that lost the race is
+        # shown the placement the row actually holds rather than its own answer.
+        placement = placement_service.store(db, suggestion_id, placement)
         db.commit()
 
     return PlacementOut(
@@ -1109,8 +1350,19 @@ def review_suggestion(
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
     authorize_site(db, principal, suggestion.site_id)
-    _set_audit_actor(db, actor)
-    if not _review_ids(db, [suggestion_id], payload.status):
+    _set_review_context(
+        db,
+        actor,
+        review_kind="individual",
+        rejection_reason=payload.rejection_reason,
+    )
+    if not _review_ids(
+        db,
+        [suggestion_id],
+        payload.status,
+        actor=actor,
+        rejection_reason=payload.rejection_reason,
+    ):
         raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
     db.commit()
     logger.info(

@@ -32,6 +32,12 @@ POLL_TIMEOUT_SECONDS = 25
 #: margin every long poll aborts on the client side exactly as it succeeds.
 _HTTP_MARGIN = 10
 
+#: Ceiling on one downloaded file. Avatars are the only thing this client
+#: fetches and Telegram keeps a profile photo far below this, so the bound costs
+#: nothing in normal use. It stops a malformed or hostile response from being
+#: read into memory in full.
+MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
+
 
 class TelegramError(RuntimeError):
     """The API answered, and said no."""
@@ -98,11 +104,23 @@ class TelegramClient:
         result = self._call("getFile", {"file_id": file_id}, http_timeout=10.0)
         return result if isinstance(result, dict) else {}
 
-    def download_file(self, file_path: str) -> bytes:
+    def download_file(self, file_path: str, *, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes:
+        """Read at most ``max_bytes``.
+
+        Streamed rather than read whole, so the ceiling applies as the body
+        arrives instead of after the process has already spent the memory.
+        """
         url = f"{self._base_url}/file/bot{self._token}/{file_path}"
-        response = self._http.get(url, timeout=10.0)
-        response.raise_for_status()
-        return response.content
+        chunks: list[bytes] = []
+        total = 0
+        with self._http.stream("GET", url, timeout=10.0) as response:
+            response.raise_for_status()
+            for chunk in response.iter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise TelegramError(f"file is larger than the {max_bytes} byte limit")
+                chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def client_from_settings() -> TelegramClient | None:

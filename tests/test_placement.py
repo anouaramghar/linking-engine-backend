@@ -7,6 +7,7 @@ here is what the engine does with an answer, not that a model produced one.
 """
 
 import json
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -423,3 +424,39 @@ def test_the_queue_does_not_carry_placement(monkeypatch, enable_openrouter, clie
 
     assert response.status_code == 200
     assert "placement_context" not in response.json()["items"][0]
+
+
+def test_the_first_stored_placement_wins_a_race(db, suggestion):
+    """A late write must not re-describe an edit somebody has already approved.
+
+    Both callers check for a missing placement before a multi-second model call,
+    so a drawer opened during a preparation pass can finish second. Preparation
+    freezes the edited HTML and its hash from what it generated; letting the
+    loser overwrite the columns would leave an approved edit sitting beside an
+    explanation of a different anchor in a different passage.
+    """
+    first = placement_service.Placement(
+        anchor_text="fewer acids",
+        placement_context=REAL_PASSAGE,
+        llm_model="model-a",
+        generated_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+    second = placement_service.Placement(
+        anchor_text="another phrase",
+        placement_context="a different passage",
+        llm_model="model-b",
+        generated_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+
+    assert placement_service.store(db, suggestion.id, first) is first
+    db.commit()
+    winner = placement_service.store(db, suggestion.id, second)
+    db.commit()
+
+    assert winner.anchor_text == "fewer acids"
+    assert winner.llm_model == "model-a"
+    db.expire_all()
+    stored = db.get(Suggestion, suggestion.id)
+    assert stored.anchor_text == "fewer acids"
+    assert stored.placement_context == REAL_PASSAGE
+    assert stored.llm_model == "model-a"

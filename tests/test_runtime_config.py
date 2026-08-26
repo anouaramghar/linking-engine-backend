@@ -7,6 +7,22 @@ from app.services.job_service import handle_abandoned_job, handle_work_horse_kil
 from app.worker import LinkMeshWorker
 
 
+def _compose_service_block(compose: str, service_name: str) -> str:
+    lines = compose.splitlines()
+    start = lines.index(f"  {service_name}:")
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith("  ")
+            and not lines[index].startswith("    ")
+            and lines[index].endswith(":")
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
 def test_compose_worker_runs_scheduler_for_delayed_retries():
     compose = (Path(__file__).parents[1] / "docker-compose.yml").read_text()
     worker_command = next(
@@ -15,6 +31,20 @@ def test_compose_worker_runs_scheduler_for_delayed_retries():
 
     assert '"worker", "--worker-class", "app.worker.LinkMeshWorker"' in worker_command
     assert '"--with-scheduler"' in worker_command
+
+
+def test_compose_registers_content_pool_schedule_before_worker():
+    compose = (Path(__file__).parents[1] / "docker-compose.yml").read_text()
+    registrar = _compose_service_block(compose, "pool-scheduler-init")
+    worker = _compose_service_block(compose, "worker")
+
+    assert 'command: ["python", "scripts/schedule_pool_ingestion.py"]' in registrar
+    assert "redis:" in registrar
+    assert "migrate:" in registrar
+    assert 'restart: "no"' in registrar
+    assert (
+        "      pool-scheduler-init:\n        condition: service_completed_successfully"
+    ) in worker
 
 
 def test_linkmesh_worker_wires_durable_handlers_and_preserves_existing(monkeypatch):

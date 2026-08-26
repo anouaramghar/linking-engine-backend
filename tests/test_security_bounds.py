@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from app.api.csv_stream import csv_escape_formula
+
 from app.config import Settings, settings
 from app.connectors.base import ArticleData, ContentConnector
 from app.connectors.html_crawler import HTMLConnector
@@ -25,6 +27,21 @@ def _site(base_url: str = "https://example.com") -> SimpleNamespace:
         wp_app_password=None,
         platform="wordpress",
     )
+
+
+@pytest.mark.parametrize("prefix", ["=", "+", "-", "@", "\t", "\r"])
+def test_an_export_cell_cannot_open_as_a_formula(prefix):
+    """A title an editor never wrote is still a title the export carries.
+
+    The tab and the carriage return are in this list because a spreadsheet
+    discards them before it parses the cell, so escaping only the four visible
+    characters leaves the same formula one keystroke away.
+    """
+    assert csv_escape_formula(f'{prefix}HYPERLINK("http://evil")').startswith("'")
+
+
+def test_an_ordinary_export_cell_is_left_alone():
+    assert csv_escape_formula("Ordinary article title") == "Ordinary article title"
 
 
 def test_html_sitemap_response_is_bounded(monkeypatch):

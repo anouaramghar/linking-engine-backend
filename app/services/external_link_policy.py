@@ -14,7 +14,7 @@ from app.models import Article, ExternalLinkPolicy, Site, Suggestion, Suggestion
 @dataclass(frozen=True)
 class PolicyState:
     site_id: int
-    external_links_enabled: bool = True
+    external_links_enabled: bool = False
     require_https: bool = True
     min_trust_score: int = 60
     min_domain_age_days: int = 0
@@ -162,8 +162,7 @@ def _domain_age_days(target_url: str, target_site: Site) -> int | None:
     target_domain = domain_from_url(target_url)
     source_domain = domain_from_url(target_site.base_url)
     if not (
-        domain_matches(target_domain, source_domain)
-        or domain_matches(source_domain, target_domain)
+        domain_matches(target_domain, source_domain) or domain_matches(source_domain, target_domain)
     ):
         return None
     return max(0, (datetime.now(UTC).date() - registered).days)
@@ -255,9 +254,7 @@ def evaluate_external_url(
         reasons.append("domain is marked as a competitor")
     if owned:
         reasons.append("domain belongs to a managed site")
-    if policy.min_domain_age_days and (
-        age_days is None or age_days < policy.min_domain_age_days
-    ):
+    if policy.min_domain_age_days and (age_days is None or age_days < policy.min_domain_age_days):
         reasons.append(
             "domain age is unknown"
             if age_days is None
@@ -391,13 +388,10 @@ def expire_ineligible_external_suggestions(
         .options(joinedload(Suggestion.target_article))
     ).all()
     target_site_ids = {
-        row.target_article.site_id
-        for row in suggestions
-        if row.target_article is not None
+        row.target_article.site_id for row in suggestions if row.target_article is not None
     }
     target_sites = {
-        site.id: site
-        for site in db.scalars(select(Site).where(Site.id.in_(target_site_ids))).all()
+        site.id: site for site in db.scalars(select(Site).where(Site.id.in_(target_site_ids))).all()
     }
     expired = 0
     now = datetime.now(UTC)

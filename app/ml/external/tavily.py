@@ -70,9 +70,9 @@ def _credits_used(value: object) -> int | None:
 
 
 def _excluded_domains(values: Sequence[str]) -> list[str]:
-    return sorted(
-        {value.strip().lower() for value in values if value.strip()}
-    )[:TAVILY_MAX_EXCLUDE_DOMAINS]
+    return sorted({value.strip().lower() for value in values if value.strip()})[
+        :TAVILY_MAX_EXCLUDE_DOMAINS
+    ]
 
 
 class TavilySearchProvider:
@@ -98,9 +98,7 @@ class TavilySearchProvider:
         self.api_key = settings.tavily_api_key if api_key is None else api_key
         self.base_url = (base_url or settings.tavily_base_url).rstrip("/")
         self.timeout_seconds = (
-            timeout_seconds
-            if timeout_seconds is not None
-            else settings.tavily_timeout_seconds
+            timeout_seconds if timeout_seconds is not None else settings.tavily_timeout_seconds
         )
         self.max_results_per_request = (
             max_results_per_request
@@ -109,8 +107,7 @@ class TavilySearchProvider:
         )
         if not 1 <= self.max_results_per_request <= TAVILY_PROJECT_MAX_RESULTS:
             raise ValueError(
-                "max_results_per_request must be between 1 and "
-                f"{TAVILY_PROJECT_MAX_RESULTS}"
+                f"max_results_per_request must be between 1 and {TAVILY_PROJECT_MAX_RESULTS}"
             )
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero")
@@ -178,8 +175,13 @@ class TavilySearchProvider:
                     )
 
                 if attempt > len(self.retry_delays_seconds):
-                    assert transient_error is not None
-                    raise transient_error
+                    # `or` rather than an assertion: `python -O` strips
+                    # assertions, and a stripped one here would leave
+                    # `raise None`, reporting the exhausted retry as an
+                    # unrelated TypeError.
+                    raise transient_error or ExternalSearchTransientError(
+                        "Tavily request failed without a recorded error"
+                    )
                 sleep(self.retry_delays_seconds[attempt - 1])
         finally:
             if owned:

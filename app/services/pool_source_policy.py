@@ -4,13 +4,25 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.article import Article
 from app.models.site import Site
 from app.models.suggestion import Suggestion
+
+
+# Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C49 shared content
+# snapshot, 0x4C4A enqueue, 0x4C50 publication, 0x4C42 this PBN check.
+_PBN_LOCK_NAMESPACE = 0x4C42  # "LB"
+#: One key for the whole check rather than one per domain. `_same_property`
+#: matches parents and children, so example.com and blog.example.com must
+#: exclude each other while hashing to different keys — a per-domain lock would
+#: let exactly the racing pair it is meant to stop run side by side. Creating a
+#: site and approving a pool source are rare operator actions, so serializing
+#: them costs nothing measurable.
+_PBN_LOCK_KEY = 0
 
 
 class PoolSourcePolicyError(ValueError):
@@ -84,7 +96,15 @@ def require_no_pbn_conflict(db: Session, base_url: str, *, as_pool: bool) -> Non
     client site holds, and creating a client site rejects a domain an approved
     pool source holds. One direction alone would leave the bad state reachable
     by doing the two steps in the other order.
+
+    Both directions read before they write, so without a lock two transactions
+    can each see a clean table and each commit the half that conflicts with the
+    other — a client site and a pool approval for the same property, created
+    concurrently, both passing. The advisory lock is transaction-level and every
+    caller commits on the same session, so it is held from the check until the
+    write it protects lands.
     """
+    db.execute(select(func.pg_advisory_xact_lock(_PBN_LOCK_NAMESPACE, _PBN_LOCK_KEY)))
     domain = pool_source_domain(base_url)
     query = (
         select(Site.base_url).where(Site.platform != "pool")

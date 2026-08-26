@@ -13,6 +13,7 @@ from app.db import SessionLocal, engine
 from app.models import Article, Embedding, Site, Suggestion
 from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
+from app.ml.candidate_ordering import order_candidates
 from app.ml.external.base import ExternalSearchProvider
 from app.ml.hybrid import HybridRanker, RankedCandidate
 from app.services.external_suggestion_service import fill_external_suggestion_gap
@@ -21,8 +22,10 @@ from app.services.external_link_policy import external_target_context
 from app.services.editorial_feedback import (
     FEEDBACK_CANDIDATE_POOL,
     load_editorial_feedback,
-    rerank_with_editorial_feedback,
-    score_percent,
+)
+from app.services.graph_service import (
+    ensure_graph_snapshot,
+    snapshot_features,
 )
 
 BATCH_SIZE = 32
@@ -223,6 +226,7 @@ def generate_suggestions(
     site_id: int,
     job_run_id: int | None = None,
     *,
+    article_id: int | None = None,
     ranking_mode_override: str | None = None,
     comparison_only: bool = False,
     external_provider: ExternalSearchProvider | None = None,
@@ -240,6 +244,16 @@ def generate_suggestions(
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             encoded = _embed_missing(db, site_id, model, job_run_id)
+            graph_snapshot, graph_created = ensure_graph_snapshot(db, site_id)
+            # The snapshot is a derived observation of the accepted article/link
+            # state. Persist it before candidate generation so every suggestion
+            # can carry the exact graph version it was ranked against.
+            if graph_created:
+                db.commit()
+                db.refresh(graph_snapshot)
+            else:
+                db.commit()
+            graph_features = snapshot_features(db, graph_snapshot.id)
             pool_site_ids = db.scalars(
                 select(Article.site_id)
                 .where(
@@ -292,14 +306,13 @@ def generate_suggestions(
                         site_id,
                     )
 
-            article_ids = db.scalars(
-                select(Article.id)
-                .where(
-                    Article.site_id == site_id,
-                    Article.is_active.is_(True),
-                )
-                .order_by(Article.id)
-            ).all()
+            article_query = select(Article.id).where(
+                Article.site_id == site_id,
+                Article.is_active.is_(True),
+            )
+            if article_id is not None:
+                article_query = article_query.where(Article.id == article_id)
+            article_ids = db.scalars(article_query.order_by(Article.id)).all()
             shadow_source_ids = (
                 _evenly_spaced_ids(article_ids, settings.hybrid_max_sources_per_run)
                 if ranking_mode == "shadow"
@@ -346,6 +359,7 @@ def generate_suggestions(
             external_created = 0
             external_credits_used = 0
             external_filtered: dict[str, int] = {}
+            graph_reordered_sources = 0
             for article_id in article_ids:
                 if ranking_mode == "hybrid" and site_capacity <= 0:
                     break
@@ -396,9 +410,7 @@ def generate_suggestions(
                     )
                 else:
                     try:
-                        ranking_limit = (
-                            suggestion_cap if shadow_selected else candidate_pool_limit
-                        )
+                        ranking_limit = suggestion_cap if shadow_selected else candidate_pool_limit
                         ranking = hybrid_ranker.rank(
                             db,
                             source_id=article_id,
@@ -459,61 +471,45 @@ def generate_suggestions(
                             else []
                         )
 
-                feedback_components: dict[int, dict] = {}
+                ordered_rows = ()
                 if has_capacity and not comparison_only:
-                    candidate_rows = [
-                        candidate
-                        for candidate in candidate_rows
-                        if score_percent(candidate.semantic_score)
-                        >= site.editorial_min_score_percent
-                    ]
-                    if feedback_profile is not None:
-                        candidate_rows, feedback_components = rerank_with_editorial_feedback(
-                            candidate_rows,
-                            feedback_profile,
-                            weight=site.editorial_feedback_weight,
-                        )
-                    candidate_rows = candidate_rows[:remaining]
-                if comparison_only:
+                    ordering = order_candidates(
+                        candidate_rows,
+                        method=method,
+                        minimum_score_percent=site.editorial_min_score_percent,
+                        remaining=remaining,
+                        graph_features=graph_features,
+                        graph_snapshot=graph_snapshot,
+                        source_article_id=article_id,
+                        graph_mode=settings.graph_reranking_mode,
+                        minimum_relevance=settings.suggestion_min_score,
+                        feedback_profile=feedback_profile,
+                        feedback_weight=site.editorial_feedback_weight,
+                        external_trust=external_trust,
+                    )
+                    ordered_rows = ordering.items
+                    candidate_rows = [item.candidate for item in ordered_rows]
+                    if ordering.graph_reordered:
+                        graph_reordered_sources += 1
+                else:
                     candidate_rows = []
-                for candidate in candidate_rows:
+                for ordered_candidate in ordered_rows:
+                    candidate = ordered_candidate.candidate
                     db.add(
                         Suggestion(
                             site_id=site_id,
                             source_article_id=article_id,
+                            generation_job_run_id=job_run_id,
                             target_article_id=candidate.target_id,
                             method=method,
                             # Cosine similarity for both methods, so one number keeps
                             # one meaning across the mixed queue.
                             score=candidate.semantic_score,
-                            score_components=(
-                                {
-                                    **(
-                                        candidate.score_components()
-                                        if method == "hybrid_bm25"
-                                        else {}
-                                    ),
-                                    **(
-                                        {
-                                            "external_trust": external_trust[
-                                                candidate.target_id
-                                            ].as_score_component()
-                                        }
-                                        if candidate.target_id in external_trust
-                                        else {}
-                                    ),
-                                    **(
-                                        {
-                                            "editorial_feedback": feedback_components[
-                                                candidate.target_id
-                                            ]
-                                        }
-                                        if candidate.target_id in feedback_components
-                                        else {}
-                                    ),
-                                }
-                                or None
-                            ),
+                            score_components=ordered_candidate.score_components,
+                            retrieval_version=ordered_candidate.retrieval_version,
+                            ranking_version=ordered_candidate.ranking_version,
+                            final_rank=ordered_candidate.final_rank,
+                            feature_snapshot=ordered_candidate.score_components,
                             status="pending",
                         )
                     )
@@ -572,6 +568,11 @@ def generate_suggestions(
                     feedback_profile.samples if feedback_profile is not None else 0
                 ),
                 "editorial_min_score_percent": site.editorial_min_score_percent,
+                "graph_snapshot_id": graph_snapshot.id,
+                "graph_version": graph_snapshot.graph_version,
+                "graph_reranking_mode": settings.graph_reranking_mode,
+                "graph_reordered_sources": graph_reordered_sources,
+                "source_article_id": article_id,
             }
             if ranking_mode != "baseline":
                 result.update(

@@ -42,6 +42,12 @@ from app.connectors.base import StalePlanError
 from app.connectors.registry import get_connector
 from app.db import SessionLocal
 from app.models import Article, JobRun, PublicationPlan, Site, Suggestion, SuggestionEvent
+from app.schemas.publication import (
+    PublicationPreparationError,
+    PublicationPreparationJobLink,
+    PublicationPreparationJobPlan,
+    PublicationPreparationJobResult,
+)
 from app.services.alerts import send_alert
 from app.services.publication_plan_service import (
     MAX_REASON_CHARS,
@@ -76,13 +82,20 @@ def prepare_publication_plans(
     site_id: int,
     job_run_id: int | None = None,
     max_articles: int = 10,
+    suggestion_ids: list[int] | None = None,
 ) -> dict:
-    """Durably prepare one bounded, compact review batch for an operator."""
+    """Durably prepare one bounded, compact review batch for an operator.
+
+    `suggestion_ids` is a plain list rather than a set because this signature is
+    what RQ serialises into Redis and what the durable `job_runs` payload
+    records.
+    """
     return run_durably(
         job_run_id,
         _prepare_publication_plans,
         site_id,
         max_articles=max_articles,
+        suggestion_ids=suggestion_ids,
     )
 
 
@@ -90,6 +103,7 @@ def _prepare_publication_plans(
     site_id: int,
     job_run_id: int | None = None,
     max_articles: int = 10,
+    suggestion_ids: list[int] | None = None,
 ) -> dict:
     with SessionLocal() as db:
         site = db.get(Site, site_id)
@@ -99,6 +113,7 @@ def _prepare_publication_plans(
             db,
             site,
             max_articles=max_articles,
+            suggestion_ids=set(suggestion_ids) if suggestion_ids else None,
             job_run_id=job_run_id,
         )
         suggestion_ids = [
@@ -111,42 +126,45 @@ def _prepare_publication_plans(
                 )
             ).all()
         )
-        plans = []
-        for plan in preparation.plans:
-            links = [
-                {**item, "placement_context": contexts.get(item["suggestion_id"])}
-                for item in (plan.items or [])
-            ]
-            plans.append(
-                {
-                    "id": plan.id,
-                    "status": plan.status,
-                    "plan_hash": plan.plan_hash,
-                    "source_article_id": plan.source_article_id,
-                    "source_url": plan.source_url,
-                    "links": links,
-                }
+        plans = [
+            PublicationPreparationJobPlan(
+                id=plan.id,
+                status=plan.status,
+                plan_hash=plan.plan_hash,
+                source_article_id=plan.source_article_id,
+                source_url=plan.source_url,
+                links=[
+                    PublicationPreparationJobLink(
+                        **{**item, "placement_context": contexts.get(item["suggestion_id"])}
+                    )
+                    for item in (plan.items or [])
+                ],
             )
+            for plan in preparation.plans
+        ]
         record_progress_durably(
             job_run_id,
             stage="ready",
             completed=len(preparation.plans),
             total=min(max_articles, len(preparation.plans) + len(preparation.errors)),
         )
-        return {
-            "site_id": site_id,
-            "selected_suggestions": preparation.selected_suggestions,
-            "plans": plans,
-            "errors": [
-                {
-                    "source_article_id": error.source_article_id,
-                    "source_url": error.source_url,
-                    "message": error.message,
-                }
+        # Named, validated, and only then serialized. The dashboard reads this
+        # JSON straight out of `JobRun.result`, so the last place a contract
+        # break can be caught cheaply is here, before it is persisted.
+        return PublicationPreparationJobResult(
+            site_id=site_id,
+            selected_suggestions=preparation.selected_suggestions,
+            plans=plans,
+            errors=[
+                PublicationPreparationError(
+                    source_article_id=error.source_article_id,
+                    source_url=error.source_url,
+                    message=error.message,
+                )
                 for error in preparation.errors
             ],
-            "has_more": preparation.has_more,
-        }
+            has_more=preparation.has_more,
+        ).model_dump(mode="json")
 
 
 def publish_approved_plans(
@@ -293,7 +311,7 @@ def _publish_approved_plans(
                     record_progress_durably(job_run_id, session=progress_db, **progress)
                     continue
                 except Exception:
-                    # Only the customer's publication boundary consumes a
+                    # Only the WordPress publication boundary consumes a
                     # suggestion attempt. Database and progress failures are
                     # infrastructure errors, not evidence that this plan is bad.
                     charge_suggestions = True

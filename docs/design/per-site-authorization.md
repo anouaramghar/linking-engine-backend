@@ -3,6 +3,18 @@
 Status: implemented on `feat/trust-boundary` (phase 2). Open questions below were
 resolved with the defaults in `docs/design/trust-boundary-phase2.md`.
 
+> **The threat model in this document is wrong, and it is kept only as a record
+> of how the mechanism was designed.** It was written assuming client companies
+> whose data must stay separate. There are none: every site belongs to the same
+> team and every dashboard operator sees all of them. On 2026-08-06 the team lead
+> settled it — *"keep the scoped keys, they're for limiting blast radius if one
+> ever leaks, not client isolation, since we don't have clients."*
+>
+> Read every "client" below as "a key", and every "cross-tenant access" as "one
+> leaked credential reaching further than it should". The shipped mechanism is
+> unchanged and correct; only its purpose is restated.
+> `app/services/authorization.py` is authoritative.
+
 ## Problem and threat model
 
 Today, every protected API route uses one static `API_KEY` value from the environment and
@@ -10,9 +22,9 @@ the `X-API-Key` header. The key is global: anyone who has it can list, read, mod
 publish, or delete data for every site in the LinkMesh installation. Site IDs and related
 resource IDs are not ownership boundaries.
 
-The primary threat is a legitimate client, integration, or leaked client key accessing a
-different client's site. This includes direct site routes and indirect resources such as a
-suggestion ID or RQ job ID. The target guarantee is:
+The primary threat is one leaked or over-broad key reaching sites it was never issued for.
+This includes direct site routes and indirect resources such as a suggestion ID or RQ job
+ID. The target guarantee is:
 
 > Credentials for site A cannot read or change site B or any resource owned by site B.
 
@@ -131,13 +143,13 @@ and an explicit invalidation path so revocation is not delayed unexpectedly.
 
 Use a time-limited compatibility mode:
 
-1. Add tenant ownership and database-backed key authentication without changing existing
-   clients.
+1. Add scope ownership and database-backed key authentication without changing existing
+   callers.
 2. When the legacy environment `API_KEY` matches, construct a compatibility principal with
    explicit all-sites admin scope.
 3. Emit a deprecation metric or structured warning for every legacy-key request, without
    logging the key.
-4. Issue tenant-scoped database keys and migrate clients one at a time.
+4. Issue scoped database keys to machine callers and integrations as they appear.
 5. Set and communicate a removal date, then disable compatibility in non-development
    environments before deleting the legacy setting in a later release.
 
@@ -165,19 +177,26 @@ principal. Its temporary all-sites power must be visible as an admin scope.
 - rate limiting, quotas, and abuse throttling;
 - changing RQ worker trust boundaries or encrypting site content at rest.
 
-## Open questions for the team lead
+## Answers from the team lead
 
-1. Is one tenant exactly one client company, or can an agency manage multiple client
-   tenants?
-2. Can a site ever be shared by multiple tenants, or is ownership strictly singular?
-3. Who may issue, rotate, and revoke tenant keys: platform operators only, or tenant admins
-   through a future self-service API?
-4. Should normal keys support narrower scopes such as read-only, analyze, or publish, or is
-   tenant-wide read/write sufficient for the first version?
-5. Should admin keys list all sites by default, or require an explicit tenant filter to
-   reduce accidental cross-tenant operations?
-6. What expiration policy and rotation overlap are required for production clients?
-7. Is `403` for a foreign-but-existing resource acceptable, or should the API return `404`
-   to reduce resource-enumeration signals?
-8. What is the required deprecation date for the legacy `API_KEY`, and which clients must be
-   migrated before compatibility mode can be disabled?
+All eight are settled. Kept with their answers so nobody reopens them.
+
+1. **Is one tenant exactly one client company?** Neither. There are no client
+   companies — the question does not apply. A scope bounds one key's reach
+   (2026-08-06).
+2. **Can a site be shared by multiple tenants?** No, ownership is singular
+   (`sites.tenant_id NOT NULL`). Content-pool sources are the one shared kind,
+   readable by every scope and writable only by admins.
+3. **Who may issue, rotate, and revoke keys?** Admin principals only, via
+   `POST /admin/api-keys`. No self-service API is planned.
+4. **Should keys support narrower scopes (read-only, analyze, publish)?** Not
+   yet. Scope-wide read/write is sufficient, and finer grades only pay off
+   against a threat model this product does not have.
+5. **Should admin keys list all sites by default?** Yes.
+6. **What expiration and rotation overlap?** Optional `expires_at` only, no
+   forced rotation.
+7. **`403` or `404` for a foreign-but-existing resource?** `403`. Enumeration
+   hardening is not worth the debugging cost when every caller is internal.
+8. **Deprecation date for the legacy `API_KEY`?** None set. It stays an explicit
+   admin principal with a structured warning; the dashboard proxy depends on it,
+   and no external caller has to be migrated off it.

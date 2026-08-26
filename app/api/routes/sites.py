@@ -43,6 +43,8 @@ from app.schemas.site import (
     ArticleOut,
     EditorialRankingPolicyOut,
     EditorialRankingPolicyUpdate,
+    PoolSourceValidationRequest,
+    PoolSourceValidationResult,
     SiteBulkCreated,
     SiteBulkFailure,
     SiteBulkRequest,
@@ -59,15 +61,31 @@ from app.services.external_link_policy import (
 from app.services.ingestion_service import latest_run
 from app.services.pool_source_audit import record_pool_source_audit_event
 from app.services.pool_source_policy import (
+    PoolSourceFetchError,
     PoolSourcePolicyError,
     expire_pool_target_suggestions,
     require_allowed_pool_domain,
     require_no_pbn_conflict,
 )
+from app.services.pool_source_validation import classify_pool_source, probe_pool_source
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
 DUPLICATE_REASON = "a site with this base_url already exists"
+
+#: How much of a failure message travels on a list row. Long enough for the
+#: sentence that names the cause, short enough that 250 failed sites do not
+#: turn one page into a megabyte of tracebacks.
+MAX_ROW_ERROR_CHARS = 300
+
+
+def _row_error(message: str | None) -> str | None:
+    if not message:
+        return None
+    trimmed = " ".join(message.split())
+    if len(trimmed) <= MAX_ROW_ERROR_CHARS:
+        return trimmed
+    return trimmed[: MAX_ROW_ERROR_CHARS - 1].rstrip() + "…"
 
 
 def _managed_site_or_409(site: Site) -> Site:
@@ -87,6 +105,8 @@ def _external_policy_out(
         updated_at=stored.updated_at if stored is not None else None,
         expired_suggestions=expired_suggestions,
     )
+
+
 def _first_error(exc: ValidationError) -> str:
     """Flatten a row's validation failure into one reviewer-readable line."""
     error = exc.errors()[0]
@@ -210,9 +230,15 @@ def _site_out(
     if run is not None:
         item.last_ingestion_status = run.status
         item.last_crawl_at = run.finished_at or run.started_at
+        # Only for a failure: a message left on a succeeded run would read as a
+        # problem the site does not have.
+        if run.status == "failed":
+            item.last_ingestion_error = _row_error(run.error)
     if analysis is not None:
         item.last_analysis_status = analysis.status
         item.last_analysis_at = analysis.finished_at or analysis.enqueued_at
+        if analysis.status == "failed":
+            item.last_analysis_error = _row_error(analysis.error)
     return item
 
 
@@ -331,6 +357,61 @@ def bulk_create_sites(
     return SiteBulkResult(created=created, skipped=skipped, rejected=rejected)
 
 
+@router.post("/pool-source/validate", response_model=PoolSourceValidationResult)
+def validate_pool_source(
+    payload: PoolSourceValidationRequest,
+    tenant_id: int | None = Query(None, ge=1),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> PoolSourceValidationResult:
+    """Validate one remote pool source without creating, approving, or crawling it."""
+
+    require_creatable_platform(principal, "pool")
+    owner_tenant_id = resolve_create_tenant_id(db, principal, tenant_id=tenant_id)
+    try:
+        item = SiteCreate.model_validate(
+            {"name": payload.name, "base_url": payload.base_url, "platform": "pool"}
+        )
+    except ValidationError as exc:
+        return PoolSourceValidationResult(
+            base_url=payload.base_url,
+            valid=False,
+            reason=_first_error(exc),
+        )
+
+    source_type = classify_pool_source(item.base_url)
+    if db.scalar(
+        select(Site.id).where(
+            Site.base_url == item.base_url,
+            Site.tenant_id == owner_tenant_id,
+        )
+    ):
+        return PoolSourceValidationResult(
+            base_url=item.base_url,
+            valid=False,
+            source_type=source_type,
+            reason=DUPLICATE_REASON,
+        )
+
+    try:
+        require_allowed_pool_domain(item.base_url)
+        require_no_pbn_conflict(db, item.base_url, as_pool=True)
+        source_type = probe_pool_source(Site(**item.model_dump(), tenant_id=owner_tenant_id))
+    except (PoolSourcePolicyError, PoolSourceFetchError) as error:
+        return PoolSourceValidationResult(
+            base_url=item.base_url,
+            valid=False,
+            source_type=source_type,
+            reason=str(error),
+        )
+
+    return PoolSourceValidationResult(
+        base_url=item.base_url,
+        valid=True,
+        source_type=source_type,
+    )
+
+
 @router.get("", response_model=list[SiteOut])
 def list_sites(
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
@@ -389,7 +470,10 @@ def update_external_link_policy(
     if policy is None:
         policy = ExternalLinkPolicy(site_id=site.id)
         db.add(policy)
-    for field, value in payload.model_dump().items():
+    # The policy surface accepts partial updates in practice.  Do not turn an
+    # omitted field into its schema default: an existing explicitly enabled
+    # policy must remain enabled when an operator changes only a domain rule.
+    for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(policy, field, value)
     policy.updated_by = operator_id
     db.flush()

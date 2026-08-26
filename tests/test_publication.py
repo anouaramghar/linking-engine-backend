@@ -457,9 +457,7 @@ def test_a_retry_after_a_successful_remote_write_does_not_write_twice(
     assert _status(db, suggestion.id) == "applied"
 
 
-def test_two_sequential_workers_cannot_publish_the_same_plan_twice(
-    db, site, articles, monkeypatch
-):
+def test_two_sequential_workers_cannot_publish_the_same_plan_twice(db, site, articles, monkeypatch):
     suggestion = _suggestion(db, site, *articles)
     plan = _approved_plan(db, site, articles[0], [suggestion])
     calls = _stub_connector(monkeypatch)
@@ -473,9 +471,7 @@ def test_two_sequential_workers_cannot_publish_the_same_plan_twice(
     assert _plan_status(db, plan.id) == "applied"
 
 
-def test_two_concurrent_workers_cannot_publish_the_same_plan_twice(
-    db, site, articles, monkeypatch
-):
+def test_two_concurrent_workers_cannot_publish_the_same_plan_twice(db, site, articles, monkeypatch):
     suggestion = _suggestion(db, site, *articles)
     _approved_plan(db, site, articles[0], [suggestion])
     calls = _stub_connector(monkeypatch)
@@ -497,9 +493,7 @@ def test_two_concurrent_workers_cannot_publish_the_same_plan_twice(
     assert sum(result["skipped"] for result in results) == 1
 
 
-def test_a_scoped_worker_leaves_other_approved_plans_untouched(
-    db, site, articles, monkeypatch
-):
+def test_a_scoped_worker_leaves_other_approved_plans_untouched(db, site, articles, monkeypatch):
     first = _suggestion(db, site, *articles)
     first_plan = _approved_plan(db, site, articles[0], [first])
     second_source = Article(

@@ -15,7 +15,7 @@ from app.connectors.wordpress import WordPressConnector
 from app.models import Article, PublicationPlan, Suggestion
 from app.services import publication_plan_service
 from app.tasks import publication
-from app.tasks.publication import publish_approved_plans
+from app.tasks.publication import _prepare_publication_plans, publish_approved_plans
 
 BEFORE = "<p>Costs of solar panel installations fell last year.</p>"
 
@@ -86,13 +86,15 @@ def test_end_to_end_only_the_approved_bytes_are_ever_written(client, db, site, w
     db.add(suggestion)
     db.commit()
 
-    # 2. Prepare a plan and record its hash.
-    body = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()
+    # 2. Prepare a plan and record its hash. Preparation is queued work, so this
+    #    runs the worker's own task body rather than an HTTP route.
+    body = _prepare_publication_plans(site.id)
     plan = body["plans"][0]
     first_hash = plan["plan_hash"]
     assert body["selected_suggestions"] == 1
-    assert plan["original_html"] == BEFORE
-    assert 'data-linkmesh="in-text"' in plan["updated_html"]
+    stored_plan = db.get(PublicationPlan, plan["id"])
+    assert stored_plan.original_html == BEFORE
+    assert 'data-linkmesh="in-text"' in stored_plan.updated_html
     assert state["posts"] == []  # preparation never writes
 
     # 3. Approve it as a named operator.
@@ -115,11 +117,12 @@ def test_end_to_end_only_the_approved_bytes_are_ever_written(client, db, site, w
     assert (revived.status, revived.publication_plan_id) == ("approved", None)
 
     # 5. Prepare and approve a new plan against the article as it now is.
-    second = client.post(f"/api/v1/publish/{site.id}/plans/prepare").json()["plans"][0]
+    second = _prepare_publication_plans(site.id)["plans"][0]
     assert second["id"] != plan["id"]
     assert second["plan_hash"] != first_hash
-    assert second["original_html"] == state["raw"]
-    approved_html = second["updated_html"]
+    stored_second = db.get(PublicationPlan, second["id"])
+    assert stored_second.original_html == state["raw"]
+    approved_html = stored_second.updated_html
     assert (
         client.post(
             f"/api/v1/publish/{site.id}/plans/approve",

@@ -143,6 +143,20 @@ class SiteBulkResult(BaseModel):
     rejected: list[SiteBulkFailure]  # failed validation, including the SSRF guard
 
 
+class PoolSourceValidationRequest(BaseModel):
+    """One pool source to probe without creating or approving it."""
+
+    name: str | None = None
+    base_url: str | None = None
+
+
+class PoolSourceValidationResult(BaseModel):
+    base_url: str | None
+    valid: bool
+    source_type: Literal["wikipedia", "rss_atom"] | None = None
+    reason: str | None = None
+
+
 class SiteOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -162,7 +176,7 @@ class SiteOut(BaseModel):
     pool_source_last_reactivated_at: datetime | None = None
     pool_source_last_reactivated_by: str | None = None
     domain_registered_at: date | None = None
-    editorial_feedback_enabled: bool = True
+    editorial_feedback_enabled: bool = False
     editorial_min_score_percent: int = 0
     editorial_feedback_weight: float = 0.20
     editorial_feedback_min_samples: int = 10
@@ -175,21 +189,26 @@ class SiteOut(BaseModel):
     has_wordpress_credentials: bool = False
     created_at: datetime
     last_ingestion_status: str | None = None
+    #: Why the last crawl failed, in the crawler's own words. Carried on the
+    #: list row so a failed site can say what went wrong where it is shown,
+    #: instead of sending the operator to the engine logs. Trimmed, because a
+    #: stack-trace-length message on every row is payload nobody reads.
+    last_ingestion_error: str | None = None
     # Last *finished* analysis, so a crawled site reads differently from an
     # analysed one once both jobs have left the active feed.
     last_analysis_status: str | None = None
     last_analysis_at: datetime | None = None
+    last_analysis_error: str | None = None
     article_count: int = 0
     internal_link_count: int = 0
     last_crawl_at: datetime | None = None
 
 
-class SiteSuggestionModeUpdate(BaseModel):
-    suggestion_mode: Literal["standard", "experimental"]
-
-
 class EditorialRankingPolicyUpdate(BaseModel):
-    enabled: bool = True
+    #: Required, not defaulted: switching feedback reranking on is a deliberate
+    #: act while it is unproven, so an omitted field must not turn it on as a
+    #: side effect of editing the thresholds beside it.
+    enabled: bool
     min_score_percent: int = Field(ge=0, le=100)
     feedback_weight: float = Field(ge=0.0, le=1.0)
     min_samples: int = Field(ge=1, le=10_000)
@@ -197,12 +216,6 @@ class EditorialRankingPolicyUpdate(BaseModel):
 
 class EditorialRankingPolicyOut(EditorialRankingPolicyUpdate):
     site_id: int
-
-
-class SiteSuggestionModeState(BaseModel):
-    suggestion_mode: Literal["standard", "experimental"]
-    suggestion_mode_managed: bool
-    suggestion_comparison_enabled: bool
 
 
 class ArticleBrief(BaseModel):
@@ -232,6 +245,29 @@ class IngestionRunOut(BaseModel):
     status: str
     articles_upserted: int
     links_found: int
+    discovered_urls: int
+    accepted_urls: int
+    skipped_urls: int
+    diagnostic_summary: dict
     error: str | None
     started_at: datetime
     finished_at: datetime | None
+
+
+class IngestionDiagnosticOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    site_id: int
+    ingestion_run_id: int
+    url: str
+    state: str
+    reason_code: str
+    reason_detail: str | None
+    discovered_from: str | None
+    depth: int
+    http_status: int | None
+    content_type: str | None
+    final_url: str | None
+    canonical_url: str | None
+    created_at: datetime

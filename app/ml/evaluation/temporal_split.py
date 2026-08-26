@@ -1,6 +1,7 @@
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, aliased
@@ -11,6 +12,17 @@ from app.models import Article, InternalLink, Suggestion
 GroundTruth = Literal["editor", "observed"]
 
 SCHEMA_VERSION = 2
+
+
+class FrozenSplitError(ValueError):
+    """A stored split cannot be read back as the split it claims to be."""
+
+
+def _parse_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise FrozenSplitError(f"stored timestamp {value!r} has no timezone")
+    return parsed
 
 
 @dataclass(frozen=True)
@@ -29,6 +41,19 @@ class TemporalLinkExample:
         for field in ("event_at", "source_published_at", "target_published_at"):
             payload[field] = payload[field].isoformat()
         return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TemporalLinkExample":
+        return cls(
+            site_id=int(payload["site_id"]),
+            source_article_id=int(payload["source_article_id"]),
+            target_article_id=int(payload["target_article_id"]),
+            event_at=_parse_datetime(payload["event_at"]),
+            source_published_at=_parse_datetime(payload["source_published_at"]),
+            target_published_at=_parse_datetime(payload["target_published_at"]),
+            source_is_new=bool(payload["source_is_new"]),
+            target_is_new=bool(payload["target_is_new"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -51,6 +76,33 @@ class TemporalEvaluationSplit:
             "test": [row.to_dict() for row in self.test],
             "skipped_without_publication_date": self.skipped_without_publication_date,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "TemporalEvaluationSplit":
+        """Read back a frozen split, refusing anything this code cannot interpret.
+
+        A frozen split is the fixed target every method is measured against, so a
+        file written by a different schema must fail loudly here. Silently reading
+        it would compare two methods against two different test sets and report the
+        difference as an improvement.
+        """
+        stored_version = payload.get("schema_version")
+        if stored_version != SCHEMA_VERSION:
+            raise FrozenSplitError(
+                f"frozen split has schema_version {stored_version!r}, "
+                f"this code reads {SCHEMA_VERSION}"
+            )
+        ground_truth = payload.get("ground_truth")
+        if ground_truth not in ("editor", "observed"):
+            raise FrozenSplitError(f"frozen split has unsupported ground_truth {ground_truth!r}")
+        return cls(
+            schema_version=SCHEMA_VERSION,
+            ground_truth=ground_truth,
+            cutoff_at=_parse_datetime(payload["cutoff_at"]),
+            train=tuple(TemporalLinkExample.from_dict(row) for row in payload["train"]),
+            test=tuple(TemporalLinkExample.from_dict(row) for row in payload["test"]),
+            skipped_without_publication_date=int(payload["skipped_without_publication_date"]),
+        )
 
 
 def _require_aware_cutoff(cutoff_at: datetime) -> None:

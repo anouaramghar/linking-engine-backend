@@ -151,8 +151,27 @@ def fill_external_suggestion_gap(
         outcome.filtered["empty_title"] += 1
         return outcome
 
-    search_provider = provider or TavilySearchProvider()
     policy = policy_state(db, site.id)
+    search_provider = provider or TavilySearchProvider()
+    if not policy.external_links_enabled:
+        # Before the per-candidate guard, not with it. The search is billed and
+        # it sends this article's title to a third party — both happen the moment
+        # the request leaves, and rejecting every result afterwards undoes
+        # neither. A site with external links switched off must produce no
+        # outbound request at all.
+        outcome.filtered["external_links_disabled"] += 1
+        _audit_event(
+            db,
+            site=site,
+            article=article,
+            job_run_id=job_run_id,
+            provider=search_provider.name,
+            request_id=None,
+            query=query,
+            decision="external_links_disabled",
+            details={"missing_slots": missing_slots},
+        )
+        return outcome
     owned = managed_domains(db)
     exclude_domains = sorted(
         set(owned) | set(policy.blocklist_domains) | set(policy.competitor_domains)
@@ -316,12 +335,16 @@ def fill_external_suggestion_gap(
             )
         )
 
-    scores = _semantic_scores(
-        db,
-        article=article,
-        model=model,
-        candidates=scorable,
-    ) if scorable else []
+    scores = (
+        _semantic_scores(
+            db,
+            article=article,
+            model=model,
+            candidates=scorable,
+        )
+        if scorable
+        else []
+    )
     ranked = sorted(
         zip(scorable, scores, strict=True),
         key=lambda item: (-item[1], item[0].provider_rank),
@@ -373,9 +396,16 @@ def fill_external_suggestion_gap(
             )
             continue
 
+        feature_snapshot = {
+            "semantic": semantic_score,
+            "semantic_model": model,
+            "provider_rank": candidate.provider_rank,
+            "external_safety": candidate.safety.as_score_component(),
+        }
         suggestion = Suggestion(
             site_id=site.id,
             source_article_id=article.id,
+            generation_job_run_id=job_run_id,
             target_article_id=None,
             external_url=candidate.normalized_url,
             external_title=candidate.title,
@@ -386,12 +416,11 @@ def fill_external_suggestion_gap(
             search_query=response.query,
             method="external_search",
             score=semantic_score,
-            score_components={
-                "semantic": semantic_score,
-                "semantic_model": model,
-                "provider_rank": candidate.provider_rank,
-                "external_safety": candidate.safety.as_score_component(),
-            },
+            score_components=feature_snapshot,
+            retrieval_version="external_search_v1",
+            ranking_version="external_search_provider_v1",
+            final_rank=candidate.provider_rank,
+            feature_snapshot=feature_snapshot,
             status="pending",
         )
         db.add(suggestion)

@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import require_api_key
 from app.api.routes import auth as auth_routes
@@ -36,11 +37,16 @@ def configure_login(db, monkeypatch):
     wipe()
 
 
-def _login_as(client: TestClient, db, telegram_id: int = 4242) -> str:
-    """Drive the full flow and return the session cookie."""
+def _login_as(client: TestClient, db, telegram_id: int = 4242, admin: bool = True) -> str:
+    """Drive the full flow and return the session cookie.
+
+    Signed in as an admin unless a test is specifically about what an ordinary
+    approved account may do — approve and revoke belong to the admin group.
+    """
     user, code = dashboard_auth.create_login_code(db, telegram_id)
     assert code is None
     dashboard_auth.approve_user(db, user, approved_by="bootstrap")
+    dashboard_auth.set_admin(db, user, admin)
     db.commit()
     _user, code = dashboard_auth.create_login_code(db, telegram_id)
     db.commit()
@@ -65,8 +71,8 @@ def test_start_login_returns_a_deep_link_and_code_lifetime(client, monkeypatch):
     assert body["expires_in_seconds"] == 300
 
 
-def test_start_login_clears_out_expired_codes(client, db):
-    """Housekeeping rides along here because nothing else schedules it."""
+def test_start_login_does_not_write_housekeeping_rows(client, db):
+    """An anonymous start request only returns the static Telegram deep link."""
     user = _request_user(db, 4242)
     dashboard_auth.approve_user(db, user, approved_by="bootstrap")
     db.commit()
@@ -77,7 +83,42 @@ def test_start_login_clears_out_expired_codes(client, db):
 
     client.post("/api/v1/auth/login/start")
 
+    assert db.query(LoginNonce).count() == 1
+
+
+def test_valid_login_code_clears_expired_codes(client, db):
+    user = _request_user(db, 4242)
+    dashboard_auth.approve_user(db, user, approved_by="bootstrap")
+    db.commit()
+    _user, _stale_code = dashboard_auth.create_login_code(db, 4242)
+    stale = db.query(LoginNonce).one()
+    stale.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.commit()
+    _user, live_code = dashboard_auth.create_login_code(db, 4242)
+    db.commit()
+
+    response = client.post("/api/v1/auth/login/complete", json={"code": live_code})
+
+    assert response.json()["state"] == "approved"
     assert db.query(LoginNonce).count() == 0
+
+
+def test_valid_login_succeeds_when_cleanup_fails(client, db, monkeypatch):
+    user = _request_user(db, 4242)
+    dashboard_auth.approve_user(db, user, approved_by="bootstrap")
+    db.commit()
+    _user, code = dashboard_auth.create_login_code(db, 4242)
+    db.commit()
+
+    def fail_cleanup(_db):
+        raise SQLAlchemyError("database unavailable")
+
+    monkeypatch.setattr(auth_routes.dashboard_auth, "purge_expired_login_codes", fail_cleanup)
+
+    response = client.post("/api/v1/auth/login/complete", json={"code": code})
+
+    assert response.json()["state"] == "approved"
+    assert SESSION_COOKIE in response.cookies
 
 
 def test_start_login_fails_closed_when_unconfigured(client, monkeypatch):
@@ -142,6 +183,68 @@ def test_admission_routes_require_a_session(client):
     assert client.get("/api/v1/auth/users").status_code == 401
     assert client.post("/api/v1/auth/users/1/approve").status_code == 401
     assert client.post("/api/v1/auth/users/1/revoke").status_code == 401
+    assert client.post("/api/v1/auth/users/1/admin").status_code == 401
+    assert client.delete("/api/v1/auth/users/1/admin").status_code == 401
+
+
+def test_an_approved_non_admin_cannot_admit_or_remove_anyone(client, db):
+    """The gate Amir asked to see enforced past the hidden buttons.
+
+    A non-admin holds a perfectly good session, so every one of these requests
+    is authenticated. What stops them is authorization, in the API.
+    """
+    _login_as(client, db, telegram_id=4242, admin=False)
+    newcomer = _request_user(db, 9999)
+
+    assert client.get("/api/v1/auth/users").status_code == 200
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/approve").status_code == 403
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/revoke").status_code == 403
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/admin").status_code == 403
+    assert client.delete(f"/api/v1/auth/users/{newcomer.id}/admin").status_code == 403
+
+    db.refresh(newcomer)
+    assert newcomer.status == "pending"
+
+
+def test_the_roster_says_who_holds_the_keys(client, db):
+    _login_as(client, db, telegram_id=4242)
+    _request_user(db, 9999)
+
+    listed = client.get("/api/v1/auth/users").json()
+
+    assert {row["telegram_id"]: row["is_admin"] for row in listed} == {4242: True, 9999: False}
+
+
+def test_an_admin_can_promote_and_demote_another_account(client, db):
+    _login_as(client, db, telegram_id=4242)
+    newcomer = _request_user(db, 9999)
+
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/admin").status_code == 409
+
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+    assert client.post(f"/api/v1/auth/users/{newcomer.id}/admin").json()["is_admin"] is True
+    assert client.delete(f"/api/v1/auth/users/{newcomer.id}/admin").json()["is_admin"] is False
+
+
+def test_an_admin_cannot_demote_themselves(client, db):
+    """Same rule as revoking yourself: the last admin out locks the door."""
+    _login_as(client, db, telegram_id=4242)
+    me = client.get("/api/v1/auth/session").json()["user"]["id"]
+
+    assert client.delete(f"/api/v1/auth/users/{me}/admin").status_code == 409
+    assert client.get("/api/v1/auth/session").json()["user"]["is_admin"] is True
+
+
+def test_a_promoted_account_keeps_its_access_when_demoted(client, db):
+    _login_as(client, db, telegram_id=4242)
+    newcomer = _request_user(db, 9999)
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+    client.post(f"/api/v1/auth/users/{newcomer.id}/admin")
+
+    body = client.delete(f"/api/v1/auth/users/{newcomer.id}/admin").json()
+
+    assert body["status"] == "approved"
+    assert body["is_admin"] is False
 
 
 def test_approving_admits_the_next_login(client, db):
@@ -197,6 +300,29 @@ def test_revoking_is_refused_for_your_own_account(client, db):
     assert client.get("/api/v1/auth/session").status_code == 200
 
 
+def test_revoking_an_admin_leaves_the_admin_group_alone(client, db):
+    """Suspending access and demoting somebody are two separate decisions.
+
+    Silently dropping the flag would make restoring a colleague a quiet
+    demotion nobody asked for and nobody is told about. "Remove admin" is the
+    action that changes membership, so a revoked admin comes back an admin.
+    """
+    _login_as(client, db, telegram_id=4242)
+    newcomer = _request_user(db, 9999)
+    client.post(f"/api/v1/auth/users/{newcomer.id}/approve")
+    client.post(f"/api/v1/auth/users/{newcomer.id}/admin")
+
+    revoked = client.post(f"/api/v1/auth/users/{newcomer.id}/revoke").json()
+
+    assert revoked["status"] == "revoked"
+    assert revoked["is_admin"] is True
+
+    restored = client.post(f"/api/v1/auth/users/{newcomer.id}/approve").json()
+
+    assert restored["status"] == "approved"
+    assert restored["is_admin"] is True
+
+
 def test_revoking_someone_ends_their_open_session(client, db):
     admin = TestClient(app)
     _login_as(admin, db, telegram_id=4242)
@@ -250,6 +376,30 @@ def test_dashboard_user_out_includes_photo_url(client, db):
     user = session["user"]
     assert "photo_url" in user
     assert user["photo_url"] == f"/api/v1/auth/users/{user['id']}/avatar"
+
+
+def test_user_avatar_is_cached_privately(client, db, monkeypatch):
+    """A shared cache must never hold this.
+
+    The route is behind a dashboard session and the picture belongs to the
+    account it names, so `public` would let a proxy serve one operator's face to
+    whoever asked next. `private` keeps the browser caching that the long
+    max-age is actually for.
+    """
+    _login_as(client, db, telegram_id=4242)
+    session = client.get("/api/v1/auth/session").json()
+    user = session["user"]
+
+    monkeypatch.setattr("app.services.telegram.client_from_settings", lambda: object())
+    monkeypatch.setattr(
+        "app.services.telegram.get_user_profile_photo_bytes",
+        lambda _client, _tid: (b"\x89PNG\r\n\x1a\n", "image/png"),
+    )
+
+    res = client.get(f"/api/v1/auth/users/{user['id']}/avatar")
+    assert res.status_code == 200
+    assert "public" not in res.headers["cache-control"]
+    assert res.headers["cache-control"] == "private, max-age=86400"
 
 
 def test_user_avatar_endpoint_returns_404_when_user_has_no_photo(client, db, monkeypatch):

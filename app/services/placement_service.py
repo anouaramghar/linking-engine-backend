@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -221,17 +221,33 @@ def generate(suggestion: Suggestion, taken_anchors: Sequence[str] = ()) -> Place
     )
 
 
-def store(db: Session, suggestion_id: int, placement: Placement) -> None:
-    """Persist a generated placement. The caller commits.
+def store(db: Session, suggestion_id: int, placement: Placement) -> Placement:
+    """Persist a generated placement if the row has none. The caller commits.
+
+    Returns the placement that is on the row afterwards — the given one, or the
+    one that was already there.
 
     A bare UPDATE rather than a loaded instance: the row was read before the
     model call and may have been reviewed since. These columns describe the pair,
     not the decision, so writing them must not touch `status` or resurrect a
     stale copy of it.
+
+    First generation wins. Both callers only ever generate for a row with no
+    placement, but they check that before a multi-second model call, so a drawer
+    opened during a preparation pass can finish second and overwrite it. That is
+    not harmless: preparation freezes the edited HTML and its hash from the
+    placement it generated, so a late overwrite leaves an approved edit sitting
+    beside an explanation of a *different* anchor, in a different passage. The
+    artifact stays correct and the operator is misinformed about it, which is
+    worse than a stale explanation. The guard is a WHERE clause rather than a
+    lock because a lock would have to be held across the model call.
     """
-    db.execute(
+    updated = db.execute(
         update(Suggestion)
-        .where(Suggestion.id == suggestion_id)
+        .where(
+            Suggestion.id == suggestion_id,
+            Suggestion.placement_generated_at.is_(None),
+        )
         .values(
             anchor_text=placement.anchor_text,
             placement_context=placement.placement_context,
@@ -239,6 +255,30 @@ def store(db: Session, suggestion_id: int, placement: Placement) -> None:
             placement_generated_at=placement.generated_at,
         )
         .execution_options(synchronize_session=False)
+    ).rowcount
+    if updated:
+        return placement
+    winner = db.execute(
+        select(
+            Suggestion.anchor_text,
+            Suggestion.placement_context,
+            Suggestion.llm_model,
+            Suggestion.placement_generated_at,
+        ).where(Suggestion.id == suggestion_id)
+    ).first()
+    if winner is None or winner.placement_generated_at is None:
+        # The row was deleted between the model call and this write. Nothing is
+        # stored and nothing else refers to it; report what was generated.
+        return placement
+    logger.info(
+        "placement for suggestion %s was generated concurrently; keeping the stored one",
+        suggestion_id,
+    )
+    return Placement(
+        anchor_text=winner.anchor_text,
+        placement_context=winner.placement_context,
+        llm_model=winner.llm_model,
+        generated_at=winner.placement_generated_at,
     )
 
 
