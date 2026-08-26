@@ -136,6 +136,7 @@ def order_candidates(
     feedback_profile: EditorialFeedbackProfile | None,
     feedback_weight: float,
     external_trust: Mapping[int, TrustEvaluation],
+    scan_limit: int | None = None,
 ) -> CandidateOrdering:
     """Apply final ranking policy and build persistence-ready evidence.
 
@@ -143,12 +144,20 @@ def order_candidates(
     editorial feedback may reorder only eligible candidates; the returned
     ``OrderedCandidate`` records the resulting rank and every explanation that
     belongs to that row.
+
+    ``remaining`` is how many rows the caller may keep. ``scan_limit`` is how
+    many ranked rows it wants to *see*: a caller that rejects candidates after
+    ranking — an external target that has since gone dead — needs the next
+    ranked ones to fall back to, instead of returning fewer suggestions than the
+    article has room for. It never changes the order, only where it is cut, and
+    the caller assigns the final ranks of the rows it actually keeps.
     """
 
     if remaining < 0:
         raise ValueError("remaining must be non-negative")
     if not candidates or not remaining:
         return CandidateOrdering((), False)
+    kept = max(remaining, scan_limit or 0)
 
     ordered = [
         candidate
@@ -175,7 +184,7 @@ def order_candidates(
             feedback_profile,
             weight=feedback_weight,
         )
-    ordered = ordered[:remaining]
+    ordered = ordered[:kept]
 
     items: list[OrderedCandidate] = []
     for final_rank, candidate in enumerate(ordered, start=1):

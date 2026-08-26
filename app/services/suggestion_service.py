@@ -39,6 +39,14 @@ from app.services.live_url import LiveURLCheck, LiveURLChecker
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
+#: How deep a source may read into its own ranked candidates when content-pool
+#: targets are in play. Liveness is part of eligibility, so a dead pool row has
+#: to be replaced by the next eligible ranked candidate rather than by a paid
+#: search; a fixed margin would only move the boundary at which that stops being
+#: true. This is the pool size the pipeline already retrieves for one source
+#: elsewhere, so it bounds the query, the scan, and the number of live checks —
+#: which are cached per target for the whole run — without inventing a number.
+POOL_LIVE_SCAN_POOL = FEEDBACK_CANDIDATE_POOL
 # Open review work. 'applied' is deliberately absent: a published link stops
 # occupying the queue. It still counts against the article — see _LIFETIME_STATUSES.
 _ACTIVE_STATUSES = ("pending", "approved", "applying")
@@ -364,6 +372,13 @@ def generate_suggestions(
                         .join(Site, Site.id == Article.site_id)
                         .where(Article.id.in_(external_trust))
                     ).all()
+                    # `external_target_context` keeps trust evidence for every
+                    # pool row so the caller can explain blocked targets, but
+                    # only eligible rows enter the candidate SQL. Keep the
+                    # liveness over-fetch trigger in sync with that same set;
+                    # an unrelated/unapproved pool must not widen every local
+                    # ranking query.
+                    if article.id in allowed_target_ids
                 }
             pool_live_cache: dict[tuple[int, str], LiveURLCheck] = {}
             model = settings.embedding_model
@@ -554,10 +569,23 @@ def generate_suggestions(
                     citation_need_sentences_detected += citation_analysis.total_detected
                 method = "baseline_cosine"
                 candidate_rows: list[RankedCandidate]
-                candidate_pool_limit = (
-                    max(remaining, FEEDBACK_CANDIDATE_POOL)
-                    if feedback_profile is not None and has_capacity and not comparison_only
+                # Ranking stops at `remaining`, but a content-pool row can still
+                # be dropped after it — the live check below is part of
+                # eligibility, and a dead target is not eligible. Keeping only
+                # `remaining` ranked rows turned every dead pool target into an
+                # unfilled slot that Tavily was then billed to fill, ahead of
+                # ranked candidates that were live and free. Read deeper into the
+                # same ranked order instead, and only call it a gap once those
+                # candidates are exhausted.
+                pool_scan_limit = (
+                    max(remaining, POOL_LIVE_SCAN_POOL)
+                    if pool_targets and has_capacity and not comparison_only
                     else remaining
+                )
+                candidate_pool_limit = (
+                    max(pool_scan_limit, FEEDBACK_CANDIDATE_POOL)
+                    if feedback_profile is not None and has_capacity and not comparison_only
+                    else pool_scan_limit
                 )
                 if ranking_mode == "baseline" or (ranking_mode == "shadow" and not shadow_selected):
                     candidate_rows = _baseline_rows(
@@ -660,10 +688,16 @@ def generate_suggestions(
                         feedback_profile=feedback_profile,
                         feedback_weight=site.editorial_feedback_weight,
                         external_trust=external_trust,
+                        scan_limit=pool_scan_limit,
                     )
                     ordered_rows = ordering.items
                     live_ordered_rows: list[OrderedCandidate] = []
                     for ordered_candidate in ordered_rows:
+                        if len(live_ordered_rows) >= remaining:
+                            # The slots this article had are filled. The rows
+                            # below were only ever fallbacks for dead ones, so
+                            # they are not checked, not billed, and not stored.
+                            break
                         target_context = pool_targets.get(ordered_candidate.candidate.target_id)
                         if target_context is None:
                             live_ordered_rows.append(

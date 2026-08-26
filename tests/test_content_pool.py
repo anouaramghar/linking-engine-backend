@@ -1208,6 +1208,101 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
         db.commit()
 
 
+def test_a_dead_pool_target_falls_through_to_the_next_live_one(db, site, monkeypatch):
+    """A dead top-ranked pool target is a ranking miss, not a paid search slot.
+
+    The open slot used to be handed to Tavily: the pipeline kept exactly
+    `remaining` ranked candidates, the live check then discarded the dead one,
+    and the resulting gap was filled by a billed request that also sent the
+    source title to a third party — while the next ranked pool candidate was
+    live, free, and already eligible.
+    """
+    monkeypatch.setattr(
+        "app.ml.embeddings.encode",
+        lambda texts: [_vector(1.0) for _text in texts],
+    )
+    monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 1)
+    monkeypatch.setattr(
+        "app.services.suggestion_service.fill_external_suggestion_gap",
+        lambda *_args, **_kwargs: pytest.fail("a live ranked pool candidate was skipped for Tavily"),
+    )
+    pool = _pool(db)
+    source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/tomato-guide",
+        title="Tomato canning guide",
+        content_text="A 2024 study found that safe tomato canning reduces infection risk by 30%.",
+    )
+    dead = Article(
+        site_id=pool.id,
+        url="https://example.com/tomato-dead",
+        title="Safe tomato canning",
+        content_text="tomato canning jars boiling water safety",
+    )
+    live = Article(
+        site_id=pool.id,
+        url="https://example.com/tomato-live",
+        title="Tomato canning basics",
+        content_text="tomato canning jars boiling water basics",
+    )
+    db.add_all([source, dead, live])
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
+    db.flush()
+    for article, vector in ((source, _vector(1.0)), (dead, _vector(1.0)), (live, _vector(0.8, 0.6))):
+        db.add(
+            Embedding(
+                article_id=article.id,
+                model=settings.embedding_model,
+                vector=vector,
+                content_fingerprint=_fingerprint(article.title, article.content_text),
+                input_recipe_version=1,
+                vector_size=EMBEDDING_DIM,
+            )
+        )
+    db.commit()
+
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested.append(url)
+        return httpx.Response(410 if url.endswith("/tomato-dead") else 200)
+
+    checker = LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        validator=lambda _url: None,
+    )
+
+    try:
+        # Use the deterministic cosine path so the intentionally closest dead
+        # target is first; the regression is about post-ranking liveness
+        # filtering, not about which hybrid retriever wins the ordering.
+        result = generate_suggestions(
+            site.id,
+            live_url_checker=checker,
+            ranking_mode_override="baseline",
+        )
+
+        suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+        assert [row.target_article_id for row in suggestions] == [live.id]
+        stored = suggestions[0]
+        # The slot the dead row vacated, filled by rank and re-numbered: the
+        # evidence describes the row that was stored, not the one that was not.
+        assert stored.final_rank == 1
+        assert stored.method != "external_search"
+        assert stored.score_components["live_url"]["eligible"] is True
+        assert stored.score_components["live_url"]["checks"]["final_url"].endswith("/tomato-live")
+        assert stored.score_components["external_trust"]["eligible"] is True
+        assert requested == [dead.url, live.url]
+        assert result["external_searches"] == 0
+        assert result["external_suggestions_created"] == 0
+        assert result["live_url_candidates_checked"] == 2
+        assert result["live_url_candidates_blocked"] == 1
+    finally:
+        db.delete(pool)
+        db.commit()
+
+
 def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
     pool = _pool(db)
     source = Article(
