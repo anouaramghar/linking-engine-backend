@@ -245,7 +245,11 @@ def analyze_citation_needs(
     effective_threshold = (
         settings.citation_need_threshold if threshold is None else float(threshold)
     )
-    effective_results = settings.citation_need_max_results if max_results is None else max_results
+    effective_results = (
+        settings.citation_need_max_results
+        if max_results is None
+        else min(max_results, settings.citation_need_max_results)
+    )
     effective_chars = (
         settings.citation_need_max_article_chars if max_article_chars is None else max_article_chars
     )
@@ -270,7 +274,7 @@ def analyze_citation_needs(
     for start, end in spans:
         sentence = bounded_text[start:end]
         confidence, reasons = _score_sentence(sentence)
-        if confidence < effective_threshold:
+        if not reasons or confidence < effective_threshold:
             continue
         needs.append(
             CitationNeed(

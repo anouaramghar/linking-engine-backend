@@ -365,7 +365,7 @@ def generate_suggestions(
                         .where(Article.id.in_(external_trust))
                     ).all()
                 }
-            pool_live_cache: dict[str, LiveURLCheck] = {}
+            pool_live_cache: dict[tuple[int, str], LiveURLCheck] = {}
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             check_job_cancellation(job_run_id)
@@ -691,13 +691,14 @@ def generate_suggestions(
                             return evaluation.eligible, evaluation.reasons
 
                         live_url_candidates_checked += 1
-                        live_url = pool_live_cache.get(target_article.url)
+                        cache_key = (target_site.id, target_article.url)
+                        live_url = pool_live_cache.get(cache_key)
                         if live_url is None:
                             live_url = live_url_checker.check(
                                 target_article.url,
                                 policy_check=pool_policy,
                             )
-                            pool_live_cache[target_article.url] = live_url
+                            pool_live_cache[cache_key] = live_url
                         if not live_url.eligible or live_url.final_url is None:
                             live_url_candidates_blocked += 1
                             continue

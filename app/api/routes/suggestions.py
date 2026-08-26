@@ -1284,7 +1284,7 @@ def trigger_article_analysis(
 )
 def get_article_citation_needs(
     article_id: int,
-    limit: int = Query(default=10, ge=1, le=100),
+    limit: int = Query(default=10, ge=1, le=10),
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> CitationNeedAnalysisOut:
