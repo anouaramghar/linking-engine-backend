@@ -18,7 +18,7 @@ LinkMesh. Tavily continues to receive the article title only.
 ## Detector contract
 
 `app/services/citation_need.py` exposes `analyze_citation_needs`. The result is
-content-addressed with SHA-256 and versioned as `citation_rules_en_v1`. Each
+content-addressed with SHA-256 and versioned as `citation_rules_en_v2`. Each
 accepted sentence records:
 
 - the exact sentence copied from the article;
@@ -34,18 +34,26 @@ the requested result limit.
 
 ## Explainable signals
 
-The English v1 baseline recognizes six evidence-bearing signal families:
+The English baseline recognizes six signal families, split by whether the
+signal can qualify a sentence on its own:
 
-| Signal | Examples | Weight |
-| --- | --- | ---: |
-| Research or attribution | study, survey, according to, data shows | 0.85 |
-| Quantitative claim | percentages, currency, measured units | 0.78 |
-| Health or safety claim | risk, treatment, unsafe, infection | 0.70 |
-| Time-sensitive claim | years, currently, latest, as of | 0.62 |
-| Causal claim | causes, reduces, associated with | 0.60 |
-| Comparative claim | higher, lower, largest, most | 0.55 |
+| Signal | Examples | Weight | Kind |
+| --- | --- | ---: | --- |
+| Research or attribution | study, survey, according to, data shows | 0.85 | primary |
+| Quantitative claim | percentages, currency, measured units | 0.78 | primary |
+| Health or safety claim | risk, treatment, unsafe, infection | 0.70 | primary |
+| Causal claim | causes, reduces, associated with | 0.60 | primary |
+| Time-sensitive claim | years, currently, latest, as of | 0.62 | supporting |
+| Comparative claim | higher, lower, largest, most | 0.55 | supporting |
 
-Multiple matching signals combine as independent evidence:
+A sentence qualifies only when at least one **primary** signal matches.
+Supporting signals are ordinary English — "now", "more", "better" — that
+co-occurs with claims without being one. In v1 the two supporting signals
+combined to `0.829` and cleared the threshold by themselves, so sentences like
+"Our team now offers more flexible scheduling" were flagged. They may now only
+raise the confidence of a sentence a primary signal already selected.
+
+Matching signals combine as independent evidence:
 
 `confidence = 1 - product(1 - signal_weight)`
 
@@ -77,9 +85,13 @@ Older suggestions and articles with no qualifying sentence simply have no
 
 ## Deliberate limitations
 
-- V1 lexical rules are English. Language-neutral numeric signals still work in
-  other languages, but the API reports the article language so results are not
-  misrepresented as multilingual evaluation.
+- The lexical rules are English, so an article whose language is positively
+  identified as anything else is skipped: the result reports
+  `language_supported: false` with no sentences analyzed, which distinguishes
+  "not analyzed" from "nothing needs a source". A language of `None` or `und`
+  stays analyzable on purpose — connectors that cannot detect a language store
+  `None` (the WordPress connector does so explicitly for an English-only
+  fleet), and skipping those would disable the feature everywhere.
 - Plain article text cannot reliably tell whether HTML anchor text already
   cites a claim; only explicit URLs and bracketed numeric citations are skipped.
 - A detected sentence is generation evidence, not a placement. The subsequent

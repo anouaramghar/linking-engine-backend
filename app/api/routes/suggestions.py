@@ -1310,6 +1310,7 @@ def get_article_citation_needs(
         sentences_analyzed=analysis.sentences_analyzed,
         total_detected=analysis.total_detected,
         truncated=analysis.truncated,
+        language_supported=analysis.language_supported,
         items=[CitationNeedOut(**need.as_score_component()) for need in analysis.needs],
     )
 

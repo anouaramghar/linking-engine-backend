@@ -71,6 +71,9 @@ class CitationNeedAnalysisOut(BaseModel):
     sentences_analyzed: int = Field(ge=0)
     total_detected: int = Field(ge=0)
     truncated: bool
+    # False means the article's language is outside the detector's rules, so an
+    # empty list is "not analyzed" rather than "nothing needs a source".
+    language_supported: bool = True
     items: list[CitationNeedOut]
 
 

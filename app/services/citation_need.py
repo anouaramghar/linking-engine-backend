@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from app.config import settings
 
-CITATION_DETECTOR_VERSION = "citation_rules_en_v1"
+CITATION_DETECTOR_VERSION = "citation_rules_en_v2"
 
 _CLOSING_PUNCTUATION = frozenset("\"'\u2019\u201d)]}")
 _ABBREVIATIONS = frozenset(
@@ -38,12 +38,37 @@ _URL_OR_INLINE_CITATION = re.compile(
 )
 _WORD = re.compile(r"\b[\w'-]+\b", re.UNICODE)
 
+# Every rule above is English lexis, so the detector may only speak about
+# English prose. Crawlers that cannot determine a language store ``None``
+# (see the WordPress connector), and an unknown language must stay analyzable
+# or the feature would silently switch itself off across the managed fleet.
+# Only a language positively identified as something else is skipped.
+_SUPPORTED_LANGUAGES = frozenset({"en", "und"})
+
+
+def _language_tags(language: str | None) -> tuple[str, str]:
+    """Return the tag to report and the base tag to decide support on.
+
+    The reported tag stays as the article declared it (lowercased) so evidence
+    records what was actually seen; only the base subtag drives the gate, so
+    ``en-GB`` and ``en_US`` are recognised as the English the rules were written
+    for.
+    """
+
+    reported = (language or "").strip().lower() or "und"
+    return reported, reported.replace("_", "-").split("-", 1)[0] or "und"
+
 
 @dataclass(frozen=True, slots=True)
 class _SignalRule:
     reason: str
     weight: float
     pattern: re.Pattern[str]
+    # Primary signals name the thing a source would actually support: an
+    # attribution, a number, a health claim. Supporting signals ("now", "more")
+    # are ordinary English that happens to co-occur with such claims, so they
+    # may only strengthen a primary match, never qualify a sentence alone.
+    is_primary: bool = True
 
 
 _SIGNAL_RULES = (
@@ -86,6 +111,7 @@ _SIGNAL_RULES = (
             r"this (?:year|month|quarter)|last (?:year|month|quarter))\b",
             re.IGNORECASE,
         ),
+        is_primary=False,
     ),
     _SignalRule(
         "causal_claim",
@@ -105,6 +131,7 @@ _SIGNAL_RULES = (
             r"smallest|fastest|slowest|most|least)\b",
             re.IGNORECASE,
         ),
+        is_primary=False,
     ),
 )
 
@@ -143,6 +170,9 @@ class CitationNeedAnalysis:
     total_detected: int
     truncated: bool
     needs: tuple[CitationNeed, ...]
+    # Distinguishes "analyzed, nothing needs a source" from "never analyzed".
+    # Both return no needs, and only this flag keeps an empty result honest.
+    language_supported: bool = True
 
     @property
     def primary(self) -> CitationNeed | None:
@@ -223,7 +253,10 @@ def _score_sentence(sentence: str) -> tuple[float, tuple[str, ...]]:
         return 0.0, ()
 
     matched = tuple(rule for rule in _SIGNAL_RULES if rule.pattern.search(sentence))
-    if not matched:
+    if not any(rule.is_primary for rule in matched):
+        # "now" and "more" are ordinary prose. Without a primary signal beside
+        # them there is no claim for a source to support, and flagging the
+        # sentence would only cost an editor a read.
         return 0.0, ()
     # Independent-evidence combination: two medium signals strengthen one
     # another without an unbounded sum ever exceeding one.
@@ -261,6 +294,20 @@ def analyze_citation_needs(
     if effective_results < 1 or effective_chars < 1 or effective_sentences < 1:
         raise ValueError("citation analysis bounds must be positive")
 
+    reported_language, base_language = _language_tags(language)
+    if base_language not in _SUPPORTED_LANGUAGES:
+        return CitationNeedAnalysis(
+            content_fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            detector_version=CITATION_DETECTOR_VERSION,
+            threshold=effective_threshold,
+            language=reported_language,
+            sentences_analyzed=0,
+            total_detected=0,
+            truncated=False,
+            needs=(),
+            language_supported=False,
+        )
+
     bounded_text = text[:effective_chars]
     spans, sentence_truncated = _sentence_spans(bounded_text, effective_sentences)
     if len(text) > effective_chars and spans and spans[-1][1] == len(bounded_text):
@@ -292,7 +339,7 @@ def analyze_citation_needs(
         content_fingerprint=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         detector_version=CITATION_DETECTOR_VERSION,
         threshold=effective_threshold,
-        language=(language or "und").strip().lower() or "und",
+        language=reported_language,
         sentences_analyzed=len(spans),
         total_detected=total_detected,
         truncated=len(text) > effective_chars or sentence_truncated,

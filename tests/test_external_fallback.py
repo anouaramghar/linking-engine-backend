@@ -159,7 +159,7 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
         "end": 62,
         "confidence": 0.7,
         "reasons": ["health_or_safety_claim"],
-        "detector_version": "citation_rules_en_v1",
+        "detector_version": "citation_rules_en_v2",
     }
 
     decisions = db.scalars(

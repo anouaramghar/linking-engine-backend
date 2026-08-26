@@ -1195,7 +1195,7 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
         assert suggestion.target_article_id == target.id
         assert suggestion.score_components["live_url"]["eligible"] is True
         assert suggestion.score_components["citation_need"]["detector_version"] == (
-            "citation_rules_en_v1"
+            "citation_rules_en_v2"
         )
         assert (
             suggestion.feature_snapshot["citation_need"]

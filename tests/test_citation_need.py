@@ -140,3 +140,63 @@ def test_article_citation_need_endpoint_is_site_scoped_and_bounded(client, db, s
 def test_article_citation_need_endpoint_rejects_unknown_article(client) -> None:
     response = client.get("/api/v1/articles/99999999/citation-needs")
     assert response.status_code == 404
+
+
+def test_supporting_signals_alone_do_not_flag_ordinary_prose() -> None:
+    """ "now" and "more" are everyday English, not a claim needing a source."""
+
+    text = (
+        "Our team now offers more flexible scheduling for customers who book online. "
+        "The new editor is better than the old one and loads faster today for most users."
+    )
+
+    analysis = analyze_citation_needs(text, language="en")
+
+    assert analysis.sentences_analyzed == 2
+    assert analysis.total_detected == 0
+    assert analysis.needs == ()
+    assert analysis.language_supported is True
+
+
+def test_supporting_signals_still_strengthen_a_primary_signal() -> None:
+    supported = "Researchers say the treatment reduces mortality by 34 percent."
+    unsupported = "The dashboard now loads more quickly for most of our customers."
+
+    flagged = analyze_citation_needs(supported, language="en")
+    ignored = analyze_citation_needs(unsupported, language="en")
+
+    assert flagged.total_detected == 1
+    primary = flagged.primary
+    assert primary is not None
+    assert "research_or_attribution" in primary.reasons
+    assert ignored.total_detected == 0
+
+
+def test_detector_skips_languages_its_rules_were_not_written_for() -> None:
+    text = (
+        "Selon une etude de 2024, la mise en conserve reduit le risque de botulisme de 80%. "
+        "Les chercheurs signalent que des temperatures dangereuses causent des infections."
+    )
+
+    analysis = analyze_citation_needs(text, language="fr")
+
+    assert analysis.language_supported is False
+    assert analysis.language == "fr"
+    assert analysis.total_detected == 0
+    assert analysis.sentences_analyzed == 0
+    assert analysis.needs == ()
+    # Still content-addressed, so a later English re-analysis is comparable.
+    assert analysis.content_fingerprint == hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_english_variants_and_unknown_languages_stay_analyzable() -> None:
+    """Crawlers store None when they cannot detect a language (WordPress does)."""
+
+    text = "According to a 2024 study, the treatment reduced mortality by 12 percent."
+
+    for language in ("en", "en-US", "EN_gb", None):
+        analysis = analyze_citation_needs(text, language=language)
+        assert analysis.language_supported is True, language
+        assert analysis.total_detected == 1, language
+
+    assert analyze_citation_needs(text, language=None).language == "und"
