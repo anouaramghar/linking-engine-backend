@@ -76,6 +76,17 @@ def _bounded_history(payload: AgentChatRequest) -> list[dict[str, str]]:
     return history[-max_history_messages:] if max_history_messages else []
 
 
+def _view_context(payload: AgentChatRequest) -> dict | None:
+    """Detach normalized navigation metadata from the request model.
+
+    A context that survived normalization with nothing in it resolves no
+    reference, so it is dropped rather than spent on prompt budget.
+    """
+    if payload.context is None or not payload.context.describes_a_view():
+        return None
+    return payload.context.model_dump(mode="json")
+
+
 def _body(result: AssistantReply) -> AgentChatResponse:
     """The wire body for a finished turn, shared by both endpoints."""
     return AgentChatResponse(
@@ -95,7 +106,13 @@ def chat(
     db: Session = Depends(get_db),
 ) -> AgentChatResponse:
     try:
-        result = answer_question(db, principal, payload.message, _bounded_history(payload))
+        result = answer_question(
+            db,
+            principal,
+            payload.message,
+            _bounded_history(payload),
+            context=_view_context(payload),
+        )
     except AgentUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
     except OpenRouterError as exc:
@@ -147,6 +164,7 @@ def chat_stream(
 
     message = payload.message
     history = _bounded_history(payload)
+    context = _view_context(payload)
 
     def events():
         # A comment frame first: it commits the response through any proxy that
@@ -163,7 +181,9 @@ def chat_stream(
         def produce() -> None:
             with SessionLocal() as stream_db:
                 try:
-                    for event in stream_answer(stream_db, principal, message, history):
+                    for event in stream_answer(
+                        stream_db, principal, message, history, context=context
+                    ):
                         pending.put(("event", event))
                 except Exception as exc:
                     pending.put(("error", exc))
