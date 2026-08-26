@@ -25,6 +25,11 @@ from app.models import (
     Suggestion,
     SuggestionEvent,
 )
+from app.services.citation_need import (
+    CitationNeed,
+    CitationNeedAnalysis,
+    analyze_citation_needs,
+)
 from app.services.editorial_feedback import score_percent
 from app.services.external_link_policy import (
     WebSearchSafetyEvaluation,
@@ -46,6 +51,7 @@ class ExternalFallbackResult:
     created: int = 0
     credits_used: int = 0
     live_url_checked: int = 0
+    citation_needs_detected: int = 0
     filtered: Counter[str] = field(default_factory=Counter)
 
 
@@ -157,12 +163,22 @@ def fill_external_suggestion_gap(
     job_run_id: int | None = None,
     provider: ExternalSearchProvider | None = None,
     live_url_checker: LiveURLChecker | None = None,
+    citation_analysis: CitationNeedAnalysis | None = None,
 ) -> ExternalFallbackResult:
     """Use one bounded web search only when the normal pipeline left open slots."""
 
     outcome = ExternalFallbackResult()
     if missing_slots <= 0:
         return outcome
+
+    if citation_analysis is None:
+        citation_analysis = analyze_citation_needs(
+            article.content_text,
+            language=article.language,
+        )
+    outcome.citation_needs_detected = citation_analysis.total_detected
+    citation_need: CitationNeed | None = citation_analysis.primary
+    citation_evidence = citation_need.as_score_component() if citation_need else None
 
     query = article.title.strip()[:TAVILY_MAX_QUERY_CHARS]
     if not query:
@@ -245,6 +261,9 @@ def fill_external_suggestion_gap(
             "exclude_domains": exclude_domains[:150],
             "response_time_seconds": response.response_time_seconds,
             "result_count": len(response.results),
+            "citation_need": citation_evidence,
+            "citation_detector_version": citation_analysis.detector_version,
+            "citation_needs_detected": outcome.citation_needs_detected,
         },
     )
     if not response.results:
@@ -446,6 +465,8 @@ def fill_external_suggestion_gap(
             "safety": candidate.safety.as_score_component(),
             "live_url": candidate.live_url.as_score_component(),
         }
+        if citation_evidence is not None:
+            details["citation_need"] = citation_evidence
         if (
             semantic_score < settings.suggestion_min_score
             or score_percent(semantic_score) < site.editorial_min_score_percent
@@ -491,6 +512,8 @@ def fill_external_suggestion_gap(
             "external_safety": candidate.safety.as_score_component(),
             "live_url": candidate.live_url.as_score_component(),
         }
+        if citation_evidence is not None:
+            feature_snapshot["citation_need"] = citation_evidence
         suggestion = Suggestion(
             site_id=site.id,
             source_article_id=article.id,

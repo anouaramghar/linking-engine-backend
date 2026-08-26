@@ -131,10 +131,13 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
     db.commit()
 
     assert len(provider.calls) == 1
+    # Detection remains local: article prose is evidence for the editor, not a
+    # new field sent to the paid search provider.
     assert provider.calls[0][:2] == (source.title, 5)
     assert domain_from_url(site.base_url) in provider.calls[0][2]
     assert outcome.created == 1
     assert outcome.credits_used == 1
+    assert outcome.citation_needs_detected == 1
     assert outcome.filtered == {
         "safety_blocked": 1,
         "duplicate": 1,
@@ -150,6 +153,14 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
     assert suggestion.score_components["external_safety"]["eligible"] is True
     assert suggestion.score_components["live_url"]["eligible"] is True
     assert suggestion.score_components["live_url"]["checks"]["http_status"] == 200
+    assert suggestion.score_components["citation_need"] == {
+        "sentence": "Safe temperatures and processing times for preserved tomatoes.",
+        "start": 0,
+        "end": 62,
+        "confidence": 0.7,
+        "reasons": ["health_or_safety_claim"],
+        "detector_version": "citation_rules_en_v1",
+    }
 
     decisions = db.scalars(
         select(ExternalSearchAuditEvent.decision)
@@ -171,6 +182,7 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
     ).one()
     assert trace.details["provider_request_id"] == "request-1"
     assert trace.details["semantic_model"] == settings.embedding_model
+    assert trace.details["citation_need"] == suggestion.score_components["citation_need"]
     request_event = db.scalars(
         select(ExternalSearchAuditEvent).where(
             ExternalSearchAuditEvent.source_article_id == source.id,
@@ -179,6 +191,8 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
     ).one()
     assert request_event.details["credits_used"] == 1
     assert request_event.details["attempt_count"] == 2
+    assert request_event.details["citation_needs_detected"] == 1
+    assert request_event.details["citation_need"] == suggestion.score_components["citation_need"]
 
 
 def test_zero_gap_never_calls_provider(db, site) -> None:
