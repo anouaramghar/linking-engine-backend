@@ -292,8 +292,8 @@ def _anchor_span(content: str, anchor: str) -> tuple[int, int] | None:
 _READ_AHEAD_END = object()
 
 
-def _read_ahead(source: Iterator[T], *, depth: int = 1) -> Iterator[T]:
-    """Yield from ``source`` while one worker thread runs it ``depth`` items ahead.
+def _read_ahead(source: Iterator[T]) -> Iterator[T]:
+    """Yield from ``source`` while one worker thread runs one item ahead.
 
     Ordering, values and exceptions are what a direct iteration would give. A
     failure is handed across the queue and raised only once the consumer has
@@ -306,7 +306,7 @@ def _read_ahead(source: Iterator[T], *, depth: int = 1) -> Iterator[T]:
     ``next()`` call to finish; once that call returns, the producer sees the flag
     before fetching another item.
     """
-    queue: Queue = Queue(maxsize=max(1, depth))
+    queue: Queue = Queue(maxsize=1)
     stop = Event()
 
     def produce() -> None:
