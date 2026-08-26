@@ -13,6 +13,7 @@ spinner for the half-minute a turn can take.
 import json
 import logging
 from collections.abc import Generator
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -142,11 +143,26 @@ def chat_with_tools(
 STREAM_BYTE_BUDGET = 1_000_000
 
 
+@dataclass(frozen=True)
+class ReasoningText:
+    """A fragment of the model's thinking, wrapped so it cannot pass for reply.
+
+    A reasoning model writes for a long time before its first word of answer —
+    measured at 19s of thinking on this deployment's provider — and sends that
+    thinking in its own delta field. Read plainly it looks exactly like text
+    arriving, which is why it is wrapped: the type is what stops it being
+    appended to ``content``, replayed to the provider as something the
+    assistant said, or shown to the operator as the answer.
+    """
+
+    text: str
+
+
 def stream_chat_with_tools(
     *,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
-) -> Generator[str | None, None, dict[str, Any]]:
+) -> Generator[str | ReasoningText | None, None, dict[str, Any]]:
     """Run one model turn over SSE. Yields text as it arrives; returns the message.
 
     The return value is the same assistant message `chat_with_tools` hands back
@@ -154,6 +170,10 @@ def stream_chat_with_tools(
     loop above does not care which client produced its turn. What the yields add
     is timing: the panel can render a sentence while the rest of it is still
     being written.
+
+    Three kinds of yield, and the type tells them apart: a ``str`` is reply
+    text, a `ReasoningText` is the model thinking out loud, and ``None`` is a
+    transport keep-alive that is not text at all.
 
     The generator owns the connection for as long as it is iterated, and closing
     it early closes the response. Raises `OpenRouterError` for transport
@@ -206,9 +226,9 @@ def stream_chat_with_tools(
                     frame = line[len("data:") :].strip()
                     if frame == "[DONE]":
                         break
-                    text = _fold_frame(_parse_frame(frame), content, calls)
-                    if text:
-                        yield text
+                    folded = _fold_frame(_parse_frame(frame), content, calls)
+                    if folded is not None:
+                        yield folded
         except (httpx.HTTPError, ResponseTooLargeError) as exc:
             raise OpenRouterError(f"{provider_host()} request failed: {exc}") from exc
 
@@ -237,12 +257,25 @@ def _parse_frame(frame: str) -> dict[str, Any]:
     return chunk
 
 
+#: Where a reasoning model puts its thinking. ``reasoning_content`` is what
+#: NVIDIA NIM, vLLM, and DeepSeek send; ``reasoning`` is OpenRouter's name for
+#: the same thing. Neither is part of the OpenAI schema this client otherwise
+#: follows, so both are read and neither is required.
+_REASONING_FIELDS = ("reasoning_content", "reasoning")
+
+
 def _fold_frame(
     chunk: dict[str, Any],
     content: list[str],
     calls: dict[int, dict[str, Any]],
-) -> str:
-    """Fold one frame into the message being assembled; return its new text.
+) -> str | ReasoningText | None:
+    """Fold one frame into the message being assembled; return what it added.
+
+    ``None`` for a frame that added nothing the caller can show — metadata, or
+    a tool-call fragment, which is reported only once the whole call is
+    assembled. Reply text is returned as ``str`` and accumulates into
+    ``content``; thinking is returned wrapped and accumulates nowhere, because
+    it is not part of the message the provider will be sent back.
 
     Tool-call fragments are merged by index rather than appended as they come:
     the id and the function name ride the first fragment for a call, and its
@@ -252,7 +285,7 @@ def _fold_frame(
     choices = chunk.get("choices")
     if not isinstance(choices, list) or not choices:
         # Usage-only and metadata frames carry no choices at all.
-        return ""
+        return None
     delta = choices[0].get("delta") or {}
 
     for fragment in delta.get("tool_calls") or []:
@@ -270,7 +303,14 @@ def _fold_frame(
             call["function"]["arguments"] += function["arguments"]
 
     text = delta.get("content")
-    if not isinstance(text, str) or not text:
-        return ""
-    content.append(text)
-    return text
+    if isinstance(text, str) and text:
+        content.append(text)
+        return text
+
+    # Checked after content, never before: a frame carrying both is a frame
+    # whose answer text has started, and the answer is the thing to show.
+    for field in _REASONING_FIELDS:
+        thinking = delta.get(field)
+        if isinstance(thinking, str) and thinking:
+            return ReasoningText(thinking)
+    return None

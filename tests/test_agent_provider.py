@@ -262,6 +262,69 @@ class TestTheStreamedTurn:
         assert fragments == [None]
         assert message == {"role": "assistant", "content": None}
 
+    def test_thinking_is_reported_apart_from_the_reply(self, transport):
+        """A reasoning model's draft is not the answer and must not read as one.
+
+        It arrives in its own delta field and was previously dropped on the
+        floor, which is what made a turn look frozen for the twenty seconds the
+        model spent thinking. Reported now — wrapped, so nothing downstream can
+        append it to the reply or send it back as something the assistant said.
+        """
+        transport(
+            [
+                'data: {"choices":[{"delta":{"reasoning_content":"They want a count. "}}]}',
+                'data: {"choices":[{"delta":{"reasoning_content":"Check the queue."}}]}',
+                'data: {"choices":[{"delta":{"content":"Two are pending."}}]}',
+                "data: [DONE]",
+            ]
+        )
+
+        fragments, message = self._turn(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        assert fragments == [
+            agent_client.ReasoningText("They want a count. "),
+            agent_client.ReasoningText("Check the queue."),
+            "Two are pending.",
+        ]
+        # The message the loop sends back to the provider carries the reply
+        # alone: the draft the model talked itself through is not a turn it took.
+        assert message == {"role": "assistant", "content": "Two are pending."}
+
+    def test_openrouters_name_for_thinking_is_read_too(self, transport):
+        """``reasoning`` and ``reasoning_content`` are one field with two names.
+
+        Neither is in the OpenAI schema this client otherwise follows, and the
+        assistant's provider is a deployment setting — so the panel would
+        otherwise go back to showing nothing on a move between providers.
+        """
+        transport(
+            [
+                'data: {"choices":[{"delta":{"reasoning":"Counting."}}]}',
+                'data: {"choices":[{"delta":{"content":"None."}}]}',
+                "data: [DONE]",
+            ]
+        )
+
+        fragments, message = self._turn(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        assert fragments == [agent_client.ReasoningText("Counting."), "None."]
+        assert message == {"role": "assistant", "content": "None."}
+
+    def test_a_frame_carrying_both_is_read_as_reply(self, transport):
+        """Once the answer has started, the answer is the thing to show."""
+        transport(
+            [
+                'data: {"choices":[{"delta":{"reasoning_content":"Still unsure. ",'
+                '"content":"The queue is empty."}}]}',
+                "data: [DONE]",
+            ]
+        )
+
+        fragments, message = self._turn(messages=[{"role": "user", "content": "hi"}], tools=[])
+
+        assert fragments == ["The queue is empty."]
+        assert message == {"role": "assistant", "content": "The queue is empty."}
+
     def test_a_tool_call_split_across_frames_is_reassembled(self, transport):
         transport(
             [

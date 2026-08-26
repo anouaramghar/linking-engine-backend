@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.api.routes import agent as agent_route
 from app.config import settings
+from app.ml.llm.agent import ReasoningText
 from app.ml.llm.openrouter import OpenRouterError
 from app.models import Article, InternalLink
 from app.schemas.agent import (
@@ -704,6 +705,38 @@ class TestStreamedChat:
         name, done = events[-1]
         assert name == "done"
         assert done == {"reply": "Two sites.", "tools_used": [], "proposals": []}
+
+    def test_a_reasoning_model_reports_its_thinking_as_its_own_event(self, monkeypatch, client):
+        """The silence before a reasoning model's first word, made visible.
+
+        Measured at ~19s on this deployment's provider, during which the panel
+        had only its heartbeat to show. The draft rides its own event name so a
+        client that does not know it ignores the frame rather than rendering a
+        line of thinking as the answer.
+        """
+        monkeypatch.setattr(
+            agent_service,
+            "stream_chat_with_tools",
+            _scripted_stream(
+                [
+                    (
+                        [ReasoningText("They want a count. "), "Two sites."],
+                        {"content": "Two sites."},
+                    )
+                ]
+            ),
+        )
+
+        events = _frames(_stream(client, "how many sites?"))
+
+        assert ("reasoning", {"text": "They want a count. "}) in events
+        assert ("delta", {"text": "Two sites."}) in events
+        # The thinking stays out of the answer on both routes: the closing body
+        # is what the panel keeps, and it is the reply alone.
+        assert events[-1] == (
+            "done",
+            {"reply": "Two sites.", "tools_used": [], "proposals": []},
+        )
 
     def test_a_provider_keepalive_reaches_the_dashboard_stream(self, monkeypatch, client):
         """Provider warm-up comments keep the browser from timing out mid-turn."""

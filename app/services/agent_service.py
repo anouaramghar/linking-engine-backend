@@ -35,7 +35,12 @@ from dataclasses import dataclass, field
 
 from app.agent_tools import call_tool, openai_tool_specs
 from app.config import settings
-from app.ml.llm.agent import chat_with_tools, is_configured, stream_chat_with_tools
+from app.ml.llm.agent import (
+    ReasoningText,
+    chat_with_tools,
+    is_configured,
+    stream_chat_with_tools,
+)
 from app.services.authorization import Principal
 
 logger = logging.getLogger(__name__)
@@ -365,6 +370,20 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class ReasoningDelta:
+    """A fragment of the model's thinking, before it starts answering.
+
+    Reported separately from `TextDelta` and never folded into the reply: it is
+    a draft the model is talking itself through, so it can contradict the answer
+    it arrives at. The panel shows it as visible progress during the silence a
+    reasoning model leaves before its first word, and drops it once the reply
+    begins. It is never sent back to the provider as assistant text.
+    """
+
+    text: str
+
+
+@dataclass(frozen=True)
 class StreamKeepAlive:
     """A transport heartbeat, never shown as assistant text."""
 
@@ -381,10 +400,11 @@ class AssistantReply:
 
 #: What one run reports as it happens. A ``ToolInvocation`` lands when its tool
 #: returns and a ``TextDelta`` as the model writes, so the panel can show work
-#: in progress; ``StreamKeepAlive`` keeps a slow provider turn from looking
-#: idle; the ``AssistantReply`` closes every run and is the authority on what
-#: was said — a turn that streamed nothing still ends with one.
-AgentEvent = ToolInvocation | TextDelta | StreamKeepAlive | AssistantReply
+#: in progress; a ``ReasoningDelta`` reports a reasoning model thinking before
+#: it writes anything at all; ``StreamKeepAlive`` keeps a slow provider turn
+#: from looking idle; the ``AssistantReply`` closes every run and is the
+#: authority on what was said — a turn that streamed nothing still ends with one.
+AgentEvent = ToolInvocation | TextDelta | ReasoningDelta | StreamKeepAlive | AssistantReply
 
 
 class AgentUnavailable(RuntimeError):
@@ -441,12 +461,15 @@ def _nonempty_reply(content: object) -> str:
 def _streamed_turn(
     messages: list[dict],
     specs: list[dict],
-) -> Generator[TextDelta | StreamKeepAlive, None, dict]:
+) -> Generator[TextDelta | ReasoningDelta | StreamKeepAlive, None, dict]:
     """One streamed model turn: report each fragment, hand back the message.
 
-    The client yields raw text and returns the assembled message, so the two
-    halves are separated here — the fragments become events for the panel, and
-    ``yield from`` gives the loop the same message the blocking client returns.
+    The client yields raw fragments and returns the assembled message, so the
+    two halves are separated here — the fragments become events for the panel,
+    and ``yield from`` gives the loop the same message the blocking client
+    returns. Which event a fragment becomes is decided by its type, which is
+    why the client wraps thinking rather than yielding a bare string: the two
+    are the same shape on the wire and must not be shown the same way.
     Catching ``StopIteration`` is what reads a generator's return value; letting
     it escape a generator would become a ``RuntimeError`` instead (PEP 479).
     """
@@ -454,7 +477,12 @@ def _streamed_turn(
     try:
         while True:
             fragment = next(fragments)
-            yield StreamKeepAlive() if fragment is None else TextDelta(fragment)
+            if fragment is None:
+                yield StreamKeepAlive()
+            elif isinstance(fragment, ReasoningText):
+                yield ReasoningDelta(fragment.text)
+            else:
+                yield TextDelta(fragment)
     except StopIteration as finished:
         return finished.value
 

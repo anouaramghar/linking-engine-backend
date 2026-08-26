@@ -31,6 +31,7 @@ from app.services.agent_service import (
     AgentEvent,
     AgentUnavailable,
     AssistantReply,
+    ReasoningDelta,
     StreamKeepAlive,
     TextDelta,
     ToolInvocation,
@@ -137,6 +138,12 @@ def _event_frame(event: AgentEvent) -> str:
         return ": keep-alive\n\n"
     if isinstance(event, TextDelta):
         return _frame("delta", {"text": event.text})
+    # Its own event name, not `delta`: a client that does not know the name
+    # ignores the frame, which is the right default — thinking is progress to
+    # show, never the answer, and a client that mistook one for the other would
+    # render a draft the model may be about to contradict.
+    if isinstance(event, ReasoningDelta):
+        return _frame("reasoning", {"text": event.text})
     if isinstance(event, ToolInvocation):
         return _frame(
             "tool",
