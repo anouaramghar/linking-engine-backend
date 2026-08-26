@@ -301,22 +301,32 @@ def _read_ahead(source: Iterator[T], *, depth: int = 1) -> Iterator[T]:
     the items in between.
 
     Stopping early — a sample limit, or any exception in the consumer — sets the
-    stop flag and drains one slot, so a producer parked on a full queue wakes,
-    sees the flag and exits rather than leaking a thread holding an HTTP
-    connection.
+    stop flag and drains queued values, so a producer parked on a full queue
+    wakes, sees the flag and exits. Cleanup never waits for an arbitrary source
+    ``next()`` call to finish; once that call returns, the producer sees the flag
+    before fetching another item.
     """
     queue: Queue = Queue(maxsize=max(1, depth))
     stop = Event()
 
     def produce() -> None:
         try:
-            for item in source:
+            source_iterator = iter(source)
+            while True:
+                if stop.is_set():
+                    return
+                try:
+                    item = next(source_iterator)
+                except StopIteration:
+                    if not stop.is_set():
+                        queue.put(_READ_AHEAD_END)
+                    return
                 queue.put(item)
                 if stop.is_set():
                     return
-            queue.put(_READ_AHEAD_END)
         except BaseException as error:  # re-raised in the consumer, in order
-            queue.put(error)
+            if not stop.is_set():
+                queue.put(error)
 
     worker = Thread(target=produce, name="wordpress-read-ahead", daemon=True)
     worker.start()
@@ -330,15 +340,15 @@ def _read_ahead(source: Iterator[T], *, depth: int = 1) -> Iterator[T]:
             yield item
     finally:
         stop.set()
-        # At most `depth` producer puts can be parked; free that many slots.
-        for _ in range(queue.maxsize + 1):
-            if not worker.is_alive():
-                break
+        # Free every queued value so a producer parked on `queue.put` wakes.
+        # Do not wait for a producer blocked inside an arbitrary source `next()`;
+        # that operation may be a network read with its own much longer timeout.
+        while True:
             try:
                 queue.get_nowait()
             except Empty:
-                worker.join(timeout=0.5)
-        worker.join(timeout=5)
+                break
+        worker.join(timeout=0.1)
 
 
 class WordPressConnector(ContentConnector):

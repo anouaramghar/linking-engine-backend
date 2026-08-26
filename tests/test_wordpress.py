@@ -1198,6 +1198,39 @@ def test_read_ahead_stops_the_producer_when_the_consumer_stops_early():
     assert not any(t.name == "wordpress-read-ahead" and t.is_alive() for t in threading.enumerate())
 
 
+def test_read_ahead_does_not_wait_for_a_source_blocked_in_next():
+    """Closing a sample must not wait on the next network page already in flight."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def source():
+        yield "page-1"
+        entered.set()
+        release.wait(timeout=2)
+        yield "page-2"
+
+    stream = wordpress_module._read_ahead(source())
+    try:
+        assert next(stream) == "page-1"
+        assert entered.wait(timeout=2), "producer did not enter the blocked source"
+
+        started = time.perf_counter()
+        stream.close()
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.5, f"close waited on the in-flight source: {elapsed:.3f}s"
+    finally:
+        release.set()
+        stream.close()
+
+    deadline = time.perf_counter() + 2
+    while any(t.name == "wordpress-read-ahead" and t.is_alive() for t in threading.enumerate()):
+        if time.perf_counter() >= deadline:
+            break
+        time.sleep(0.01)
+    assert not any(t.name == "wordpress-read-ahead" and t.is_alive() for t in threading.enumerate())
+
+
 def test_read_ahead_overlaps_the_producer_with_the_consumer():
     """The point of the change: fetching and writing stop taking turns."""
     delay = 0.05
