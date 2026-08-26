@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import httpx
 from sqlalchemy import select
 
 from app.agent_tools import call_tool
@@ -10,7 +11,9 @@ from app.services.external_link_policy import (
     PolicyState,
     evaluate_external_url,
     external_target_context,
+    recheck_external_suggestions_before_publication,
 )
+from app.services.live_url import LiveURLChecker
 
 
 def _admin() -> Principal:
@@ -30,6 +33,15 @@ def _article(db, site: Site, *, url: str, title: str = "Article") -> Article:
     db.commit()
     db.refresh(article)
     return article
+
+
+def _live_checker(status_code: int) -> LiveURLChecker:
+    return LiveURLChecker(
+        client=httpx.Client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(status_code))
+        ),
+        validator=lambda _url: None,
+    )
 
 
 def _pool(db, *, approved: bool = True, registered_days_ago: int | None = None) -> Site:
@@ -454,3 +466,86 @@ def test_pool_site_cannot_own_an_outgoing_external_policy(client, db):
     assert response.status_code == 409
     db.delete(pool)
     db.commit()
+
+
+def _approved_web_suggestion(db, site, *, url: str) -> Suggestion:
+    source = _article(db, site, url=f"{site.base_url}/{uuid4().hex}", title="Source")
+    policy = db.get(ExternalLinkPolicy, site.id)
+    if policy is None:
+        db.add(
+            ExternalLinkPolicy(
+                site_id=site.id,
+                external_links_enabled=True,
+                min_trust_score=0,
+            )
+        )
+    else:
+        policy.external_links_enabled = True
+    suggestion = Suggestion(
+        site_id=site.id,
+        source_article_id=source.id,
+        target_article_id=None,
+        external_url=url,
+        external_title="External source",
+        method="external_search",
+        score=0.9,
+        rank_score=0.9,
+        status="approved",
+        anchor_text="source",
+    )
+    db.add(suggestion)
+    db.commit()
+    db.refresh(suggestion)
+    return suggestion
+
+
+def test_prepublication_live_gate_expires_a_dead_external_target(db, site):
+    suggestion = _approved_web_suggestion(db, site, url="https://reference.example/dead")
+
+    result = recheck_external_suggestions_before_publication(
+        db,
+        site,
+        actor="system:test",
+        checker=_live_checker(410),
+    )
+    db.commit()
+
+    db.refresh(suggestion)
+    assert result.checked == 1
+    assert result.passed == 0
+    assert result.expired == 1
+    assert suggestion.status == "expired"
+    event = db.scalars(
+        select(SuggestionEvent).where(
+            SuggestionEvent.suggestion_id == suggestion.id,
+            SuggestionEvent.event_type == "live_url_expired",
+        )
+    ).one()
+    assert event.details["from_status"] == "approved"
+    assert event.details["to_status"] == "expired"
+    assert event.details["live_url"]["checks"]["http_status"] == 410
+
+
+def test_prepublication_live_gate_records_a_fresh_pass(db, site):
+    suggestion = _approved_web_suggestion(db, site, url="https://reference.example/live")
+
+    result = recheck_external_suggestions_before_publication(
+        db,
+        site,
+        actor="system:test",
+        checker=_live_checker(204),
+    )
+    db.commit()
+
+    db.refresh(suggestion)
+    assert result.checked == 1
+    assert result.passed == 1
+    assert result.expired == 0
+    assert suggestion.status == "approved"
+    event = db.scalars(
+        select(SuggestionEvent).where(
+            SuggestionEvent.suggestion_id == suggestion.id,
+            SuggestionEvent.event_type == "live_url_checked",
+        )
+    ).one()
+    assert event.details["live_url"]["checks"]["http_status"] == 204

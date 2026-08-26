@@ -1,6 +1,7 @@
 import math
 from dataclasses import dataclass, field
 
+import httpx
 from sqlalchemy import select
 
 from app.config import settings
@@ -16,6 +17,7 @@ from app.models import (
 )
 from app.models.article import EMBEDDING_DIM
 from app.services.external_suggestion_service import fill_external_suggestion_gap
+from app.services.live_url import LiveURLChecker
 
 
 def _vector(similarity: float = 1.0, axis: int = 1) -> list[float]:
@@ -62,6 +64,14 @@ class FakeProvider:
     ) -> ExternalSearchResponse:
         self.calls.append((query, max_results, tuple(exclude_domains)))
         return self.response
+
+
+def _live_checker(handler=None) -> LiveURLChecker:
+    handler = handler or (lambda _request: httpx.Response(200))
+    return LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        validator=lambda _url: None,
+    )
 
 
 def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> None:
@@ -116,14 +126,18 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
         missing_slots=1,
         model=settings.embedding_model,
         provider=provider,
+        live_url_checker=_live_checker(),
     )
     db.commit()
 
     assert len(provider.calls) == 1
+    # Detection remains local: article prose is evidence for the editor, not a
+    # new field sent to the paid search provider.
     assert provider.calls[0][:2] == (source.title, 5)
     assert domain_from_url(site.base_url) in provider.calls[0][2]
     assert outcome.created == 1
     assert outcome.credits_used == 1
+    assert outcome.citation_needs_detected == 1
     assert outcome.filtered == {
         "safety_blocked": 1,
         "duplicate": 1,
@@ -137,6 +151,16 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
     assert suggestion.provider_score == 0.91
     assert suggestion.score == 0.80
     assert suggestion.score_components["external_safety"]["eligible"] is True
+    assert suggestion.score_components["live_url"]["eligible"] is True
+    assert suggestion.score_components["live_url"]["checks"]["http_status"] == 200
+    assert suggestion.score_components["citation_need"] == {
+        "sentence": "Safe temperatures and processing times for preserved tomatoes.",
+        "start": 0,
+        "end": 62,
+        "confidence": 0.7,
+        "reasons": ["health_or_safety_claim"],
+        "detector_version": "citation_rules_en_v1",
+    }
 
     decisions = db.scalars(
         select(ExternalSearchAuditEvent.decision)
@@ -158,6 +182,7 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
     ).one()
     assert trace.details["provider_request_id"] == "request-1"
     assert trace.details["semantic_model"] == settings.embedding_model
+    assert trace.details["citation_need"] == suggestion.score_components["citation_need"]
     request_event = db.scalars(
         select(ExternalSearchAuditEvent).where(
             ExternalSearchAuditEvent.source_article_id == source.id,
@@ -166,6 +191,8 @@ def test_fallback_filters_scores_persists_and_audits(monkeypatch, db, site) -> N
     ).one()
     assert request_event.details["credits_used"] == 1
     assert request_event.details["attempt_count"] == 2
+    assert request_event.details["citation_needs_detected"] == 1
+    assert request_event.details["citation_need"] == suggestion.score_components["citation_need"]
 
 
 def test_zero_gap_never_calls_provider(db, site) -> None:
@@ -227,3 +254,47 @@ def test_disabled_external_links_never_reach_the_provider(db, site) -> None:
         )
     )
     assert decisions == ["external_links_disabled"]
+
+
+def test_dead_live_url_is_audited_and_never_becomes_a_suggestion(monkeypatch, db, site) -> None:
+    source = _source(db, site)
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
+    db.commit()
+    provider = FakeProvider(
+        ExternalSearchResponse(
+            provider="tavily",
+            query=source.title,
+            request_id="request-dead",
+            results=(
+                ExternalSearchResult(
+                    title="Retired reference",
+                    url="https://reference.example/gone",
+                    snippet="No longer available.",
+                    provider_score=0.9,
+                ),
+            ),
+        )
+    )
+    monkeypatch.setattr("app.ml.embeddings.encode", lambda _texts: [])
+
+    outcome = fill_external_suggestion_gap(
+        db,
+        site=site,
+        article=source,
+        missing_slots=1,
+        model=settings.embedding_model,
+        provider=provider,
+        live_url_checker=_live_checker(lambda _request: httpx.Response(410)),
+    )
+    db.commit()
+
+    assert outcome.created == 0
+    assert outcome.filtered["live_url_failed"] == 1
+    assert db.scalar(select(Suggestion).where(Suggestion.source_article_id == source.id)) is None
+    blocked = db.scalars(
+        select(ExternalSearchAuditEvent).where(
+            ExternalSearchAuditEvent.source_article_id == source.id,
+            ExternalSearchAuditEvent.decision == "live_url_failed",
+        )
+    ).one()
+    assert blocked.details["live_url"]["checks"]["http_status"] == 410

@@ -53,6 +53,27 @@ class SuggestionEventOut(BaseModel):
     created_at: datetime
 
 
+class CitationNeedOut(BaseModel):
+    sentence: str
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasons: list[str]
+    detector_version: str
+
+
+class CitationNeedAnalysisOut(BaseModel):
+    article_id: int
+    content_fingerprint: str
+    detector_version: str
+    threshold: float = Field(ge=0.0, le=1.0)
+    language: str
+    sentences_analyzed: int = Field(ge=0)
+    total_detected: int = Field(ge=0)
+    truncated: bool
+    items: list[CitationNeedOut]
+
+
 class TraceEventOut(SuggestionEventOut):
     trace_id: str
     site_id: int

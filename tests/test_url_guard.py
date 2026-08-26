@@ -4,6 +4,8 @@ DNS, sockets, and HTTP transports are stubbed at their respective seams.
 """
 
 import socket
+from threading import Event
+from time import monotonic
 from types import SimpleNamespace
 
 import httpcore
@@ -263,6 +265,67 @@ def test_public_resolution_connects_to_the_validated_address():
 
     assert result.text == "ok"
     assert fake_socket.connected_to == ("93.184.216.34", 80)
+
+
+def test_socket_reads_cannot_refresh_the_total_network_deadline():
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    class DripSocket(_FakeSocket):
+        def __init__(self, clock):
+            super().__init__()
+            self.clock = clock
+            self.timeouts = []
+
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+
+        def recv(self, _max_bytes):
+            self.clock.now += 0.6
+            return b"x"
+
+    clock = Clock()
+    drip = DripSocket(clock)
+    stream = url_guard._SocketStream(drip)
+
+    with url_guard.network_deadline(1.0, clock=clock):
+        assert stream.read(1, timeout=8.0) == b"x"
+        with pytest.raises(httpcore.ReadTimeout, match="total network deadline"):
+            stream.read(1, timeout=8.0)
+
+    assert drip.timeouts == [1.0, pytest.approx(0.4)]
+
+
+def test_dns_resolution_obeys_the_total_network_deadline():
+    release = Event()
+    finished = Event()
+
+    def stuck_resolver(_host, _port, **_kwargs):
+        try:
+            release.wait(timeout=5)
+            return []
+        finally:
+            finished.set()
+
+    backend = ValidatingNetworkBackend(
+        resolver=stuck_resolver,
+        socket_factory=lambda *_args: pytest.fail("timed-out DNS must not connect"),
+    )
+    started = monotonic()
+    try:
+        with (
+            url_guard.network_deadline(started + 0.05),
+            pytest.raises(httpcore.ConnectTimeout, match="DNS resolution"),
+        ):
+            backend.connect_tcp("slow-dns.example", 443)
+    finally:
+        release.set()
+
+    assert monotonic() - started < 1.0
+    assert finished.wait(timeout=1)
 
 
 def test_connect_backend_rejects_if_any_resolved_address_is_private():

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.domain_policy import domain_from_url, domain_matches
 from app.models import Article, ExternalLinkPolicy, Site, Suggestion, SuggestionEvent
+from app.services.live_url import LiveURLCheck, LiveURLChecker
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,13 @@ class WebSearchSafetyEvaluation:
             "reasons": list(self.reasons),
             "checks": self.checks,
         }
+
+
+@dataclass(frozen=True)
+class LiveURLGateResult:
+    checked: int = 0
+    passed: int = 0
+    expired: int = 0
 
 
 def policy_state(db: Session, site_id: int) -> PolicyState:
@@ -379,11 +387,14 @@ def ineligible_external_suggestions(
     *,
     statuses: tuple[str, ...] = ("pending", "approved"),
     policy: PolicyState | None = None,
+    publication_plan_ids: tuple[int, ...] | None = None,
 ) -> list[IneligibleExternalSuggestion]:
     """Read the exact rows a policy would expire, without changing them."""
+    if publication_plan_ids is not None and not publication_plan_ids:
+        return []
     effective_policy = policy or policy_state(db, source_site.id)
     owned = managed_domains(db)
-    suggestions = db.scalars(
+    query = (
         select(Suggestion)
         .where(
             Suggestion.site_id == source_site.id,
@@ -393,7 +404,10 @@ def ineligible_external_suggestions(
             joinedload(Suggestion.source_article),
             joinedload(Suggestion.target_article),
         )
-    ).all()
+    )
+    if publication_plan_ids is not None:
+        query = query.where(Suggestion.publication_plan_id.in_(publication_plan_ids))
+    suggestions = db.scalars(query).all()
     target_site_ids = {
         row.target_article.site_id for row in suggestions if row.target_article is not None
     }
@@ -437,9 +451,15 @@ def expire_ineligible_external_suggestions(
     *,
     statuses: tuple[str, ...] = ("pending", "approved"),
     actor: str,
+    publication_plan_ids: tuple[int, ...] | None = None,
 ) -> int:
     """Expire old rows that no longer satisfy the current external policy."""
-    ineligible = ineligible_external_suggestions(db, source_site, statuses=statuses)
+    ineligible = ineligible_external_suggestions(
+        db,
+        source_site,
+        statuses=statuses,
+        publication_plan_ids=publication_plan_ids,
+    )
     now = datetime.now(UTC)
     for suggestion, evaluation, details_key in ineligible:
         previous = suggestion.status
@@ -458,3 +478,151 @@ def expire_ineligible_external_suggestions(
             )
         )
     return len(ineligible)
+
+
+def recheck_external_suggestions_before_publication(
+    db: Session,
+    source_site: Site,
+    *,
+    statuses: tuple[str, ...] = ("approved",),
+    actor: str,
+    checker: LiveURLChecker | None = None,
+    publication_plan_ids: tuple[int, ...] | None = None,
+) -> LiveURLGateResult:
+    """Recheck external targets immediately before an approved write.
+
+    The suggestion's original safety evidence is historical. Link rot and
+    redirect destinations can change after review, so publication records a
+    fresh observation and expires any row that no longer reaches a safe 2xx
+    destination. Internal targets come from the managed site's own live
+    publication boundary and are deliberately skipped here.
+    """
+
+    if publication_plan_ids is not None and not publication_plan_ids:
+        return LiveURLGateResult()
+
+    query = (
+        select(Suggestion)
+        .where(
+            Suggestion.site_id == source_site.id,
+            Suggestion.status.in_(statuses),
+        )
+        .options(joinedload(Suggestion.target_article))
+        .order_by(Suggestion.id)
+    )
+    if publication_plan_ids is not None:
+        query = query.where(Suggestion.publication_plan_id.in_(publication_plan_ids))
+    suggestions = db.scalars(query).all()
+    target_site_ids = {
+        row.target_article.site_id
+        for row in suggestions
+        if row.external_url is None
+        and row.target_article is not None
+        and row.target_article.site_id != source_site.id
+    }
+    target_sites = {
+        site.id: site for site in db.scalars(select(Site).where(Site.id.in_(target_site_ids))).all()
+    }
+    external_rows = [
+        row
+        for row in suggestions
+        if row.external_url is not None
+        or (
+            row.target_article is not None
+            and row.target_article.site_id in target_sites
+            and target_sites[row.target_article.site_id].platform == "pool"
+        )
+    ]
+    if not external_rows:
+        return LiveURLGateResult()
+
+    policy = policy_state(db, source_site.id)
+    owned = managed_domains(db)
+    owns_checker = checker is None
+    checker = checker or LiveURLChecker()
+    cache: dict[tuple[str, int | None], LiveURLCheck] = {}
+    checked = 0
+    passed = 0
+    expired = 0
+    now = datetime.now(UTC)
+    try:
+        for suggestion in external_rows:
+            target_site: Site | None = None
+            if suggestion.external_url is not None:
+                target_url = suggestion.external_url
+                cache_key = (target_url, None)
+
+                def target_policy(candidate_url: str) -> tuple[bool, tuple[str, ...]]:
+                    evaluation = evaluate_web_search_url(
+                        source_site=source_site,
+                        target_url=candidate_url,
+                        policy=policy,
+                        owned_domains=owned,
+                    )
+                    return evaluation.eligible, evaluation.reasons
+
+            else:
+                target = suggestion.target_article
+                if target is None:
+                    continue
+                target_site = target_sites.get(target.site_id)
+                if target_site is None or target_site.platform != "pool":
+                    continue
+                target_url = target.url
+                cache_key = (target_url, target_site.id)
+
+                def target_policy(
+                    candidate_url: str,
+                    *,
+                    pool_site: Site = target_site,
+                ) -> tuple[bool, tuple[str, ...]]:
+                    evaluation = evaluate_external_url(
+                        source_site=source_site,
+                        target_site=pool_site,
+                        target_url=candidate_url,
+                        policy=policy,
+                        owned_domains=owned,
+                    )
+                    return evaluation.eligible, evaluation.reasons
+
+            checked += 1
+            live_url = cache.get(cache_key)
+            if live_url is None:
+                live_url = checker.check(target_url, policy_check=target_policy)
+                cache[cache_key] = live_url
+
+            component = live_url.as_score_component()
+            if live_url.eligible:
+                passed += 1
+                db.add(
+                    SuggestionEvent(
+                        suggestion_id=suggestion.id,
+                        event_type="live_url_checked",
+                        actor=actor[:255],
+                        details={"live_url": component},
+                        created_at=now,
+                    )
+                )
+                continue
+
+            previous = suggestion.status
+            suggestion.status = "expired"
+            expired += 1
+            db.add(
+                SuggestionEvent(
+                    suggestion_id=suggestion.id,
+                    event_type="live_url_expired",
+                    actor=actor[:255],
+                    details={
+                        "from_status": previous,
+                        "to_status": "expired",
+                        "live_url": component,
+                    },
+                    created_at=now,
+                )
+            )
+    finally:
+        if owns_checker:
+            checker.close()
+
+    return LiveURLGateResult(checked=checked, passed=passed, expired=expired)

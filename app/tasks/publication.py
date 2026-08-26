@@ -49,6 +49,16 @@ from app.schemas.publication import (
     PublicationPreparationJobResult,
 )
 from app.services.alerts import send_alert
+from app.services.external_link_policy import (
+    expire_ineligible_external_suggestions,
+    recheck_external_suggestions_before_publication,
+)
+from app.services.job_service import (
+    NonRetryableTaskError,
+    record_progress,
+    record_progress_durably,
+    run_durably,
+)
 from app.services.publication_plan_service import (
     MAX_REASON_CHARS,
     PlanIntegrityError,
@@ -64,13 +74,6 @@ from app.services.publication_progress import (
     record_publication_failure,
     record_publication_skip,
     resume_outcome_counts,
-)
-from app.services.external_link_policy import expire_ineligible_external_suggestions
-from app.services.job_service import (
-    NonRetryableTaskError,
-    record_progress,
-    record_progress_durably,
-    run_durably,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,11 +195,14 @@ def _publish_approved_plans(
         if site is None:
             raise ValueError(f"site {site_id} not found")
         connector = get_connector(site)
+        plans = load_approved_plans(db, site_id, plan_ids=plan_ids)
+        selected_plan_ids = tuple(plan.id for plan in plans)
         policy_expired = expire_ineligible_external_suggestions(
             db,
             site,
             statuses=("approved",),
             actor="system:publication-policy",
+            publication_plan_ids=selected_plan_ids,
         )
         if policy_expired:
             db.commit()
@@ -205,7 +211,22 @@ def _publish_approved_plans(
                 policy_expired,
                 site_id,
             )
-        plans = load_approved_plans(db, site_id, plan_ids=plan_ids)
+        live_url_gate = recheck_external_suggestions_before_publication(
+            db,
+            site,
+            statuses=("approved",),
+            actor="system:publication-live-url",
+            publication_plan_ids=selected_plan_ids,
+        )
+        if live_url_gate.checked:
+            db.commit()
+            logger.info(
+                "publication live-URL gate checked %s external suggestion(s) for site %s; "
+                "%s expired",
+                live_url_gate.checked,
+                site_id,
+                live_url_gate.expired,
+            )
         # The batch is the links inside approved artifacts, not everything a
         # reviewer has selected. Those are different numbers now, and reporting
         # the larger one would describe work this run was never going to do.
@@ -423,6 +444,9 @@ def _publish_approved_plans(
             "block": outcome_counts["block"],
             "already_present": outcome_counts["already_present"],
             "policy_expired": policy_expired,
+            "live_url_checked": live_url_gate.checked,
+            "live_url_passed": live_url_gate.passed,
+            "live_url_expired": live_url_gate.expired,
         }
     finally:
         db.close()

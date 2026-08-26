@@ -5,30 +5,37 @@ import hashlib
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from sqlalchemy import and_, func, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import SessionLocal, engine
-from app.models import Article, Embedding, Site, Suggestion
-from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
-from app.ml.candidate_ordering import order_candidates
+from app.ml.candidate_ordering import OrderedCandidate, order_candidates
 from app.ml.external.base import ExternalSearchProvider
 from app.ml.hybrid import HybridRanker, RankedCandidate
-from app.services.external_suggestion_service import fill_external_suggestion_gap
-from app.services.job_service import JobCancelled, check_job_cancellation, record_progress
-from app.services.external_link_policy import external_target_context
+from app.models import Article, Embedding, Site, Suggestion
+from app.models.article import EMBEDDING_DIM
+from app.services.citation_need import analyze_citation_needs
 from app.services.editorial_feedback import (
     FEEDBACK_CANDIDATE_POOL,
     load_editorial_feedback,
 )
+from app.services.external_link_policy import (
+    evaluate_external_url,
+    external_target_context,
+    managed_domains,
+    policy_state,
+)
+from app.services.external_suggestion_service import fill_external_suggestion_gap
 from app.services.graph_service import (
     ensure_graph_snapshot,
     snapshot_features,
 )
+from app.services.job_service import JobCancelled, check_job_cancellation, record_progress
+from app.services.live_url import LiveURLCheck, LiveURLChecker
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
@@ -331,10 +338,13 @@ def generate_suggestions(
     ranking_mode_override: str | None = None,
     comparison_only: bool = False,
     external_provider: ExternalSearchProvider | None = None,
+    live_url_checker: LiveURLChecker | None = None,
 ) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
         db = SessionLocal()
+        owns_live_url_checker = live_url_checker is None
+        live_url_checker = live_url_checker or LiveURLChecker()
         try:
             check_job_cancellation(job_run_id)
             site = db.get(Site, site_id)
@@ -343,6 +353,19 @@ def generate_suggestions(
             if site.platform == "pool":
                 raise ValueError("content-pool sources cannot generate suggestions")
             allowed_target_ids, external_trust = external_target_context(db, site)
+            external_policy = policy_state(db, site.id)
+            owned_domains = managed_domains(db)
+            pool_targets: dict[int, tuple[Article, Site]] = {}
+            if external_trust:
+                pool_targets = {
+                    article.id: (article, target_site)
+                    for article, target_site in db.execute(
+                        select(Article, Site)
+                        .join(Site, Site.id == Article.site_id)
+                        .where(Article.id.in_(external_trust))
+                    ).all()
+                }
+            pool_live_cache: dict[str, LiveURLCheck] = {}
             model = settings.embedding_model
             _validate_embedding_dimension(model)
             check_job_cancellation(job_run_id)
@@ -481,18 +504,24 @@ def generate_suggestions(
             external_created = 0
             external_credits_used = 0
             external_filtered: dict[str, int] = {}
+            live_url_candidates_checked = 0
+            live_url_candidates_blocked = 0
+            citation_need_sources_detected = 0
+            citation_need_sentences_detected = 0
             graph_reordered_sources = 0
-            for source_index, article_id in enumerate(article_ids, start=1):
+            for source_index, source_article_id in enumerate(article_ids, start=1):
                 check_job_cancellation(job_run_id)
                 if ranking_mode == "hybrid" and site_capacity <= 0:
                     break
                 remaining = min(
-                    suggestion_cap - existing_counts.get(article_id, 0),
-                    lifetime_cap - lifetime_counts.get(article_id, 0),
+                    suggestion_cap - existing_counts.get(source_article_id, 0),
+                    lifetime_cap - lifetime_counts.get(source_article_id, 0),
                     site_capacity,
                 )
                 has_capacity = remaining > 0
-                shadow_selected = ranking_mode == "shadow" and article_id in shadow_source_ids
+                shadow_selected = (
+                    ranking_mode == "shadow" and source_article_id in shadow_source_ids
+                )
                 if comparison_only and not shadow_selected:
                     continue
                 if not has_capacity and not shadow_selected:
@@ -503,6 +532,26 @@ def generate_suggestions(
                     hybrid_sources_selected += 1
                 if has_capacity:
                     eligible_sources += 1
+                source_article = db.get(Article, source_article_id)
+                if source_article is None:
+                    raise ValueError(
+                        f"source article {source_article_id} disappeared during analysis"
+                    )
+                citation_analysis = (
+                    analyze_citation_needs(
+                        source_article.content_text,
+                        language=source_article.language,
+                    )
+                    if has_capacity and not comparison_only
+                    else None
+                )
+                citation_need = citation_analysis.primary if citation_analysis else None
+                citation_evidence = (
+                    citation_need.as_score_component() if citation_need is not None else None
+                )
+                if citation_analysis is not None:
+                    citation_need_sources_detected += int(citation_analysis.total_detected > 0)
+                    citation_need_sentences_detected += citation_analysis.total_detected
                 method = "baseline_cosine"
                 candidate_rows: list[RankedCandidate]
                 candidate_pool_limit = (
@@ -513,7 +562,7 @@ def generate_suggestions(
                 if ranking_mode == "baseline" or (ranking_mode == "shadow" and not shadow_selected):
                     candidate_rows = _baseline_rows(
                         db,
-                        article_id,
+                        source_article_id,
                         model,
                         candidate_pool_limit,
                         allowed_target_ids=allowed_target_ids,
@@ -523,7 +572,7 @@ def generate_suggestions(
                     candidate_rows = (
                         _baseline_rows(
                             db,
-                            article_id,
+                            source_article_id,
                             model,
                             candidate_pool_limit,
                             allowed_target_ids=allowed_target_ids,
@@ -536,7 +585,7 @@ def generate_suggestions(
                         ranking_limit = suggestion_cap if shadow_selected else candidate_pool_limit
                         ranking = hybrid_ranker.rank(
                             db,
-                            source_id=article_id,
+                            source_id=source_article_id,
                             model=model,
                             limit=ranking_limit,
                             duplicate_similarity_threshold=(
@@ -582,12 +631,12 @@ def generate_suggestions(
                         logger.exception(
                             "hybrid ranking failed for site %s source %s; using baseline cosine",
                             site_id,
-                            article_id,
+                            source_article_id,
                         )
                         candidate_rows = (
                             _baseline_rows(
                                 db,
-                                article_id,
+                                source_article_id,
                                 model,
                                 candidate_pool_limit,
                                 allowed_target_ids=allowed_target_ids,
@@ -605,7 +654,7 @@ def generate_suggestions(
                         remaining=remaining,
                         graph_features=graph_features,
                         graph_snapshot=graph_snapshot,
-                        source_article_id=article_id,
+                        source_article_id=source_article_id,
                         graph_mode=settings.graph_reranking_mode,
                         minimum_relevance=settings.suggestion_min_score,
                         feedback_profile=feedback_profile,
@@ -613,6 +662,67 @@ def generate_suggestions(
                         external_trust=external_trust,
                     )
                     ordered_rows = ordering.items
+                    live_ordered_rows: list[OrderedCandidate] = []
+                    for ordered_candidate in ordered_rows:
+                        target_context = pool_targets.get(ordered_candidate.candidate.target_id)
+                        if target_context is None:
+                            live_ordered_rows.append(
+                                replace(
+                                    ordered_candidate,
+                                    final_rank=len(live_ordered_rows) + 1,
+                                )
+                            )
+                            continue
+
+                        target_article, target_site = target_context
+
+                        def pool_policy(
+                            candidate_url: str,
+                            *,
+                            pool_site: Site = target_site,
+                        ) -> tuple[bool, tuple[str, ...]]:
+                            evaluation = evaluate_external_url(
+                                source_site=site,
+                                target_site=pool_site,
+                                target_url=candidate_url,
+                                policy=external_policy,
+                                owned_domains=owned_domains,
+                            )
+                            return evaluation.eligible, evaluation.reasons
+
+                        live_url_candidates_checked += 1
+                        live_url = pool_live_cache.get(target_article.url)
+                        if live_url is None:
+                            live_url = live_url_checker.check(
+                                target_article.url,
+                                policy_check=pool_policy,
+                            )
+                            pool_live_cache[target_article.url] = live_url
+                        if not live_url.eligible or live_url.final_url is None:
+                            live_url_candidates_blocked += 1
+                            continue
+
+                        final_trust = evaluate_external_url(
+                            source_site=site,
+                            target_site=target_site,
+                            target_url=live_url.final_url,
+                            policy=external_policy,
+                            owned_domains=owned_domains,
+                        )
+                        if not final_trust.eligible:
+                            live_url_candidates_blocked += 1
+                            continue
+                        components = dict(ordered_candidate.score_components or {})
+                        components["external_trust"] = final_trust.as_score_component()
+                        components["live_url"] = live_url.as_score_component()
+                        live_ordered_rows.append(
+                            replace(
+                                ordered_candidate,
+                                final_rank=len(live_ordered_rows) + 1,
+                                score_components=components,
+                            )
+                        )
+                    ordered_rows = tuple(live_ordered_rows)
                     candidate_rows = [item.candidate for item in ordered_rows]
                     if ordering.graph_reordered:
                         graph_reordered_sources += 1
@@ -620,10 +730,14 @@ def generate_suggestions(
                     candidate_rows = []
                 for ordered_candidate in ordered_rows:
                     candidate = ordered_candidate.candidate
+                    generation_evidence = ordered_candidate.score_components
+                    if citation_evidence is not None:
+                        generation_evidence = dict(generation_evidence or {})
+                        generation_evidence["citation_need"] = citation_evidence
                     db.add(
                         Suggestion(
                             site_id=site_id,
-                            source_article_id=article_id,
+                            source_article_id=source_article_id,
                             generation_job_run_id=job_run_id,
                             target_article_id=candidate.target_id,
                             method=method,
@@ -633,11 +747,11 @@ def generate_suggestions(
                             # What the queue orders and filters on: the strength
                             # of the signal that actually chose this row.
                             rank_score=ordered_candidate.rank_score,
-                            score_components=ordered_candidate.score_components,
+                            score_components=generation_evidence,
                             retrieval_version=ordered_candidate.retrieval_version,
                             ranking_version=ordered_candidate.ranking_version,
                             final_rank=ordered_candidate.final_rank,
-                            feature_snapshot=ordered_candidate.score_components,
+                            feature_snapshot=generation_evidence,
                             status="pending",
                         )
                     )
@@ -646,22 +760,25 @@ def generate_suggestions(
                 external_missing = remaining - len(candidate_rows)
                 if external_missing > 0 and has_capacity and not comparison_only:
                     check_job_cancellation(job_run_id)
-                    article = db.get(Article, article_id)
-                    if article is None:
-                        raise ValueError(f"source article {article_id} disappeared during analysis")
                     external_outcome = fill_external_suggestion_gap(
                         db,
                         site=site,
-                        article=article,
+                        article=source_article,
                         missing_slots=external_missing,
                         model=model,
                         job_run_id=job_run_id,
                         provider=external_provider,
+                        live_url_checker=live_url_checker,
+                        citation_analysis=citation_analysis,
                     )
                     external_searches += external_outcome.searched
                     external_for_source = external_outcome.created
                     external_created += external_for_source
                     external_credits_used += external_outcome.credits_used
+                    live_url_candidates_checked += external_outcome.live_url_checked
+                    live_url_candidates_blocked += external_outcome.filtered.get(
+                        "live_url_failed", 0
+                    )
                     created += external_for_source
                     for reason, count in external_outcome.filtered.items():
                         external_filtered[reason] = external_filtered.get(reason, 0) + count
@@ -692,6 +809,10 @@ def generate_suggestions(
                 "external_suggestions_created": external_created,
                 "external_credits_used": external_credits_used,
                 "external_filtered": external_filtered,
+                "live_url_candidates_checked": live_url_candidates_checked,
+                "live_url_candidates_blocked": live_url_candidates_blocked,
+                "citation_need_sources_detected": citation_need_sources_detected,
+                "citation_need_sentences_detected": citation_need_sentences_detected,
                 "external_candidates_eligible": sum(
                     evaluation.eligible for evaluation in external_trust.values()
                 ),
@@ -760,4 +881,6 @@ def generate_suggestions(
                     )
             return result
         finally:
+            if owns_live_url_checker:
+                live_url_checker.close()
             db.close()

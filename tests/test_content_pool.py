@@ -20,9 +20,15 @@ from app.connectors.feed_discovery import (
 )
 from app.connectors.registry import get_connector
 from app.connectors.rss_connector import RSSConnector
+from app.connectors.url_guard import UnsafeURLError
 from app.connectors.wikipedia_connector import (
     MAX_EMPTY_RESPONSES,
     WikipediaConnector,
+)
+from app.main import app
+from app.ml.external.cleaning import (
+    deduplicate_external_urls,
+    normalize_external_url,
 )
 from app.models import (
     Article,
@@ -34,14 +40,9 @@ from app.models import (
     Suggestion,
 )
 from app.models.article import EMBEDDING_DIM
-from app.ml.external.cleaning import (
-    deduplicate_external_urls,
-    normalize_external_url,
-)
-from app.main import app
 from app.schemas.site import SiteCreate
-from app.connectors.url_guard import UnsafeURLError
 from app.services.crawl_snapshot import _reconcile_snapshot
+from app.services.live_url import LiveURLChecker
 from app.services.pool_source_policy import (
     PoolSourceFetchError,
     PoolSourcePolicyError,
@@ -52,6 +53,13 @@ from app.services.pool_source_policy import (
 from app.services.suggestion_service import generate_suggestions
 from app.tasks import ingestion as ingestion_task
 from app.tasks import pool_ingestion
+
+
+def _passing_live_url_checker() -> LiveURLChecker:
+    return LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(200))),
+        validator=lambda _url: None,
+    )
 
 
 def _vector(first: float, second: float = 0.0) -> list[float]:
@@ -1144,7 +1152,7 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
         site_id=site.id,
         url=f"{site.base_url}/tomato-guide",
         title="Tomato canning guide",
-        content_text="tomato canning jars safety",
+        content_text=("A 2024 study found that safe tomato canning reduces infection risk by 30%."),
     )
     target = Article(
         site_id=pool.id,
@@ -1177,11 +1185,24 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
     )
     db.commit()
     try:
-        generate_suggestions(site.id)
+        result = generate_suggestions(
+            site.id,
+            live_url_checker=_passing_live_url_checker(),
+        )
         suggestion = db.scalar(select(Suggestion).where(Suggestion.site_id == site.id))
         assert suggestion is not None
         assert suggestion.source_article_id == source.id
         assert suggestion.target_article_id == target.id
+        assert suggestion.score_components["live_url"]["eligible"] is True
+        assert suggestion.score_components["citation_need"]["detector_version"] == (
+            "citation_rules_en_v1"
+        )
+        assert (
+            suggestion.feature_snapshot["citation_need"]
+            == (suggestion.score_components["citation_need"])
+        )
+        assert result["citation_need_sources_detected"] == 1
+        assert result["citation_need_sentences_detected"] == 1
     finally:
         db.delete(pool)
         db.commit()

@@ -19,6 +19,7 @@ time and pydantic-settings lets a real environment variable win over ``.env``.
 
 import os
 import uuid
+from datetime import UTC, datetime
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
@@ -127,6 +128,27 @@ from app.main import app  # noqa: E402
 from app.models import Site, Tenant  # noqa: E402
 from app.services import telegram  # noqa: E402
 from app.services.authorization import Principal, ensure_default_tenant  # noqa: E402
+from app.services.live_url import LiveURLCheck  # noqa: E402
+
+
+class _OfflineLiveURLChecker:
+    """Deterministic stand-in for tests that do not exercise HTTP liveness."""
+
+    def check(self, url, *, policy_check=None):
+        allowed, reasons = (True, ()) if policy_check is None else policy_check(url)
+        return LiveURLCheck(
+            original_url=url,
+            final_url=url,
+            eligible=allowed,
+            status_code=200 if allowed else None,
+            redirect_count=0,
+            checked_at=datetime.now(UTC),
+            reason_code=None if allowed else "policy_blocked",
+            reason=None if allowed else "; ".join(reasons),
+        )
+
+    def close(self):
+        return None
 
 
 @event.listens_for(Site, "before_insert")
@@ -248,6 +270,24 @@ def offline_tavily(monkeypatch):
     provider unit tests pass an explicit fake key and a mock HTTP transport.
     """
     monkeypatch.setattr(settings, "tavily_api_key", "")
+
+
+@pytest.fixture(autouse=True)
+def offline_live_urls(monkeypatch):
+    """Keep ordinary ranking/publication tests deterministic and offline.
+
+    Dedicated live-URL tests pass a ``LiveURLChecker`` backed by
+    ``httpx.MockTransport`` and therefore still exercise status, redirect,
+    timeout, policy and SSRF behavior explicitly.
+    """
+    from app.services import (  # noqa: PLC0415
+        external_link_policy,
+        external_suggestion_service,
+        suggestion_service,
+    )
+
+    for module in (external_link_policy, external_suggestion_service, suggestion_service):
+        monkeypatch.setattr(module, "LiveURLChecker", _OfflineLiveURLChecker)
 
 
 @pytest.fixture(autouse=True)
