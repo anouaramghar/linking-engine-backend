@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import select
 
 from app.db import SessionLocal
-from app.models import JobRun, PipelineBatch, PipelineSiteRun, SiteSchedule
+from app.models import JobRun, PipelineBatch, PipelineSiteRun, Site, SiteSchedule
 from app.schemas.site_schedule import SiteScheduleUpdate
 from app.services.site_schedule_service import (
     ScheduledPipelineBusyError,
@@ -143,6 +143,62 @@ def test_disabling_schedule_removes_the_next_cursor(client, site):
     assert disabled.status_code == 200
     assert disabled.json()["enabled"] is False
     assert disabled.json()["next_run_at"] is None
+
+
+def test_first_schedule_confirmation_serializes_on_the_site_row(db, site):
+    """A concurrent first creation becomes a stale preview, never a uniqueness 500."""
+    blocker = SessionLocal()
+    second_started = Event()
+    second_finished = Event()
+    payload = SiteScheduleUpdate(
+        enabled=True,
+        cadence="daily",
+        local_time="03:15",
+        timezone="UTC",
+        expected={"exists": False},
+    )
+
+    def confirm_from_second_session():
+        session = SessionLocal()
+        try:
+            second_site = session.get(Site, site.id)
+            second_started.set()
+            return "success", save_schedule(session, second_site, payload)
+        except Exception as error:  # noqa: BLE001 - assert the exact loser below
+            return "error", error
+        finally:
+            second_finished.set()
+            session.close()
+
+    try:
+        # KEY SHARE still permits a child-row insert, but conflicts with the
+        # UPDATE-strength site lock that serializes schedule creation.
+        blocker.execute(
+            select(Site.id).where(Site.id == site.id).with_for_update(read=True, key_share=True)
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(confirm_from_second_session)
+            assert second_started.wait(timeout=5)
+            assert not second_finished.wait(timeout=0.5)
+
+            blocker.add(
+                SiteSchedule(
+                    site_id=site.id,
+                    enabled=True,
+                    cadence="daily",
+                    local_time=time(2),
+                    timezone="UTC",
+                )
+            )
+            blocker.commit()
+            result = future.result(timeout=5)
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert result[0] == "error"
+    assert isinstance(result[1], ValueError)
+    assert "changed after this action was previewed" in str(result[1])
 
 
 def test_run_now_queues_the_normal_pipeline(client, site, monkeypatch):

@@ -8,6 +8,7 @@ that a scheduled run is an ordinary crawl-then-analysis pipeline.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -23,19 +24,38 @@ class ScheduledPipelineBusyError(RuntimeError):
     """A site already has crawl or analysis work that must finish first."""
 
 
-def schedule_state(schedule: SiteSchedule | None) -> dict[str, object | None]:
-    """Return the small, JSON-safe state used by guarded schedule updates."""
+@dataclass(frozen=True)
+class SiteSchedulePreview:
+    """One desired configuration compared with the exact persisted snapshot."""
+
+    current: SiteScheduleExpected
+    desired: SiteScheduleExpected
+    next_run_at: datetime | None
+
+    @property
+    def changes(self) -> dict[str, dict[str, object | None]]:
+        current = self.current.wire_state()
+        desired = self.desired.wire_state()
+        return {
+            field: {"from": current.get(field), "to": desired.get(field)}
+            for field in ("exists", "enabled", "cadence", "weekday", "local_time", "timezone")
+            if current.get(field) != desired.get(field)
+        }
+
+
+def schedule_state(schedule: SiteSchedule | None) -> SiteScheduleExpected:
+    """Return the typed state used by previews and guarded schedule updates."""
 
     if schedule is None:
-        return {"exists": False}
-    return {
-        "exists": True,
-        "enabled": schedule.enabled,
-        "cadence": schedule.cadence,
-        "weekday": schedule.weekday,
-        "local_time": schedule.local_time.isoformat(),
-        "timezone": schedule.timezone,
-    }
+        return SiteScheduleExpected(exists=False)
+    return SiteScheduleExpected(
+        exists=True,
+        enabled=schedule.enabled,
+        cadence=schedule.cadence,
+        weekday=schedule.weekday,
+        local_time=schedule.local_time,
+        timezone=schedule.timezone,
+    )
 
 
 def _utc(value: datetime) -> datetime:
@@ -113,6 +133,40 @@ def next_schedule_run_at(
     return candidate.astimezone(UTC)
 
 
+def _next_run_for_update(payload: SiteScheduleUpdate, *, after: datetime) -> datetime | None:
+    if not payload.enabled:
+        return None
+    return next_schedule_run_at(
+        cadence=payload.cadence,
+        local_time=payload.local_time,
+        timezone=payload.timezone,
+        weekday=payload.weekday,
+        after=after,
+    )
+
+
+def preview_schedule(
+    schedule: SiteSchedule | None,
+    desired: SiteScheduleUpdate,
+    *,
+    after: datetime | None = None,
+) -> SiteSchedulePreview:
+    """Compare one normalized desired configuration with the persisted state."""
+
+    desired_exists = desired.enabled or schedule is not None
+    desired_state = (
+        SiteScheduleExpected(exists=True, **desired.configuration())
+        if desired_exists
+        else SiteScheduleExpected(exists=False)
+    )
+    current_time = _utc(after or datetime.now(UTC))
+    return SiteSchedulePreview(
+        current=schedule_state(schedule),
+        desired=desired_state,
+        next_run_at=_next_run_for_update(desired, after=current_time),
+    )
+
+
 def save_schedule(
     db: Session,
     site: Site,
@@ -126,11 +180,17 @@ def save_schedule(
     if site.platform == "pool":
         raise ValueError("content-pool sources use their own daily ingestion schedule")
     current_time = _utc(now or datetime.now(UTC))
+
+    # A schedule row cannot lock the first creation because it does not exist
+    # yet. The parent site is the stable per-site seam: serializing here makes a
+    # concurrent expected-absence confirmation observe the winner and fail as
+    # stale instead of colliding with the unique site_id constraint.
+    db.execute(select(Site.id).where(Site.id == site.id).with_for_update()).scalar_one()
     schedule = db.scalar(
         select(SiteSchedule).where(SiteSchedule.site_id == site.id).with_for_update()
     )
     if payload.expected is not None:
-        current = SiteScheduleExpected.model_validate(schedule_state(schedule))
+        current = schedule_state(schedule)
         if payload.expected != current:
             raise ValueError(
                 "site schedule changed after this action was previewed; refresh before confirming"
@@ -145,17 +205,7 @@ def save_schedule(
     schedule.weekday = payload.weekday
     schedule.local_time = payload.local_time.replace(tzinfo=None)
     schedule.timezone = payload.timezone
-    schedule.next_run_at = (
-        next_schedule_run_at(
-            cadence=payload.cadence,
-            local_time=schedule.local_time,
-            timezone=payload.timezone,
-            weekday=payload.weekday,
-            after=current_time,
-        )
-        if payload.enabled
-        else None
-    )
+    schedule.next_run_at = _next_run_for_update(payload, after=current_time)
     if updated_by is not None:
         if schedule.created_by is None:
             schedule.created_by = updated_by[:255]

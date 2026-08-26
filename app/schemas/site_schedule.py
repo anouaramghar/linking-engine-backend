@@ -25,14 +25,25 @@ class SiteScheduleExpected(BaseModel):
         required = (self.enabled, self.cadence, self.local_time, self.timezone)
         if self.exists:
             if any(value is None for value in required):
-                raise ValueError("an existing schedule snapshot must include its full configuration")
+                raise ValueError(
+                    "an existing schedule snapshot must include its full configuration"
+                )
             if self.cadence == "daily" and self.weekday is not None:
                 raise ValueError("daily schedule snapshots cannot include a weekday")
             if self.cadence == "weekly" and self.weekday is None:
                 raise ValueError("weekly schedule snapshots require a weekday")
-        elif any(value is not None for value in (self.enabled, self.cadence, self.weekday, self.local_time, self.timezone)):
+        elif any(
+            value is not None
+            for value in (self.enabled, self.cadence, self.weekday, self.local_time, self.timezone)
+        ):
             raise ValueError("an absent schedule snapshot cannot include configuration")
         return self
+
+    def wire_state(self) -> dict[str, object]:
+        """Return the compact JSON state used by previews and guarded writes."""
+        if not self.exists:
+            return {"exists": False}
+        return self.model_dump(mode="json")
 
 
 class SiteScheduleUpdate(BaseModel):
@@ -54,6 +65,13 @@ class SiteScheduleUpdate(BaseModel):
         if self.cadence == "daily":
             self.weekday = None
         return self
+
+    def configuration(self) -> dict[str, object]:
+        """Return only the normalized schedule values accepted by the update route."""
+        return self.model_dump(
+            mode="json",
+            include={"enabled", "cadence", "weekday", "local_time", "timezone"},
+        )
 
 
 class SiteScheduleOut(BaseModel):

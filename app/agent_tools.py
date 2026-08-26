@@ -88,9 +88,8 @@ from app.services.pool_source_policy import (
 )
 from app.services.site_schedule_service import (
     load_schedule,
-    next_schedule_run_at,
+    preview_schedule,
     schedule_output,
-    schedule_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -204,19 +203,15 @@ class PreviewSiteScheduleArgs(BaseModel):
 
     @model_validator(mode="after")
     def normalize_calendar(self) -> "PreviewSiteScheduleArgs":
-        normalized = SiteScheduleUpdate.model_validate(
-            {
-                "enabled": self.enabled,
-                "cadence": self.cadence,
-                "weekday": self.weekday,
-                "local_time": self.local_time,
-                "timezone": self.timezone,
-            }
-        )
+        normalized = self.to_update()
         self.weekday = normalized.weekday
         self.local_time = normalized.local_time
         self.timezone = normalized.timezone
         return self
+
+    def to_update(self) -> SiteScheduleUpdate:
+        """Normalize the flat tool interface through the schedule domain model."""
+        return SiteScheduleUpdate.model_validate(self.model_dump(exclude={"site_id"}))
 
 
 class PreviewSiteCreationItem(BaseModel):
@@ -1111,9 +1106,7 @@ def _preview_site_creation(
     return result
 
 
-def _get_site_schedule(
-    db: Session, principal: Principal, args: SiteScheduleArgs
-) -> dict[str, Any]:
+def _get_site_schedule(db: Session, principal: Principal, args: SiteScheduleArgs) -> dict[str, Any]:
     """Read one managed site's durable recurring refresh configuration."""
 
     site = authorize_site_read(db, principal, _resolve_site_id(db, principal, args.site_id))
@@ -1139,38 +1132,13 @@ def _preview_site_schedule(
     if site.platform == POOL_PLATFORM:
         raise HTTPException(409, "content-pool sources use their own daily ingestion schedule")
 
-    desired_payload = SiteScheduleUpdate.model_validate(args.model_dump())
+    desired_payload = args.to_update()
     schedule = load_schedule(db, site.id)
-    current = schedule_state(schedule)
-    desired_exists = desired_payload.enabled or schedule is not None
-    desired = (
-        {
-            "exists": True,
-            "enabled": desired_payload.enabled,
-            "cadence": desired_payload.cadence,
-            "weekday": desired_payload.weekday,
-            "local_time": desired_payload.local_time.isoformat(),
-            "timezone": desired_payload.timezone,
-        }
-        if desired_exists
-        else {"exists": False}
-    )
-    changes = {
-        field: {"from": current.get(field), "to": desired.get(field)}
-        for field in ("exists", "enabled", "cadence", "weekday", "local_time", "timezone")
-        if current.get(field) != desired.get(field)
-    }
-    next_run_at = (
-        next_schedule_run_at(
-            cadence=desired_payload.cadence,
-            local_time=desired_payload.local_time,
-            timezone=desired_payload.timezone,
-            weekday=desired_payload.weekday,
-            after=datetime.now(UTC),
-        ).isoformat()
-        if desired_payload.enabled
-        else None
-    )
+    preview = preview_schedule(schedule, desired_payload, after=datetime.now(UTC))
+    current = preview.current.wire_state()
+    desired = preview.desired.wire_state()
+    changes = preview.changes
+    next_run_at = preview.next_run_at.isoformat() if preview.next_run_at is not None else None
     result: dict[str, Any] = {
         "site": {"id": site.id, "name": site.name, "platform": site.platform},
         "current": current,
@@ -1190,11 +1158,7 @@ def _preview_site_schedule(
         "method": "PUT",
         "endpoint": f"/api/v1/sites/{site.id}/schedule",
         "payload": {
-            "enabled": desired_payload.enabled,
-            "cadence": desired_payload.cadence,
-            "weekday": desired_payload.weekday,
-            "local_time": desired_payload.local_time.isoformat(),
-            "timezone": desired_payload.timezone,
+            **desired_payload.configuration(),
             "expected": current,
         },
         "context": {
