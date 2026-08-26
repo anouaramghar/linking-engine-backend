@@ -1,8 +1,8 @@
 # Slice 2 — Core Workflow: Agent Implementation Brief
 
-> **Implementer:** delegated coding agent  
-> **Reviewer:** primary Codex agent  
-> **Date:** 2026-08-14  
+> **Implementer:** delegated coding agent
+> **Reviewer:** primary Codex agent
+> **Date:** 2026-08-14
 > **Scope:** LinkMesh v2 Slice 2 only
 
 ## 1. Objective

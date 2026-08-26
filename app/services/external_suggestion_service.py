@@ -32,6 +32,7 @@ from app.services.external_link_policy import (
     managed_domains,
     policy_state,
 )
+from app.services.live_url import LiveURLCheck, LiveURLChecker
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class ExternalFallbackResult:
     searched: int = 0
     created: int = 0
     credits_used: int = 0
+    live_url_checked: int = 0
     filtered: Counter[str] = field(default_factory=Counter)
 
 
@@ -54,7 +56,22 @@ class _ScorableCandidate:
     title: str
     snippet: str
     safety: WebSearchSafetyEvaluation
+    live_url: LiveURLCheck
     provider_rank: int
+
+
+def _check_live_candidate(
+    checker: LiveURLChecker | None,
+    url: str,
+    *,
+    policy_check,
+) -> LiveURLCheck:
+    """Use the analysis-wide client, or own one for a direct service call."""
+
+    if checker is not None:
+        return checker.check(url, policy_check=policy_check)
+    with LiveURLChecker() as one_shot:
+        return one_shot.check(url, policy_check=policy_check)
 
 
 def _audit_event(
@@ -139,6 +156,7 @@ def fill_external_suggestion_gap(
     model: str,
     job_run_id: int | None = None,
     provider: ExternalSearchProvider | None = None,
+    live_url_checker: LiveURLChecker | None = None,
 ) -> ExternalFallbackResult:
     """Use one bounded web search only when the normal pipeline left open slots."""
 
@@ -306,6 +324,74 @@ def fill_external_suggestion_gap(
                 },
             )
             continue
+
+        def candidate_policy(candidate_url: str) -> tuple[bool, tuple[str, ...]]:
+            evaluation = evaluate_web_search_url(
+                source_site=site,
+                target_url=candidate_url,
+                policy=policy,
+                owned_domains=owned,
+            )
+            return evaluation.eligible, evaluation.reasons
+
+        live_url = _check_live_candidate(
+            live_url_checker,
+            normalized_url,
+            policy_check=candidate_policy,
+        )
+        outcome.live_url_checked += 1
+        if not live_url.eligible or live_url.final_url is None:
+            outcome.filtered["live_url_failed"] += 1
+            _audit_event(
+                db,
+                site=site,
+                article=article,
+                job_run_id=job_run_id,
+                provider=provider_name,
+                request_id=response.request_id,
+                query=response.query,
+                candidate_url=normalized_url,
+                provider_score=result.provider_score,
+                decision="live_url_failed",
+                details={
+                    "provider_rank": provider_rank,
+                    "live_url": live_url.as_score_component(),
+                },
+            )
+            continue
+
+        # Store the concrete safe destination rather than a provider-supplied
+        # redirect alias. The checker applied policy before every hop; this
+        # final evaluation is the evidence persisted beside the suggestion.
+        normalized_url = live_url.final_url
+        safety = evaluate_web_search_url(
+            source_site=site,
+            target_url=normalized_url,
+            policy=policy,
+            owned_domains=owned,
+        )
+        if not safety.eligible:
+            # Defensive: the same policy ran inside the checker, but keeping the
+            # persistence boundary closed protects future checker refactors.
+            outcome.filtered["safety_blocked"] += 1
+            _audit_event(
+                db,
+                site=site,
+                article=article,
+                job_run_id=job_run_id,
+                provider=provider_name,
+                request_id=response.request_id,
+                query=response.query,
+                candidate_url=normalized_url,
+                provider_score=result.provider_score,
+                decision="safety_blocked",
+                details={
+                    "provider_rank": provider_rank,
+                    "safety": safety.as_score_component(),
+                    "live_url": live_url.as_score_component(),
+                },
+            )
+            continue
         if normalized_url in existing_urls or normalized_url in seen_urls:
             outcome.filtered["duplicate"] += 1
             _audit_event(
@@ -331,6 +417,7 @@ def fill_external_suggestion_gap(
                 title=(result.title.strip() or safety.domain)[:_MAX_STORED_TITLE_CHARS],
                 snippet=result.snippet.strip()[:_MAX_STORED_SNIPPET_CHARS],
                 safety=safety,
+                live_url=live_url,
                 provider_rank=provider_rank,
             )
         )
@@ -357,6 +444,7 @@ def fill_external_suggestion_gap(
             "semantic_model": model,
             "semantic_score": semantic_score,
             "safety": candidate.safety.as_score_component(),
+            "live_url": candidate.live_url.as_score_component(),
         }
         if (
             semantic_score < settings.suggestion_min_score
@@ -401,6 +489,7 @@ def fill_external_suggestion_gap(
             "semantic_model": model,
             "provider_rank": candidate.provider_rank,
             "external_safety": candidate.safety.as_score_component(),
+            "live_url": candidate.live_url.as_score_component(),
         }
         suggestion = Suggestion(
             site_id=site.id,
