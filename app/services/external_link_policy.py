@@ -605,8 +605,23 @@ def recheck_external_suggestions_before_publication(
                 )
                 continue
 
-            previous = suggestion.status
-            suggestion.status = "expired"
+            # The check ran outside any lock — deliberately, because it is an
+            # HTTP request — so the row may have moved on while it was in
+            # flight. Take the row lock now, after the network work and for the
+            # few microseconds until commit, and expire only what is still in
+            # the status this gate was asked about: another worker's 'applied'
+            # must not be overwritten by an observation that started earlier.
+            current = db.scalars(
+                select(Suggestion)
+                .where(Suggestion.id == suggestion.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            ).first()
+            if current is None or current.status not in statuses:
+                continue
+
+            previous = current.status
+            current.status = "expired"
             expired += 1
             db.add(
                 SuggestionEvent(

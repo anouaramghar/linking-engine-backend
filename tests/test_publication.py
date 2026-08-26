@@ -293,6 +293,119 @@ def test_dead_external_target_stales_plan_before_wordpress_write(db, site, artic
     assert _plan_status(db, plan.id) == "stale"
 
 
+def test_each_plan_is_live_checked_at_its_own_publication_boundary(
+    db, site, articles, monkeypatch
+):
+    """The second target dies while the first plan is being written.
+
+    A gate that ran once for the whole batch had already blessed this target
+    before the first WordPress call, the optional inter-request pause, and every
+    other plan's network work. By the time its own write left, the observation
+    was minutes old and wrong, and LinkMesh published a dead link. The check
+    belongs to the plan, not to the run.
+    """
+    sources = []
+    suggestions = []
+    for index in range(2):
+        source = Article(
+            site_id=site.id,
+            url=f"{site.base_url}/live-src-{index}",
+            title=f"src {index}",
+            content_text="a",
+        )
+        db.add(source)
+        db.commit()
+        suggestion = Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=None,
+            external_url=f"https://reference.example/target-{index}",
+            external_title=f"Target {index}",
+            provider="tavily",
+            method="external_search",
+            score=0.9,
+            rank_score=0.9,
+            status="approved",
+            anchor_text="anchor",
+        )
+        db.add(suggestion)
+        db.commit()
+        db.refresh(suggestion)
+        sources.append(source)
+        suggestions.append(suggestion)
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True, min_trust_score=0))
+    db.commit()
+    plans = [
+        _approved_plan(db, site, source, [suggestion])
+        for source, suggestion in zip(sources, suggestions, strict=True)
+    ]
+
+    second_alive = True
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested.append(url)
+        if url.endswith("/target-1") and not second_alive:
+            return httpx.Response(410)
+        return httpx.Response(200)
+
+    checker = LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        validator=lambda _url: None,
+    )
+
+    def scoped_live_gate(session, source_site, **kwargs):
+        return recheck_external_suggestions_before_publication(
+            session,
+            source_site,
+            statuses=kwargs["statuses"],
+            actor=kwargs["actor"],
+            checker=checker,
+            publication_plan_ids=kwargs["publication_plan_ids"],
+        )
+
+    monkeypatch.setattr(
+        publication,
+        "recheck_external_suggestions_before_publication",
+        scoped_live_gate,
+    )
+
+    def kill_the_second_target(_source, _original_html, _updated_html):
+        nonlocal second_alive
+        second_alive = False
+
+    calls = _stub_connector(monkeypatch, apply=kill_the_second_target)
+
+    result = publish_approved_plans(site.id)
+
+    # The write that matters is the one that did not happen.
+    assert [call.source_id for call in calls] == [sources[0].id]
+    assert requested == [
+        "https://reference.example/target-0",
+        "https://reference.example/target-1",
+    ]
+    assert _core(result) == {"applied": 1, "failed": 0, "skipped": 1}
+    assert (result["live_url_checked"], result["live_url_passed"], result["live_url_expired"]) == (
+        2,
+        1,
+        1,
+    )
+    assert _status(db, suggestions[0].id) == "applied"
+    assert _plan_status(db, plans[0].id) == "applied"
+    assert _status(db, suggestions[1].id) == "expired"
+    assert _plan_status(db, plans[1].id) == "stale"
+    assert (
+        db.scalar(
+            select(SuggestionEvent).where(
+                SuggestionEvent.suggestion_id == suggestions[1].id,
+                SuggestionEvent.event_type == "live_url_expired",
+            )
+        )
+        is not None
+    )
+
+
 def test_a_site_with_only_selected_suggestions_publishes_nothing(db, site, articles, monkeypatch):
     """The whole point. 'approved' on a suggestion is a selection, not consent."""
     suggestion = _suggestion(db, site, *articles)
