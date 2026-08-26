@@ -291,6 +291,107 @@ class TestInformationalTurns:
         assert agent_service._is_informational_turn(question) is False
         assert agent_service._requests_explicit_site_job(question) is True
 
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "don't run the crawl; reject suggestion 123 instead",
+            "no need to run analysis; approve suggestion 123",
+            "never mind the crawl; schedule site 7 daily",
+            "never mind the crawl, please approve suggestion 123",
+            "don't start the crawl: replace the external link policy for site 3",
+            "never mind the analysis — acknowledge the alert instead",
+        ],
+    )
+    def test_a_retracted_job_does_not_hide_a_different_staged_action(self, question):
+        """The staged set is not only job starts.
+
+        A retraction plus a review, policy, or schedule instruction used to be
+        classified by its first clause alone, so the operator's actual order
+        reached a model that had just had every preview tool taken away.
+        """
+        assert agent_service._is_informational_turn(question) is False
+        # Nor may it narrow to the job preview: the job words belong to the
+        # clause being withdrawn, and that tool cannot stage what was asked.
+        assert agent_service._requests_explicit_site_job(question) is False
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "never mind, don't approve suggestion 123",
+            "no need to approve suggestion 123",
+            "did you approve suggestion 123?",
+            "never mind the schedule",
+            "just checking, did you update the policy?",
+            "just curious whether the policy changed",
+        ],
+    )
+    def test_withdrawn_and_negated_non_job_actions_stay_informational(self, question):
+        assert agent_service._is_informational_turn(question) is True
+        assert agent_service._requests_explicit_site_job(question) is False
+
+    def test_a_retracted_job_keeps_the_review_preview_and_can_stage_it(
+        self, monkeypatch, client, site
+    ):
+        """End to end: the replacement action reaches the panel as a proposal."""
+        monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+        proposal = {
+            "kind": "suggestion_review",
+            "risk": "reversible",
+            "method": "POST",
+            "endpoint": "/api/v1/suggestions/123/reject",
+            "payload": {"expected_status": "pending"},
+            "impact": {"suggestion_count": 1},
+        }
+        system_prompts = []
+        tool_names_by_call = []
+
+        def scripted_tool(_db, _principal, name, arguments):
+            assert name == "preview_suggestion_review"
+            assert arguments == {"suggestion_id": 123, "decision": "reject"}
+            return {"suggestion": {"id": 123}, "proposal": proposal}
+
+        def scripted_model(messages, tools):
+            system_prompts.append(messages[0]["content"])
+            names = [spec["function"]["name"] for spec in tools]
+            tool_names_by_call.append(names)
+            assert "preview_suggestion_review" in names
+            if len(system_prompts) == 1:
+                return {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "review-1",
+                            "function": {
+                                "name": "preview_suggestion_review",
+                                "arguments": json.dumps(
+                                    {"suggestion_id": 123, "decision": "reject"}
+                                ),
+                            },
+                        }
+                    ],
+                }
+            return {
+                "role": "assistant",
+                "content": "The rejection is staged for your confirmation. The crawl was dropped.",
+                "tool_calls": [],
+            }
+
+        monkeypatch.setattr(agent_service, "call_tool", scripted_tool)
+        monkeypatch.setattr(agent_service, "chat_with_tools", scripted_model)
+
+        response = _chat(client, "don't run the crawl; reject suggestion 123 instead")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["proposals"] == [
+            {"tool": "preview_suggestion_review", **proposal, "match_count": None, "context": None}
+        ]
+        assert [trace["name"] for trace in body["tools_used"]] == ["preview_suggestion_review"]
+        # Not narrowed to the withdrawn job, and not told this was a question.
+        assert "preview_site_job" in tool_names_by_call[0]
+        assert agent_service.INFORMATIONAL_TURN_NOTE.strip() not in system_prompts[0]
+
     def test_a_corrected_command_still_receives_preview_tools(self, monkeypatch, client):
         """A retraction must not hide the replacement action after a clause separator."""
         monkeypatch.setattr(settings, "openrouter_api_key", "test-key")

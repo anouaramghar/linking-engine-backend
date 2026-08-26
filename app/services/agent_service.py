@@ -212,6 +212,27 @@ _IMPERATIVE_JOB_ACTION_RE = re.compile(
     r"(?:please\s+)?(?:start|run|crawl|analy[sz]e|launch|begin)\b"
 )
 
+#: The staged tool set is not only job starts: it covers suggestion review,
+#: policy replacement, and schedules. A turn that retracts a job and then asks
+#: for one of those — "don't run the crawl; reject suggestion 123 instead" — is
+#: an action turn, and withholding every preview tool from it left the operator
+#: with a refusal to an instruction they had just given. The clause-boundary
+#: rule is the job pattern's, for the same reason: a negation puts "don't"
+#: between the boundary and the verb, so "don't approve suggestion 123" and
+#: "no need to schedule it" stay informational.
+_IMPERATIVE_REVIEW_ACTION_RE = re.compile(
+    r"(?:^|[.!?;,:\r\n–—]|\s-\s|\b(?:and|but|then|please)\b)\s*"
+    r"(?:please\s+)?(?:approve|reject|dismiss|schedule|reschedule|acknowledge)\b"
+)
+
+#: Policy verbs are ordinary English on their own ("update me on the crawl"), so
+#: they only read as an action when the clause also names what is being changed.
+_IMPERATIVE_POLICY_ACTION_RE = re.compile(
+    r"(?:^|[.!?;,:\r\n–—]|\s-\s|\b(?:and|but|then|please)\b)\s*"
+    r"(?:please\s+)?(?:set|update|change|replace|raise|lower)\b"
+    r"[^.!?;:\r\n]{0,60}?\bpolic(?:y|ies)\b"
+)
+
 #: Phrases that ask about the past or decline an action. Deliberately narrow:
 #: each one must be impossible to read as an imperative.
 _INFORMATIONAL_TURN_MARKERS = (
@@ -258,18 +279,29 @@ _INFORMATIONAL_TURN_MARKERS = (
 _QUESTION_SUBJECT_WORDS = frozenset({"u", "you", "did", "has", "have", "was", "were", "is", "are"})
 
 
+def _requests_staged_non_job_action(text: str) -> bool:
+    """True when a clause gives an imperative for a staged action other than a job.
+
+    Casefolded text only — the callers have already lowered the question.
+    """
+    return bool(
+        _IMPERATIVE_REVIEW_ACTION_RE.search(text) or _IMPERATIVE_POLICY_ACTION_RE.search(text)
+    )
+
+
 def _is_informational_turn(question: str) -> bool:
     """Tell "did you run it?" from "run it".
 
     Every turn still reaches the model, but a clearly informational one receives
     no preview tools. "run it?" stays actionable because it starts with an
     imperative verb. A later imperative clause also wins over an earlier
-    retraction, while negated actions remain informational.
+    retraction — for any staged action, not only a job start — while negated
+    actions remain informational.
     """
     text = question.casefold()
     if any(phrase in text for phrase in _SOFT_ACTION_REQUEST_PHRASES):
         return False
-    if _IMPERATIVE_JOB_ACTION_RE.search(text):
+    if _IMPERATIVE_JOB_ACTION_RE.search(text) or _requests_staged_non_job_action(text):
         return False
     stripped = text.strip()
     first_word = stripped.split(None, 1)[0].rstrip(",!?") if stripped else ""
@@ -313,6 +345,11 @@ def _requests_explicit_site_job(question: str) -> bool:
     if _is_informational_turn(question):
         return False
     text = question.casefold()
+    if _requests_staged_non_job_action(text) and not _IMPERATIVE_JOB_ACTION_RE.search(text):
+        # The job words are in the clause being retracted; the live instruction
+        # asks for a review, policy, or schedule action. Narrowing this turn to
+        # the job preview would remove the only tool that can stage it.
+        return False
     if "article" in text or "pipeline" in text:
         return False
     if any(
