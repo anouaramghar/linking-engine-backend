@@ -8,7 +8,7 @@ Finish the confirmed correctness, recovery, contract, documentation, and formatt
 
 The finished change must:
 
-1. make mandatory review an explicit action for every selected exact edit;
+1. ~~make mandatory review an explicit action for every selected exact edit~~ — superseded on 2026-08-26, see Workstream 1;
 2. let an operator queue durable approved plans after a reload or on another browser;
 3. validate and type the asynchronous publication-preparation result end to end;
 4. keep the publication migration safely reversible after preparation jobs exist;
@@ -19,7 +19,7 @@ The finished change must:
 
 Treat these as requirements, not findings to undo:
 
-- Reviewing each exact edit is mandatory before approval. There is no skip-review path.
+- ~~Reviewing each exact edit is mandatory before approval. There is no skip-review path.~~ **Superseded 2026-08-26:** approval is no longer gated on opening each edit. The guarantee is disclosure, not a click: every selected edit is rendered in full on the approval page before the operator decides. See Workstream 1.
 - The human-readable edit review is the required surface. Raw before/after HTML remains an optional advanced inspection tool; do not force operators to read raw HTML.
 - One privileged dashboard admin group may approve, revoke, promote, and demote accounts. This must be enforced by the backend, not only hidden in the UI.
 - Approved non-admin users retain full application access except for those access-management mutations.
@@ -61,6 +61,17 @@ Re-run the state checks before editing because this snapshot can drift.
 ---
 
 ## Workstream 1 — Make mandatory review explicit
+
+> **Superseded 2026-08-26.** Amir decided that direct approval is the intended
+> workflow: the per-article `opened`/reviewed gate, its unread counter, and the
+> "Read the next change" action are gone on purpose, and the shipped
+> `PublicationReview` enables approval for every selected plan as soon as the
+> batch is prepared. What survives from this workstream is the disclosure
+> requirement, which the current UI still meets: every selected edit is rendered
+> in full — outcome, target, and the anchor marked inside its own sentence —
+> before the operator can approve, and raw HTML stays optional. The button
+> wording in step 5 also still holds. Do not reintroduce the gate from the
+> sections below; they are kept as the record of the earlier decision.
 
 ### Problem
 
