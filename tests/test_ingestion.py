@@ -714,3 +714,153 @@ def test_failed_run_never_stays_running(db, site, monkeypatch):
     run = db.scalars(select(IngestionRun).where(IngestionRun.site_id == site.id)).one()
     assert run.status == "failed"
     assert "connector exploded" in run.error
+
+
+class RepeatedTaxonomyStubConnector(StubConnector):
+    """One article listing the same term twice, plus a term shared with others."""
+
+    def fetch_articles(self):
+        base = self.site.base_url
+        yield ArticleData(
+            url=f"{base}/a",
+            title="Article A",
+            content_text="text a",
+            external_id="1",
+            taxonomies=[
+                TaxonomyData(kind="category", name="SEO"),
+                TaxonomyData(kind="category", name="SEO"),
+                TaxonomyData(kind="tag", name="Shared"),
+            ],
+        )
+        for index in range(3):
+            yield ArticleData(
+                url=f"{base}/shared-{index}",
+                title=f"Shared {index}",
+                content_text="shared",
+                external_id=f"shared-{index}",
+                taxonomies=[TaxonomyData(kind="tag", name="Shared")],
+            )
+
+
+class RelabelledTaxonomyStubConnector(StubConnector):
+    def fetch_articles(self):
+        yield ArticleData(
+            url=f"{self.site.base_url}/a",
+            title="Article A",
+            content_text="text a",
+            external_id="1",
+            taxonomies=[TaxonomyData(kind="category", name="SEO", external_id="cat-99")],
+        )
+
+
+def _count_statements(fragment: str):
+    """Count executed statements containing `fragment`, case-insensitively."""
+    seen = []
+
+    def record(_conn, _cursor, statement, *_rest):
+        if fragment.lower() in statement.lower():
+            seen.append(statement)
+
+    return seen, record
+
+
+def test_an_article_listing_one_term_twice_gets_one_membership(db, site, monkeypatch):
+    """The memberships of an article go in as a single multi-row statement, and
+    PostgreSQL refuses to let ON CONFLICT DO UPDATE touch a row twice inside
+    one statement. A connector repeating a term is normal, so the de-duplication
+    that makes it legal is a correctness requirement, not tidiness."""
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: RepeatedTaxonomyStubConnector(s)
+    )
+
+    ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    names = db.scalars(
+        select(Taxonomy.name)
+        .join(ArticleTaxonomy, ArticleTaxonomy.taxonomy_id == Taxonomy.id)
+        .join(Article, ArticleTaxonomy.article_id == Article.id)
+        .where(Article.site_id == site.id, Article.url == f"{site.base_url}/a")
+        .order_by(Taxonomy.name)
+    ).all()
+    assert names == ["SEO", "Shared"]
+
+
+def test_a_term_shared_across_articles_is_resolved_once_per_run(db, site, monkeypatch):
+    """Sites reuse a small vocabulary across a large corpus. Resolving `Shared`
+    again for each of the four articles carrying it is the round trip this
+    cache removes, so the count is asserted rather than the outcome alone."""
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: RepeatedTaxonomyStubConnector(s)
+    )
+    inserts, record = _count_statements("INSERT INTO taxonomies")
+
+    event.listen(engine, "after_cursor_execute", record)
+    try:
+        ingestion_service.run_ingestion(site.id)
+    finally:
+        event.remove(engine, "after_cursor_execute", record)
+
+    # Two distinct terms across four articles, and `Shared` is on all four.
+    assert len(inserts) == 2
+
+
+def test_a_term_arriving_with_a_new_external_id_still_updates_it(db, site, monkeypatch):
+    """The run cache is keyed on external_id as well as (kind, name).
+
+    The upsert is last-write-wins on that column, so a term whose external id
+    changed has to miss the cache and go through the statement again. Keying on
+    (kind, name) alone would silently keep the first spelling of the run.
+    """
+    monkeypatch.setattr(ingestion_service, "get_connector", lambda s: StubConnector(s))
+    ingestion_service.run_ingestion(site.id)
+
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: RelabelledTaxonomyStubConnector(s)
+    )
+    ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    terms = db.scalars(
+        select(Taxonomy).where(Taxonomy.site_id == site.id, Taxonomy.name == "SEO")
+    ).all()
+    assert len(terms) == 1
+    assert terms[0].external_id == "cat-99"
+
+
+class DriftingExternalIdStubConnector(StubConnector):
+    """One term reported with a CMS id on one article and without it on the next.
+
+    The last article of the crawl decides, because the upsert is last-write-wins
+    on `external_id`.
+    """
+
+    def fetch_articles(self):
+        base = self.site.base_url
+        for index, external_id in enumerate(["cat-1", None, "cat-2", None]):
+            yield ArticleData(
+                url=f"{base}/drift-{index}",
+                title=f"Drift {index}",
+                content_text="drift",
+                external_id=str(index),
+                taxonomies=[TaxonomyData(kind="category", name="SEO", external_id=external_id)],
+            )
+
+
+def test_the_last_mention_of_a_term_in_a_run_decides_its_external_id(db, site, monkeypatch):
+    """Caught by a differential harness, not by reasoning: caching a term's id
+    for the run and skipping every repeat froze whichever external id arrived
+    first, so a term last reported without one kept a stale value. The cache now
+    skips the statement only when it would write back what is already stored.
+    """
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda s: DriftingExternalIdStubConnector(s)
+    )
+
+    ingestion_service.run_ingestion(site.id)
+
+    db.expire_all()
+    term = db.scalars(
+        select(Taxonomy).where(Taxonomy.site_id == site.id, Taxonomy.name == "SEO")
+    ).one()
+    assert term.external_id is None

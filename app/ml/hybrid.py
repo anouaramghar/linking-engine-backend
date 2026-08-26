@@ -182,7 +182,7 @@ def structured_terms(article: CorpusArticle) -> list[str]:
     taxonomy_terms = [
         term for taxonomy_name in article.taxonomy_names for term in tokenize(taxonomy_name)
     ]
-    content_terms = tokenize(article.content_text)[:CONTENT_TOKEN_LIMIT]
+    content_terms = tokenize(article.content_text, CONTENT_TOKEN_LIMIT)
     return title_terms * TITLE_WEIGHT + taxonomy_terms * TAXONOMY_WEIGHT + content_terms
 
 

@@ -46,9 +46,33 @@ STOPWORDS = frozenset(
 )
 
 
-def tokenize(text: str) -> list[str]:
-    """Return lowercase alphanumeric terms with common English stopwords removed."""
-    return [term for term in TOKEN_RE.findall(text.lower()) if term not in STOPWORDS]
+def tokenize(text: str, limit: int | None = None) -> list[str]:
+    """Return lowercase alphanumeric terms with common English stopwords removed.
+
+    ``limit`` stops the scan once that many terms have been kept. For any
+    non-negative ``limit`` the result is exactly ``tokenize(text)[:limit]`` —
+    same lowering, same pattern, same stopword rule, same order. It exists
+    because the BM25 recipe keeps the first 512 terms of an article body that
+    may run to 100 000 characters, and building the whole list first was the
+    largest cost of loading a corpus.
+
+    The lowering deliberately stays on the whole string rather than being done
+    per match. It is not equivalent to scanning the original with a
+    case-insensitive pattern: ``"İ".lower()`` is ``i`` plus a combining mark, so
+    the two disagree about where terms begin. Ranking is frozen, so the cheaper
+    spelling is not available here.
+    """
+    if limit is not None and limit <= 0:
+        return []
+    terms: list[str] = []
+    for match in TOKEN_RE.finditer(text.lower()):
+        term = match.group()
+        if term in STOPWORDS:
+            continue
+        terms.append(term)
+        if limit is not None and len(terms) >= limit:
+            break
+    return terms
 
 
 class BM25Index:

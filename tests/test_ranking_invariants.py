@@ -284,3 +284,38 @@ def test_final_ranks_are_contiguous_and_start_at_one():
     ordered = _order(_candidates(0.91, 0.83, 0.77))
 
     assert [item.final_rank for item in ordered.items] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2, 5, 7, 8, 9, 50, CONTENT_TOKEN_LIMIT])
+def test_a_limited_tokenization_equals_slicing_the_full_one(limit):
+    """`tokenize(text, n)` stops the scan early instead of building every term.
+
+    That is only safe because it is `tokenize(text)[:n]` and nothing else. The
+    text below interleaves stopwords on purpose: the limit counts terms that
+    were kept, not matches the pattern found, so an implementation that counted
+    matches would drift from the slice exactly here.
+    """
+    text = (
+        "The quick brown fox and the lazy dog are in a Field of 42 Flowers "
+        "which the gardener planted for you when it was warm"
+    )
+
+    assert tokenize(text, limit) == tokenize(text)[:limit]
+
+
+def test_a_limit_past_the_end_returns_every_term():
+    text = "sourdough starter feeding flour"
+
+    assert tokenize(text, 1000) == tokenize(text)
+
+
+def test_tokenization_lowercases_the_whole_text_before_matching():
+    """Pins the frozen recipe against a cheaper-looking rewrite.
+
+    Scanning the original text with a case-insensitive pattern would be faster
+    than lowering a 100 000-character body first, but it is not the same
+    function: `"İ".lower()` is `i` plus a combining mark, so lowering first
+    splits this title into three terms where matching first would find two.
+    Ranking is frozen, so the current answer is the correct one.
+    """
+    assert tokenize("İnternal linking") == ["i", "nternal", "linking"]

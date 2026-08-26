@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import logging
 from inspect import Parameter, signature
+from time import monotonic
 
 from rq import Retry, get_current_job
 from rq.command import send_stop_job_command
@@ -234,6 +235,49 @@ def check_job_cancellation(job_run_id: int | None) -> None:
         db.close()
     if status in {"cancel_requested", "cancelled"}:
         raise JobCancelled("job cancellation requested")
+
+
+#: How stale a cancellation decision may get inside a tight loop. A crawl asks
+#: once per article, and each ask is a fresh connection plus `pool_pre_ping`'s
+#: SELECT 1 — two round trips against a loop body of about three. Cancellation
+#: is a human pressing a button, so second granularity loses nothing that a
+#: person could perceive.
+CANCELLATION_POLL_INTERVAL_SECONDS = 1.0
+
+
+class ThrottledCancellationCheck:
+    """A cancellation probe for a loop that runs thousands of times.
+
+    Use this only where the loop body is small enough that the probe itself is a
+    material share of it. Everywhere else call :func:`check_job_cancellation`
+    directly: a checkpoint guarding one expensive or irreversible step must ask
+    every time, and the first call here always does.
+
+    Raises :class:`JobCancelled` exactly as the unthrottled function does; the
+    only difference is that a cancellation may be noticed up to
+    ``interval`` later, having processed a few more items.
+    """
+
+    __slots__ = ("_interval", "_job_run_id", "_last_checked_at")
+
+    def __init__(
+        self,
+        job_run_id: int | None,
+        *,
+        interval: float = CANCELLATION_POLL_INTERVAL_SECONDS,
+    ) -> None:
+        self._job_run_id = job_run_id
+        self._interval = interval
+        self._last_checked_at: float | None = None
+
+    def __call__(self) -> None:
+        if self._job_run_id is None:
+            return
+        now = monotonic()
+        if self._last_checked_at is not None and now - self._last_checked_at < self._interval:
+            return
+        self._last_checked_at = now
+        check_job_cancellation(self._job_run_id)
 
 
 def _mark_run_lost(run: JobRun) -> None:

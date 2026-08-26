@@ -18,6 +18,7 @@ from app.schemas.job import JobRunOut
 from app.services import alerts as alert_service
 from app.services.job_service import (
     JobCancelled,
+    ThrottledCancellationCheck,
     check_job_cancellation,
     enqueue_job,
     handle_abandoned_job,
@@ -1223,3 +1224,75 @@ def test_check_job_cancellation_raises_for_requested_job(db, site):
 
     with pytest.raises(JobCancelled):
         check_job_cancellation(run.id)
+
+
+def test_throttled_cancellation_check_always_asks_on_the_first_call(db, site):
+    """The throttle must never hide a job that was already cancelled when the
+    loop started, which is the common case for a run cancelled while queued."""
+    run = JobRun(site_id=site.id, kind="ingestion", status="cancel_requested")
+    db.add(run)
+    db.commit()
+
+    with pytest.raises(JobCancelled):
+        ThrottledCancellationCheck(run.id)()
+
+
+def test_throttled_cancellation_check_reads_once_per_interval(db, site, monkeypatch):
+    run = JobRun(site_id=site.id, kind="ingestion", status="running")
+    db.add(run)
+    db.commit()
+
+    asked = []
+    monkeypatch.setattr(job_service, "check_job_cancellation", asked.append)
+    now = SimpleNamespace(value=100.0)
+    monkeypatch.setattr(job_service, "monotonic", lambda: now.value)
+    cancelled = ThrottledCancellationCheck(run.id, interval=1.0)
+
+    cancelled()
+    assert asked == [run.id]
+
+    now.value = 100.999
+    cancelled()
+    cancelled()
+    assert asked == [run.id], "calls inside the interval must not reach the database"
+
+    now.value = 101.0
+    cancelled()
+    assert asked == [run.id, run.id]
+
+
+def test_throttled_cancellation_check_still_stops_a_job_cancelled_mid_interval(
+    db, site, monkeypatch
+):
+    """A request made during the quiet window is acted on at the next interval,
+    not lost. This is the whole cost of the throttle, so it is pinned here."""
+    run = JobRun(site_id=site.id, kind="ingestion", status="running")
+    db.add(run)
+    db.commit()
+
+    now = SimpleNamespace(value=0.0)
+    monkeypatch.setattr(job_service, "monotonic", lambda: now.value)
+    cancelled = ThrottledCancellationCheck(run.id, interval=1.0)
+    cancelled()
+
+    run.status = "cancel_requested"
+    db.commit()
+
+    now.value = 0.5
+    cancelled()
+
+    now.value = 1.0
+    with pytest.raises(JobCancelled):
+        cancelled()
+
+
+def test_throttled_cancellation_check_without_a_run_id_never_reads(monkeypatch):
+    """Ingestion runs outside a durable job pass None, and must not pay for it."""
+    asked = []
+    monkeypatch.setattr(job_service, "check_job_cancellation", asked.append)
+    cancelled = ThrottledCancellationCheck(None, interval=0.0)
+
+    cancelled()
+    cancelled()
+
+    assert asked == []

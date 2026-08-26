@@ -1,6 +1,8 @@
 """WordPress connector — link extraction and publication, no network (MockTransport)."""
 
 import json
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from types import SimpleNamespace
@@ -1142,3 +1144,134 @@ def test_nothing_decided_after_approval_can_change_the_submitted_html(monkeypatc
     c.apply_planned_edit(_SOURCE, original_html=_APPROVED_BEFORE, updated_html=_APPROVED_AFTER)
 
     assert captured["content"] == _APPROVED_AFTER
+
+
+# -- page read-ahead --------------------------------------------------------
+#
+# `_paginate` runs the next page fetch in a worker thread while ingestion writes
+# the current one. These cover the three properties that makes risky: order,
+# where a failure surfaces, and that stopping early stops the producer.
+
+
+def test_read_ahead_preserves_order_and_values():
+    assert list(wordpress_module._read_ahead(iter(range(50)))) == list(range(50))
+
+
+def test_read_ahead_raises_a_producer_error_only_after_the_items_before_it():
+    """A failure fetching page three must not skip pages one and two.
+
+    The worker runs ahead, so it may hit the error long before the consumer
+    reaches it. Surfacing it early would silently drop already-fetched articles.
+    """
+
+    def source():
+        yield "page-1"
+        yield "page-2"
+        raise httpx.ConnectError("boom")
+
+    seen = []
+    with pytest.raises(httpx.ConnectError):
+        for item in wordpress_module._read_ahead(source()):
+            seen.append(item)
+    assert seen == ["page-1", "page-2"]
+
+
+def test_read_ahead_stops_the_producer_when_the_consumer_stops_early():
+    """A sample-limited crawl abandons the iterator; the thread must not leak."""
+    produced = []
+    started = threading.Event()
+
+    def source():
+        for i in range(1000):
+            produced.append(i)
+            started.set()
+            yield i
+
+    stream = wordpress_module._read_ahead(source())
+    assert next(stream) == 0
+    started.wait(timeout=2)
+    stream.close()
+
+    settled = len(produced)
+    time.sleep(0.2)
+    assert len(produced) == settled, "producer kept fetching after the consumer stopped"
+    assert not any(t.name == "wordpress-read-ahead" and t.is_alive() for t in threading.enumerate())
+
+
+def test_read_ahead_overlaps_the_producer_with_the_consumer():
+    """The point of the change: fetching and writing stop taking turns."""
+    delay = 0.05
+
+    def source():
+        for i in range(6):
+            time.sleep(delay)  # stands in for the REST round trip
+            yield i
+
+    def consume(stream):
+        for _ in stream:
+            time.sleep(delay)  # stands in for the database writes
+
+    serial_start = time.perf_counter()
+    consume(source())
+    serial = time.perf_counter() - serial_start
+
+    overlapped_start = time.perf_counter()
+    consume(wordpress_module._read_ahead(source()))
+    overlapped = time.perf_counter() - overlapped_start
+
+    assert overlapped < serial * 0.75, f"no overlap: {overlapped:.3f}s vs {serial:.3f}s"
+
+
+def test_paginate_reads_every_page_in_order_through_the_read_ahead():
+    connector = make_connector()
+    connector._api_candidates = ["https://example.com/wp-json/wp/v2/"]
+
+    def handler(request):
+        page = int(request.url.params["page"])
+        if page > 4:
+            return httpx.Response(400, json={"code": "rest_post_invalid_page_number"})
+        return httpx.Response(
+            200,
+            json=[{"id": page * 10 + n} for n in range(3)],
+            headers={"X-WP-TotalPages": "4"},
+        )
+
+    connector.client = httpx.Client(
+        base_url="https://example.com", transport=httpx.MockTransport(handler)
+    )
+
+    assert [item["id"] for item in connector._paginate("posts")] == [
+        10,
+        11,
+        12,
+        20,
+        21,
+        22,
+        30,
+        31,
+        32,
+        40,
+        41,
+        42,
+    ]
+
+
+def test_paginate_still_refuses_to_run_past_the_page_limit(monkeypatch):
+    """The read-ahead must not swallow the bound that stops a runaway crawl."""
+    connector = make_connector()
+    connector._api_candidates = ["https://example.com/wp-json/wp/v2/"]
+    monkeypatch.setattr(settings, "crawl_max_wordpress_pages", 2)
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json=[{"id": int(request.url.params["page"])}],
+            headers={"X-WP-TotalPages": "99"},
+        )
+
+    connector.client = httpx.Client(
+        base_url="https://example.com", transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(ValueError, match="page limit"):
+        list(connector._paginate("posts"))
