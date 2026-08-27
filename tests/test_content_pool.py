@@ -1224,7 +1224,9 @@ def test_a_dead_pool_target_falls_through_to_the_next_live_one(db, site, monkeyp
     monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 1)
     monkeypatch.setattr(
         "app.services.suggestion_service.fill_external_suggestion_gap",
-        lambda *_args, **_kwargs: pytest.fail("a live ranked pool candidate was skipped for Tavily"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "a live ranked pool candidate was skipped for Tavily"
+        ),
     )
     pool = _pool(db)
     source = Article(
@@ -1248,7 +1250,11 @@ def test_a_dead_pool_target_falls_through_to_the_next_live_one(db, site, monkeyp
     db.add_all([source, dead, live])
     db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
     db.flush()
-    for article, vector in ((source, _vector(1.0)), (dead, _vector(1.0)), (live, _vector(0.8, 0.6))):
+    for article, vector in (
+        (source, _vector(1.0)),
+        (dead, _vector(1.0)),
+        (live, _vector(0.8, 0.6)),
+    ):
         db.add(
             Embedding(
                 article_id=article.id,

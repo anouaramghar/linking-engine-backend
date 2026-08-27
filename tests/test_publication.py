@@ -293,9 +293,7 @@ def test_dead_external_target_stales_plan_before_wordpress_write(db, site, artic
     assert _plan_status(db, plan.id) == "stale"
 
 
-def test_each_plan_is_live_checked_at_its_own_publication_boundary(
-    db, site, articles, monkeypatch
-):
+def test_each_plan_is_live_checked_at_its_own_publication_boundary(db, site, articles, monkeypatch):
     """The second target dies while the first plan is being written.
 
     A gate that ran once for the whole batch had already blessed this target
