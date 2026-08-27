@@ -31,6 +31,7 @@ def _decision(db, site, score: float, status: str, index: int) -> None:
             target_article_id=target.id,
             method="hybrid_bm25",
             score=score,
+            rank_score=score,
             status=status,
         )
     )
@@ -77,6 +78,41 @@ def test_per_site_editorial_policy_api(client, site):
         "feedback_weight": 0.35,
         "min_samples": 25,
     }
+
+
+def test_editorial_policy_expected_snapshot_prevents_a_stale_overwrite(client, site):
+    expected = {
+        "enabled": False,
+        "min_score_percent": 0,
+        "feedback_weight": 0.2,
+        "min_samples": 10,
+    }
+    changed = client.put(
+        f"/api/v1/sites/{site.id}/editorial-ranking-policy",
+        json={
+            "enabled": False,
+            "min_score_percent": 60,
+            "feedback_weight": 0.25,
+            "min_samples": 20,
+        },
+    )
+    assert changed.status_code == 200
+
+    stale = client.put(
+        f"/api/v1/sites/{site.id}/editorial-ranking-policy",
+        json={
+            "enabled": True,
+            "min_score_percent": 70,
+            "feedback_weight": 0.35,
+            "min_samples": 25,
+            "expected": expected,
+        },
+    )
+    assert stale.status_code == 409
+    assert "changed since it was previewed" in stale.json()["detail"]
+
+    current = client.get(f"/api/v1/sites/{site.id}/editorial-ranking-policy")
+    assert current.json()["min_score_percent"] == 60
 
 
 def test_a_new_site_does_not_get_feedback_reranking_by_default(db, site):

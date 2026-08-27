@@ -161,11 +161,7 @@ def evaluate_reviewer_rankings(
     _validate_rankings(rankings)
     judgments, duplicate_pairs = _judgments(labels)
     relevant_by_source = {
-        source_id: {
-            target_id
-            for target_id, label in targets.items()
-            if label.label == "approved"
-        }
+        source_id: {target_id for target_id, label in targets.items() if label.label == "approved"}
         for source_id, targets in judgments.items()
     }
     positive_queries = sum(bool(relevant) for relevant in relevant_by_source.values())

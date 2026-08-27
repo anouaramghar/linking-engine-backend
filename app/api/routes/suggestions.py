@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session, aliased, joinedload
 from app.api.csv_stream import CSV_FETCH_BATCH, csv_escape_formula, csv_response
 from app.api.deps import get_audit_actor, get_db, require_api_key, require_site_access
 from app.api.pagination import MAX_PAGE_SIZE
+from app.api.routes.sites import _site_counts
+from app.config import settings
 from app.ml.llm import openrouter
 from app.ml.llm.openrouter import OpenRouterError, OpenRouterNotConfigured
 from app.models import (
@@ -23,7 +25,7 @@ from app.models import (
     SuggestionEvent,
 )
 from app.models import PublicationPlan
-from app.schemas.job import JobAccepted
+from app.schemas.job import ArticleAnalysisStartGuard, JobAccepted, JobStartGuard
 from app.schemas.site import ArticleBrief
 from app.schemas.suggestion import (
     MAX_BULK_REVIEW,
@@ -32,6 +34,8 @@ from app.schemas.suggestion import (
     BulkReviewFilter,
     BulkReviewFilterResult,
     BulkReviewUndoResult,
+    CitationNeedAnalysisOut,
+    CitationNeedOut,
     PlacementOut,
     SuggestionCounts,
     SuggestionCursor,
@@ -47,14 +51,16 @@ from app.schemas.suggestion import (
     TraceEventPage,
 )
 from app.services import placement_service
+from app.services.citation_need import analyze_citation_needs
 from app.services.authorization import (
     Principal,
     authorize_site,
     check_site_access,
     require_admin_principal,
 )
-from app.services.job_service import DuplicateJobError, enqueue_job
+from app.services.job_service import DuplicateJobError, enqueue_job, require_active_job_snapshot
 from app.services.graph_service import current_feature_map
+from app.services.suggestion_service import article_suggestion_capacity
 from app.tasks.analysis import analyze_article, analyze_site, compare_site
 
 logger = logging.getLogger(__name__)
@@ -68,6 +74,27 @@ UNREVIEWABLE = ("applying", "applied", "expired")
 #: a link on the source article, or already is one. A rejected, expired or
 #: quarantined row will never publish, so the words it picked are free again.
 CLAIMS_AN_ANCHOR = ("pending", "approved", "applying", "applied")
+
+
+def _brief_article_options():
+    """Eager-load both endpoint articles with only the columns a brief renders.
+
+    `Article.content_text` and `content_html` hold the whole post — up to
+    `crawl_max_article_chars` each — and a plain `joinedload` fetches both for
+    every row on the page. `_suggestion_outputs` reads id, title and url (the
+    three fields of `ArticleBrief`) plus the target's `site_id`, so a 50-row
+    page was moving up to a hundred article bodies across the wire to render
+    none of them.
+
+    Only for read paths that stop at a brief. `get_suggestion_placement` passes
+    the source article to the placement service, which reads `content_text`;
+    narrowing that query would turn one join into a lazy load per request.
+    """
+    columns = (Article.id, Article.title, Article.url, Article.site_id)
+    return (
+        joinedload(Suggestion.source_article).load_only(*columns),
+        joinedload(Suggestion.target_article).load_only(*columns),
+    )
 
 
 def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[SuggestionOut]:
@@ -168,6 +195,7 @@ def _suggestion_outputs(db: Session, suggestions: Sequence[Suggestion]) -> list[
                 target_site_name=target_site_name,
                 method=suggestion.method,
                 score=suggestion.score,
+                rank_score=suggestion.rank_score,
                 score_components=score_components or None,
                 provider=suggestion.provider,
                 provider_request_id=suggestion.provider_request_id,
@@ -289,10 +317,14 @@ def _review_ids(
     *,
     actor: str | None = None,
     rejection_reason: str | None = None,
+    expected_status: str | None = None,
 ) -> set[int]:
+    conditions = [Suggestion.id.in_(suggestion_ids)]
+    if expected_status is not None:
+        conditions.append(Suggestion.status == expected_status)
     return _review_matching(
         db,
-        [Suggestion.id.in_(suggestion_ids)],
+        conditions,
         status,
         actor=actor,
         rejection_reason=rejection_reason,
@@ -490,8 +522,8 @@ def _has_stronger_reverse_pair():
     entirely, so this matches only the weaker direction — the stronger one
     survives and the pair costs one review decision instead of two.
 
-    Ordered by (score, id) to match the queue's own ordering, which makes the
-    surviving direction the one the editor would have reached first anyway.
+    Ordered by (rank_score, id) to match the queue's own ordering, which makes
+    the surviving direction the one the editor would have reached first anyway.
     """
     reverse = aliased(Suggestion)
     return exists(
@@ -499,16 +531,16 @@ def _has_stronger_reverse_pair():
             reverse.source_article_id == Suggestion.target_article_id,
             reverse.target_article_id == Suggestion.source_article_id,
             reverse.status != "expired",
-            tuple_(reverse.score, reverse.id) > tuple_(Suggestion.score, Suggestion.id),
+            tuple_(reverse.rank_score, reverse.id) > tuple_(Suggestion.rank_score, Suggestion.id),
         )
     )
 
 
 def _percent_boundary(percent: int) -> float:
-    """Raw-score boundary equivalent to JavaScript's Math.round(score * 100).
+    """Raw boundary equivalent to JavaScript's Math.round(rank_score * 100).
 
-    Scores are non-negative, so Math.round(score * 100) >= P is exactly
-    score >= (P - 0.5) / 100. Comparing the indexed column with that constant
+    Rank scores are non-negative, so Math.round(v * 100) >= P is exactly
+    v >= (P - 0.5) / 100. Comparing the indexed column with that constant
     preserves index scans and avoids PostgreSQL's different half-rounding rule.
     """
 
@@ -556,9 +588,9 @@ def _queue_conditions(
     if method is not None:
         conditions.append(Suggestion.method == method)
     if min_percent is not None:
-        conditions.append(Suggestion.score >= _percent_boundary(min_percent))
+        conditions.append(Suggestion.rank_score >= _percent_boundary(min_percent))
     if max_percent is not None:
-        conditions.append(Suggestion.score < _percent_boundary(max_percent))
+        conditions.append(Suggestion.rank_score < _percent_boundary(max_percent))
     # A search of only whitespace is the same as no search; it must not collapse
     # to '%%' and quietly match the whole queue.
     if q is not None and q.strip():
@@ -1081,7 +1113,7 @@ def list_suggestion_page(
     q: str | None = Query(None, max_length=MAX_SEARCH_TERM),
     target_origin: TargetOrigin | None = None,
     exclude_reciprocal: bool = False,
-    after_score: float | None = Query(None, ge=0, le=1),
+    after_rank_score: float | None = Query(None, ge=0, le=1),
     after_id: int | None = Query(None, ge=1),
     include_total: bool = False,
     limit: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
@@ -1111,24 +1143,24 @@ def list_suggestion_page(
     if offset is not None:
         raise HTTPException(
             422,
-            "offset pagination is not supported; continue with after_score and after_id",
+            "offset pagination is not supported; continue with after_rank_score and after_id",
         )
-    if (after_score is None) != (after_id is None):
-        raise HTTPException(422, "after_score and after_id must be provided together")
+    if (after_rank_score is None) != (after_id is None):
+        raise HTTPException(422, "after_rank_score and after_id must be provided together")
 
     page_conditions = list(conditions)
-    if after_score is not None and after_id is not None:
+    if after_rank_score is not None and after_id is not None:
         # Both sort keys descend, so the next page is strictly below the last
         # tuple returned. Removing or inserting rows above it cannot shift this
         # boundary as it can with OFFSET.
         page_conditions.append(
-            tuple_(Suggestion.score, Suggestion.id) < tuple_(after_score, after_id)
+            tuple_(Suggestion.rank_score, Suggestion.id) < tuple_(after_rank_score, after_id)
         )
     items = db.scalars(
         select(Suggestion)
         .where(*page_conditions)
-        .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
-        .order_by(Suggestion.score.desc(), Suggestion.id.desc())
+        .options(*_brief_article_options())
+        .order_by(Suggestion.rank_score.desc(), Suggestion.id.desc())
         # One look-ahead row tells the client whether another request is useful
         # without paying for COUNT(*) on every page.
         .limit(limit + 1)
@@ -1138,7 +1170,7 @@ def list_suggestion_page(
     serialized_items = _suggestion_outputs(db, items)
     next_cursor = None
     if has_more and items:
-        next_cursor = SuggestionCursor(score=items[-1].score, id=items[-1].id)
+        next_cursor = SuggestionCursor(rank_score=items[-1].rank_score, id=items[-1].id)
     total = None
     if include_total:
         total = db.scalar(select(func.count()).select_from(Suggestion).where(*conditions)) or 0
@@ -1152,11 +1184,37 @@ def list_suggestion_page(
 
 @router.post("/suggestions/{site_id}", status_code=202, response_model=JobAccepted)
 def trigger_analysis(
+    payload: JobStartGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    if payload is not None:
+        try:
+            require_active_job_snapshot(
+                db,
+                site_ids=site.id,
+                kinds="analysis",
+                expected_ids=payload.expected_active_job_run_ids,
+            )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+    active_article_counts, _, active_suggestion_counts = _site_counts(db, [site.id])
+    active_article_count = active_article_counts.get(site.id, 0)
+    active_suggestion_count = active_suggestion_counts.get(site.id, 0)
+    if active_article_count == 0:
+        raise HTTPException(409, "site has no active articles; crawl it before generating more")
+    site_capacity = min(
+        active_article_count * settings.hybrid_max_suggestions_per_article,
+        settings.hybrid_max_active_suggestions_per_site,
+    )
+    if active_suggestion_count >= site_capacity:
+        raise HTTPException(
+            409,
+            "site suggestion capacity is full; review or publish existing suggestions "
+            "before generating more",
+        )
     try:
         run = enqueue_job(db, site.id, "analysis", analyze_site, job_timeout=7200)
     except DuplicateJobError as e:
@@ -1167,6 +1225,7 @@ def trigger_analysis(
 @router.post("/articles/{article_id}/suggestions", status_code=202, response_model=JobAccepted)
 def trigger_article_analysis(
     article_id: int,
+    payload: ArticleAnalysisStartGuard | None = None,
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
@@ -1177,6 +1236,34 @@ def trigger_article_analysis(
     site = authorize_site(db, principal, article.site_id)
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    if payload is not None:
+        if not article.is_active:
+            raise HTTPException(
+                409,
+                "article availability changed after this action was previewed; refresh first",
+            )
+        if (
+            article_suggestion_capacity(
+                db,
+                site_id=site.id,
+                article_id=article.id,
+            ).remaining
+            == 0
+        ):
+            raise HTTPException(
+                409,
+                "article or site suggestion capacity changed after this action was previewed; "
+                "refresh first",
+            )
+        try:
+            require_active_job_snapshot(
+                db,
+                site_ids=site.id,
+                kinds="analysis",
+                expected_ids=payload.expected_active_job_run_ids,
+            )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
     try:
         run = enqueue_job(
             db,
@@ -1191,13 +1278,61 @@ def trigger_article_analysis(
     return JobAccepted(job_id=run.queue_job_id, job_run_id=run.id)
 
 
+@router.get(
+    "/articles/{article_id}/citation-needs",
+    response_model=CitationNeedAnalysisOut,
+)
+def get_article_citation_needs(
+    article_id: int,
+    limit: int = Query(default=10, ge=1, le=10),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> CitationNeedAnalysisOut:
+    """Return bounded, local citation-need evidence for one source article."""
+
+    article = db.get(Article, article_id)
+    if article is None:
+        raise HTTPException(404, f"article {article_id} not found")
+    site = authorize_site(db, principal, article.site_id)
+    if site.platform == "pool":
+        raise HTTPException(409, "content-pool articles cannot be suggestion sources")
+    analysis = analyze_citation_needs(
+        article.content_text,
+        language=article.language,
+        max_results=limit,
+    )
+    return CitationNeedAnalysisOut(
+        article_id=article.id,
+        content_fingerprint=analysis.content_fingerprint,
+        detector_version=analysis.detector_version,
+        threshold=analysis.threshold,
+        language=analysis.language,
+        sentences_analyzed=analysis.sentences_analyzed,
+        total_detected=analysis.total_detected,
+        truncated=analysis.truncated,
+        language_supported=analysis.language_supported,
+        items=[CitationNeedOut(**need.as_score_component()) for need in analysis.needs],
+    )
+
+
 @router.post("/suggestions/{site_id}/compare", status_code=202, response_model=JobAccepted)
 def trigger_analysis_comparison(
+    payload: JobStartGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
 ) -> JobAccepted:
     if site.platform == "pool":
         raise HTTPException(409, "content-pool sources cannot generate suggestions")
+    if payload is not None:
+        try:
+            require_active_job_snapshot(
+                db,
+                site_ids=site.id,
+                kinds="analysis",
+                expected_ids=payload.expected_active_job_run_ids,
+            )
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
     try:
         run = enqueue_job(db, site.id, "analysis", compare_site, job_timeout=7200)
     except DuplicateJobError as e:
@@ -1217,8 +1352,8 @@ def list_suggestions(
     query = (
         select(Suggestion)
         .where(Suggestion.site_id == site.id)
-        .options(joinedload(Suggestion.source_article), joinedload(Suggestion.target_article))
-        .order_by(Suggestion.score.desc())
+        .options(*_brief_article_options())
+        .order_by(Suggestion.rank_score.desc())
     )
     if status:
         query = query.where(Suggestion.status == status)
@@ -1345,7 +1480,7 @@ def review_suggestion(
     suggestion = db.get(
         Suggestion,
         suggestion_id,
-        options=[joinedload(Suggestion.source_article), joinedload(Suggestion.target_article)],
+        options=list(_brief_article_options()),
     )
     if suggestion is None:
         raise HTTPException(404, f"suggestion {suggestion_id} not found")
@@ -1362,8 +1497,12 @@ def review_suggestion(
         payload.status,
         actor=actor,
         rejection_reason=payload.rejection_reason,
+        expected_status=payload.expected_status,
     ):
-        raise HTTPException(409, f"suggestion {suggestion_id} is no longer reviewable")
+        detail = f"suggestion {suggestion_id} is no longer reviewable"
+        if payload.expected_status is not None:
+            detail += f" with status {payload.expected_status}"
+        raise HTTPException(409, detail)
     db.commit()
     logger.info(
         "suggestion review trace_id=%s actor=%s mode=single status=%s",

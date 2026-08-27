@@ -14,7 +14,14 @@ from app.connectors.base import (
     SiteMetadata,
 )
 from app.connectors.html_crawler import HTMLConnector
-from app.models import Article, IngestionDiagnostic, IngestionRun, JobRun, PublicationPlan, Suggestion
+from app.models import (
+    Article,
+    IngestionDiagnostic,
+    IngestionRun,
+    JobRun,
+    PublicationPlan,
+    Suggestion,
+)
 from app.services.publication_plan_service import compute_plan_hash
 from app.tasks.queues import redis_conn
 
@@ -96,9 +103,7 @@ def test_html_crawl_records_noindex_without_ingesting_it(monkeypatch):
 
     assert list(connector.fetch_articles()) == []
     assert any(
-        item.url.endswith("/private")
-        and item.state == "skipped"
-        and item.reason_code == "noindex"
+        item.url.endswith("/private") and item.state == "skipped" and item.reason_code == "noindex"
         for item in connector.drain_discovery_observations()
     )
 
@@ -176,7 +181,9 @@ class DiagnosticConnector(ContentConnector):
         return None
 
     def get_site_metadata(self):
-        return SiteMetadata(name=self.site.name, base_url=self.site.base_url, platform=self.site.platform)
+        return SiteMetadata(
+            name=self.site.name, base_url=self.site.base_url, platform=self.site.platform
+        )
 
     def supports_incremental_sync(self):
         return False
@@ -186,7 +193,9 @@ class DiagnosticConnector(ContentConnector):
 
 
 def test_ingestion_persists_connector_diagnostics(db, site, monkeypatch):
-    monkeypatch.setattr(ingestion_service, "get_connector", lambda current: DiagnosticConnector(current))
+    monkeypatch.setattr(
+        ingestion_service, "get_connector", lambda current: DiagnosticConnector(current)
+    )
 
     result = ingestion_service.run_ingestion(site.id)
 
@@ -254,9 +263,7 @@ def test_article_generation_trigger_scopes_the_existing_task(client, db, site):
     body = response.json()
     run = db.get(JobRun, body["job_run_id"])
     assert run.kind == "analysis"
-    job = __import__("rq.job", fromlist=["Job"]).Job.fetch(
-        body["job_id"], connection=redis_conn
-    )
+    job = __import__("rq.job", fromlist=["Job"]).Job.fetch(body["job_id"], connection=redis_conn)
     assert job.func_name == "app.tasks.analysis.analyze_article"
     assert job.kwargs["article_id"] == article.id
     job.delete()
@@ -284,6 +291,7 @@ def test_non_wordpress_export_streams_only_verified_approved_plans(client, db, s
         target_article_id=target.id,
         method="baseline_cosine",
         score=0.9,
+        rank_score=0.9,
         status="approved",
         anchor_text="target",
         placement_context="source context",

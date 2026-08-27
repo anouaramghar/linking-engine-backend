@@ -71,6 +71,7 @@ def _suggest(db, site, pair, score, status="pending"):
         target_article_id=pair[1].id,
         method=QUEUE_METHOD,
         score=score,
+        rank_score=score,
         status=status,
     )
     db.add(suggestion)
@@ -152,7 +153,7 @@ def test_tied_scores_page_without_repeating_or_losing_rows(client, db, site):
         params = {"site_id": site.id, "limit": 3, "include_total": not seen}
         if cursor is not None:
             params |= {
-                "after_score": cursor["score"],
+                "after_rank_score": cursor["rank_score"],
                 "after_id": cursor["id"],
             }
         page = _get(client, "/api/v1/suggestions", **params)
@@ -197,7 +198,7 @@ def test_cursor_does_not_shift_when_rows_above_it_change(client, db, site):
         site_id=site.id,
         status="pending",
         limit=2,
-        after_score=first["next_cursor"]["score"],
+        after_rank_score=first["next_cursor"]["rank_score"],
         after_id=first["next_cursor"]["id"],
     )
     assert [item["id"] for item in second["items"]] == [
@@ -211,7 +212,7 @@ def test_cursor_contract_rejects_offsets_and_partial_boundaries(client):
     path = "/api/v1/suggestions"
 
     assert client.get(path, params={"offset": 0}).status_code == 422
-    assert client.get(path, params={"after_score": 0.5}).status_code == 422
+    assert client.get(path, params={"after_rank_score": 0.5}).status_code == 422
     assert client.get(path, params={"after_id": 1}).status_code == 422
 
 
@@ -654,3 +655,100 @@ def test_pending_publication_separates_selected_rows_from_approved_plans(
     assert owned == {site.id: (2, 0)}
     status = client.get(f"/api/v1/publish/{site.id}/status").json()
     assert (status["selected_suggestions"], status["approved_plans"]) == (2, 0)
+
+
+def test_the_queue_orders_and_filters_on_rank_score_not_cosine(client, db, site):
+    """The two numbers disagree on a fused row, and the queue follows one.
+
+    Cosine is nearly constant across a real candidate pool, so if the queue
+    still sorted on it, the order an editor sees would not be the order the
+    ranker produced — and the percentage on the card would not explain the
+    position of the row it sits on.
+    """
+    pair = _pair(db, site)
+    rows = {}
+    # Deliberately inverted: the weakest ranked row has the best cosine.
+    for cosine, rank in ((0.93, 0.20), (0.92, 0.60), (0.91, 0.95)):
+        suggestion = Suggestion(
+            site_id=site.id,
+            source_article_id=pair[0].id,
+            target_article_id=pair[1].id,
+            method=QUEUE_METHOD,
+            score=cosine,
+            rank_score=rank,
+            status="pending",
+        )
+        db.add(suggestion)
+        db.flush()
+        rows[rank] = suggestion.id
+    db.commit()
+
+    listed = _get(client, "/api/v1/suggestions", site_id=site.id, status="pending")
+    assert [item["id"] for item in listed["items"]] == [rows[0.95], rows[0.60], rows[0.20]]
+    assert [item["rank_score"] for item in listed["items"]] == [0.95, 0.60, 0.20]
+    # The cosine score is still carried, just no longer in charge of the order.
+    assert [item["score"] for item in listed["items"]] == [0.91, 0.92, 0.93]
+
+    # A chip set above every cosine value would match nothing if it still read
+    # `score`; on rank_score it selects exactly the one strong row.
+    above = _get(
+        client,
+        "/api/v1/suggestions",
+        site_id=site.id,
+        status="pending",
+        min_percent=94,
+        include_total=True,
+    )
+    assert [item["id"] for item in above["items"]] == [rows[0.95]]
+    assert above["total"] == 1
+
+    below = _get(
+        client,
+        "/api/v1/suggestions",
+        site_id=site.id,
+        status="pending",
+        max_percent=94,
+        include_total=True,
+    )
+    assert {item["id"] for item in below["items"]} == {rows[0.60], rows[0.20]}
+
+    # And the bulk rule must select the same set the list just showed.
+    reviewed = _rule(client, status="approved", site_id=site.id, threshold_percent=94).json()
+    assert reviewed["reviewed"] == 1
+    assert _status(db, rows[0.95]) == "approved"
+    assert _status(db, rows[0.60]) == "pending"
+
+
+def test_the_cursor_walks_rank_score_when_cosine_would_disagree(client, db, site):
+    """A page boundary read from the wrong column repeats or skips rows."""
+    pair = _pair(db, site)
+    ordered = []
+    for cosine, rank in ((0.90, 0.80), (0.95, 0.70), (0.91, 0.60), (0.99, 0.50)):
+        suggestion = Suggestion(
+            site_id=site.id,
+            source_article_id=pair[0].id,
+            target_article_id=pair[1].id,
+            method=QUEUE_METHOD,
+            score=cosine,
+            rank_score=rank,
+            status="pending",
+        )
+        db.add(suggestion)
+        db.flush()
+        ordered.append(suggestion.id)
+    db.commit()
+
+    first = _get(client, "/api/v1/suggestions", site_id=site.id, status="pending", limit=2)
+    assert [item["id"] for item in first["items"]] == ordered[:2]
+    assert first["next_cursor"]["rank_score"] == 0.70
+
+    second = _get(
+        client,
+        "/api/v1/suggestions",
+        site_id=site.id,
+        status="pending",
+        limit=2,
+        after_rank_score=first["next_cursor"]["rank_score"],
+        after_id=first["next_cursor"]["id"],
+    )
+    assert [item["id"] for item in second["items"]] == ordered[2:]

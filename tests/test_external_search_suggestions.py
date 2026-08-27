@@ -45,6 +45,7 @@ def test_direct_external_suggestion_is_exposed_as_web_search(client, db, site) -
         search_query=source.title,
         method="external_search",
         score=0.82,
+        rank_score=0.82,
         score_components={"external_safety": safety},
         status="pending",
     )

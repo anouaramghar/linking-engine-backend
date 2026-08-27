@@ -6,7 +6,7 @@ from sqlalchemy import event, func, select
 
 from app.config import settings
 from app.db import engine
-from app.models import Article, Embedding
+from app.models import Article, Embedding, JobRun
 from app.models.article import EMBEDDING_DIM
 from app.services.suggestion_service import _embed_missing
 
@@ -248,3 +248,83 @@ def test_only_active_articles_are_refreshed(db, site, monkeypatch):
         )
         == 1
     )
+
+
+def test_encoding_reports_progress_for_pages_that_needed_no_work(db, site, monkeypatch):
+    """The dashboard's bar needs a number on every page, not only changed ones.
+
+    A re-analysis walks articles whose embedding is already current. While those
+    pages reported nothing, the activity row showed the stage and no figure at
+    all until the first changed article appeared — which on an unchanged site is
+    never.
+    """
+    _require_embedding_metadata()
+    article = _make_article(db, site)
+    db.add(
+        Embedding(
+            article_id=article.id,
+            model=settings.embedding_model,
+            vector=[0.0] * EMBEDDING_DIM,
+            content_fingerprint=_fingerprint(article.title, article.content_text),
+            input_recipe_version=1,
+            vector_size=EMBEDDING_DIM,
+        )
+    )
+    run = JobRun(site_id=site.id, kind="analysis", status="running")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        "app.ml.embeddings.encode",
+        lambda _texts: pytest.fail("a current embedding must not be re-encoded"),
+    )
+
+    assert _embed_missing(db, site.id, settings.embedding_model, run.id) == 0
+
+    db.refresh(run)
+    assert run.progress["stage"] == "encoding"
+    assert run.progress["processed"] == 1
+    assert run.progress["total"] == 1
+    assert run.progress["encoded"] == 0
+
+
+def test_encoding_progress_spans_every_pass_of_the_stage(db, site, monkeypatch):
+    """A pool site is a second pass, not a second bar.
+
+    `total` is the whole stage, so the caller hands the same denominator to each
+    pass along with the count the previous ones already walked. Without that the
+    bar restarted at every pool site and read as a job going backwards.
+    """
+    _require_embedding_metadata()
+    article = _make_article(db, site)
+    db.add(
+        Embedding(
+            article_id=article.id,
+            model=settings.embedding_model,
+            vector=[0.0] * EMBEDDING_DIM,
+            content_fingerprint=_fingerprint(article.title, article.content_text),
+            input_recipe_version=1,
+            vector_size=EMBEDDING_DIM,
+        )
+    )
+    run = JobRun(site_id=site.id, kind="analysis", status="running")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(
+        "app.ml.embeddings.encode",
+        lambda _texts: pytest.fail("a current embedding must not be re-encoded"),
+    )
+
+    # Stand in for the second pass: four articles already walked, nine in the
+    # stage, and this site's one article closing the gap to five.
+    _embed_missing(
+        db,
+        site.id,
+        settings.embedding_model,
+        run.id,
+        scanned_offset=4,
+        total=9,
+    )
+
+    db.refresh(run)
+    assert run.progress["processed"] == 5
+    assert run.progress["total"] == 9

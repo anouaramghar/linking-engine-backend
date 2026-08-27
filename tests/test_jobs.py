@@ -13,10 +13,13 @@ from sqlalchemy import select
 import app.services.job_service as job_service
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Alert, IngestionRun, JobRun, Site
+from app.models import Alert, Article, IngestionRun, JobRun, Site
 from app.schemas.job import JobRunOut
 from app.services import alerts as alert_service
 from app.services.job_service import (
+    JobCancelled,
+    ThrottledCancellationCheck,
+    check_job_cancellation,
     enqueue_job,
     handle_abandoned_job,
     handle_job_stopped,
@@ -117,7 +120,18 @@ def test_duplicate_trigger_rejected_while_active(client, db, site, cleanup_rq):
     assert second.status_code == 409
     assert "already queued" in second.json()["detail"]
 
-    # a different kind is not blocked by an active ingestion
+    # a different kind is not blocked by an active ingestion. Analysis also
+    # refuses a site with nothing crawled yet, so give it one active article.
+    db.add(
+        Article(
+            site_id=site.id,
+            url=f"{site.base_url}/seed",
+            title="Seed article",
+            content_text="seed",
+        )
+    )
+    db.commit()
+
     analysis = client.post(f"/api/v1/suggestions/{site.id}")
     assert analysis.status_code == 202
     cleanup_rq.append(analysis.json()["job_id"])
@@ -175,7 +189,7 @@ def test_lost_job_is_reconciled_and_retriggerable(client, db, site, cleanup_rq, 
             "attempts": 0,
             "error": "lost from queue before completion",
         },
-        {"kind": "job_lost", "site_id": site.id},
+        {"kind": "job_lost", "site_id": site.id, "dedupe": False},
     ) in alerts
 
 
@@ -202,6 +216,43 @@ def test_final_job_failure_sends_alert(db, site, monkeypatch):
         "attempts": 1,
         "error": "x" * 2000,
     }
+
+
+def test_successful_job_records_a_partial_in_app_notification(db, site, monkeypatch):
+    run = JobRun(site_id=site.id, kind="publication")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(job_service, "send_alert", lambda *_args, **_kwargs: pytest.fail())
+
+    result = run_durably(
+        run.id,
+        lambda _site_id: {"applied": 2, "skipped": 1},
+        site.id,
+    )
+
+    assert result == {"applied": 2, "skipped": 1}
+    db.expire_all()
+    alert = db.scalar(select(Alert).where(Alert.site_id == site.id, Alert.kind == "job_partial"))
+    assert alert is not None
+    assert alert.subject == "LinkMesh publication job partially completed"
+    assert alert.payload["job_run_id"] == run.id
+    assert alert.payload["outcome"] == "partial"
+
+
+def test_successful_job_records_a_completed_in_app_notification(db, site, monkeypatch):
+    run = JobRun(site_id=site.id, kind="analysis")
+    db.add(run)
+    db.commit()
+    monkeypatch.setattr(job_service, "send_alert", lambda *_args, **_kwargs: pytest.fail())
+
+    run_durably(run.id, lambda _site_id: {"suggestions": 3}, site.id)
+
+    db.expire_all()
+    alert = db.scalar(select(Alert).where(Alert.site_id == site.id, Alert.kind == "job_succeeded"))
+    assert alert is not None
+    assert alert.subject == "LinkMesh analysis job completed"
+    assert alert.payload["job_run_id"] == run.id
+    assert alert.payload["outcome"] == "succeeded"
 
 
 def test_nonfinal_job_failure_does_not_send_alert(db, site, monkeypatch):
@@ -336,7 +387,7 @@ def test_terminal_killed_work_horse_fails_once_and_alerts_once(db, site, monkeyp
                 "attempts": 3,
                 "error": stored.error,
             },
-            {"kind": "job_failed", "site_id": site.id},
+            {"kind": "job_failed", "site_id": site.id, "dedupe": False},
         )
     ]
 
@@ -557,12 +608,12 @@ def test_terminal_abandoned_job_fails_and_alerts_once(db, site, monkeypatch):
                 "attempts": 3,
                 "error": "job abandoned after worker termination",
             },
-            {"kind": "job_failed", "site_id": site.id},
+            {"kind": "job_failed", "site_id": site.id, "dedupe": False},
         )
     ]
 
 
-def test_stopped_job_fails_linked_ingestion_and_alerts_once(db, site, monkeypatch):
+def test_stopped_job_cancels_linked_ingestion_and_alerts_once(db, site, monkeypatch):
     started_at = datetime.now(timezone.utc)
     run = JobRun(
         site_id=site.id,
@@ -596,14 +647,14 @@ def test_stopped_job_fails_linked_ingestion_and_alerts_once(db, site, monkeypatc
     db.expire_all()
     stored = db.get(JobRun, run.id)
     stored_ingestion = db.get(IngestionRun, ingestion_run.id)
-    assert stored.status == "failed"
+    assert stored.status == "cancelled"
     assert stored.error == "job stopped intentionally"
     assert stored.finished_at is not None
-    assert stored_ingestion.status == "failed"
+    assert stored_ingestion.status == "cancelled"
     assert stored_ingestion.error == stored.error
     assert alerts == [
         (
-            "LinkMesh ingestion job stopped",
+            "LinkMesh ingestion job cancelled",
             {
                 "site_id": site.id,
                 "kind": "ingestion",
@@ -611,7 +662,7 @@ def test_stopped_job_fails_linked_ingestion_and_alerts_once(db, site, monkeypatc
                 "attempts": 1,
                 "error": "job stopped intentionally",
             },
-            {"kind": "job_stopped", "site_id": site.id},
+            {"kind": "job_cancelled", "site_id": site.id, "dedupe": False},
         )
     ]
 
@@ -822,8 +873,8 @@ def test_job_status_reports_progress_while_job_is_live_in_redis(client, db, site
         ("started", "running"),
         ("finished", "succeeded"),
         ("failed", "failed"),
-        ("stopped", "failed"),
-        ("canceled", "failed"),
+        ("stopped", "cancelled"),
+        ("canceled", "cancelled"),
     ],
 )
 def test_live_rq_status_uses_stable_public_vocabulary(
@@ -975,17 +1026,18 @@ def test_list_job_runs_per_site(client, db, site):
 def test_list_active_job_runs_excludes_terminal_work(client, db, site):
     queued = JobRun(site_id=site.id, kind="ingestion", status="queued")
     running = JobRun(site_id=site.id, kind="analysis", status="running")
+    stopping = JobRun(site_id=site.id, kind="publication", status="cancel_requested")
     succeeded = JobRun(site_id=site.id, kind="publication", status="succeeded")
     failed = JobRun(site_id=site.id, kind="analysis", status="failed")
-    db.add_all([queued, running, succeeded, failed])
+    db.add_all([queued, running, stopping, succeeded, failed])
     db.commit()
 
     response = client.get("/api/v1/jobs/active")
 
     assert response.status_code == 200, response.text
     active = response.json()
-    assert {item["id"] for item in active} == {queued.id, running.id}
-    assert {item["status"] for item in active} == {"queued", "running"}
+    assert {item["id"] for item in active} == {queued.id, running.id, stopping.id}
+    assert {item["status"] for item in active} == {"queued", "running", "cancel_requested"}
 
 
 def test_list_active_job_runs_reconciles_stale_unqueued_work(client, db, site, monkeypatch):
@@ -1058,3 +1110,189 @@ def test_job_run_out_serializes_progress(db, site):
 
     assert serialized.progress == {"stage": "crawling", "articles": 50}
     assert serialized.progress_at == progress_at
+
+
+def test_cancel_queued_job_marks_it_cancelled_without_running_the_task(
+    client, db, site, cleanup_rq, monkeypatch
+):
+    accepted = client.post(f"/api/v1/sites/{site.id}/ingest").json()
+    cleanup_rq.append(accepted["job_id"])
+    cancelled = []
+    live_job = SimpleNamespace(
+        id=accepted["job_id"],
+        get_status=lambda refresh=False: "queued",
+        cancel=lambda: cancelled.append(True),
+        delete=lambda: None,
+    )
+    monkeypatch.setattr(
+        job_service.Job,
+        "fetch",
+        staticmethod(lambda _job_id, connection: live_job),
+    )
+
+    response = client.post(f"/api/v1/jobs/runs/{accepted['job_run_id']}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+    db.expire_all()
+    run = db.get(JobRun, accepted["job_run_id"])
+    assert run.status == "cancelled"
+    assert run.finished_at is not None
+    assert cancelled == [True]
+
+
+def test_cancel_running_job_requests_stop_and_keeps_durable_state_visible(
+    client, db, site, monkeypatch
+):
+    run = JobRun(
+        site_id=site.id,
+        kind="analysis",
+        status="running",
+        queue_job_id="cancel-running",
+        attempts=1,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    stop_commands = []
+    live_job = SimpleNamespace(
+        id=run.queue_job_id,
+        get_status=lambda refresh=False: "started",
+    )
+    monkeypatch.setattr(
+        job_service.Job,
+        "fetch",
+        staticmethod(lambda _job_id, connection: live_job),
+    )
+    monkeypatch.setattr(
+        job_service,
+        "send_stop_job_command",
+        lambda connection, job_id: stop_commands.append((connection, job_id)),
+    )
+
+    response = client.post(f"/api/v1/jobs/runs/{run.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancel_requested"
+    assert stop_commands == [(job_service.redis_conn, run.queue_job_id)]
+    db.expire_all()
+    assert db.get(JobRun, run.id).status == "cancel_requested"
+
+
+def test_run_durably_honors_cancellation_before_start(db, site):
+    run = JobRun(site_id=site.id, kind="ingestion", status="cancel_requested")
+    db.add(run)
+    db.commit()
+    called = False
+
+    def task(_site_id):
+        nonlocal called
+        called = True
+        return {"articles": 10}
+
+    assert run_durably(run.id, task, site.id) == {"cancelled": True}
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert called is False
+    assert stored.status == "cancelled"
+    assert stored.result == {"cancelled": True}
+
+
+def test_run_durably_cancellation_wins_over_a_late_success(db, site):
+    run = JobRun(site_id=site.id, kind="analysis", status="queued")
+    db.add(run)
+    db.commit()
+
+    def task(_site_id):
+        with SessionLocal() as worker_db:
+            worker_run = worker_db.get(JobRun, run.id)
+            worker_run.status = "cancel_requested"
+            worker_db.commit()
+        return {"suggestions_created": 4}
+
+    assert run_durably(run.id, task, site.id) == {"cancelled": True}
+    db.expire_all()
+    stored = db.get(JobRun, run.id)
+    assert stored.status == "cancelled"
+    assert stored.result == {"cancelled": True}
+
+
+def test_check_job_cancellation_raises_for_requested_job(db, site):
+    run = JobRun(site_id=site.id, kind="analysis", status="cancel_requested")
+    db.add(run)
+    db.commit()
+
+    with pytest.raises(JobCancelled):
+        check_job_cancellation(run.id)
+
+
+def test_throttled_cancellation_check_always_asks_on_the_first_call(db, site):
+    """The throttle must never hide a job that was already cancelled when the
+    loop started, which is the common case for a run cancelled while queued."""
+    run = JobRun(site_id=site.id, kind="ingestion", status="cancel_requested")
+    db.add(run)
+    db.commit()
+
+    with pytest.raises(JobCancelled):
+        ThrottledCancellationCheck(run.id)()
+
+
+def test_throttled_cancellation_check_reads_once_per_interval(db, site, monkeypatch):
+    run = JobRun(site_id=site.id, kind="ingestion", status="running")
+    db.add(run)
+    db.commit()
+
+    asked = []
+    monkeypatch.setattr(job_service, "check_job_cancellation", asked.append)
+    now = SimpleNamespace(value=100.0)
+    monkeypatch.setattr(job_service, "monotonic", lambda: now.value)
+    cancelled = ThrottledCancellationCheck(run.id, interval=1.0)
+
+    cancelled()
+    assert asked == [run.id]
+
+    now.value = 100.999
+    cancelled()
+    cancelled()
+    assert asked == [run.id], "calls inside the interval must not reach the database"
+
+    now.value = 101.0
+    cancelled()
+    assert asked == [run.id, run.id]
+
+
+def test_throttled_cancellation_check_still_stops_a_job_cancelled_mid_interval(
+    db, site, monkeypatch
+):
+    """A request made during the quiet window is acted on at the next interval,
+    not lost. This is the whole cost of the throttle, so it is pinned here."""
+    run = JobRun(site_id=site.id, kind="ingestion", status="running")
+    db.add(run)
+    db.commit()
+
+    now = SimpleNamespace(value=0.0)
+    monkeypatch.setattr(job_service, "monotonic", lambda: now.value)
+    cancelled = ThrottledCancellationCheck(run.id, interval=1.0)
+    cancelled()
+
+    run.status = "cancel_requested"
+    db.commit()
+
+    now.value = 0.5
+    cancelled()
+
+    now.value = 1.0
+    with pytest.raises(JobCancelled):
+        cancelled()
+
+
+def test_throttled_cancellation_check_without_a_run_id_never_reads(monkeypatch):
+    """Ingestion runs outside a durable job pass None, and must not pay for it."""
+    asked = []
+    monkeypatch.setattr(job_service, "check_job_cancellation", asked.append)
+    cancelled = ThrottledCancellationCheck(None, interval=0.0)
+
+    cancelled()
+    cancelled()
+
+    assert asked == []

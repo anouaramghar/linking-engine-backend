@@ -130,9 +130,24 @@ def complete_login(
 
 @router.get("/session", response_model=SessionOut)
 def current_session(user: DashboardUser = Depends(require_dashboard_session)) -> SessionOut:
-    """Who am I. Doubles as the proxy's `auth_request` target, which reads only
-    the status code."""
+    """Who am I. The dashboard's own call; the proxy uses `/session/probe`."""
     return SessionOut(user=DashboardUserOut.model_validate(user))
+
+
+@router.get("/session/probe", status_code=204)
+def session_probe(_: DashboardUser = Depends(require_dashboard_session)) -> Response:
+    """The proxy's `auth_request` target: admits with 204, refuses with 401.
+
+    Identical in authority to `/session` — same dependency, so the same session
+    is accepted and the same revocation ends it — and deliberately empty.
+
+    The emptiness is the point. `auth_request` reads only the status and throws
+    the body away, but nginx will not return a connection to its keepalive pool
+    with an undrained response on it. Pointed at `/session` and its 330-byte
+    user object, every gated request therefore opened a fresh connection to the
+    API, which is half of the two this proxy used to cost per dashboard call.
+    """
+    return Response(status_code=204)
 
 
 @router.post("/logout", status_code=204)

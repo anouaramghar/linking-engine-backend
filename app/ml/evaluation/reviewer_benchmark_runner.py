@@ -71,9 +71,7 @@ def run_reviewer_benchmark(
         test_by_site[label.site_id].append(label)
 
     site_results: dict[str, dict] = {}
-    all_rankings: dict[str, dict[int, list[int]]] = {
-        variant: {} for variant in selected_variants
-    }
+    all_rankings: dict[str, dict[int, list[int]]] = {variant: {} for variant in selected_variants}
     all_labels: list[ReviewerLabelExample] = []
     for site_id in sorted(test_by_site):
         site_rankings, graph_nodes, training_edges = _rank_site(

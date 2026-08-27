@@ -144,8 +144,8 @@ def _seed(url: str, *, hybrid_statuses=(), cosine_statuses=(), site_mode="standa
                     text(
                         "INSERT INTO suggestions "
                         "(site_id, source_article_id, target_article_id, method, score, "
-                        " status, score_components) "
-                        "VALUES (:site_id, :source, :target, :method, 0.8, :status, "
+                        " rank_score, status, score_components) "
+                        "VALUES (:site_id, :source, :target, :method, 0.8, 0.8, :status, "
                         "        CAST(:components AS jsonb))"
                     ),
                     {

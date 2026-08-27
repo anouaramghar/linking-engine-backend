@@ -67,6 +67,15 @@ class SiteCreate(BaseModel):
         return self
 
 
+class SiteCreateRequest(SiteCreate):
+    """Site creation plus the absence guard carried by staged proposals."""
+
+    expected_absent: Literal[True] | None = Field(
+        None,
+        description="When true, creation is confirmed only while this tenant has no matching URL.",
+    )
+
+
 class SiteCredentials(BaseModel):
     """A WordPress account for a site that already exists.
 
@@ -88,6 +97,33 @@ class SiteCredentials(BaseModel):
         except CredentialEncryptionError as error:
             raise ValueError(str(error)) from error
         return self
+
+
+class PoolSourceExpectedState(BaseModel):
+    """The mutable pool-source fields a staged lifecycle action binds."""
+
+    approved: bool
+    quarantined: bool
+    consecutive_failures: int = Field(ge=0)
+    quarantined_at: datetime | None
+
+
+class PoolSourceActionGuard(BaseModel):
+    """Optional race guard for approval, revocation, and reactivation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    expected: PoolSourceExpectedState | None = None
+    expected_expiring_suggestion_ids: list[int] | None = None
+
+    @field_validator("expected_expiring_suggestion_ids")
+    @classmethod
+    def sorted_unique_positive_ids(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None and (any(item < 1 for item in value) or value != sorted(set(value))):
+            raise ValueError(
+                "expected_expiring_suggestion_ids must be sorted, unique, and positive"
+            )
+        return value
 
 
 class SiteBulkRow(BaseModel):
@@ -122,6 +158,22 @@ class SiteBulkRow(BaseModel):
 
 class SiteBulkRequest(BaseModel):
     sites: list[SiteBulkRow] = Field(min_length=1, max_length=MAX_BULK_SITES)
+    expected_absent_base_urls: list[str] | None = Field(
+        None,
+        min_length=1,
+        max_length=MAX_BULK_SITES,
+        description=(
+            "Optional exact normalized URL set for an atomic staged bulk creation. "
+            "Ordinary CSV imports omit it and retain partial-success behavior."
+        ),
+    )
+
+    @field_validator("expected_absent_base_urls")
+    @classmethod
+    def sorted_unique_expected_urls(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and value != sorted(set(value)):
+            raise ValueError("expected_absent_base_urls must be sorted and unique")
+        return value
 
 
 class SiteBulkCreated(BaseModel):
@@ -141,6 +193,20 @@ class SiteBulkResult(BaseModel):
     created: list[SiteBulkCreated]
     skipped: list[SiteBulkFailure]  # already present, or duplicated within the upload
     rejected: list[SiteBulkFailure]  # failed validation, including the SSRF guard
+
+
+class PoolSourceValidationRequest(BaseModel):
+    """One pool source to probe without creating or approving it."""
+
+    name: str | None = None
+    base_url: str | None = None
+
+
+class PoolSourceValidationResult(BaseModel):
+    base_url: str | None
+    valid: bool
+    source_type: Literal["wikipedia", "rss_atom"] | None = None
+    reason: str | None = None
 
 
 class SiteOut(BaseModel):
@@ -190,7 +256,7 @@ class SiteOut(BaseModel):
     last_crawl_at: datetime | None = None
 
 
-class EditorialRankingPolicyUpdate(BaseModel):
+class EditorialRankingPolicyValues(BaseModel):
     #: Required, not defaulted: switching feedback reranking on is a deliberate
     #: act while it is unproven, so an omitted field must not turn it on as a
     #: side effect of editing the thresholds beside it.
@@ -200,7 +266,17 @@ class EditorialRankingPolicyUpdate(BaseModel):
     min_samples: int = Field(ge=1, le=10_000)
 
 
-class EditorialRankingPolicyOut(EditorialRankingPolicyUpdate):
+class EditorialRankingPolicyUpdate(EditorialRankingPolicyValues):
+    expected: EditorialRankingPolicyValues | None = Field(
+        None,
+        description=(
+            "Only save if the current policy still equals this snapshot. "
+            "Agent-staged changes use it as an optimistic-concurrency guard."
+        ),
+    )
+
+
+class EditorialRankingPolicyOut(EditorialRankingPolicyValues):
     site_id: int
 
 

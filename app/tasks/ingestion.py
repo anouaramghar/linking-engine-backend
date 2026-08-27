@@ -8,7 +8,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.models import Site
 from app.services.ingestion_service import run_ingestion
-from app.services.job_service import run_durably
+from app.services.job_service import check_job_cancellation, run_durably
 from app.services.pool_source_policy import (
     PoolSourceFetchError,
     PoolSourcePolicyError,
@@ -31,6 +31,7 @@ def _run_pool_ingestion(site_id: int, job_run_id: int | None = None) -> dict:
             raise ValueError(f"site {site_id} not found")
         require_approved_pool_source(site)
     result = run_ingestion(site_id, job_run_id=job_run_id)
+    check_job_cancellation(job_run_id)
     _record_pool_ingestion_success(site_id)
     return result
 

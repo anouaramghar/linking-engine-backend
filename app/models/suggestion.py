@@ -55,22 +55,26 @@ class Suggestion(Base):
     __tablename__ = "suggestions"
     # Exact-status and default active-queue reads need different leading columns:
     # status-first serves a selected chip, while the partial indexes preserve
-    # global score order across every non-expired status. All are ascending because
+    # global rank order across every non-expired status. All are ascending because
     # PostgreSQL can walk them backwards for the uniformly descending queue.
+    #
+    # These four are keyed on rank_score rather than score: the queue orders,
+    # cursors and filters on rank_score, and an index on the other column cannot
+    # serve any of the three.
     __table_args__ = (
         Index("ix_suggestions_status_created_at", "status", "created_at"),
-        Index("ix_suggestions_queue", "status", "score", "id"),
-        Index("ix_suggestions_site_queue", "site_id", "status", "score", "id"),
+        Index("ix_suggestions_queue", "status", "rank_score", "id"),
+        Index("ix_suggestions_site_queue", "site_id", "status", "rank_score", "id"),
         Index(
             "ix_suggestions_active_queue",
-            "score",
+            "rank_score",
             "id",
             postgresql_where=text("status <> 'expired'"),
         ),
         Index(
             "ix_suggestions_site_active_queue",
             "site_id",
-            "score",
+            "rank_score",
             "id",
             postgresql_where=text("status <> 'expired'"),
         ),
@@ -126,12 +130,25 @@ class Suggestion(Base):
     provider_score: Mapped[float | None] = mapped_column(Float)
     search_query: Mapped[str | None] = mapped_column(Text)
     method: Mapped[str] = mapped_column(SuggestionMethod)
-    # Cosine semantic similarity, for every method. The dashboard percentage, its
-    # thresholds, and the global queue order all read this one column, so it has
-    # to keep one meaning across methods — a pilot row and a baseline row at 0.82
-    # are equally similar. What the Hybrid ranker used to *choose* the pair goes
-    # in score_components instead of being rescaled into this column.
+    # Cosine semantic similarity, for every method. It has to keep one meaning
+    # across methods — a pilot row and a baseline row at 0.82 are equally
+    # similar — so what the Hybrid ranker used to *choose* the pair goes in
+    # score_components rather than being rescaled into this column.
     score: Mapped[float] = mapped_column(Float)
+    # How strongly the ranker that selected this row preferred it, 0-1, where 1
+    # is the strongest that ranker can say. This is the queue's sort key, its
+    # cursor, its percent filters and the number on the review card.
+    #
+    # It is a separate column from `score` because the two answer different
+    # questions and only one of them is comparable across a mixed queue. For a
+    # fusion-ordered hybrid row this is the weighted-RRF score over its
+    # reachable ceiling; for every other method the fusion did not decide the
+    # order, nothing else is bounded, and cosine stands in. See
+    # `app.ml.candidate_ordering._rank_score` for why.
+    #
+    # Generation-time evidence like the columns below: never recomputed against
+    # a later ceiling, so a stored row keeps the position it was given.
+    rank_score: Mapped[float] = mapped_column(Float)
     # Truthful, method-specific explanation of the row: for hybrid_bm25, the BM25
     # score that ordered it plus its fusion and per-retriever ranks. Null for rows
     # written before the column existed.

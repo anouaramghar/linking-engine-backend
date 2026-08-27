@@ -52,6 +52,7 @@ def _label(
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.8,
+        rank_score=0.8,
         status=label,
         created_at=reviewed_at - timedelta(hours=1),
         reviewed_at=reviewed_at,

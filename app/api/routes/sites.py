@@ -43,27 +43,37 @@ from app.schemas.site import (
     ArticleOut,
     EditorialRankingPolicyOut,
     EditorialRankingPolicyUpdate,
+    PoolSourceValidationRequest,
+    PoolSourceValidationResult,
+    PoolSourceActionGuard,
     SiteBulkCreated,
     SiteBulkFailure,
     SiteBulkRequest,
     SiteBulkResult,
     SiteCreate,
+    SiteCreateRequest,
     SiteCredentials,
     SiteOut,
 )
 from app.services.external_link_policy import (
+    PolicyState,
     expire_ineligible_external_suggestions,
+    ineligible_external_suggestions,
     policy_state,
     source_evaluations,
 )
 from app.services.ingestion_service import latest_run
 from app.services.pool_source_audit import record_pool_source_audit_event
 from app.services.pool_source_policy import (
+    PoolSourceFetchError,
     PoolSourcePolicyError,
     expire_pool_target_suggestions,
+    pool_source_state,
+    pool_target_suggestion_ids,
     require_allowed_pool_domain,
     require_no_pbn_conflict,
 )
+from app.services.pool_source_validation import classify_pool_source, probe_pool_source
 
 router = APIRouter(prefix="/sites", tags=["sites"])
 
@@ -73,6 +83,29 @@ DUPLICATE_REASON = "a site with this base_url already exists"
 #: sentence that names the cause, short enough that 250 failed sites do not
 #: turn one page into a megabyte of tracebacks.
 MAX_ROW_ERROR_CHARS = 300
+
+
+def _guard_pool_source_action(
+    db: Session,
+    site: Site,
+    guard: PoolSourceActionGuard | None,
+    *,
+    include_expiring_suggestions: bool = False,
+) -> None:
+    """Lock and compare the exact state a staged proposal displayed."""
+
+    db.refresh(site, with_for_update=True)
+    if guard is None or guard.expected is None:
+        return
+    if guard.expected.model_dump(mode="json") != pool_source_state(site):
+        raise HTTPException(409, "pool source state changed after preview; refresh before acting")
+    if include_expiring_suggestions:
+        current_ids = pool_target_suggestion_ids(db, site.id, reason="revoked")
+        if guard.expected_expiring_suggestion_ids != current_ids:
+            raise HTTPException(
+                409,
+                "pool source suggestion impact changed after preview; refresh before revoking",
+            )
 
 
 def _row_error(message: str | None) -> str | None:
@@ -240,7 +273,7 @@ def _site_out(
 
 @router.post("", status_code=201, response_model=SiteOut)
 def create_site(
-    payload: SiteCreate,
+    payload: SiteCreateRequest,
     tenant_id: int | None = Query(None, ge=1),
     principal: Principal = Depends(require_api_key),
     db: Session = Depends(get_db),
@@ -261,7 +294,7 @@ def create_site(
             require_no_pbn_conflict(db, payload.base_url, as_pool=False)
         except PoolSourcePolicyError as error:
             raise HTTPException(409, str(error)) from error
-    site = Site(**payload.model_dump(), tenant_id=owner_tenant_id)
+    site = Site(**payload.model_dump(exclude={"expected_absent"}), tenant_id=owner_tenant_id)
     db.add(site)
     db.commit()
     db.refresh(site)
@@ -277,20 +310,54 @@ def bulk_create_sites(
 ) -> SiteBulkResult:
     """Create many sites in one request, reporting the outcome of every row.
 
-    Partial success is the contract: a row that fails validation or collides with an
-    existing site is reported and skipped, and the rest of the upload still lands. Each
-    insert runs in its own savepoint so one collision cannot poison the batch.
+    Ordinary imports use partial success: a bad or duplicate row is reported while the
+    rest still lands. A staged proposal supplies ``expected_absent_base_urls`` and uses
+    an atomic contract instead; any validation, eligibility, or availability drift
+    rejects the entire confirmation with 409.
     """
     created: list[SiteBulkCreated] = []
     skipped: list[SiteBulkFailure] = []
     rejected: list[SiteBulkFailure] = []
     seen: set[str] = set()
     owner_tenant_id = resolve_create_tenant_id(db, principal, tenant_id=tenant_id)
+    guarded = payload.expected_absent_base_urls is not None
+    if guarded:
+        try:
+            guarded_rows = [SiteCreate.model_validate(row.model_dump()) for row in payload.sites]
+        except ValidationError as exc:
+            raise HTTPException(
+                409,
+                "site creation inputs changed since preview; refresh before confirming",
+            ) from exc
+        normalized_urls = sorted(item.base_url for item in guarded_rows)
+        if normalized_urls != payload.expected_absent_base_urls:
+            raise HTTPException(
+                409,
+                "site creation scope changed since preview; refresh before confirming",
+            )
+        existing_urls = sorted(
+            db.scalars(
+                select(Site.base_url).where(
+                    Site.tenant_id == owner_tenant_id,
+                    Site.base_url.in_(normalized_urls),
+                )
+            ).all()
+        )
+        if existing_urls:
+            raise HTTPException(
+                409,
+                "site creation availability changed since preview; refresh before confirming",
+            )
 
     for index, row in enumerate(payload.sites, start=1):
         try:
             item = SiteCreate.model_validate(row.model_dump())
         except ValidationError as exc:
+            if guarded:
+                raise HTTPException(
+                    409,
+                    "site creation inputs changed since preview; refresh before confirming",
+                ) from exc
             rejected.append(
                 SiteBulkFailure(row=index, base_url=row.base_url, reason=_first_error(exc))
             )
@@ -304,6 +371,11 @@ def bulk_create_sites(
 
         # `item.base_url` is normalized by SiteCreate, so both checks compare like for like.
         if item.base_url in seen:
+            if guarded:
+                raise HTTPException(
+                    409,
+                    "site creation scope changed since preview; refresh before confirming",
+                )
             skipped.append(
                 SiteBulkFailure(
                     row=index,
@@ -320,6 +392,11 @@ def bulk_create_sites(
                 Site.tenant_id == owner_tenant_id,
             )
         ):
+            if guarded:
+                raise HTTPException(
+                    409,
+                    "site creation availability changed since preview; refresh before confirming",
+                )
             skipped.append(
                 SiteBulkFailure(row=index, base_url=item.base_url, reason=DUPLICATE_REASON)
             )
@@ -329,6 +406,11 @@ def bulk_create_sites(
             try:
                 require_no_pbn_conflict(db, item.base_url, as_pool=False)
             except PoolSourcePolicyError as error:
+                if guarded:
+                    raise HTTPException(
+                        409,
+                        "site creation eligibility changed since preview; refresh before confirming",
+                    ) from error
                 rejected.append(
                     SiteBulkFailure(row=index, base_url=item.base_url, reason=str(error))
                 )
@@ -340,6 +422,11 @@ def bulk_create_sites(
                 db.add(site)
                 db.flush()
         except IntegrityError:  # a concurrent import claimed the same base_url
+            if guarded:
+                raise HTTPException(
+                    409,
+                    "site creation availability changed since preview; refresh before confirming",
+                )
             skipped.append(
                 SiteBulkFailure(row=index, base_url=item.base_url, reason=DUPLICATE_REASON)
             )
@@ -351,6 +438,61 @@ def bulk_create_sites(
 
     db.commit()
     return SiteBulkResult(created=created, skipped=skipped, rejected=rejected)
+
+
+@router.post("/pool-source/validate", response_model=PoolSourceValidationResult)
+def validate_pool_source(
+    payload: PoolSourceValidationRequest,
+    tenant_id: int | None = Query(None, ge=1),
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> PoolSourceValidationResult:
+    """Validate one remote pool source without creating, approving, or crawling it."""
+
+    require_creatable_platform(principal, "pool")
+    owner_tenant_id = resolve_create_tenant_id(db, principal, tenant_id=tenant_id)
+    try:
+        item = SiteCreate.model_validate(
+            {"name": payload.name, "base_url": payload.base_url, "platform": "pool"}
+        )
+    except ValidationError as exc:
+        return PoolSourceValidationResult(
+            base_url=payload.base_url,
+            valid=False,
+            reason=_first_error(exc),
+        )
+
+    source_type = classify_pool_source(item.base_url)
+    if db.scalar(
+        select(Site.id).where(
+            Site.base_url == item.base_url,
+            Site.tenant_id == owner_tenant_id,
+        )
+    ):
+        return PoolSourceValidationResult(
+            base_url=item.base_url,
+            valid=False,
+            source_type=source_type,
+            reason=DUPLICATE_REASON,
+        )
+
+    try:
+        require_allowed_pool_domain(item.base_url)
+        require_no_pbn_conflict(db, item.base_url, as_pool=True)
+        source_type = probe_pool_source(Site(**item.model_dump(), tenant_id=owner_tenant_id))
+    except (PoolSourcePolicyError, PoolSourceFetchError) as error:
+        return PoolSourceValidationResult(
+            base_url=item.base_url,
+            valid=False,
+            source_type=source_type,
+            reason=str(error),
+        )
+
+    return PoolSourceValidationResult(
+        base_url=item.base_url,
+        valid=True,
+        source_type=source_type,
+    )
 
 
 @router.get("", response_model=list[SiteOut])
@@ -407,6 +549,39 @@ def update_external_link_policy(
     operator_id: str = Depends(get_audit_actor),
 ) -> ExternalLinkPolicyOut:
     _managed_site_or_409(site)
+    current_values = policy_state(db, site.id).as_payload()
+    current_values.pop("site_id")
+    if payload.expected is not None and current_values != payload.expected.model_dump():
+        raise HTTPException(
+            409,
+            "external link policy changed since it was previewed; refresh before saving",
+        )
+    special = {"expected", "expected_expiring_suggestion_ids"}
+    updates = payload.model_dump(exclude_unset=True, exclude=special)
+    desired = {**current_values, **updates}
+    proposed_policy = PolicyState(
+        site_id=site.id,
+        external_links_enabled=desired["external_links_enabled"],
+        require_https=desired["require_https"],
+        min_trust_score=desired["min_trust_score"],
+        min_domain_age_days=desired["min_domain_age_days"],
+        trusted_tlds=tuple(desired["trusted_tlds"]),
+        allowlist_domains=tuple(desired["allowlist_domains"]),
+        blocklist_domains=tuple(desired["blocklist_domains"]),
+        competitor_domains=tuple(desired["competitor_domains"]),
+    )
+    if payload.expected_expiring_suggestion_ids is not None:
+        actual_expiring_ids = sorted(
+            suggestion.id
+            for suggestion, _evaluation, _details_key in ineligible_external_suggestions(
+                db, site, policy=proposed_policy
+            )
+        )
+        if actual_expiring_ids != payload.expected_expiring_suggestion_ids:
+            raise HTTPException(
+                409,
+                "external link policy impact changed since it was previewed; refresh before saving",
+            )
     policy = db.get(ExternalLinkPolicy, site.id)
     if policy is None:
         policy = ExternalLinkPolicy(site_id=site.id)
@@ -414,7 +589,7 @@ def update_external_link_policy(
     # The policy surface accepts partial updates in practice.  Do not turn an
     # omitted field into its schema default: an existing explicitly enabled
     # policy must remain enabled when an operator changes only a domain rule.
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    for field, value in updates.items():
         setattr(policy, field, value)
     policy.updated_by = operator_id
     db.flush()
@@ -459,6 +634,14 @@ def update_editorial_ranking_policy(
     db: Session = Depends(get_db),
 ) -> EditorialRankingPolicyOut:
     _managed_site_or_409(site)
+    current = _editorial_policy_out(site)
+    if payload.expected is not None:
+        current_values = current.model_dump(exclude={"site_id"})
+        if current_values != payload.expected.model_dump():
+            raise HTTPException(
+                409,
+                "editorial ranking policy changed since it was previewed; refresh before saving",
+            )
     site.editorial_feedback_enabled = payload.enabled
     site.editorial_min_score_percent = payload.min_score_percent
     site.editorial_feedback_weight = payload.feedback_weight
@@ -519,12 +702,14 @@ def get_site(
 
 @router.post("/{site_id}/pool-source/approval", response_model=SiteOut)
 def approve_pool_source(
+    payload: PoolSourceActionGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
     operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
     if site.platform != "pool":
         raise HTTPException(409, f"site {site.id} is not a content-pool source")
+    _guard_pool_source_action(db, site, payload)
     try:
         require_allowed_pool_domain(site.base_url)
         require_no_pbn_conflict(db, site.base_url, as_pool=True)
@@ -541,12 +726,14 @@ def approve_pool_source(
 
 @router.delete("/{site_id}/pool-source/approval", response_model=SiteOut)
 def revoke_pool_source_approval(
+    payload: PoolSourceActionGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
     operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
     if site.platform != "pool":
         raise HTTPException(409, f"site {site.id} is not a content-pool source")
+    _guard_pool_source_action(db, site, payload, include_expiring_suggestions=True)
     site.pool_source_approved = False
     site.pool_source_approved_at = None
     site.pool_source_approved_by = None
@@ -559,12 +746,14 @@ def revoke_pool_source_approval(
 
 @router.post("/{site_id}/pool-source/reactivate", response_model=SiteOut)
 def reactivate_pool_source(
+    payload: PoolSourceActionGuard | None = None,
     site: Site = Depends(require_site_access),
     db: Session = Depends(get_db),
     operator_id: str = Depends(require_operator_identity),
 ) -> SiteOut:
     if site.platform != "pool":
         raise HTTPException(409, f"site {site.id} is not a content-pool source")
+    _guard_pool_source_action(db, site, payload)
     if not site.pool_source_approved:
         raise HTTPException(409, f"pool source site {site.id} must be approved first")
     try:

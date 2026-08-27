@@ -55,6 +55,7 @@ def _suggestion(db, site, src, tgt, status="approved", score=0.9):
         target_article_id=tgt.id,
         method="baseline_cosine",
         score=score,
+        rank_score=score,
         status=status,
     )
     db.add(row)
@@ -277,7 +278,10 @@ def test_non_ascii_content_is_hashed_stably(db, site, articles):
     digest depend on the json library rather than on the bytes."""
     plan = _artifact(db, site, articles[0], updated_html="<p>Coût d'électricité — 日本語</p>")
 
-    assert compute_plan_hash(plan) == compute_plan_hash(plan)
+    first_hash = compute_plan_hash(plan)
+    second_hash = compute_plan_hash(plan)
+
+    assert first_hash == second_hash
     assert compute_plan_hash(plan) != compute_plan_hash(
         _artifact(db, site, articles[0], updated_html="<p>Cout d'electricite - 日本語</p>")
     )

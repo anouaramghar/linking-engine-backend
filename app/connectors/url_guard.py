@@ -13,8 +13,14 @@ import ipaddress
 import select
 import socket
 import ssl
-from collections.abc import Callable, Iterable
-from typing import Any
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from queue import Empty, Queue
+from threading import BoundedSemaphore, Thread
+from time import monotonic
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import httpcore
@@ -28,6 +34,95 @@ _NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 class UnsafeURLError(Exception):
     """URL failed crawl-safety validation."""
+
+
+class _NetworkDeadlineExceeded(TimeoutError):
+    """The caller's wall-clock network budget has been consumed."""
+
+
+@dataclass(frozen=True, slots=True)
+class _NetworkDeadline:
+    expires_at: float
+    clock: Callable[[], float]
+
+    def remaining(self) -> float:
+        remaining = self.expires_at - self.clock()
+        if remaining <= 0:
+            raise _NetworkDeadlineExceeded("total network deadline exceeded")
+        return remaining
+
+
+_CURRENT_NETWORK_DEADLINE: ContextVar[_NetworkDeadline | None] = ContextVar(
+    "linkmesh_network_deadline",
+    default=None,
+)
+_RESOLVER_SLOTS = BoundedSemaphore(4)
+
+
+@contextmanager
+def network_deadline(
+    expires_at: float,
+    *,
+    clock: Callable[[], float] = monotonic,
+) -> Iterator[None]:
+    """Apply one wall-clock budget across DNS, connects, TLS and socket I/O.
+
+    HTTPX timeouts are inactivity limits for individual operations. A hostile
+    peer can otherwise send one small header fragment before every timeout and
+    keep a synchronous worker occupied indefinitely. The context-local absolute
+    deadline makes every later operation inherit only the time still remaining.
+    """
+
+    token = _CURRENT_NETWORK_DEADLINE.set(_NetworkDeadline(expires_at, clock))
+    try:
+        yield
+    finally:
+        _CURRENT_NETWORK_DEADLINE.reset(token)
+
+
+def _bounded_timeout(timeout: float | None) -> float | None:
+    deadline = _CURRENT_NETWORK_DEADLINE.get()
+    if deadline is None:
+        return timeout
+    remaining = deadline.remaining()
+    return remaining if timeout is None else min(timeout, remaining)
+
+
+def _bounded_resolve(
+    resolver: Callable[..., list[tuple]],
+    host: str,
+    port: int,
+    *,
+    timeout: float | None,
+) -> list[tuple]:
+    """Bound blocking system DNS without allowing unbounded stuck threads."""
+
+    kwargs = {"type": socket.SOCK_STREAM, "proto": socket.IPPROTO_TCP}
+    if timeout is None:
+        return resolver(host, port, **kwargs)
+    if not _RESOLVER_SLOTS.acquire(blocking=False):
+        raise _NetworkDeadlineExceeded("DNS resolver capacity is exhausted")
+
+    result: Queue[tuple[bool, object]] = Queue(maxsize=1)
+
+    def resolve() -> None:
+        try:
+            result.put((True, resolver(host, port, **kwargs)))
+        except Exception as error:  # noqa: BLE001 - transfer resolver errors to caller
+            result.put((False, error))
+        finally:
+            _RESOLVER_SLOTS.release()
+
+    Thread(target=resolve, name="linkmesh-live-url-dns", daemon=True).start()
+    try:
+        succeeded, value = result.get(timeout=timeout)
+    except Empty as error:
+        raise _NetworkDeadlineExceeded("DNS resolution exceeded total network deadline") from error
+    if succeeded:
+        return cast(list[tuple], value)
+    if isinstance(value, Exception):
+        raise value
+    raise RuntimeError("DNS resolver returned an invalid result")
 
 
 def _is_public_address(address: _IPAddress) -> bool:
@@ -58,18 +153,25 @@ class _SocketStream(httpcore.NetworkStream):
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         try:
-            self._sock.settimeout(timeout)
-            return self._sock.recv(max_bytes)
-        except socket.timeout as error:
+            self._sock.settimeout(_bounded_timeout(timeout))
+            result = self._sock.recv(max_bytes)
+            _bounded_timeout(timeout)
+            return result
+        except _NetworkDeadlineExceeded as error:
+            raise httpcore.ReadTimeout(str(error)) from error
+        except TimeoutError as error:
             raise httpcore.ReadTimeout(str(error)) from error
         except OSError as error:
             raise httpcore.ReadError(str(error)) from error
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
         try:
-            self._sock.settimeout(timeout)
+            self._sock.settimeout(_bounded_timeout(timeout))
             self._sock.sendall(buffer)
-        except socket.timeout as error:
+            _bounded_timeout(timeout)
+        except _NetworkDeadlineExceeded as error:
+            raise httpcore.WriteTimeout(str(error)) from error
+        except TimeoutError as error:
             raise httpcore.WriteTimeout(str(error)) from error
         except OSError as error:
             raise httpcore.WriteError(str(error)) from error
@@ -83,18 +185,25 @@ class _SocketStream(httpcore.NetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> httpcore.NetworkStream:
+        wrapped: ssl.SSLSocket | None = None
         try:
-            self._sock.settimeout(timeout)
+            self._sock.settimeout(_bounded_timeout(timeout))
             wrapped = ssl_context.wrap_socket(self._sock, server_hostname=server_hostname)
-        except socket.timeout as error:
-            self.close()
+            _bounded_timeout(timeout)
+        except _NetworkDeadlineExceeded as error:
+            (wrapped or self._sock).close()
+            raise httpcore.ConnectTimeout(str(error)) from error
+        except TimeoutError as error:
+            (wrapped or self._sock).close()
             raise httpcore.ConnectTimeout(str(error)) from error
         except OSError as error:
-            self.close()
+            (wrapped or self._sock).close()
             raise httpcore.ConnectError(str(error)) from error
         except Exception:
-            self.close()
+            (wrapped or self._sock).close()
             raise
+        if wrapped is None:  # pragma: no cover - ssl.wrap_socket either returns or raises
+            raise httpcore.ConnectError("TLS wrapping returned no socket")
         return _SocketStream(wrapped)
 
     def get_extra_info(self, info: str) -> Any:
@@ -132,11 +241,11 @@ class ValidatingNetworkBackend(httpcore.NetworkBackend):
 
     def _resolve(self, host: str, port: int) -> list[tuple]:
         try:
-            infos = self._resolver(
+            infos = _bounded_resolve(
+                self._resolver,
                 host,
                 port,
-                type=socket.SOCK_STREAM,
-                proto=socket.IPPROTO_TCP,
+                timeout=_bounded_timeout(None),
             )
         except socket.gaierror as error:
             raise UnsafeURLError(f"cannot resolve host {host!r}") from error
@@ -163,13 +272,18 @@ class ValidatingNetworkBackend(httpcore.NetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[tuple] | None = None,
     ) -> httpcore.NetworkStream:
-        infos = self._resolve(host, port)
+        try:
+            _bounded_timeout(timeout)
+            infos = self._resolve(host, port)
+            _bounded_timeout(timeout)
+        except _NetworkDeadlineExceeded as error:
+            raise httpcore.ConnectTimeout(str(error)) from error
         last_error: Exception | None = None
         for family, sock_type, proto, _canonname, sockaddr in infos:
             sock: socket.socket | None = None
             try:
                 sock = self._socket_factory(family, sock_type, proto)
-                sock.settimeout(timeout)
+                sock.settimeout(_bounded_timeout(timeout))
                 if local_address is not None:
                     bind_address = (
                         (local_address, 0, 0, 0)
@@ -181,8 +295,11 @@ class ValidatingNetworkBackend(httpcore.NetworkBackend):
                     sock.setsockopt(*option)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock.connect(sockaddr)
+                _bounded_timeout(timeout)
                 return _SocketStream(sock)
-            except socket.timeout as error:
+            except _NetworkDeadlineExceeded as error:
+                last_error = httpcore.ConnectTimeout(str(error))
+            except TimeoutError as error:
                 last_error = httpcore.ConnectTimeout(str(error))
             except OSError as error:
                 last_error = httpcore.ConnectError(str(error))

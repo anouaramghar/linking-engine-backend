@@ -6,9 +6,11 @@ import math
 import pytest
 from sqlalchemy import select
 
+from unittest.mock import patch
+
 from app.config import Settings, settings
 from app.ml.hybrid import (
-    DENSE_RRF_WEIGHT,
+    rank_hybrid_candidates,
     LEXICAL_RRF_WEIGHT,
     RRF_RANK_CONSTANT,
     CorpusArticle,
@@ -242,6 +244,7 @@ def eligibility_corpus(db, site):
             target_article_id=targets["decided"].id,
             method="baseline_cosine",
             score=0.5,
+            rank_score=0.5,
             status="rejected",
         )
     )
@@ -278,19 +281,65 @@ def test_frozen_structured_recipe_and_weighted_rrf():
     assert terms.count("guide") == 3
     assert terms.count("travel") == 2
     assert terms[-2:] == ["restaurants", "ocean"]
-    assert weighted_reciprocal_rank_fusion([1, 2], [3, 2]) == [2, 3, 1]
+    # Equal weights: 2 is in both lists and wins; 1 and 3 each lead one list and
+    # tie, so the id breaks it. Under the old 0.25 dense weight this was
+    # [2, 3, 1], because a lexical-only hit outscored a dense-only one.
+    assert weighted_reciprocal_rank_fusion([1, 2], [3, 2]) == [2, 1, 3]
 
 
-def test_the_fusion_weights_are_the_frozen_ones():
+def test_the_fusion_weights_are_the_configured_ones():
     """Arithmetic, not just order: a silent weight change would still rank the same
-    way in the small case above."""
-    assert (DENSE_RRF_WEIGHT, LEXICAL_RRF_WEIGHT, RRF_RANK_CONSTANT) == (0.25, 1.0, 10)
+    way in the small case above.
 
+    The dense weight became configurable when the delivered order moved from
+    BM25-512 to the fusion score. It was 0.25, which made the fusion so
+    lexical-heavy that `hybrid` and `lexical` produced identical rankings on
+    every corpus measured. Both values are asserted here so a change to either
+    has to be deliberate.
+    """
+    assert (settings.hybrid_dense_rrf_weight, LEXICAL_RRF_WEIGHT, RRF_RANK_CONSTANT) == (
+        1.0,
+        1.0,
+        10,
+    )
+
+    dense_weight = settings.hybrid_dense_rrf_weight
     scores = dict(weighted_rrf_scores([7, 8], [8, 9]))
 
-    assert scores[7] == pytest.approx(0.25 / 11)
-    assert scores[8] == pytest.approx(0.25 / 12 + 1.0 / 11)
+    assert scores[7] == pytest.approx(dense_weight / 11)
+    assert scores[8] == pytest.approx(dense_weight / 12 + 1.0 / 11)
     assert scores[9] == pytest.approx(1.0 / 12)
+
+
+def test_the_delivered_order_is_the_fusion_order():
+    """The fusion score decides the delivered order, not BM25 alone.
+
+    Before this, `weighted_rrf_scores` chose which candidates were considered
+    and BM25-512 alone ordered them, so the dense signal was computed and then
+    discarded. Measured against links real editors wrote on two commercial
+    blogs, the fusion order recovered 10-26% more known-good targets in the top
+    five across four splits, and beat either retriever used alone in all of
+    them.
+    """
+    # Both retrievers agree that 7 is best, so the fusion order is 7, 8, 9.
+    # BM25 alone strongly prefers 9, so the previous recipe inverted that.
+    dense_ids = [7, 8, 9]
+    lexical_ids = [7, 8, 9]
+    bm25 = {7: 0.1, 8: 0.2, 9: 9.0}
+    semantic = {7: 0.9, 8: 0.8, 9: 0.7}
+
+    fusion_order = [
+        c.target_id for c in rank_hybrid_candidates(dense_ids, lexical_ids, bm25, semantic, limit=3)
+    ]
+
+    with patch.object(settings, "hybrid_final_order", "bm25"):
+        bm25_order = [
+            c.target_id
+            for c in rank_hybrid_candidates(dense_ids, lexical_ids, bm25, semantic, limit=3)
+        ]
+
+    assert bm25_order == [9, 8, 7], "the previous recipe ordered by BM25 alone"
+    assert fusion_order == [7, 8, 9], "both retrievers agree, so their agreement wins"
 
 
 def test_normalized_title_matches_sql_lower_btrim():
@@ -506,8 +555,13 @@ def test_lexical_pool_backfills_after_an_ineligible_first_page(monkeypatch):
     assert checked_pages == [list(range(1, 101)), [101]]
     assert ranking.lexical_count == 100
     assert ranking.union_count == 101
-    assert ranking.candidates[0].target_id == 101
-    assert ranking.candidates[0].bm25_score == pytest.approx(101.0)
+    # 101 is the backfilled row, and `union_count` above proves it reached the
+    # pool -- which is what this test is about. It no longer reaches the top
+    # five: it carries a lexical rank only, and the fusion order rewards targets
+    # both retrievers found. Under BM25-only ordering its score of 101.0 put it
+    # first. 102 leads now, holding rank 1 dense and rank 2 lexical.
+    assert ranking.candidates[0].target_id == 102
+    assert 101 not in [candidate.target_id for candidate in ranking.candidates]
 
 
 def test_a_cross_site_article_is_never_a_candidate(db, site, eligibility_corpus):
@@ -571,21 +625,30 @@ def test_pilot_rows_store_cosine_as_the_score_and_bm25_in_the_components(
 
     # BM25 is reported separately, raw, and is not rescaled into anything that
     # reads as a confidence.
-    assert components["version"] == "hybrid_bm25_v1"
-    assert components["final_order"] == "bm25_512"
+    assert components["version"] == "hybrid_wrrf_v2"
+    assert components["final_order"] == "wrrf"
     assert components["score_is"] == "cosine_semantic_similarity"
     assert components["recipe"] == "structured_t3_tax2_c512"
     assert components["bm25_score"] > 0.0
     assert components["bm25_score"] != pytest.approx(row.score)
     assert components["fusion"] == {
-        "name": "wrrf_d025_l100_k10",
-        "dense_weight": 0.25,
+        "name": "wrrf_d1_l100_k10",
+        "dense_weight": 1.0,
         "lexical_weight": 1.0,
         "rank_constant": 10,
+        # Recorded with the row so a later reweighting cannot make historic
+        # rows look stronger than the ones normalized against the new ceiling.
+        "ceiling": pytest.approx(2 / 11),
     }
     assert components["fusion_rank"] >= 1
     assert components["fusion_score"] > 0.0
     assert components["lexical_rank"] >= 1
+    # The stored rank score is that fusion score as a fraction of the ceiling.
+    assert components["normalized_fusion_score"] == pytest.approx(
+        components["fusion_score"] / components["fusion"]["ceiling"]
+    )
+    assert row.rank_score == pytest.approx(components["normalized_fusion_score"])
+    assert 0.0 <= row.rank_score <= 1.0
 
 
 def test_comparison_rows_store_no_components(db, site):
@@ -610,7 +673,7 @@ def test_the_api_serves_the_components_for_a_pilot_row(db, site, client, eligibi
     assert payload
     served = next(row for row in payload if row["source_article"]["id"] == source.id)
     assert served["method"] == "hybrid_bm25"
-    assert served["score_components"]["final_order"] == "bm25_512"
+    assert served["score_components"]["final_order"] == "wrrf"
     assert served["score_components"]["bm25_score"] > 0.0
     assert served["score"] == pytest.approx(served["score_components"]["semantic"])
 

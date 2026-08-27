@@ -7,6 +7,32 @@ jobs.
 
 ## Local stack
 
+Keep the backend and frontend repositories as sibling directories, as in this
+workspace, then run the full application stack from the backend repository:
+
+```bash
+docker compose up -d --build
+```
+
+This builds the backend image and the frontend nginx image, runs the migration,
+and starts the API, workers, Telegram bot, and dashboard. The dashboard is
+available at `http://127.0.0.1:8080` by default and reaches the API through the
+internal `api:8000` Compose address. The Compose frontend maps `API_KEY` to the
+frontend proxy's `LINKMESH_API_KEY`; the key is never sent to the browser.
+
+Set a non-empty `API_KEY` in `.env` before starting the dashboard. Change
+`DASHBOARD_HOST_PORT` if port 8080 is already occupied.
+
+## Agent surfaces
+
+A read-only MCP registry at `/mcp/` (for Claude Code, Cursor, and any MCP
+client) and an optional chat assistant in the dashboard reuse the REST route
+functions, tenant scoping included. MCP staging tools can hand an authenticated
+editor a signed review link; the one MCP-only writer accepts only the resulting
+short-lived, one-time, identity-bound receipt. Publication stays human-only.
+Configuration, the tool list, and the security boundary are documented in
+[docs/design/agent-surfaces.md](docs/design/agent-surfaces.md).
+
 ## Review reliability and traceability
 
 Large reversible review operations, exact partial-failure recovery, and their
@@ -49,6 +75,13 @@ storage model are documented in
 Accepted Tavily suggestions join the normal lifecycle audit, while request and
 candidate decisions also have a durable provider audit described in
 [`docs/design/suggestion-traceability.md`](docs/design/suggestion-traceability.md).
+The one-shot `pool-scheduler-init` Compose service automatically registers the
+unique daily content-pool ingestion coordinator during deployment; repeated
+deployments reuse the existing schedule.
+
+For an isolated staging deployment with secret-backed database credentials,
+separate ports and volumes, and a real RSS/Wikipedia pilot, follow
+[`docs/deployment/content-pool-staging.md`](docs/deployment/content-pool-staging.md).
 
 ## Running the tests
 Create `.env` from `.env.example`, then start the services:

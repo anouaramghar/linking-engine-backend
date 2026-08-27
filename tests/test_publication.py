@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import OperationalError
@@ -23,8 +24,18 @@ from sqlalchemy.exc import OperationalError
 from app.config import settings
 from app.connectors.base import StalePlanError
 from app.db import SessionLocal
-from app.models import Alert, Article, ExternalLinkPolicy, JobRun, PublicationPlan, Suggestion
+from app.models import (
+    Alert,
+    Article,
+    ExternalLinkPolicy,
+    JobRun,
+    PublicationPlan,
+    Suggestion,
+    SuggestionEvent,
+)
 from app.services import job_service, publication_plan_service
+from app.services.external_link_policy import recheck_external_suggestions_before_publication
+from app.services.live_url import LiveURLChecker
 from app.tasks import publication
 from app.tasks.publication import publish_approved_plans
 
@@ -49,6 +60,7 @@ def _suggestion(db, site, src, tgt, status="approved", score=0.9, anchor_text="a
         target_article_id=tgt.id,
         method="baseline_cosine",
         score=score,
+        rank_score=score,
         status=status,
         anchor_text=anchor_text,
     )
@@ -197,6 +209,7 @@ def test_policy_retired_tavily_target_stales_plan_before_network_access(
         provider="tavily",
         method="external_search",
         score=0.9,
+        rank_score=0.9,
         status="approved",
         anchor_text="anchor",
     )
@@ -222,6 +235,173 @@ def test_policy_retired_tavily_target_stales_plan_before_network_access(
     retired = db.get(Suggestion, suggestion.id)
     assert (retired.status, retired.publication_plan_id) == ("expired", None)
     assert _plan_status(db, plan.id) == "stale"
+
+
+def test_dead_external_target_stales_plan_before_wordpress_write(db, site, articles, monkeypatch):
+    suggestion = Suggestion(
+        site_id=site.id,
+        source_article_id=articles[0].id,
+        target_article_id=None,
+        external_url="https://reference.example/dead",
+        external_title="Dead source",
+        provider="tavily",
+        method="external_search",
+        score=0.9,
+        rank_score=0.9,
+        status="approved",
+        anchor_text="anchor",
+    )
+    db.add(suggestion)
+    db.add(
+        ExternalLinkPolicy(
+            site_id=site.id,
+            external_links_enabled=True,
+            min_trust_score=0,
+        )
+    )
+    db.commit()
+    db.refresh(suggestion)
+    plan = _approved_plan(db, site, articles[0], [suggestion])
+    calls = _stub_connector(monkeypatch)
+    checker = LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(410))),
+        validator=lambda _url: None,
+    )
+
+    def dead_live_gate(session, source_site, **kwargs):
+        return recheck_external_suggestions_before_publication(
+            session,
+            source_site,
+            statuses=kwargs["statuses"],
+            actor=kwargs["actor"],
+            checker=checker,
+            publication_plan_ids=kwargs["publication_plan_ids"],
+        )
+
+    monkeypatch.setattr(
+        publication,
+        "recheck_external_suggestions_before_publication",
+        dead_live_gate,
+    )
+
+    result = publish_approved_plans(site.id)
+
+    assert calls == []
+    assert result["live_url_checked"] == 1
+    assert result["live_url_expired"] == 1
+    assert _status(db, suggestion.id) == "expired"
+    assert _plan_status(db, plan.id) == "stale"
+
+
+def test_each_plan_is_live_checked_at_its_own_publication_boundary(db, site, articles, monkeypatch):
+    """The second target dies while the first plan is being written.
+
+    A gate that ran once for the whole batch had already blessed this target
+    before the first WordPress call, the optional inter-request pause, and every
+    other plan's network work. By the time its own write left, the observation
+    was minutes old and wrong, and LinkMesh published a dead link. The check
+    belongs to the plan, not to the run.
+    """
+    sources = []
+    suggestions = []
+    for index in range(2):
+        source = Article(
+            site_id=site.id,
+            url=f"{site.base_url}/live-src-{index}",
+            title=f"src {index}",
+            content_text="a",
+        )
+        db.add(source)
+        db.commit()
+        suggestion = Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=None,
+            external_url=f"https://reference.example/target-{index}",
+            external_title=f"Target {index}",
+            provider="tavily",
+            method="external_search",
+            score=0.9,
+            rank_score=0.9,
+            status="approved",
+            anchor_text="anchor",
+        )
+        db.add(suggestion)
+        db.commit()
+        db.refresh(suggestion)
+        sources.append(source)
+        suggestions.append(suggestion)
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True, min_trust_score=0))
+    db.commit()
+    plans = [
+        _approved_plan(db, site, source, [suggestion])
+        for source, suggestion in zip(sources, suggestions, strict=True)
+    ]
+
+    second_alive = True
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested.append(url)
+        if url.endswith("/target-1") and not second_alive:
+            return httpx.Response(410)
+        return httpx.Response(200)
+
+    checker = LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        validator=lambda _url: None,
+    )
+
+    def scoped_live_gate(session, source_site, **kwargs):
+        return recheck_external_suggestions_before_publication(
+            session,
+            source_site,
+            statuses=kwargs["statuses"],
+            actor=kwargs["actor"],
+            checker=checker,
+            publication_plan_ids=kwargs["publication_plan_ids"],
+        )
+
+    monkeypatch.setattr(
+        publication,
+        "recheck_external_suggestions_before_publication",
+        scoped_live_gate,
+    )
+
+    def kill_the_second_target(_source, _original_html, _updated_html):
+        nonlocal second_alive
+        second_alive = False
+
+    calls = _stub_connector(monkeypatch, apply=kill_the_second_target)
+
+    result = publish_approved_plans(site.id)
+
+    # The write that matters is the one that did not happen.
+    assert [call.source_id for call in calls] == [sources[0].id]
+    assert requested == [
+        "https://reference.example/target-0",
+        "https://reference.example/target-1",
+    ]
+    assert _core(result) == {"applied": 1, "failed": 0, "skipped": 1}
+    assert (result["live_url_checked"], result["live_url_passed"], result["live_url_expired"]) == (
+        2,
+        1,
+        1,
+    )
+    assert _status(db, suggestions[0].id) == "applied"
+    assert _plan_status(db, plans[0].id) == "applied"
+    assert _status(db, suggestions[1].id) == "expired"
+    assert _plan_status(db, plans[1].id) == "stale"
+    assert (
+        db.scalar(
+            select(SuggestionEvent).where(
+                SuggestionEvent.suggestion_id == suggestions[1].id,
+                SuggestionEvent.event_type == "live_url_expired",
+            )
+        )
+        is not None
+    )
 
 
 def test_a_site_with_only_selected_suggestions_publishes_nothing(db, site, articles, monkeypatch):
@@ -514,6 +694,109 @@ def test_a_scoped_worker_leaves_other_approved_plans_untouched(db, site, article
     assert [call.source_id for call in calls] == [second_source.id]
     assert _plan_status(db, first_plan.id) == "approved"
     assert _plan_status(db, second_plan.id) == "applied"
+
+
+def test_a_scoped_worker_checks_only_external_links_in_its_selected_plan(
+    db, site, articles, monkeypatch
+):
+    first_source = articles[0]
+    second_source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/second-external",
+        title="second external",
+        content_text="second external",
+    )
+    db.add(second_source)
+    db.add(
+        ExternalLinkPolicy(
+            site_id=site.id,
+            external_links_enabled=True,
+            min_trust_score=0,
+            blocklist_domains=["blocked.example"],
+        )
+    )
+    db.commit()
+
+    first = Suggestion(
+        site_id=site.id,
+        source_article_id=first_source.id,
+        external_url="https://blocked.example/unrelated",
+        external_title="Unrelated blocked target",
+        provider="tavily",
+        method="external_search",
+        score=0.9,
+        rank_score=0.9,
+        status="approved",
+        anchor_text="unrelated",
+    )
+    second = Suggestion(
+        site_id=site.id,
+        source_article_id=second_source.id,
+        external_url="https://reference.example/selected",
+        external_title="Selected live target",
+        provider="tavily",
+        method="external_search",
+        score=0.9,
+        rank_score=0.9,
+        status="approved",
+        anchor_text="selected",
+    )
+    db.add_all([first, second])
+    db.commit()
+    db.refresh(first)
+    db.refresh(second)
+    first_plan = _approved_plan(db, site, first_source, [first])
+    second_plan = _approved_plan(db, site, second_source, [second])
+
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(204)
+
+    checker = LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        validator=lambda _url: None,
+    )
+
+    def scoped_live_gate(session, source_site, **kwargs):
+        return recheck_external_suggestions_before_publication(
+            session,
+            source_site,
+            statuses=kwargs["statuses"],
+            actor=kwargs["actor"],
+            checker=checker,
+            publication_plan_ids=kwargs["publication_plan_ids"],
+        )
+
+    monkeypatch.setattr(
+        publication,
+        "recheck_external_suggestions_before_publication",
+        scoped_live_gate,
+    )
+    calls = _stub_connector(monkeypatch)
+
+    result = publish_approved_plans(site.id, plan_ids=[second_plan.id])
+
+    assert result["applied"] == 1
+    assert result["policy_expired"] == 0
+    assert result["live_url_checked"] == 1
+    assert requested == ["https://reference.example/selected"]
+    assert [call.source_id for call in calls] == [second_source.id]
+    assert _status(db, first.id) == "approved"
+    assert _plan_status(db, first_plan.id) == "approved"
+    assert _plan_status(db, second_plan.id) == "applied"
+    assert (
+        db.scalar(
+            select(SuggestionEvent).where(
+                SuggestionEvent.suggestion_id == first.id,
+                SuggestionEvent.event_type.in_(
+                    ("policy_expired", "live_url_checked", "live_url_expired")
+                ),
+            )
+        )
+        is None
+    )
 
 
 def test_a_plan_invalidated_after_the_batch_read_is_skipped(db, site, articles, monkeypatch):

@@ -25,6 +25,7 @@ def _suggestion(db, site) -> Suggestion:
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.87,
+        rank_score=0.87,
         status="pending",
     )
     db.add(suggestion)

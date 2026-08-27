@@ -110,12 +110,47 @@ score rules are not applied to direct web-search results. A Tavily result is not
 a pool source and has no operator-supplied registration metadata. Treating it as
 if it had those attributes would create false trust evidence.
 
+## Live URL gate
+
+Static policy is necessary but cannot detect link rot. External candidates that
+reach final selection therefore receive a bounded live check before persistence,
+and approved external suggestions receive a fresh check immediately before a
+publication write. A candidate passes only when its final response is HTTP 2xx.
+
+The checker sends `HEAD` first and falls back to a streaming `GET` when a server
+refuses HEAD with 403, 405, or 501. It never reads the response body. The whole
+candidate check shares one `LIVE_URL_TIMEOUT_SECONDS` wall-clock deadline (8
+seconds by default) across DNS, connect, TLS, HEAD/GET fallback, socket reads and
+every redirect hop. It follows at most `LIVE_URL_MAX_REDIRECTS` redirects (5 by
+default), verifies TLS, and ignores proxy environment variables.
+
+Every redirect hop passes the connect-time SSRF guard and the site's external
+policy before the request is sent. A public URL cannot redirect LinkMesh to
+localhost, a private/link-local address, HTTP, an owned domain, or a blocked or
+competitor domain. Direct web-search suggestions store the normalized final URL
+rather than the provider's redirect alias. Content-pool URLs retain their
+article identity but carry the observed final destination as evidence.
+
+The generation-time observation is stored under `score_components.live_url`,
+including the status, final URL, redirect count, timestamp, and refusal reason.
+A failed provider candidate is retained in `external_search_audit_events` with
+decision `live_url_failed`. The fresh publication-time observation is append-only
+evidence in a `live_url_checked` or `live_url_expired` suggestion event, because
+ranking snapshots are immutable. A failed check expires the suggestion and makes
+its immutable plan stale before WordPress is contacted.
+
 Candidates that pass the hard guards are embedded from their title and snippet.
 Their cosine similarity to the source article must satisfy both the global
 `SUGGESTION_MIN_SCORE` and the site's editorial minimum. LinkMesh ranks them by
 that semantic score, using Tavily rank only as a deterministic tie-breaker, and
 stores no more than the number of open slots. `provider_score` remains separate
 provider trace data; it is never presented as LinkMesh semantic confidence.
+
+A web-search row's `rank_score` is that same cosine similarity. The provider's
+relevance is a different quantity on a coincidentally similar scale, so it is
+never rescaled into the queue's percentage. See
+[Global Hybrid standard](global-hybrid-ranking.md) for what `rank_score` means
+across the other methods.
 
 ## URL identity and storage
 

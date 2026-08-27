@@ -53,6 +53,30 @@ class SuggestionEventOut(BaseModel):
     created_at: datetime
 
 
+class CitationNeedOut(BaseModel):
+    sentence: str
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasons: list[str]
+    detector_version: str
+
+
+class CitationNeedAnalysisOut(BaseModel):
+    article_id: int
+    content_fingerprint: str
+    detector_version: str
+    threshold: float = Field(ge=0.0, le=1.0)
+    language: str
+    sentences_analyzed: int = Field(ge=0)
+    total_detected: int = Field(ge=0)
+    truncated: bool
+    # False means the article's language is outside the detector's rules, so an
+    # empty list is "not analyzed" rather than "nothing needs a source".
+    language_supported: bool = True
+    items: list[CitationNeedOut]
+
+
 class TraceEventOut(SuggestionEventOut):
     trace_id: str
     site_id: int
@@ -85,6 +109,14 @@ class SuggestionOut(BaseModel):
     method: str
     #: Cosine semantic similarity, whichever method selected the row.
     score: float
+    #: How strongly the ranker that selected this row preferred it, 0-1, where
+    #: 1 is the strongest that ranker can say. The queue orders, cursors and
+    #: filters on this, and it is the percentage on the review card.
+    #:
+    #: Not interchangeable with `score`: for a fusion-ordered hybrid row this
+    #: is the weighted-RRF score over its reachable ceiling, and only where no
+    #: bounded ordering signal exists does it fall back to cosine.
+    rank_score: float
     #: How this row was chosen, when the method records it. For `hybrid_bm25`:
     #: the BM25 score that ordered it, its fusion and per-retriever ranks, and
     #: the recipe names. Null for `baseline_cosine`, whose score already is its
@@ -143,6 +175,13 @@ BulkRuleStatus = Literal["approved", "rejected"]
 class SuggestionReview(BaseModel):
     status: ReviewStatus
     rejection_reason: RejectionReason | None = None
+    expected_status: ReviewStatus | None = Field(
+        None,
+        description=(
+            "Only review the suggestion if it still has this status. Agent-staged "
+            "actions use this as an optimistic-concurrency guard."
+        ),
+    )
 
     @model_validator(mode="after")
     def reason_only_applies_to_rejection(self) -> "SuggestionReview":
@@ -175,7 +214,7 @@ class SuggestionExposureResult(BaseModel):
 class SuggestionCursor(BaseModel):
     """The last ordered row from a page, used to continue strictly below it."""
 
-    score: float
+    rank_score: float
     id: int
 
 

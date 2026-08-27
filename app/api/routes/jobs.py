@@ -7,7 +7,12 @@ from app.api.pagination import MAX_PAGE_SIZE
 from app.models import JobRun, Site
 from app.schemas.job import JobRunOut, JobStatus
 from app.services.authorization import Principal, authorize_site, tenant_site_filter
-from app.services.job_service import get_job_status, reconcile_active_job_runs
+from app.services.job_service import (
+    JobCancellationConflict,
+    cancel_job_run,
+    get_job_status,
+    reconcile_active_job_runs,
+)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -21,7 +26,7 @@ def list_active_job_runs(
     """Return durable work that is still present in its RQ queue."""
     query = (
         select(JobRun)
-        .where(JobRun.status.in_(("queued", "running")))
+        .where(JobRun.status.in_(("queued", "running", "cancel_requested")))
         .order_by(JobRun.enqueued_at.desc())
         .limit(limit)
     )
@@ -43,6 +48,22 @@ def list_job_runs(
     if kind:
         query = query.where(JobRun.kind == kind)
     return db.scalars(query.order_by(JobRun.enqueued_at.desc()).limit(limit).offset(offset)).all()
+
+
+@router.post("/runs/{job_run_id}/cancel", response_model=JobRunOut)
+def cancel_job(
+    job_run_id: int,
+    principal: Principal = Depends(require_api_key),
+    db: Session = Depends(get_db),
+) -> JobRun:
+    run = db.get(JobRun, job_run_id)
+    if run is None:
+        raise HTTPException(404, f"job run {job_run_id} not found")
+    authorize_site(db, principal, run.site_id)
+    try:
+        return cancel_job_run(db, job_run_id)
+    except JobCancellationConflict as error:
+        raise HTTPException(409, str(error)) from error
 
 
 @router.get("/{job_id}", response_model=JobStatus)

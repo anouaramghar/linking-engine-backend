@@ -42,9 +42,7 @@ def main() -> None:
         parser.error("--k must be at least 1")
 
     try:
-        dataset = ReviewerLabelDataset.from_dict(
-            json.loads(args.split.read_text(encoding="utf-8"))
-        )
+        dataset = ReviewerLabelDataset.from_dict(json.loads(args.split.read_text(encoding="utf-8")))
         with SessionLocal() as db:
             payload = run_reviewer_benchmark(
                 db,

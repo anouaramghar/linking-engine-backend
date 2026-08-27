@@ -162,6 +162,7 @@ def test_a_target_the_source_already_links_to_is_still_ranked(db):
                 target_article_id=target.id,
                 method="hybrid_bm25",
                 score=0.8,
+                rank_score=0.8,
                 status="pending",
             ),
         ]
@@ -326,7 +327,7 @@ def test_each_method_orders_the_same_candidates_its_own_way(db):
 
     evidence = ranker.ranked_candidates(db, source_id=source.id, method="hybrid")
     assert [candidate.target_id for candidate in evidence] == ranked["hybrid"]
-    assert evidence[0].score_components()["final_order"] == "bm25_512"
+    assert evidence[0].score_components()["final_order"] == "wrrf"
     assert evidence[0].lexical_rank == 1
 
     db.delete(site)

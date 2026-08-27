@@ -26,7 +26,12 @@ from app.models import (
     Taxonomy,
 )
 from app.services.crawl_snapshot import CrawlSnapshot, normalize_url
-from app.services.job_service import record_progress_durably
+from app.services.job_service import (
+    JobCancelled,
+    ThrottledCancellationCheck,
+    check_job_cancellation,
+    record_progress_durably,
+)
 from app.services.pool_source_policy import PoolSourceFetchError
 
 # Advisory-lock namespace registry: 0x4C41 article upsert, 0x4C42 PBN domain
@@ -94,6 +99,8 @@ def import_articles(
         db.add(run)
         db.commit()
         snapshot = CrawlSnapshot(site_id=site.id, run_id=run.id)
+        # Once for the whole import rather than once per row; see lock_site_articles.
+        lock_site_articles(db, site.id)
         try:
             for row_number, row in enumerate(rows, start=1):
                 values = row.model_dump() if hasattr(row, "model_dump") else dict(row)
@@ -221,7 +228,7 @@ def import_articles(
                     outbound_internal_links=values.get("outbound_internal_links") or [],
                 )
                 snapshot.record_accepted_article(article)
-                article_id = _upsert_article(db, site.id, article, run.id)
+                article_id = _upsert_article(db, site.id, article, run.id, site_lock_held=True)
                 stored = db.get(Article, article_id)
                 if stored is not None and not replace_snapshot:
                     stored.is_active = True
@@ -261,8 +268,35 @@ def import_articles(
             raise
 
 
-def _upsert_article(db: Session, site_id: int, art: ArticleData, run_id: int | None = None) -> int:
+def lock_site_articles(db: Session, site_id: int) -> None:
+    """Serialize article upserts for one site until this transaction ends.
+
+    A crawl calls this once and then upserts thousands of articles under it. The
+    lock is transaction-scoped, so re-taking it per article was a round trip that
+    could only ever find it already held.
+    """
     db.execute(select(func.pg_advisory_xact_lock(_ARTICLE_UPSERT_LOCK_NAMESPACE, site_id)))
+
+
+def _upsert_article(
+    db: Session,
+    site_id: int,
+    art: ArticleData,
+    run_id: int | None = None,
+    *,
+    site_lock_held: bool = False,
+) -> int:
+    """Insert or update one article, holding the site's upsert lock.
+
+    ``site_lock_held`` is an assertion by the caller that it already took
+    :func:`lock_site_articles` in *this* transaction — true for the crawl and
+    import loops, which take it once outside the loop. It defaults to False so
+    that calling this function on its own is still safe on its own terms;
+    concurrent inserts of the same URL resolving to one row is a property of
+    this function, not of its callers' discipline.
+    """
+    if not site_lock_held:
+        lock_site_articles(db, site_id)
 
     identity_filters = [Article.url == art.url]
     if art.external_id is not None:
@@ -316,28 +350,66 @@ def _upsert_taxonomies(
     article_id: int,
     taxonomies: list[TaxonomyData],
     run_id: int,
+    resolved: dict[tuple[str, str], tuple[int, str | None]] | None = None,
 ) -> None:
+    """Attach one article to its taxonomies.
+
+    Sites reuse a small vocabulary across a large corpus, so the same category
+    was upserted again for every article carrying it — two statements per pair,
+    thousands of round trips into a crawl. ``resolved`` remembers, for the run,
+    each term's id and the ``external_id`` last written to it; pass one in from
+    the loop.
+
+    The remembered ``external_id`` is what keeps this equivalent to the loop it
+    replaces. That upsert is last-write-wins on the column, so the run's *last*
+    mention of a term decides its external id. A cache that skipped the
+    statement on every repeat would freeze whichever id arrived first, and a
+    connector that reports a term with an id on one article and without one on
+    the next would silently keep the wrong one. The statement is skipped only
+    when it would write back the value already there, which is a true no-op.
+    """
+    if resolved is None:
+        resolved = {}
+
+    taxonomy_ids: list[int] = []
     for tax in taxonomies:
+        key = (tax.kind, tax.name)
+        cached = resolved.get(key)
+        if cached is not None and cached[1] == tax.external_id:
+            taxonomy_ids.append(cached[0])
+            continue
         tax_id = db.execute(
             pg_insert(Taxonomy)
             .values(site_id=site_id, kind=tax.kind, name=tax.name, external_id=tax.external_id)
             .on_conflict_do_update(  # do_nothing returns no id; harmless update instead
-                index_elements=["site_id", "kind", "name"], set_={"external_id": tax.external_id}
+                index_elements=["site_id", "kind", "name"],
+                set_={"external_id": tax.external_id},
             )
             .returning(Taxonomy.id)
         ).scalar_one()
-        db.execute(
-            pg_insert(ArticleTaxonomy)
-            .values(
-                article_id=article_id,
-                taxonomy_id=tax_id,
-                last_seen_run_id=run_id,
-            )
-            .on_conflict_do_update(
-                index_elements=["article_id", "taxonomy_id"],
-                set_={"last_seen_run_id": run_id},
-            )
+        resolved[key] = (tax_id, tax.external_id)
+        taxonomy_ids.append(tax_id)
+
+    # One multi-row statement per article rather than one per taxonomy. The
+    # de-duplication is required, not tidiness: an article may list the same
+    # term twice, and ON CONFLICT DO UPDATE refuses to touch a row twice within
+    # a single statement. The per-row loop this replaces absorbed that silently.
+    unique_ids = list(dict.fromkeys(taxonomy_ids))
+    if not unique_ids:
+        return
+    db.execute(
+        pg_insert(ArticleTaxonomy)
+        .values(
+            [
+                {"article_id": article_id, "taxonomy_id": tax_id, "last_seen_run_id": run_id}
+                for tax_id in unique_ids
+            ]
         )
+        .on_conflict_do_update(
+            index_elements=["article_id", "taxonomy_id"],
+            set_={"last_seen_run_id": run_id},
+        )
+    )
 
 
 def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
@@ -362,6 +434,13 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         articles_seen = 0
         total_outbound_links = 0
         last_progress_count = 0
+        # Once for the whole crawl rather than once per article; see lock_site_articles.
+        lock_site_articles(db, site_id)
+        # Taxonomy ids resolved once per run and reused across articles.
+        resolved_taxonomies: dict[tuple[str, str], tuple[int, str | None]] = {}
+        # Per-article probe only. The checkpoints below that guard reconciliation
+        # and promotion keep asking every time.
+        crawl_cancelled = ThrottledCancellationCheck(job_run_id)
         try:
             articles_iterator = iter(connector.fetch_articles())
         except Exception as error:
@@ -369,6 +448,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
                 raise PoolSourceFetchError(str(error)) from error
             raise
         while True:
+            crawl_cancelled()
             check_crawl_deadline(crawl_started_at)
             try:
                 art = next(articles_iterator)
@@ -405,8 +485,8 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             if total_outbound_links > settings.crawl_max_total_links:
                 raise ValueError(f"crawl link count exceeded {settings.crawl_max_total_links}")
             snapshot.record_accepted_article(art)
-            article_id = _upsert_article(db, site_id, art, run.id)
-            _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id)
+            article_id = _upsert_article(db, site_id, art, run.id, site_lock_held=True)
+            _upsert_taxonomies(db, site_id, article_id, art.taxonomies, run.id, resolved_taxonomies)
             snapshot.stage_article(art, article_id)
             articles = snapshot.article_count
             if articles % 50 == 0 and articles != last_progress_count:
@@ -420,6 +500,7 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
 
         articles = snapshot.article_count
 
+        check_job_cancellation(job_run_id)
         try:
             snapshot.validate_completeness(db)
         except ValueError as error:
@@ -428,21 +509,29 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
             raise
 
         # Resolve links once all articles are known (forward references)
+        check_job_cancellation(job_run_id)
         record_progress_durably(job_run_id, stage="resolving_links")
         resolve_internal_url = getattr(connector, "resolve_internal_url", None)
+
+        def check_crawl_interruption() -> None:
+            check_job_cancellation(job_run_id)
+            check_crawl_deadline(crawl_started_at)
+
         links = snapshot.resolve_links(
             db,
             resolve_internal_url=resolve_internal_url,
-            check_deadline=lambda: check_crawl_deadline(crawl_started_at),
+            check_deadline=check_crawl_interruption,
         )
 
         # Reconciliation is success-gated after link resolution (Phase 0, finding 3).
+        check_job_cancellation(job_run_id)
         record_progress_durably(
             job_run_id,
             stage="reconciling",
             articles=articles,
             links=links,
         )
+        check_job_cancellation(job_run_id)
         snapshot.promote(db)
         run.status = "succeeded"
         run.articles_upserted = articles
@@ -451,6 +540,15 @@ def _run_ingestion_locked(site_id: int, job_run_id: int | None = None) -> dict:
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
         return {"articles": articles, "links": links}
+    except JobCancelled as e:
+        db.rollback()
+        run.status = "cancelled"
+        run.error = str(e)[:2000]
+        if connector is not None:
+            snapshot.persist_diagnostics(db, run, connector)
+        run.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        raise
     except Exception as e:
         db.rollback()
         run.status = "failed"
@@ -476,10 +574,15 @@ def run_ingestion(site_id: int, job_run_id: int | None = None) -> dict:
             raise
         db = SessionLocal()
         try:
+            status = "failed"
+            try:
+                check_job_cancellation(job_run_id)
+            except JobCancelled:
+                status = "cancelled"
             run = IngestionRun(
                 site_id=site_id,
                 job_run_id=job_run_id,
-                status="failed",
+                status=status,
                 error=str(error)[:2000],
                 finished_at=datetime.now(timezone.utc),
             )

@@ -20,7 +20,16 @@ from app.connectors.feed_discovery import (
 )
 from app.connectors.registry import get_connector
 from app.connectors.rss_connector import RSSConnector
-from app.connectors.wikipedia_connector import WikipediaConnector
+from app.connectors.url_guard import UnsafeURLError
+from app.connectors.wikipedia_connector import (
+    MAX_EMPTY_RESPONSES,
+    WikipediaConnector,
+)
+from app.main import app
+from app.ml.external.cleaning import (
+    deduplicate_external_urls,
+    normalize_external_url,
+)
 from app.models import (
     Article,
     Embedding,
@@ -31,14 +40,9 @@ from app.models import (
     Suggestion,
 )
 from app.models.article import EMBEDDING_DIM
-from app.ml.external.cleaning import (
-    deduplicate_external_urls,
-    normalize_external_url,
-)
-from app.main import app
 from app.schemas.site import SiteCreate
-from app.connectors.url_guard import UnsafeURLError
 from app.services.crawl_snapshot import _reconcile_snapshot
+from app.services.live_url import LiveURLChecker
 from app.services.pool_source_policy import (
     PoolSourceFetchError,
     PoolSourcePolicyError,
@@ -49,6 +53,13 @@ from app.services.pool_source_policy import (
 from app.services.suggestion_service import generate_suggestions
 from app.tasks import ingestion as ingestion_task
 from app.tasks import pool_ingestion
+
+
+def _passing_live_url_checker() -> LiveURLChecker:
+    return LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(200))),
+        validator=lambda _url: None,
+    )
 
 
 def _vector(first: float, second: float = 0.0) -> list[float]:
@@ -371,6 +382,16 @@ def test_wikipedia_connector_follows_continuation_and_validates_json(monkeypatch
 
     def handler(request):
         nonlocal calls
+        # The link pass is a separate query and is answered separately, so the
+        # extract continuation below still counts one request per article.
+        if request.url.params.get("prop") == "links" or (
+            request.url.params.get("rvdir") == "newer"
+        ):
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json; charset=utf-8"},
+                content=json.dumps({"query": {"pages": []}}).encode(),
+            )
         calls += 1
         assert "rvlimit" not in request.url.params
         payload = {"query": {"pages": [pages[calls - 1]]}}
@@ -391,7 +412,54 @@ def test_wikipedia_connector_follows_continuation_and_validates_json(monkeypatch
 
     assert [article.title for article in articles] == ["First", "Second"]
     assert calls == 2
-    assert sleeps == [settings.pool_request_delay_seconds]
+    # One delay between the two extract requests, one between the two
+    # creation-date requests. Both passes are paced by the same setting.
+    assert sleeps == [settings.pool_request_delay_seconds] * 2
+
+
+def test_wikipedia_direct_article_lookup_ignores_older_revision_continuation():
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        assert request.url.params["rvlimit"] == "1"
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(
+                {
+                    "query": {
+                        "pages": [
+                            {
+                                "pageid": 1,
+                                "title": "RSS",
+                                "fullurl": "https://en.wikipedia.org/wiki/RSS",
+                                "extract": "RSS is a web feed format.",
+                                "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+                            }
+                        ]
+                    },
+                    "continue": {"rvcontinue": "older-revision", "continue": "-||"},
+                }
+            ).encode(),
+        )
+
+    connector = WikipediaConnector(
+        Site(
+            name="Wiki",
+            base_url="https://en.wikipedia.org/wiki/RSS",
+            platform="pool",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    article = connector.fetch_article_by_url("https://en.wikipedia.org/wiki/RSS")
+
+    connector.client.close()
+    assert article is not None
+    assert article.title == "RSS"
+    assert calls == 1
 
 
 def test_wikipedia_connector_bounds_empty_continuations(monkeypatch):
@@ -421,7 +489,10 @@ def test_wikipedia_connector_bounds_empty_continuations(monkeypatch):
         list(connector.fetch_articles())
 
     connector.client.close()
-    assert calls == 2
+    # One request per requested article, plus the one that detects the budget is
+    # spent. MediaWiki returns a single extract per query, so the budget counts
+    # articles rather than generator pages.
+    assert calls == MAX_EMPTY_RESPONSES
 
 
 def test_wikipedia_connector_rejects_oversized_and_non_json_responses(monkeypatch):
@@ -768,6 +839,7 @@ def test_revoking_pool_source_expires_active_customer_suggestions(client, db):
             target_article_id=target.id,
             method="hybrid_bm25",
             score=0.8,
+            rank_score=0.8,
             status=status,
         )
         for status in ("pending", "approved", "rejected")
@@ -848,6 +920,7 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.8,
+        rank_score=0.8,
         status="pending",
     )
     already_approved = Suggestion(
@@ -856,6 +929,7 @@ def test_pool_source_is_quarantined_after_terminal_failures(monkeypatch, db):
         target_article_id=target.id,
         method="baseline_cosine",
         score=0.7,
+        rank_score=0.7,
         status="approved",
     )
     db.add_all([suggestion, already_approved])
@@ -1078,7 +1152,7 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
         site_id=site.id,
         url=f"{site.base_url}/tomato-guide",
         title="Tomato canning guide",
-        content_text="tomato canning jars safety",
+        content_text=("A 2024 study found that safe tomato canning reduces infection risk by 30%."),
     )
     target = Article(
         site_id=pool.id,
@@ -1111,11 +1185,125 @@ def test_hybrid_can_target_pool_articles_but_keeps_customer_sources(db, site, mo
     )
     db.commit()
     try:
-        generate_suggestions(site.id)
+        result = generate_suggestions(
+            site.id,
+            live_url_checker=_passing_live_url_checker(),
+        )
         suggestion = db.scalar(select(Suggestion).where(Suggestion.site_id == site.id))
         assert suggestion is not None
         assert suggestion.source_article_id == source.id
         assert suggestion.target_article_id == target.id
+        assert suggestion.score_components["live_url"]["eligible"] is True
+        assert suggestion.score_components["citation_need"]["detector_version"] == (
+            "citation_rules_en_v2"
+        )
+        assert (
+            suggestion.feature_snapshot["citation_need"]
+            == (suggestion.score_components["citation_need"])
+        )
+        assert result["citation_need_sources_detected"] == 1
+        assert result["citation_need_sentences_detected"] == 1
+    finally:
+        db.delete(pool)
+        db.commit()
+
+
+def test_a_dead_pool_target_falls_through_to_the_next_live_one(db, site, monkeypatch):
+    """A dead top-ranked pool target is a ranking miss, not a paid search slot.
+
+    The open slot used to be handed to Tavily: the pipeline kept exactly
+    `remaining` ranked candidates, the live check then discarded the dead one,
+    and the resulting gap was filled by a billed request that also sent the
+    source title to a third party — while the next ranked pool candidate was
+    live, free, and already eligible.
+    """
+    monkeypatch.setattr(
+        "app.ml.embeddings.encode",
+        lambda texts: [_vector(1.0) for _text in texts],
+    )
+    monkeypatch.setattr(settings, "hybrid_max_suggestions_per_article", 1)
+    monkeypatch.setattr(
+        "app.services.suggestion_service.fill_external_suggestion_gap",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a live ranked pool candidate was skipped for Tavily"
+        ),
+    )
+    pool = _pool(db)
+    source = Article(
+        site_id=site.id,
+        url=f"{site.base_url}/tomato-guide",
+        title="Tomato canning guide",
+        content_text="A 2024 study found that safe tomato canning reduces infection risk by 30%.",
+    )
+    dead = Article(
+        site_id=pool.id,
+        url="https://example.com/tomato-dead",
+        title="Safe tomato canning",
+        content_text="tomato canning jars boiling water safety",
+    )
+    live = Article(
+        site_id=pool.id,
+        url="https://example.com/tomato-live",
+        title="Tomato canning basics",
+        content_text="tomato canning jars boiling water basics",
+    )
+    db.add_all([source, dead, live])
+    db.add(ExternalLinkPolicy(site_id=site.id, external_links_enabled=True))
+    db.flush()
+    for article, vector in (
+        (source, _vector(1.0)),
+        (dead, _vector(1.0)),
+        (live, _vector(0.8, 0.6)),
+    ):
+        db.add(
+            Embedding(
+                article_id=article.id,
+                model=settings.embedding_model,
+                vector=vector,
+                content_fingerprint=_fingerprint(article.title, article.content_text),
+                input_recipe_version=1,
+                vector_size=EMBEDDING_DIM,
+            )
+        )
+    db.commit()
+
+    requested: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        requested.append(url)
+        return httpx.Response(410 if url.endswith("/tomato-dead") else 200)
+
+    checker = LiveURLChecker(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        validator=lambda _url: None,
+    )
+
+    try:
+        # Use the deterministic cosine path so the intentionally closest dead
+        # target is first; the regression is about post-ranking liveness
+        # filtering, not about which hybrid retriever wins the ordering.
+        result = generate_suggestions(
+            site.id,
+            live_url_checker=checker,
+            ranking_mode_override="baseline",
+        )
+
+        suggestions = db.scalars(select(Suggestion).where(Suggestion.site_id == site.id)).all()
+        assert [row.target_article_id for row in suggestions] == [live.id]
+        stored = suggestions[0]
+        # The slot the dead row vacated, filled by rank and re-numbered: the
+        # evidence describes the row that was stored, not the one that was not.
+        assert stored.final_rank == 1
+        assert stored.method != "external_search"
+        assert stored.score_components["live_url"]["eligible"] is True
+        assert stored.score_components["live_url"]["checks"]["final_url"].endswith("/tomato-live")
+        assert stored.score_components["external_trust"]["eligible"] is True
+        assert requested == [dead.url, live.url]
+        assert result["external_searches"] == 0
+        assert result["external_suggestions_created"] == 0
+        assert result["live_url_candidates_checked"] == 2
+        assert result["live_url_candidates_blocked"] == 1
     finally:
         db.delete(pool)
         db.commit()
@@ -1149,6 +1337,7 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
         target_article_id=internal_target.id,
         method="baseline_cosine",
         score=0.9,
+        rank_score=0.9,
     )
     external = Suggestion(
         site_id=site.id,
@@ -1156,6 +1345,7 @@ def test_suggestion_api_identifies_internal_and_pool_targets(client, db, site):
         target_article_id=pool_target.id,
         method="hybrid_bm25",
         score=0.8,
+        rank_score=0.8,
     )
     db.add_all([internal, external])
     db.commit()
@@ -1254,6 +1444,7 @@ def test_pool_reconciliation_expires_customer_suggestions_to_missing_targets(db,
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.8,
+        rank_score=0.8,
         status="pending",
     )
     run = IngestionRun(site_id=pool.id, status="running")
@@ -1268,3 +1459,136 @@ def test_pool_reconciliation_expires_customer_suggestions_to_missing_targets(db,
     finally:
         db.delete(pool)
         db.commit()
+
+
+def test_wikipedia_connector_captures_links_between_fetched_articles(monkeypatch):
+    """The link pass is what makes an offline ranking benchmark possible.
+
+    Wikipedia's inter-article links are human-authored link decisions, so they
+    are the only relevance judgments LinkMesh can read without asking a
+    reviewer. Only links whose target is also in the fetched set are kept:
+    ingestion resolves an outbound URL against the same site and drops the rest.
+    """
+    site = Site(
+        name="Wiki",
+        base_url="https://en.wikipedia.org/wiki/Bread",
+        platform="pool",
+    )
+    pages = [
+        {
+            "pageid": 1,
+            "title": "Bread",
+            "fullurl": "https://en.wikipedia.org/wiki/Bread",
+            "extract": "bread article",
+            "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+        },
+        {
+            "pageid": 2,
+            "title": "Sourdough",
+            "fullurl": "https://en.wikipedia.org/wiki/Sourdough",
+            "extract": "sourdough article",
+            "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+        },
+    ]
+    extract_calls = 0
+
+    def handler(request):
+        nonlocal extract_calls
+        if request.url.params.get("rvdir") == "newer":
+            # The creation-date pass; this test asserts only the link graph.
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=json.dumps({"query": {"pages": []}}).encode(),
+            )
+        if request.url.params.get("prop") == "links":
+            assert request.url.params.get("plnamespace") == "0"
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=json.dumps(
+                    {
+                        "query": {
+                            "pages": [
+                                {
+                                    "pageid": 1,
+                                    "links": [
+                                        {"ns": 0, "title": "Sourdough"},
+                                        # Outside the fetched set, so dropped.
+                                        {"ns": 0, "title": "Rye bread"},
+                                        # A self-link must never become a row.
+                                        {"ns": 0, "title": "Bread"},
+                                    ],
+                                },
+                                {"pageid": 2, "links": []},
+                            ]
+                        }
+                    }
+                ).encode(),
+            )
+        extract_calls += 1
+        payload = {"query": {"pages": [pages[extract_calls - 1]]}}
+        if extract_calls == 1:
+            payload["continue"] = {"continue": "-||", "gsroffset": 20}
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(payload).encode(),
+        )
+
+    monkeypatch.setattr(settings, "pool_max_articles_per_source", 2)
+    monkeypatch.setattr("app.connectors.wikipedia_connector.time.sleep", lambda _delay: None)
+    connector = WikipediaConnector(site, transport=httpx.MockTransport(handler))
+    articles = {article.title: article for article in connector.fetch_articles()}
+    connector.client.close()
+
+    links = articles["Bread"].outbound_internal_links
+    assert [link.url for link in links] == ["https://en.wikipedia.org/wiki/Sourdough"]
+    assert links[0].anchor_text == "Sourdough"
+    assert articles["Sourdough"].outbound_internal_links == []
+
+
+def test_wikipedia_link_capture_can_be_disabled(monkeypatch):
+    """`pool_max_links_per_article = 0` must send no link query at all."""
+    site = Site(name="Wiki", base_url="https://en.wikipedia.org/wiki/Bread", platform="pool")
+    link_queries = 0
+
+    def handler(request):
+        nonlocal link_queries
+        if request.url.params.get("prop") == "links":
+            link_queries += 1
+        if request.url.params.get("rvdir") == "newer":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                content=json.dumps({"query": {"pages": []}}).encode(),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(
+                {
+                    "query": {
+                        "pages": [
+                            {
+                                "pageid": 1,
+                                "title": "Bread",
+                                "fullurl": "https://en.wikipedia.org/wiki/Bread",
+                                "extract": "bread article",
+                                "revisions": [{"timestamp": "2026-08-01T00:00:00Z"}],
+                            }
+                        ]
+                    }
+                }
+            ).encode(),
+        )
+
+    monkeypatch.setattr(settings, "pool_max_articles_per_source", 1)
+    monkeypatch.setattr(settings, "pool_max_links_per_article", 0)
+    monkeypatch.setattr("app.connectors.wikipedia_connector.time.sleep", lambda _delay: None)
+    connector = WikipediaConnector(site, transport=httpx.MockTransport(handler))
+    articles = list(connector.fetch_articles())
+    connector.client.close()
+
+    assert link_queries == 0
+    assert articles[0].outbound_internal_links == []

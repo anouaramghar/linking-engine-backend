@@ -88,6 +88,31 @@ def _same_property(left: str, right: str) -> bool:
     return left == right or left.endswith(f".{right}") or right.endswith(f".{left}")
 
 
+def pbn_conflict_reason(db: Session, base_url: str, *, as_pool: bool) -> str | None:
+    """Describe a current PBN conflict without locking or changing state."""
+
+    domain = pool_source_domain(base_url)
+    query = (
+        select(Site.base_url).where(Site.platform != "pool")
+        if as_pool
+        else select(Site.base_url).where(
+            Site.platform == "pool", Site.pool_source_approved.is_(True)
+        )
+    )
+    for other_url in db.scalars(query):
+        try:
+            other_domain = pool_source_domain(other_url)
+        except PoolSourcePolicyError:
+            continue  # a malformed stored URL is not evidence of a conflict
+        if _same_property(domain, other_domain):
+            held_by = "a client site" if as_pool else "an approved content-pool source"
+            return (
+                f"domain {domain!r} is already {held_by} ({other_domain!r}); "
+                "linking it from other clients would form a private blog network"
+            )
+    return None
+
+
 def require_no_pbn_conflict(db: Session, base_url: str, *, as_pool: bool) -> None:
     """A domain we manage for a client may never also be a link target (PBN rule).
 
@@ -105,25 +130,8 @@ def require_no_pbn_conflict(db: Session, base_url: str, *, as_pool: bool) -> Non
     write it protects lands.
     """
     db.execute(select(func.pg_advisory_xact_lock(_PBN_LOCK_NAMESPACE, _PBN_LOCK_KEY)))
-    domain = pool_source_domain(base_url)
-    query = (
-        select(Site.base_url).where(Site.platform != "pool")
-        if as_pool
-        else select(Site.base_url).where(
-            Site.platform == "pool", Site.pool_source_approved.is_(True)
-        )
-    )
-    for other_url in db.scalars(query):
-        try:
-            other_domain = pool_source_domain(other_url)
-        except PoolSourcePolicyError:
-            continue  # a malformed stored URL is not evidence of a conflict
-        if _same_property(domain, other_domain):
-            held_by = "a client site" if as_pool else "an approved content-pool source"
-            raise PoolSourcePolicyError(
-                f"domain {domain!r} is already {held_by} ({other_domain!r}); "
-                "linking it from other clients would form a private blog network"
-            )
+    if reason := pbn_conflict_reason(db, base_url, as_pool=as_pool):
+        raise PoolSourcePolicyError(reason)
 
 
 def require_approved_pool_source(site: Site) -> None:
@@ -137,6 +145,40 @@ def require_approved_pool_source(site: Site) -> None:
             f"{site.pool_source_quarantine_reason or 'repeated ingestion failures'}"
         )
     require_allowed_pool_domain(site.base_url)
+
+
+def pool_source_state(site: Site) -> dict[str, object]:
+    """JSON-safe lifecycle state shared by previews and guarded mutations."""
+
+    return {
+        "approved": site.pool_source_approved,
+        "quarantined": site.pool_source_quarantined,
+        "consecutive_failures": site.pool_source_consecutive_failures,
+        "quarantined_at": (
+            site.pool_source_quarantined_at.isoformat()
+            if site.pool_source_quarantined_at is not None
+            else None
+        ),
+    }
+
+
+def pool_target_suggestion_ids(
+    db: Session, site_id: int, *, reason: Literal["revoked", "quarantined"]
+) -> list[int]:
+    """Exact suggestion rows a pool-source disablement would expire."""
+
+    statuses = ("pending", "approved") if reason == "revoked" else ("pending",)
+    target_ids = select(Article.id).where(Article.site_id == site_id)
+    return list(
+        db.scalars(
+            select(Suggestion.id)
+            .where(
+                Suggestion.target_article_id.in_(target_ids),
+                Suggestion.status.in_(statuses),
+            )
+            .order_by(Suggestion.id)
+        )
+    )
 
 
 def expire_pool_target_suggestions(
@@ -154,14 +196,10 @@ def expire_pool_target_suggestions(
     three times says nothing about the target article, so discarding a decision
     an editor already made would cost more than it protects.
     """
-    statuses = ("pending", "approved") if reason == "revoked" else ("pending",)
-    target_ids = select(Article.id).where(Article.site_id == site_id)
+    suggestion_ids = pool_target_suggestion_ids(db, site_id, reason=reason)
+    if not suggestion_ids:
+        return 0
     result = db.execute(
-        update(Suggestion)
-        .where(
-            Suggestion.target_article_id.in_(target_ids),
-            Suggestion.status.in_(statuses),
-        )
-        .values(status="expired")
+        update(Suggestion).where(Suggestion.id.in_(suggestion_ids)).values(status="expired")
     )
     return result.rowcount or 0

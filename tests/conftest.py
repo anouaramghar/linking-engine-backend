@@ -19,6 +19,7 @@ time and pydantic-settings lets a real environment variable win over ``.env``.
 
 import os
 import uuid
+from datetime import UTC, datetime
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
@@ -127,6 +128,27 @@ from app.main import app  # noqa: E402
 from app.models import Site, Tenant  # noqa: E402
 from app.services import telegram  # noqa: E402
 from app.services.authorization import Principal, ensure_default_tenant  # noqa: E402
+from app.services.live_url import LiveURLCheck  # noqa: E402
+
+
+class _OfflineLiveURLChecker:
+    """Deterministic stand-in for tests that do not exercise HTTP liveness."""
+
+    def check(self, url, *, policy_check=None):
+        allowed, reasons = (True, ()) if policy_check is None else policy_check(url)
+        return LiveURLCheck(
+            original_url=url,
+            final_url=url,
+            eligible=allowed,
+            status_code=200 if allowed else None,
+            redirect_count=0,
+            checked_at=datetime.now(UTC),
+            reason_code=None if allowed else "policy_blocked",
+            reason=None if allowed else "; ".join(reasons),
+        )
+
+    def close(self):
+        return None
 
 
 @event.listens_for(Site, "before_insert")
@@ -233,6 +255,39 @@ def offline_publication_defaults(monkeypatch):
     monkeypatch.setattr(settings, "publish_request_delay_seconds", 0.0)
     monkeypatch.setattr(settings, "publish_max_placement_calls_per_run", 0)
     monkeypatch.setattr(settings, "tavily_api_key", "")
+    # Same hazard as placement above: a real OPENROUTER_API_KEY in `.env` would
+    # turn assistant-loop tests into live paid completions. Tests that exercise
+    # OpenRouter set a key themselves and stub the transport.
+    monkeypatch.setattr(settings, "openrouter_api_key", "")
+
+
+@pytest.fixture(autouse=True)
+def offline_tavily(monkeypatch):
+    """Never let an unrelated test spend Tavily credits.
+
+    Developer ``.env`` files may contain a live key.  Ranking tests that do not
+    exercise the external-search provider must stay deterministic and offline;
+    provider unit tests pass an explicit fake key and a mock HTTP transport.
+    """
+    monkeypatch.setattr(settings, "tavily_api_key", "")
+
+
+@pytest.fixture(autouse=True)
+def offline_live_urls(monkeypatch):
+    """Keep ordinary ranking/publication tests deterministic and offline.
+
+    Dedicated live-URL tests pass a ``LiveURLChecker`` backed by
+    ``httpx.MockTransport`` and therefore still exercise status, redirect,
+    timeout, policy and SSRF behavior explicitly.
+    """
+    from app.services import (  # noqa: PLC0415
+        external_link_policy,
+        external_suggestion_service,
+        suggestion_service,
+    )
+
+    for module in (external_link_policy, external_suggestion_service, suggestion_service):
+        monkeypatch.setattr(module, "LiveURLChecker", _OfflineLiveURLChecker)
 
 
 @pytest.fixture(autouse=True)

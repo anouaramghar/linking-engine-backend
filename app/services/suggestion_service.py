@@ -5,31 +5,48 @@ import hashlib
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 
 from sqlalchemy import and_, func, select, update
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import SessionLocal, engine
-from app.models import Article, Embedding, Site, Suggestion
-from app.models.article import EMBEDDING_DIM
 from app.ml.baseline import top_candidates
-from app.ml.candidate_ordering import order_candidates
+from app.ml.candidate_ordering import OrderedCandidate, order_candidates
 from app.ml.external.base import ExternalSearchProvider
 from app.ml.hybrid import HybridRanker, RankedCandidate
-from app.services.external_suggestion_service import fill_external_suggestion_gap
-from app.services.job_service import record_progress
-from app.services.external_link_policy import external_target_context
+from app.models import Article, Embedding, Site, Suggestion
+from app.models.article import EMBEDDING_DIM
+from app.services.citation_need import analyze_citation_needs
 from app.services.editorial_feedback import (
     FEEDBACK_CANDIDATE_POOL,
     load_editorial_feedback,
 )
+from app.services.external_link_policy import (
+    evaluate_external_url,
+    external_target_context,
+    managed_domains,
+    policy_state,
+)
+from app.services.external_suggestion_service import fill_external_suggestion_gap
 from app.services.graph_service import (
     ensure_graph_snapshot,
     snapshot_features,
 )
+from app.services.job_service import JobCancelled, check_job_cancellation, record_progress
+from app.services.live_url import LiveURLCheck, LiveURLChecker
 
 BATCH_SIZE = 32
 INPUT_RECIPE_VERSION = 1
+#: How deep a source may read into its own ranked candidates when content-pool
+#: targets are in play. Liveness is part of eligibility, so a dead pool row has
+#: to be replaced by the next eligible ranked candidate rather than by a paid
+#: search; a fixed margin would only move the boundary at which that stops being
+#: true. This is the pool size the pipeline already retrieves for one source
+#: elsewhere, so it bounds the query, the scan, and the number of live checks —
+#: which are cached per target for the whole run — without inventing a number.
+POOL_LIVE_SCAN_POOL = FEEDBACK_CANDIDATE_POOL
 # Open review work. 'applied' is deliberately absent: a published link stops
 # occupying the queue. It still counts against the article — see _LIFETIME_STATUSES.
 _ACTIVE_STATUSES = ("pending", "approved", "applying")
@@ -38,6 +55,71 @@ _LIFETIME_STATUSES = (*_ACTIVE_STATUSES, "applied")
 _ANALYSIS_LOCK_NAMESPACE = 0x4C4D
 _DIMENSION_PROBE_INPUT = "LinkMesh dimension probe"
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ArticleSuggestionCapacity:
+    active_for_article: int
+    lifetime_for_article: int
+    active_for_site: int
+    remaining: int
+
+
+def article_suggestion_capacity(
+    db: Session,
+    *,
+    site_id: int,
+    article_id: int,
+) -> ArticleSuggestionCapacity:
+    """Return the same three capacity bounds enforced by suggestion generation."""
+
+    active_for_article = (
+        db.scalar(
+            select(func.count())
+            .select_from(Suggestion)
+            .where(
+                Suggestion.source_article_id == article_id,
+                Suggestion.status.in_(_ACTIVE_STATUSES),
+            )
+        )
+        or 0
+    )
+    lifetime_for_article = (
+        db.scalar(
+            select(func.count())
+            .select_from(Suggestion)
+            .where(
+                Suggestion.source_article_id == article_id,
+                Suggestion.status.in_(_LIFETIME_STATUSES),
+            )
+        )
+        or 0
+    )
+    active_for_site = (
+        db.scalar(
+            select(func.count())
+            .select_from(Suggestion)
+            .where(
+                Suggestion.site_id == site_id,
+                Suggestion.status.in_(_ACTIVE_STATUSES),
+            )
+        )
+        or 0
+    )
+    remaining = max(
+        0,
+        min(
+            settings.hybrid_max_suggestions_per_article - active_for_article,
+            settings.hybrid_max_lifetime_links_per_article - lifetime_for_article,
+            settings.hybrid_max_active_suggestions_per_site - active_for_site,
+        ),
+    )
+    return ArticleSuggestionCapacity(
+        active_for_article=active_for_article,
+        lifetime_for_article=lifetime_for_article,
+        active_for_site=active_for_site,
+        remaining=remaining,
+    )
 
 
 @contextmanager
@@ -51,14 +133,34 @@ def _site_analysis_lock(site_id: int) -> Iterator[None]:
         yield
 
 
+def _active_article_counts(db, site_ids: list[int]) -> dict[int, int]:
+    """Active articles per site, in one query, for the encoding stage's total."""
+    if not site_ids:
+        return {}
+    rows = db.execute(
+        select(Article.site_id, func.count())
+        .where(Article.site_id.in_(site_ids), Article.is_active.is_(True))
+        .group_by(Article.site_id)
+    ).all()
+    return {site_id: count for site_id, count in rows}
+
+
 def _embed_missing(
     db,
     site_id: int,
     model: str,
     job_run_id: int | None = None,
     encoded_offset: int = 0,
+    scanned_offset: int = 0,
+    total: int | None = None,
 ) -> int:
-    """Encode active articles whose model-specific embedding is missing or stale."""
+    """Encode active articles whose model-specific embedding is missing or stale.
+
+    `scanned_offset` and `total` describe the whole encoding stage rather than
+    this one call. A site with a content pool attached is encoded in several
+    passes, and a bar that restarted at each of them would tell the operator the
+    job had gone backwards. Left unset, a site is the whole of its own stage.
+    """
     active_count = db.scalar(
         select(func.count())
         .select_from(Article)
@@ -69,10 +171,13 @@ def _embed_missing(
             f"analysis article count exceeded {settings.analysis_max_articles_per_site} "
             f"for site {site_id}"
         )
+    denominator = active_count if total is None else total
 
     encoded = 0
+    scanned = 0
     last_article_id = 0
     while True:
+        check_job_cancellation(job_run_id)
         rows = db.execute(
             select(
                 Article.id,
@@ -98,6 +203,7 @@ def _embed_missing(
         if not rows:
             return encoded
         last_article_id = rows[-1][0]
+        scanned += len(rows)
         batch = []
         for (
             article_id,
@@ -121,42 +227,52 @@ def _embed_missing(
                 or stored_vector_size != EMBEDDING_DIM
             ):
                 batch.append((article_id, encode_input, fingerprint, embedding_id))
-        if not batch:
-            continue
-        from app.ml.embeddings import encode  # lazy — heavy import
+        if batch:
+            check_job_cancellation(job_run_id)
+            from app.ml.embeddings import encode  # lazy — heavy import
 
-        vectors = list(encode([encode_input for _, encode_input, _, _ in batch]))
-        if len(vectors) != len(batch):
-            raise ValueError(
-                f"Embedding configuration error for model {model!r}: produced "
-                f"{len(vectors)} vectors for {len(batch)} inputs"
-            )
-        for vector in vectors:
-            produced_size = len(vector)
-            if produced_size != EMBEDDING_DIM:
+            vectors = list(encode([encode_input for _, encode_input, _, _ in batch]))
+            check_job_cancellation(job_run_id)
+            if len(vectors) != len(batch):
                 raise ValueError(
-                    f"Embedding configuration error for model {model!r}: produced dimension "
-                    f"{produced_size}, storage dimension {EMBEDDING_DIM}"
+                    f"Embedding configuration error for model {model!r}: produced "
+                    f"{len(vectors)} vectors for {len(batch)} inputs"
                 )
+            for vector in vectors:
+                produced_size = len(vector)
+                if produced_size != EMBEDDING_DIM:
+                    raise ValueError(
+                        f"Embedding configuration error for model {model!r}: produced dimension "
+                        f"{produced_size}, storage dimension {EMBEDDING_DIM}"
+                    )
 
-        for (article_id, _, fingerprint, embedding_id), vector in zip(batch, vectors):
-            values = {
-                "vector": vector,
-                "content_fingerprint": fingerprint,
-                "input_recipe_version": INPUT_RECIPE_VERSION,
-                "vector_size": len(vector),
-            }
-            if embedding_id is None:
-                db.add(Embedding(article_id=article_id, model=model, **values))
-            else:
-                db.execute(update(Embedding).where(Embedding.id == embedding_id).values(**values))
-        encoded += len(batch)
+            for (article_id, _, fingerprint, embedding_id), vector in zip(batch, vectors):
+                values = {
+                    "vector": vector,
+                    "content_fingerprint": fingerprint,
+                    "input_recipe_version": INPUT_RECIPE_VERSION,
+                    "vector_size": len(vector),
+                }
+                if embedding_id is None:
+                    db.add(Embedding(article_id=article_id, model=model, **values))
+                else:
+                    db.execute(
+                        update(Embedding).where(Embedding.id == embedding_id).values(**values)
+                    )
+            encoded += len(batch)
+        # Reported for every page, not only the ones that had work to do. A
+        # re-analysis re-reads articles whose embedding is already current, and
+        # skipping those pages left the operator watching a job that showed no
+        # number at all until the first changed article appeared.
         record_progress(
             db,
             job_run_id,
             stage="encoding",
+            processed=min(scanned_offset + scanned, denominator),
+            total=denominator,
             encoded=encoded_offset + encoded,
         )
+        check_job_cancellation(job_run_id)
         db.commit()
 
 
@@ -230,20 +346,69 @@ def generate_suggestions(
     ranking_mode_override: str | None = None,
     comparison_only: bool = False,
     external_provider: ExternalSearchProvider | None = None,
+    live_url_checker: LiveURLChecker | None = None,
 ) -> dict:
     """RQ task body."""
     with _site_analysis_lock(site_id):
         db = SessionLocal()
+        owns_live_url_checker = live_url_checker is None
+        live_url_checker = live_url_checker or LiveURLChecker()
         try:
+            check_job_cancellation(job_run_id)
             site = db.get(Site, site_id)
             if site is None:
                 raise ValueError(f"site {site_id} not found")
             if site.platform == "pool":
                 raise ValueError("content-pool sources cannot generate suggestions")
             allowed_target_ids, external_trust = external_target_context(db, site)
+            external_policy = policy_state(db, site.id)
+            owned_domains = managed_domains(db)
+            pool_targets: dict[int, tuple[Article, Site]] = {}
+            if external_trust:
+                pool_targets = {
+                    article.id: (article, target_site)
+                    for article, target_site in db.execute(
+                        select(Article, Site)
+                        .join(Site, Site.id == Article.site_id)
+                        .where(Article.id.in_(external_trust))
+                    ).all()
+                    # `external_target_context` keeps trust evidence for every
+                    # pool row so the caller can explain blocked targets, but
+                    # only eligible rows enter the candidate SQL. Keep the
+                    # liveness over-fetch trigger in sync with that same set;
+                    # an unrelated/unapproved pool must not widen every local
+                    # ranking query.
+                    if article.id in allowed_target_ids
+                }
+            pool_live_cache: dict[tuple[int, str], LiveURLCheck] = {}
             model = settings.embedding_model
             _validate_embedding_dimension(model)
-            encoded = _embed_missing(db, site_id, model, job_run_id)
+            check_job_cancellation(job_run_id)
+            # Read before the first pass rather than after it: the encoding
+            # stage's denominator is every article it will walk, and a bar that
+            # learned about the pool only once it got there would jump.
+            pool_site_ids = db.scalars(
+                select(Article.site_id)
+                .where(
+                    Article.id.in_(allowed_target_ids),
+                    Article.site_id != site_id,
+                )
+                .distinct()
+                .order_by(Article.site_id)
+            ).all()
+            encoding_counts = _active_article_counts(db, [site_id, *pool_site_ids])
+            encoding_total = sum(encoding_counts.values())
+            encoded = _embed_missing(
+                db,
+                site_id,
+                model,
+                job_run_id,
+                total=encoding_total,
+            )
+            # A finished pass has walked exactly the active articles it counted,
+            # so the next pass starts where this one stopped without needing the
+            # figure handed back to it.
+            scanned = encoding_counts.get(site_id, 0)
             graph_snapshot, graph_created = ensure_graph_snapshot(db, site_id)
             # The snapshot is a derived observation of the accepted article/link
             # state. Persist it before candidate generation so every suggestion
@@ -254,16 +419,8 @@ def generate_suggestions(
             else:
                 db.commit()
             graph_features = snapshot_features(db, graph_snapshot.id)
-            pool_site_ids = db.scalars(
-                select(Article.site_id)
-                .where(
-                    Article.id.in_(allowed_target_ids),
-                    Article.site_id != site_id,
-                )
-                .distinct()
-                .order_by(Article.site_id)
-            ).all()
             for pool_site_id in pool_site_ids:
+                check_job_cancellation(job_run_id)
                 # Different customer analyses may share the same pool. Reuse the
                 # analysis advisory lock so they cannot both insert one missing
                 # article/model embedding at the same time.
@@ -274,7 +431,10 @@ def generate_suggestions(
                         model,
                         job_run_id,
                         encoded_offset=encoded,
+                        scanned_offset=scanned,
+                        total=encoding_total,
                     )
+                scanned += encoding_counts.get(pool_site_id, 0)
             ranking_mode = _ranking_mode(
                 ranking_mode_override,
             )
@@ -359,17 +519,24 @@ def generate_suggestions(
             external_created = 0
             external_credits_used = 0
             external_filtered: dict[str, int] = {}
+            live_url_candidates_checked = 0
+            live_url_candidates_blocked = 0
+            citation_need_sources_detected = 0
+            citation_need_sentences_detected = 0
             graph_reordered_sources = 0
-            for article_id in article_ids:
+            for source_index, source_article_id in enumerate(article_ids, start=1):
+                check_job_cancellation(job_run_id)
                 if ranking_mode == "hybrid" and site_capacity <= 0:
                     break
                 remaining = min(
-                    suggestion_cap - existing_counts.get(article_id, 0),
-                    lifetime_cap - lifetime_counts.get(article_id, 0),
+                    suggestion_cap - existing_counts.get(source_article_id, 0),
+                    lifetime_cap - lifetime_counts.get(source_article_id, 0),
                     site_capacity,
                 )
                 has_capacity = remaining > 0
-                shadow_selected = ranking_mode == "shadow" and article_id in shadow_source_ids
+                shadow_selected = (
+                    ranking_mode == "shadow" and source_article_id in shadow_source_ids
+                )
                 if comparison_only and not shadow_selected:
                     continue
                 if not has_capacity and not shadow_selected:
@@ -380,17 +547,50 @@ def generate_suggestions(
                     hybrid_sources_selected += 1
                 if has_capacity:
                     eligible_sources += 1
+                source_article = db.get(Article, source_article_id)
+                if source_article is None:
+                    raise ValueError(
+                        f"source article {source_article_id} disappeared during analysis"
+                    )
+                citation_analysis = (
+                    analyze_citation_needs(
+                        source_article.content_text,
+                        language=source_article.language,
+                    )
+                    if has_capacity and not comparison_only
+                    else None
+                )
+                citation_need = citation_analysis.primary if citation_analysis else None
+                citation_evidence = (
+                    citation_need.as_score_component() if citation_need is not None else None
+                )
+                if citation_analysis is not None:
+                    citation_need_sources_detected += int(citation_analysis.total_detected > 0)
+                    citation_need_sentences_detected += citation_analysis.total_detected
                 method = "baseline_cosine"
                 candidate_rows: list[RankedCandidate]
-                candidate_pool_limit = (
-                    max(remaining, FEEDBACK_CANDIDATE_POOL)
-                    if feedback_profile is not None and has_capacity and not comparison_only
+                # Ranking stops at `remaining`, but a content-pool row can still
+                # be dropped after it — the live check below is part of
+                # eligibility, and a dead target is not eligible. Keeping only
+                # `remaining` ranked rows turned every dead pool target into an
+                # unfilled slot that Tavily was then billed to fill, ahead of
+                # ranked candidates that were live and free. Read deeper into the
+                # same ranked order instead, and only call it a gap once those
+                # candidates are exhausted.
+                pool_scan_limit = (
+                    max(remaining, POOL_LIVE_SCAN_POOL)
+                    if pool_targets and has_capacity and not comparison_only
                     else remaining
+                )
+                candidate_pool_limit = (
+                    max(pool_scan_limit, FEEDBACK_CANDIDATE_POOL)
+                    if feedback_profile is not None and has_capacity and not comparison_only
+                    else pool_scan_limit
                 )
                 if ranking_mode == "baseline" or (ranking_mode == "shadow" and not shadow_selected):
                     candidate_rows = _baseline_rows(
                         db,
-                        article_id,
+                        source_article_id,
                         model,
                         candidate_pool_limit,
                         allowed_target_ids=allowed_target_ids,
@@ -400,7 +600,7 @@ def generate_suggestions(
                     candidate_rows = (
                         _baseline_rows(
                             db,
-                            article_id,
+                            source_article_id,
                             model,
                             candidate_pool_limit,
                             allowed_target_ids=allowed_target_ids,
@@ -413,7 +613,7 @@ def generate_suggestions(
                         ranking_limit = suggestion_cap if shadow_selected else candidate_pool_limit
                         ranking = hybrid_ranker.rank(
                             db,
-                            source_id=article_id,
+                            source_id=source_article_id,
                             model=model,
                             limit=ranking_limit,
                             duplicate_similarity_threshold=(
@@ -447,6 +647,8 @@ def generate_suggestions(
                             )
                             shadow_exact_matches += baseline_ids == hybrid_ids
                             candidate_rows = baseline_rows[:remaining] if has_capacity else []
+                    except JobCancelled:
+                        raise
                     except Exception:
                         # Ranking runs before this source adds suggestions or
                         # progress. Rolling back is therefore safe, and required
@@ -457,12 +659,12 @@ def generate_suggestions(
                         logger.exception(
                             "hybrid ranking failed for site %s source %s; using baseline cosine",
                             site_id,
-                            article_id,
+                            source_article_id,
                         )
                         candidate_rows = (
                             _baseline_rows(
                                 db,
-                                article_id,
+                                source_article_id,
                                 model,
                                 candidate_pool_limit,
                                 allowed_target_ids=allowed_target_ids,
@@ -480,14 +682,82 @@ def generate_suggestions(
                         remaining=remaining,
                         graph_features=graph_features,
                         graph_snapshot=graph_snapshot,
-                        source_article_id=article_id,
+                        source_article_id=source_article_id,
                         graph_mode=settings.graph_reranking_mode,
                         minimum_relevance=settings.suggestion_min_score,
                         feedback_profile=feedback_profile,
                         feedback_weight=site.editorial_feedback_weight,
                         external_trust=external_trust,
+                        scan_limit=pool_scan_limit,
                     )
                     ordered_rows = ordering.items
+                    live_ordered_rows: list[OrderedCandidate] = []
+                    for ordered_candidate in ordered_rows:
+                        if len(live_ordered_rows) >= remaining:
+                            # The slots this article had are filled. The rows
+                            # below were only ever fallbacks for dead ones, so
+                            # they are not checked, not billed, and not stored.
+                            break
+                        target_context = pool_targets.get(ordered_candidate.candidate.target_id)
+                        if target_context is None:
+                            live_ordered_rows.append(
+                                replace(
+                                    ordered_candidate,
+                                    final_rank=len(live_ordered_rows) + 1,
+                                )
+                            )
+                            continue
+
+                        target_article, target_site = target_context
+
+                        def pool_policy(
+                            candidate_url: str,
+                            *,
+                            pool_site: Site = target_site,
+                        ) -> tuple[bool, tuple[str, ...]]:
+                            evaluation = evaluate_external_url(
+                                source_site=site,
+                                target_site=pool_site,
+                                target_url=candidate_url,
+                                policy=external_policy,
+                                owned_domains=owned_domains,
+                            )
+                            return evaluation.eligible, evaluation.reasons
+
+                        live_url_candidates_checked += 1
+                        cache_key = (target_site.id, target_article.url)
+                        live_url = pool_live_cache.get(cache_key)
+                        if live_url is None:
+                            live_url = live_url_checker.check(
+                                target_article.url,
+                                policy_check=pool_policy,
+                            )
+                            pool_live_cache[cache_key] = live_url
+                        if not live_url.eligible or live_url.final_url is None:
+                            live_url_candidates_blocked += 1
+                            continue
+
+                        final_trust = evaluate_external_url(
+                            source_site=site,
+                            target_site=target_site,
+                            target_url=live_url.final_url,
+                            policy=external_policy,
+                            owned_domains=owned_domains,
+                        )
+                        if not final_trust.eligible:
+                            live_url_candidates_blocked += 1
+                            continue
+                        components = dict(ordered_candidate.score_components or {})
+                        components["external_trust"] = final_trust.as_score_component()
+                        components["live_url"] = live_url.as_score_component()
+                        live_ordered_rows.append(
+                            replace(
+                                ordered_candidate,
+                                final_rank=len(live_ordered_rows) + 1,
+                                score_components=components,
+                            )
+                        )
+                    ordered_rows = tuple(live_ordered_rows)
                     candidate_rows = [item.candidate for item in ordered_rows]
                     if ordering.graph_reordered:
                         graph_reordered_sources += 1
@@ -495,21 +765,28 @@ def generate_suggestions(
                     candidate_rows = []
                 for ordered_candidate in ordered_rows:
                     candidate = ordered_candidate.candidate
+                    generation_evidence = ordered_candidate.score_components
+                    if citation_evidence is not None:
+                        generation_evidence = dict(generation_evidence or {})
+                        generation_evidence["citation_need"] = citation_evidence
                     db.add(
                         Suggestion(
                             site_id=site_id,
-                            source_article_id=article_id,
+                            source_article_id=source_article_id,
                             generation_job_run_id=job_run_id,
                             target_article_id=candidate.target_id,
                             method=method,
                             # Cosine similarity for both methods, so one number keeps
                             # one meaning across the mixed queue.
                             score=candidate.semantic_score,
-                            score_components=ordered_candidate.score_components,
+                            # What the queue orders and filters on: the strength
+                            # of the signal that actually chose this row.
+                            rank_score=ordered_candidate.rank_score,
+                            score_components=generation_evidence,
                             retrieval_version=ordered_candidate.retrieval_version,
                             ranking_version=ordered_candidate.ranking_version,
                             final_rank=ordered_candidate.final_rank,
-                            feature_snapshot=ordered_candidate.score_components,
+                            feature_snapshot=generation_evidence,
                             status="pending",
                         )
                     )
@@ -517,22 +794,26 @@ def generate_suggestions(
                 external_for_source = 0
                 external_missing = remaining - len(candidate_rows)
                 if external_missing > 0 and has_capacity and not comparison_only:
-                    article = db.get(Article, article_id)
-                    if article is None:
-                        raise ValueError(f"source article {article_id} disappeared during analysis")
+                    check_job_cancellation(job_run_id)
                     external_outcome = fill_external_suggestion_gap(
                         db,
                         site=site,
-                        article=article,
+                        article=source_article,
                         missing_slots=external_missing,
                         model=model,
                         job_run_id=job_run_id,
                         provider=external_provider,
+                        live_url_checker=live_url_checker,
+                        citation_analysis=citation_analysis,
                     )
                     external_searches += external_outcome.searched
                     external_for_source = external_outcome.created
                     external_created += external_for_source
                     external_credits_used += external_outcome.credits_used
+                    live_url_candidates_checked += external_outcome.live_url_checked
+                    live_url_candidates_blocked += external_outcome.filtered.get(
+                        "live_url_failed", 0
+                    )
                     created += external_for_source
                     for reason, count in external_outcome.filtered.items():
                         external_filtered[reason] = external_filtered.get(reason, 0) + count
@@ -541,6 +822,11 @@ def generate_suggestions(
                     db,
                     job_run_id,
                     stage="suggesting",
+                    # Source articles, not suggestions: `created` has no ceiling
+                    # the dashboard could draw a bar against, and this stage is
+                    # the longer half of an analysis.
+                    processed=source_index,
+                    total=len(article_ids),
                     created=created,
                     ranking_mode=ranking_mode,
                     hybrid_fallback_sources=fallback_sources,
@@ -549,6 +835,7 @@ def generate_suggestions(
                     external_credits_used=external_credits_used,
                     external_filtered=external_filtered,
                 )
+                check_job_cancellation(job_run_id)
                 db.commit()
             result = {
                 "articles_encoded": encoded,
@@ -557,6 +844,10 @@ def generate_suggestions(
                 "external_suggestions_created": external_created,
                 "external_credits_used": external_credits_used,
                 "external_filtered": external_filtered,
+                "live_url_candidates_checked": live_url_candidates_checked,
+                "live_url_candidates_blocked": live_url_candidates_blocked,
+                "citation_need_sources_detected": citation_need_sources_detected,
+                "citation_need_sentences_detected": citation_need_sentences_detected,
                 "external_candidates_eligible": sum(
                     evaluation.eligible for evaluation in external_trust.values()
                 ),
@@ -625,4 +916,6 @@ def generate_suggestions(
                     )
             return result
         finally:
+            if owns_live_url_checker:
+                live_url_checker.close()
             db.close()

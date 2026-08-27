@@ -59,6 +59,33 @@ def test_graph_snapshot_is_reproducible_and_changes_with_graph_state(client, db,
     assert third.graph_version != first.graph_version
 
 
+def test_graph_network_returns_all_active_articles_and_edges(client, db, site):
+    source = _article(db, site, "source")
+    target = _article(db, site, "target")
+    orphan = _article(db, site, "orphan")
+    db.add(InternalLink(source_article_id=source.id, target_article_id=target.id))
+    db.commit()
+
+    response = client.get(f"/api/v1/sites/{site.id}/graph/network")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["article_count"] == 3
+    assert body["edge_count"] == 1
+    assert {node["article_id"] for node in body["nodes"]} == {
+        source.id,
+        target.id,
+        orphan.id,
+    }
+    assert {(edge["source_article_id"], edge["target_article_id"]) for edge in body["edges"]} == {
+        (source.id, target.id)
+    }
+    features = {node["article_id"]: node for node in body["nodes"]}
+    assert features[orphan.id]["orphan"] is True
+    assert body["orphan_count"] == sum(node["orphan"] for node in body["nodes"])
+    assert body["underlinked_count"] == sum(node["underlinked"] for node in body["nodes"])
+
+
 def test_graph_simulation_is_read_only_and_warns_on_target_concentration(client, db, site):
     source_one = _article(db, site, "source-one")
     source_two = _article(db, site, "source-two")
@@ -70,6 +97,7 @@ def test_graph_simulation_is_read_only_and_warns_on_target_concentration(client,
             target_article_id=target.id,
             method="hybrid_bm25",
             score=0.91,
+            rank_score=0.91,
             status="approved",
         ),
         Suggestion(
@@ -78,6 +106,7 @@ def test_graph_simulation_is_read_only_and_warns_on_target_concentration(client,
             target_article_id=target.id,
             method="hybrid_bm25",
             score=0.90,
+            rank_score=0.90,
             status="approved",
         ),
     ]
@@ -106,6 +135,73 @@ def test_graph_simulation_is_read_only_and_warns_on_target_concentration(client,
     )
 
 
+def test_graph_neighborhood_returns_focus_edges_and_one_hop_context(client, db, site):
+    source = _article(db, site, "source")
+    target = _article(db, site, "target")
+    neighbor = _article(db, site, "neighbor")
+    distant = _article(db, site, "distant")
+    db.add_all(
+        [
+            InternalLink(source_article_id=source.id, target_article_id=neighbor.id),
+            InternalLink(source_article_id=neighbor.id, target_article_id=distant.id),
+        ]
+    )
+    suggestions = [
+        Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=target.id,
+            method="hybrid_bm25",
+            score=0.91,
+            rank_score=0.91,
+            status="pending",
+        ),
+        Suggestion(
+            site_id=site.id,
+            source_article_id=source.id,
+            target_article_id=neighbor.id,
+            method="hybrid_bm25",
+            score=0.90,
+            rank_score=0.90,
+            status="pending",
+        ),
+    ]
+    db.add_all(suggestions)
+    db.commit()
+
+    response = client.post(
+        f"/api/v1/sites/{site.id}/graph/neighborhood",
+        json={
+            "suggestion_ids": [suggestions[0].id, suggestions[1].id],
+            "max_nodes": 4,
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["requested_suggestion_ids"] == [suggestions[0].id, suggestions[1].id]
+    assert body["skipped_suggestion_ids"] == []
+    assert {node["article_id"] for node in body["nodes"]} == {
+        source.id,
+        target.id,
+        neighbor.id,
+        distant.id,
+    }
+    assert {node["article_id"] for node in body["nodes"] if node["focus"]} == {
+        source.id,
+        target.id,
+        neighbor.id,
+    }
+    assert {
+        (edge["source_article_id"], edge["target_article_id"]) for edge in body["existing_edges"]
+    } == {(source.id, neighbor.id), (neighbor.id, distant.id)}
+    assert [edge["status"] for edge in body["proposed_edges"]] == [
+        "new",
+        "already_present",
+    ]
+    assert any("already exist" in warning for warning in body["warnings"])
+    assert db.query(InternalLink).count() == 2
+
+
 def test_queue_review_includes_current_graph_context(client, db, site):
     source = _article(db, site, "source")
     target = _article(db, site, "target")
@@ -118,6 +214,7 @@ def test_queue_review_includes_current_graph_context(client, db, site):
         target_article_id=target.id,
         method="hybrid_bm25",
         score=0.88,
+        rank_score=0.88,
         status="pending",
     )
     db.add(suggestion)

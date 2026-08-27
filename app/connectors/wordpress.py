@@ -6,7 +6,10 @@ import re
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from queue import Empty, Queue
+from threading import Event, Thread
 from time import monotonic, sleep
+from typing import TypeVar
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 import httpx
@@ -38,6 +41,8 @@ from app.connectors.url_guard import (
     validate_url,
 )
 from app.models.suggestion import Suggestion
+
+T = TypeVar("T")
 
 _API_DISCOVERY_REL = "https://api.w.org/"
 _API_LINK_RE = re.compile(r"<([^>]+)>;\s*rel=[\"']https://api\.w\.org/[\"']", re.IGNORECASE)
@@ -281,6 +286,69 @@ def _anchor_span(content: str, anchor: str) -> tuple[int, int] | None:
         and not any(start < match.end() and match.start() < end for start, end in shortcodes)
     ]
     return spans[0] if len(spans) == 1 else None
+
+
+#: Sentinel marking normal exhaustion of the producer.
+_READ_AHEAD_END = object()
+
+
+def _read_ahead(source: Iterator[T]) -> Iterator[T]:
+    """Yield from ``source`` while one worker thread runs one item ahead.
+
+    Ordering, values and exceptions are what a direct iteration would give. A
+    failure is handed across the queue and raised only once the consumer has
+    reached it, so an error on the page after next cannot surface early and skip
+    the items in between.
+
+    Stopping early — a sample limit, or any exception in the consumer — sets the
+    stop flag and drains queued values, so a producer parked on a full queue
+    wakes, sees the flag and exits. Cleanup never waits for an arbitrary source
+    ``next()`` call to finish; once that call returns, the producer sees the flag
+    before fetching another item.
+    """
+    queue: Queue = Queue(maxsize=1)
+    stop = Event()
+
+    def produce() -> None:
+        try:
+            source_iterator = iter(source)
+            while True:
+                if stop.is_set():
+                    return
+                try:
+                    item = next(source_iterator)
+                except StopIteration:
+                    if not stop.is_set():
+                        queue.put(_READ_AHEAD_END)
+                    return
+                queue.put(item)
+                if stop.is_set():
+                    return
+        except BaseException as error:  # re-raised in the consumer, in order
+            if not stop.is_set():
+                queue.put(error)
+
+    worker = Thread(target=produce, name="wordpress-read-ahead", daemon=True)
+    worker.start()
+    try:
+        while True:
+            item = queue.get()
+            if item is _READ_AHEAD_END:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop.set()
+        # Free every queued value so a producer parked on `queue.put` wakes.
+        # Do not wait for a producer blocked inside an arbitrary source `next()`;
+        # that operation may be a network read with its own much longer timeout.
+        while True:
+            try:
+                queue.get_nowait()
+            except Empty:
+                break
+        worker.join(timeout=0.1)
 
 
 class WordPressConnector(ContentConnector):
@@ -597,7 +665,8 @@ class WordPressConnector(ContentConnector):
                 f"WordPress API returned {media_type} from {response.url}, expected JSON"
             ) from error
 
-    def _paginate(self, path: str, params: dict | None = None) -> Iterator[dict]:
+    def _paginate_pages(self, path: str, params: dict | None = None) -> Iterator[list[dict]]:
+        """Yield one REST page of items at a time, newest first."""
         page = 1
         while page <= settings.crawl_max_wordpress_pages:
             resp = self._api_get(path, params={"per_page": 100, "page": page, **(params or {})})
@@ -606,7 +675,7 @@ class WordPressConnector(ContentConnector):
             items = self._json(resp)
             if not items:
                 return
-            yield from items
+            yield items
             total_pages = resp.headers.get("X-WP-TotalPages")
             if total_pages is not None:
                 declared_total = int(total_pages)
@@ -618,6 +687,21 @@ class WordPressConnector(ContentConnector):
                 raise ValueError("WordPress pagination exceeded the configured page limit")
             page += 1
         raise ValueError("WordPress pagination exceeded the configured page limit")
+
+    def _paginate(self, path: str, params: dict | None = None) -> Iterator[dict]:
+        """Every item across every page, with the next page fetched while this
+        one is being consumed.
+
+        Ingestion writes each article to the database as it arrives, so a plain
+        generator left the network idle during the writes and the writes idle
+        during the network. One page of read-ahead overlaps them.
+
+        It does not make the crawl any less polite: still one request at a time,
+        still at most one page beyond what the caller has reached, and the
+        throttle pause moves to the fetching thread rather than disappearing.
+        """
+        for items in _read_ahead(self._paginate_pages(path, params)):
+            yield from items
 
     def _taxonomy_map(self) -> dict[tuple[str, int], TaxonomyData]:
         """Map (kind, WP term id) to taxonomy; category and tag ids can overlap."""
@@ -768,10 +852,17 @@ class WordPressConnector(ContentConnector):
     def fetch_articles(self) -> Iterator[ArticleData]:
         self._begin_crawl()
         taxonomy_map = self._taxonomy_map()
+        sample = settings.crawl_sample_articles
         for article_number, post in enumerate(
             self._paginate("posts", {"status": "publish"}),
             start=1,
         ):
+            # A sample stops the crawl; the cap refuses it. The two are not the
+            # same request: `crawl_max_articles` exists to catch a site far
+            # larger than expected, and turning that into a silent truncation
+            # would let a partial snapshot deactivate most of a real site.
+            if sample and article_number > sample:
+                return
             if article_number > settings.crawl_max_articles:
                 raise ValueError(f"crawl article count exceeded {settings.crawl_max_articles}")
             yield self._to_article(post, taxonomy_map)

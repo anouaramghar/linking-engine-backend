@@ -49,6 +49,16 @@ from app.schemas.publication import (
     PublicationPreparationJobResult,
 )
 from app.services.alerts import send_alert
+from app.services.external_link_policy import (
+    expire_ineligible_external_suggestions,
+    recheck_external_suggestions_before_publication,
+)
+from app.services.job_service import (
+    NonRetryableTaskError,
+    record_progress,
+    record_progress_durably,
+    run_durably,
+)
 from app.services.publication_plan_service import (
     MAX_REASON_CHARS,
     PlanIntegrityError,
@@ -64,13 +74,6 @@ from app.services.publication_progress import (
     record_publication_failure,
     record_publication_skip,
     resume_outcome_counts,
-)
-from app.services.external_link_policy import expire_ineligible_external_suggestions
-from app.services.job_service import (
-    NonRetryableTaskError,
-    record_progress,
-    record_progress_durably,
-    run_durably,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,11 +195,14 @@ def _publish_approved_plans(
         if site is None:
             raise ValueError(f"site {site_id} not found")
         connector = get_connector(site)
+        plans = load_approved_plans(db, site_id, plan_ids=plan_ids)
+        selected_plan_ids = tuple(plan.id for plan in plans)
         policy_expired = expire_ineligible_external_suggestions(
             db,
             site,
             statuses=("approved",),
             actor="system:publication-policy",
+            publication_plan_ids=selected_plan_ids,
         )
         if policy_expired:
             db.commit()
@@ -205,7 +211,11 @@ def _publish_approved_plans(
                 policy_expired,
                 site_id,
             )
-        plans = load_approved_plans(db, site_id, plan_ids=plan_ids)
+        # Liveness is not a property of the batch. Each plan is checked at its
+        # own publication boundary below; these only total what happened.
+        live_url_checked = 0
+        live_url_passed = 0
+        live_url_expired = 0
         # The batch is the links inside approved artifacts, not everything a
         # reviewer has selected. Those are different numbers now, and reporting
         # the larger one would describe work this run was never going to do.
@@ -234,6 +244,43 @@ def _publish_approved_plans(
                 # advisory lock would block every other worker on this article.
                 sleep(settings.publish_request_delay_seconds)
             try:
+                # The last check of this target, not of some earlier plan in the
+                # batch. A batch-wide gate observed the whole cohort once and then
+                # published for as long as the batch took — the optional pause,
+                # every preceding WordPress write — so a target that died in the
+                # meantime was still written as if it had just been verified.
+                #
+                # Deliberately before the advisory lock and in its own committed
+                # transaction: an 8-second HTTP deadline held under the
+                # per-source-article lock would block every other worker on this
+                # article, and the expiry has to be durable before the locked
+                # re-read can see it. Nothing between the commit and the lock can
+                # revive an expired row, and a plan another worker publishes in
+                # that window is caught by the status re-read below, so ordering
+                # them this way loses no safety.
+                gate = recheck_external_suggestions_before_publication(
+                    db,
+                    site,
+                    statuses=("approved",),
+                    actor="system:publication-live-url",
+                    publication_plan_ids=(plan_id,),
+                )
+                live_url_checked += gate.checked
+                live_url_passed += gate.passed
+                live_url_expired += gate.expired
+                db.commit()
+                if gate.checked:
+                    logger.info(
+                        "publication live-URL gate checked %s external suggestion(s) for "
+                        "plan %s; %s expired",
+                        gate.checked,
+                        plan_id,
+                        gate.expired,
+                    )
+                # An expired suggestion is no longer approved, so the locked
+                # re-read below retires the artifact before the connector is
+                # reached: the write cannot happen after a failed check.
+
                 # one publication update per source article at a time
                 db.execute(
                     select(func.pg_advisory_xact_lock(_PUBLISH_LOCK_NAMESPACE, source_article_id))
@@ -423,6 +470,9 @@ def _publish_approved_plans(
             "block": outcome_counts["block"],
             "already_present": outcome_counts["already_present"],
             "policy_expired": policy_expired,
+            "live_url_checked": live_url_checked,
+            "live_url_passed": live_url_passed,
+            "live_url_expired": live_url_expired,
         }
     finally:
         db.close()
